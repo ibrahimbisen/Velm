@@ -1,0 +1,17 @@
+[package]
+name = "vellum-mindmap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vellum's mind maps: a node tree with tidy (Reingold-Tilford/Walker) automatic layout in horizontal, balanced two-sided and radial forms, collapse/expand, stable structural edits and connector path emission."
+
+# Versions are spelled out rather than inherited from the workspace because this
+# crate was written alongside another that owns the root manifest; they get folded
+# into `[workspace.dependencies]` when the two are merged. Both are already used at
+# these versions elsewhere in the workspace, so nothing new enters the lockfile.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"

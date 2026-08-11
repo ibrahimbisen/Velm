@@ -1,0 +1,9 @@
+[package]
+name = "vellum-scene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Spatial layer for Vellum: f64 world space, camera transforms, R-tree culling and hit-testing."
+
+[dependencies]
+rstar.workspace = true

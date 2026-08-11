@@ -1,0 +1,29 @@
+[package]
+name = "vellum-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reads Miro board content into Vellum: clipboard payloads, .rtb archives, SVG exports."
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+quick-xml.workspace = true
+# Miro keeps sticky and text content as rich-text HTML, and the pipeline turns it
+# into styled spans rather than showing the user their own markup.
+tl.workspace = true
+zip.workspace = true
+log.workspace = true
+
+# The import pipeline writes into the real document and the real blob store, so
+# nothing sits between a decoded payload and a board the user can save.
+vellum-doc.workspace = true
+# Names a link's site from its host, so an imported card reads as a card offline.
+vellum-link.workspace = true
+vellum-store.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

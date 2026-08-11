@@ -1,0 +1,17 @@
+[package]
+name = "vellum-table"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vellum's table widget: a merge-aware grid model, incremental track sizing, absolute cell layout and resize hit-testing. Pure logic, no GPU."
+
+# Versions are spelled out rather than inherited from `[workspace.dependencies]`.
+# This crate landed while the workspace manifest was being edited elsewhere, and a
+# crate that pins its own versions cannot be broken by that edit. They are trivially
+# consolidated back to `.workspace = true` once the tree is quiet.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"

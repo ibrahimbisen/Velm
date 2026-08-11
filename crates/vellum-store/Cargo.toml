@@ -1,0 +1,13 @@
+[package]
+name = "vellum-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vellum's persistence: one SQLite database per board plus a shared BLAKE3 content-addressed blob store."
+
+[dependencies]
+blake3.workspace = true
+rusqlite.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+vellum-doc.workspace = true

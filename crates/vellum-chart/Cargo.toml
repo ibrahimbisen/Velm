@@ -1,0 +1,15 @@
+[package]
+name = "vellum-chart"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Vellum's data charts: bar, line, area, scatter and pie/donut resolved to plot geometry, nice axes, gridlines, legends and collision-free value labels. Pure geometry — no GPU, no UI."
+
+# Deliberately one dependency. A chart is arithmetic over numbers and rectangles;
+# the only thing this crate cannot do itself is decide how a chart spec is stored,
+# and that belongs to `vellum-doc`, which needs it serialisable.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

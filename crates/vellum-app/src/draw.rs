@@ -1,0 +1,6594 @@
+//! Turning the visible slice of a board into a [`DrawList`].
+//!
+//! This is the frame's hot path and the only place that knows how every
+//! [`vellum_doc::ItemKind`] looks. Its shape is set by three constraints:
+//!
+//! **Cost follows the viewport.** Nothing here iterates the document. The R-tree
+//! hands back what is on screen, sorted by paint order, and the loop below runs over
+//! exactly that — which is why a 596-item board and a 60-item board cost the same to
+//! pan around.
+//!
+//! **Paint order is the document's, and it is not negotiable.** Items are emitted
+//! strictly back to front, one at a time, geometry then text. Grouping all the fills
+//! and then all the text would coalesce into fewer draw calls, and it would also
+//! draw a sticky's label on top of the frame that is supposed to be covering it.
+//! [`DrawList`] coalesces consecutive same-kind draws by itself, and a real board is
+//! run-structured enough that it gets most of that saving anyway.
+//!
+//! **Text is drawn in screen pixels.** `vellum_text` rasterises a glyph at the size
+//! it will occupy on screen and snaps its baseline to the pixel grid; pushing the
+//! result through the camera transform would scale it a second time and undo both.
+//! So a block's world origin is projected to device pixels here and the glyphs go
+//! into a screen-space view. It is also why text below
+//! [`MIN_DEVICE_FONT_SIZE`](crate::text::MIN_DEVICE_FONT_SIZE) is not rasterised at
+//! all: at the zoom that fits the whole reference board, 429 text strings rasterise
+//! to sub-pixel smudges at real cost.
+//!
+//! **Text too small to read is greeked, not dropped.** Below that threshold a block
+//! draws as a bar per line — [`Painted::Greeked`] — in the board view, so a zoomed-out
+//! board still shows *where* its words are. Dropping it instead left a board that is
+//! full looking empty, worst of all for `ItemKind::Text`, which has no geometry of its
+//! own to fall back on. The bars are quads, so they cost less than the glyphs they
+//! replace and stay in the batch the item's own geometry already opened.
+//!
+//! # Known gaps
+//!
+//! - **Frames clip at item granularity, not per pixel.** An item wholly outside its
+//!   frame is dropped; one straddling the edge is drawn whole. A scissor rect is the
+//!   real answer and needs `vellum_render::Renderer::draw` to accept one.
+//! - **Text on a rotated item is drawn upright**, centred on the item. Glyph
+//!   instances carry no rotation, so this needs either a rotated glyph pipeline or
+//!   a per-block transform in the text view.
+//! - **`vellum_doc::ItemKind` has no shape variant**, so the SDF path in
+//!   [`push_shape_card`] is currently reached only by the card kinds. Every Miro
+//!   shape is already in `vellum-shapes`; nothing here changes when the document
+//!   grows the variant except the match arm that dispatches to it.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use vellum_connect::Router;
+use vellum_doc::{
+    Align, CardMode, ItemKind, Pattern, Style, StyledText as DocText, TextSpan as DocSpan,
+};
+use vellum_ink::{Lod, Stroke};
+use vellum_render::{
+    DrawList, DrawStats, GlyphAtlas, ImageInstance, MeshTransform, QuadInstance, Renderer, Rgba,
+    ShapeStyle, View,
+};
+use vellum_scene::{Camera, ItemId as SceneId, ScreenPoint, WorldPoint};
+use vellum_shapes::{Shape, Size, TessellationOptions as ShapeTessellation};
+use vellum_text::{FitBox, GlyphImage, GlyphKey};
+
+use crate::assets::{self, Assets};
+use crate::connector;
+use crate::project::{Projected, Projection};
+use crate::text::{self, BlockKey, MIN_DEVICE_FONT_SIZE, TextCache};
+use crate::theme::{self, Theme};
+
+/// Corner radius of a sticky note, in world pixels. Miro's notes are square-ish with
+/// a small softening; `docs/05-design-language.md` §2 rules out pillowy radii.
+const STICKY_RADIUS: f32 = 4.0;
+
+/// Corner radius of a card — link preview, embed, document.
+const CARD_RADIUS: f32 = 6.0;
+
+/// Hairline width for borders, in world pixels. One device pixel at 100%.
+const HAIRLINE: f32 = 1.0;
+
+/// Selection outline width, in **device** pixels: a selection ring is chrome and
+/// must stay the same thickness however far the board is zoomed.
+const SELECTION_WIDTH: f32 = 2.0;
+
+/// How long one frame may spend shaping text it has not laid out before.
+///
+/// Opening the reference board asks for 236 text layouts at once, and Miro's auto-fit
+/// binary-searches a dozen shaping passes for each of them. Paying that in one frame
+/// is a visible stall on the very first thing the user sees. Spending a slice per
+/// frame instead means the board appears immediately and its labels fill in over the
+/// next few frames — the same policy images already follow, and for the same reason.
+/// Everything already laid out is free and unaffected.
+///
+/// **The bound is "budget plus one block", not "budget".** Shaping cannot be
+/// interrupted, so the check is made before each block rather than during it, and a
+/// single expensive one can overrun. Measured on the reference board that puts the
+/// worst frame of a cold open at 12 ms against a 3 ms budget — the overrun is one
+/// link card auto-fitting into a 4000 px box, which stops being a text layout at all
+/// once the importer emits `ItemKind::LinkPreview` instead of substituting text.
+const TEXT_LAYOUT_BUDGET: Duration = Duration::from_millis(3);
+
+/// Frame title height as a fraction of the frame, clamped. Miro scales a frame's
+/// name with the frame rather than with the zoom, so it stays readable as a label
+/// for the region rather than becoming a billboard.
+const FRAME_TITLE_FRACTION: f64 = 0.03;
+const FRAME_TITLE_MIN: f64 = 14.0;
+const FRAME_TITLE_MAX: f64 = 96.0;
+
+/// Fraction of a line's height a greeked bar occupies — roughly an x-height, so a
+/// stack of them has the visual weight of the text it replaces rather than reading
+/// as a solid block.
+const GREEK_BAR_FRACTION: f64 = 0.45;
+
+/// A greeked bar is never thinner than this on screen, in **device** pixels.
+///
+/// Without the floor a bar is as sub-pixel as the glyphs it stands in for, which
+/// defeats the point. A quad's coverage is analytic where a glyph's rasterisation is
+/// not, so one device pixel of bar is a crisp line and one device pixel of glyph is
+/// noise — that asymmetry is the whole reason this feature works.
+const GREEK_MIN_DEVICE_HEIGHT: f64 = 1.0;
+
+/// Line-to-line spacing below which a stack of bars is mush, in **device** pixels.
+/// Under this the block collapses to a single bar spanning its whole extent.
+const GREEK_LINE_SPACING_MIN: f64 = 2.0;
+
+/// Greeked text is a mark saying "words are here", not a headline. Muting it keeps a
+/// zoomed-out board reading as a board rather than as a barcode.
+const GREEK_ALPHA: f32 = 0.55;
+
+/// Everything a frame needs to know that is not the document.
+pub struct DrawContext<'a> {
+    pub camera: &'a Camera,
+    pub projection: &'a Projection,
+    pub theme: Theme,
+    /// Items drawn with a selection ring.
+    pub selection: &'a [SceneId],
+    /// The card whose ↗ open badge the pointer is on, if any.
+    ///
+    /// *"add a hover animation to the outgoing links so when i hover over this i can see
+    /// that i am actually hovering over this"*. The badge is the one thing on the board
+    /// that is a *button* rather than an object — clicking it leaves the app — and it had
+    /// no hover state at all, so nothing distinguished "about to open a web page" from
+    /// "about to select a card". Resolved by the app, which owns the hit test the click
+    /// itself uses, rather than re-derived here: two copies of a hitbox is a click landing
+    /// where the paint is not, which is the rule `card_layout` already exists to enforce.
+    pub hovered_badge: Option<SceneId>,
+    /// The marquee in flight, in physical pixels.
+    pub marquee: Option<(ScreenPoint, ScreenPoint)>,
+    /// The pen stroke being drawn right now, if the button is down.
+    ///
+    /// A stroke becomes an item only when the button comes up — see
+    /// [`crate::actions::ActiveState::commit_stroke`] for why nothing is written
+    /// before then — so until it does, this is the only thing that can put it on
+    /// screen. Without it the pen draws nothing at all until the gesture ends.
+    pub stroke: Option<LiveStroke<'a>>,
+    /// The item a create tool is sweeping out right now.
+    ///
+    /// The same reasoning as the pen's live stroke, arrived at from the other end and
+    /// reported separately: *"when i am trying to draw a frame i do not see it as i draw …
+    /// it just spawns"*. A placing drag writes nothing to the document until the button
+    /// comes up, so without this the board is unchanged for the whole gesture and the item
+    /// appears from nowhere at the end of it.
+    pub placing: Option<Placing>,
+    /// The alignment guides the gesture in flight is reporting, in **world** units.
+    ///
+    /// Miro's *Align objects*. Resolved by the app together with the correction they
+    /// explain, never re-derived here: a guide computed separately from the snap it
+    /// describes is a line pointing at somewhere the item did not go.
+    pub guides: &'a [crate::snap::Guide],
+    /// The board's own background pattern, `docs/05-design-language.md` §4's optional
+    /// grid among them. Drawn in `frost` over whatever the canvas is cleared to.
+    pub pattern: Pattern,
+    /// What the pattern is drawn in, when the board has chosen — colour *and* alpha.
+    ///
+    /// `None` means [`Theme::grid`], which is the near-black the user asked for at the
+    /// contrast feedback 27 tuned. Resolved by the app rather than read from the board
+    /// here for the reason `canvas_color` already is: one function decides the board's
+    /// paint, so the minimap and the canvas cannot come to disagree about it.
+    pub grid_color: Option<vellum_doc::Color>,
+    /// The connector being drawn, as two **world** points.
+    ///
+    /// Like the pen's live stroke and the kanban card's drop preview: a connector becomes an
+    /// item only when the button comes up, so until then this is the only thing that puts
+    /// the gesture on screen.
+    pub pending_connector: Option<(WorldPoint, WorldPoint)>,
+    /// The on-canvas caret and selection, when a text slot is being edited.
+    ///
+    /// The words travel with it — see [`TextCursor`] for why the painter is told the string
+    /// rather than reading it back off the item.
+    pub editing: Option<TextCursor<'a>>,
+    /// Where a kanban card being dragged would land, as four **world** corners.
+    ///
+    /// Corners rather than a rectangle because the item can be rotated and the
+    /// placeholder has to sit on the column it is previewing. Like the pen's live
+    /// stroke, this is the only thing that puts the gesture on screen: a card drag
+    /// writes nothing to the document until the button comes up, so without it the
+    /// drag is invisible and the card appears to jump on release.
+    pub card_drop: Option<[(f64, f64); 4]>,
+    /// Where the minimap goes, in physical pixels — `[x, y, width, height]`. `None`
+    /// hides it. Supplied by the caller rather than derived here because it has to
+    /// clear the floating chrome, and only the caller knows where that is.
+    pub minimap: Option<[f32; 4]>,
+}
+
+/// Where the caret is, what is selected, and the string both index into.
+///
+/// Byte offsets into `text`, which is what `vellum_text::Layout::caret` and
+/// `selection_boxes` index by.
+///
+/// **The string travels with the cursor rather than being read back off the item**, and
+/// that is what lets a caret sit inside a table cell or on a mind-map node. Those parts'
+/// words are inside an opaque JSON token, so a painter asked to re-derive "the text of slot
+/// 7" would have to re-implement the slot-to-cell mapping that `crate::actions` already did
+/// when the session began — a second copy of a mapping, in another module, that would go
+/// wrong silently. It is also strictly more correct for the simple kinds: the offsets came
+/// from this exact string, and every keystroke writes it through to the document, so
+/// indexing the buffer's own bytes cannot disagree with itself even for one frame.
+// No `Eq`: `idle_for` is an `f32`. `PartialEq` is what the comparisons here need, and
+// deriving `Eq` over a float is a lie regardless.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextCursor<'a> {
+    pub scene: SceneId,
+    pub slot: u16,
+    /// Seconds since the caret last moved or the text last changed, for the blink.
+    ///
+    /// Supplied by the app because the painter has no clock of its own and must not grow
+    /// one: a frame that reads `Instant::now()` is a frame whose output depends on when it
+    /// ran, which is exactly what `--screenshot` cannot reproduce.
+    pub idle_for: f32,
+    pub cursor: usize,
+    /// The other end of the selection; equal to `cursor` when nothing is selected.
+    pub anchor: usize,
+    /// The words being edited, exactly as the session's buffer holds them.
+    pub text: &'a str,
+}
+
+/// A pen stroke mid-gesture, before it is an item.
+///
+/// The points are **absolute** world units, unlike [`vellum_doc::ItemKind::Ink`],
+/// whose points are relative to the item's placement. The placement does not exist
+/// yet — it is derived from the finished path's bounds — so there is nothing to be
+/// relative to.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveStroke<'a> {
+    /// In the order they were sampled.
+    pub points: &'a [WorldPoint],
+    /// Already carries the pen kind's alpha; a highlighter arrives translucent.
+    pub color: Rgba,
+    /// Stroke width in world units.
+    pub thickness: f64,
+}
+
+/// The item a create tool is sweeping out, as it will look when the button comes up.
+///
+/// The box comes from [`crate::actions::ActiveState::swept_placement`] — the same function
+/// that commits the item — so the preview cannot be a rectangle away from the result.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placing {
+    /// Centre and extent in board units, exactly as the finished item's placement.
+    pub placement: vellum_doc::Placement,
+    pub look: PlacingLook,
+}
+
+/// How a [`Placing`] should be drawn.
+///
+/// The tool is resolved to a *look* by the app rather than matched on here, for the same
+/// reason [`TextCursor`] carries its own string: this module draws the board and knows
+/// nothing about the palette above it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlacingLook {
+    /// A frame: opaque white with its hairline edge, which is exactly what it becomes.
+    Frame,
+    /// A sticky, in the fill it will be created with.
+    Sticky,
+    /// The form the shape flyout has armed — drawn through the same SDF path the placed
+    /// shape uses, so an ellipse previews as an ellipse rather than as its bounding box.
+    Shape(Shape),
+    /// Everything whose final look is not known until it exists: a table, a chart, a mind
+    /// map, a kanban, a text box. An accent ghost, like the marquee — it reports the box
+    /// honestly and does not pretend to be a picture of the result.
+    Ghost,
+}
+
+/// What a frame drew, for the HUD and for tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PaintStats {
+    /// Items the R-tree returned for this viewport.
+    pub visible: usize,
+    /// Items actually emitted, after frame clipping.
+    pub drawn: usize,
+    /// Text blocks skipped for being too small to read.
+    pub text_skipped: usize,
+    /// Glyphs the atlas could not supply. Anything but zero is a bug in the
+    /// prepare-then-draw ordering, and it shows on screen as missing characters.
+    pub glyphs_missing: usize,
+    /// Images referenced by a visible item that had no texture this frame.
+    pub images_pending: usize,
+    /// Tables laid out this frame. Each one shapes every cell, which is the most
+    /// expensive thing a single item can ask for.
+    pub tables: usize,
+    /// Charts rebuilt this frame.
+    pub charts: usize,
+    /// Kanban boards laid out this frame. Like a table, each one shapes every card.
+    pub kanbans: usize,
+    /// Mind maps drawn this frame. A map is laid out at most once per frame however
+    /// many nodes it has — see `CachedMindMap` — so this counts maps, not tidy passes.
+    pub mindmaps: usize,
+    pub draws: DrawStats,
+}
+
+/// Which open board a [`SceneId`]-keyed cache belongs to.
+///
+/// Handed out by [`crate::editor::Editor`], one per open board, from a process-wide
+/// counter. It exists because neither of the two things that look like they identify a
+/// board actually do: `SceneId`s restart at zero for every [`Projection`], and
+/// generations restart at one. See [`Painter::sync`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BoardEpoch(pub u64);
+
+/// The first slot a table's cells — or a mind map's node labels — occupy. Below it are
+/// the two every kind has: the item's own body and its label.
+pub(crate) const CELL_SLOT_BASE: u16 = 2;
+
+/// A link card's **blurb**, which needs a block of its own.
+///
+/// Miro's card is three typographic voices — a muted site name, a large dark title, a smaller
+/// grey description — and a block carries one colour and one size, so three voices is three
+/// blocks. `PRIMARY` is the title and `SECONDARY` the provider row; this is the third.
+///
+/// It shares its number with `CELL_SLOT_BASE` rather than pushing that up, and the collision
+/// is safe by construction: the only readers that treat a slot as an *index* are the table,
+/// mind-map and kanban arms of [`Painter::block`], each gated on its own `ItemKind`, and a
+/// card is none of them. Bumping `CELL_SLOT_BASE` instead would have renumbered every cell in
+/// every table on every board — the kind of change that reads as harmless and moves the caret
+/// one cell sideways.
+pub(crate) const CARD_BLURB_SLOT: u16 = CELL_SLOT_BASE;
+
+/// A table's laid-out grid, and what it was laid out against.
+///
+/// Held for a frame at a time so that a table is laid out **once** rather than once per
+/// cell. Both text passes and the drawing all ask for the same grid, and a 3 x 3 table
+/// re-laid per slot would shape its nine cells nine times.
+#[derive(Debug)]
+struct CachedTable {
+    generation: u64,
+    /// The box it was fitted to, since a resize changes every column.
+    size: (f64, f64),
+    layout: vellum_table::TableLayout,
+    /// The decoded model. Kept beside the layout because `CellLayout` carries a cell's
+    /// *geometry* and not its words — the text is still in the table, reached by the
+    /// cell's anchor.
+    table: vellum_table::Table,
+}
+
+/// A mind map's laid-out tree, and what it was laid out against.
+///
+/// Held for the same reason [`CachedTable`] is: the drawing and both text passes all ask
+/// for the same layout, and laying a nine-node map out per slot would shape nine labels
+/// nine times. Unlike a table, the layout does **not** depend on the item's box — node
+/// boxes come from shaped text, so a tidy tree has one natural size — which is why the
+/// box is not part of the key here and the fit scale is derived from it instead.
+#[derive(Debug)]
+struct CachedMindMap {
+    generation: u64,
+    layout: vellum_mindmap::Layout,
+    /// The decoded model. Kept beside the layout because a `Placement` carries a node's
+    /// *rectangle* and not its words or its colours; those are still on the tree.
+    model: crate::mindmap::MindMapModel,
+    /// The branches, in the model's connector form. Regenerated with the layout rather
+    /// than per frame — they are a few hundred points and nothing between frames moves
+    /// them.
+    connectors: Vec<vellum_mindmap::ConnectorPath>,
+    /// The map's natural extent, so the fit scale is one division rather than a walk.
+    natural: (f64, f64),
+}
+
+impl CachedMindMap {
+    /// How much the map has to shrink to sit inside the item's box.
+    ///
+    /// Uniform, and the smaller of the two ratios: a map stretched to a dragged box
+    /// would put its text at one aspect and its branches at another. Resizing a mind
+    /// map therefore scales it, which is what [`crate::mindmap`]'s honest-limits note
+    /// records — a tidy tree's extent is determined by the tree, not chosen.
+    fn scale(&self, size: (f64, f64)) -> f64 {
+        crate::mindmap::fit_scale(self.natural, size)
+    }
+}
+
+/// One run of text a kanban board draws, and where.
+///
+/// A kanban has three kinds of label — the board's title, a column's header, a card's —
+/// at different sizes and colours, and the number of them depends on the data. So rather
+/// than deriving a slot's meaning from arithmetic over columns and cards, the layout
+/// flattens them into this list once and a slot is an index into it. The mind map's node
+/// slots could be expressed the same way; the table's cannot, because a merged cell's
+/// index is `vellum-table`'s to define.
+///
+/// [`kanban_runs`] is `pub(crate)` for one reason: it *is* the slot-to-field mapping, and
+/// the press path needs the same one to decide what a double click landed on. Two copies of
+/// this flattening — one that draws and one that decides — would be a caret that appears on
+/// a card and types into its neighbour, and nothing would catch it but the eye.
+#[derive(Debug, Clone)]
+pub(crate) struct KanbanRun {
+    /// Where the text goes, in the item's own space, already inset for padding.
+    rect: vellum_flow::Rect,
+    /// What is drawn — which for a column header is the title *plus* its count.
+    text: String,
+    /// Which field the run belongs to, so a click can be turned into an edit.
+    part: crate::edit::EditPart,
+    /// The field's own value, without any decoration [`Self::text`] adds.
+    ///
+    /// A column header draws `"To do  3/5"`, and the editable field behind it is `"To do"`.
+    /// A caret seeded from the drawn string would put the count in the buffer and write it
+    /// back into the title, so the two are kept apart: `text` is drawn, `field` is edited,
+    /// and while a run *is* being edited the painter draws `field` — see
+    /// `Painter::kanban_run_block`, where the count disappearing while you type the title is
+    /// the visible consequence and the correct one.
+    field: String,
+    font_size: f64,
+    /// Muted ink rather than primary — a column header is a label, not a heading.
+    muted: bool,
+}
+
+impl KanbanRun {
+    pub(crate) const fn part(&self) -> crate::edit::EditPart {
+        self.part
+    }
+
+    pub(crate) fn field(&self) -> &str {
+        &self.field
+    }
+
+    /// The run's box in the item's own space, for a hit test that wants the *label* rather
+    /// than the card it sits on.
+    pub(crate) const fn rect(&self) -> vellum_flow::Rect {
+        self.rect
+    }
+}
+
+/// A kanban board's laid-out columns, and what they were laid out against.
+///
+/// Keyed on the box as well as the generation, like [`CachedTable`] and unlike
+/// [`CachedMindMap`]: a kanban's column width comes straight from the item's width, and
+/// every card's measured height comes from that width, so a resize changes everything.
+#[derive(Debug)]
+struct CachedKanban {
+    generation: u64,
+    size: (f64, f64),
+    layout: vellum_flow::KanbanLayout,
+    /// Every label, flattened, so a text slot is an index. The measured board itself is
+    /// **not** kept: `runs` already holds every string the drawing needs, and holding a
+    /// second copy of the whole board per visible kanban would be state nothing reads.
+    /// The press path decodes the token afresh — see `ActiveState::card_under` for why
+    /// that is right rather than merely acceptable.
+    runs: Vec<KanbanRun>,
+}
+
+/// What a cached shape silhouette belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ShapeMeshKey {
+    id: SceneId,
+    band: i32,
+}
+
+/// One ink stroke's triangles, and the zoom band they were tessellated for.
+#[derive(Debug)]
+struct CachedInk {
+    generation: u64,
+    band: i32,
+    mesh: vellum_ink::Mesh,
+}
+
+/// Owns everything that survives between frames: layouts, tessellated ink, and the
+/// scratch buffers a steady-state frame must not reallocate.
+pub struct Painter {
+    text: TextCache,
+    ink: HashMap<SceneId, CachedInk>,
+    /// Laid-out tables, one frame at a time. See [`CachedTable`].
+    tables: HashMap<SceneId, CachedTable>,
+    /// Laid-out mind maps, one frame at a time. See [`CachedMindMap`].
+    mindmaps: HashMap<SceneId, CachedMindMap>,
+    /// Laid-out kanban boards, one frame at a time. See [`CachedKanban`].
+    kanbans: HashMap<SceneId, CachedKanban>,
+    /// Tessellated silhouettes for the shapes an SDF cannot express.
+    ///
+    /// Keyed on the LOD band as well as the item, like the ink cache: the mesh's
+    /// flattening tolerance is chosen from the drawn size, so a zoom changes what it
+    /// should be. Unlike the ink cache it is *not* keyed on the projection generation
+    /// — the mesh is in unit-box space and the transform carries the size, so a resize
+    /// moves the transform and leaves the mesh correct.
+    shapes: HashMap<ShapeMeshKey, vellum_shapes::ShapeMesh>,
+    router: Router,
+    order: Vec<(i32, SceneId)>,
+    glyphs: Vec<(GlyphKey, GlyphImage)>,
+    /// Time spent shaping new text this frame, against [`TEXT_LAYOUT_BUDGET`].
+    text_spent: Duration,
+    /// The board the caches currently hold entries for. See [`Painter::sync`].
+    painted_board: BoardEpoch,
+    /// The projection generation the caches were last pruned against.
+    pruned_generation: u64,
+    /// The scale glyph bitmaps were last rasterised at. See [`Painter::prepare_text`].
+    last_scale: f32,
+    /// Where the block being edited was drawn, in physical pixels, as of the last frame.
+    ///
+    /// Recorded rather than recomputed because a click has to resolve against **what the
+    /// user saw**, and what they saw is the last painted frame. Recomputing would mean
+    /// rebuilding a `DrawContext` outside the paint loop, and would answer a question
+    /// about a frame that has not been drawn yet.
+    ///
+    /// At most one frame stale, and a frame is requested unconditionally from
+    /// `about_to_wait`, so a camera move is always followed by a repaint before the next
+    /// click can arrive.
+    edited_origin: Option<(BlockKey, ScreenPoint)>,
+}
+
+impl std::fmt::Debug for Painter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Painter")
+            .field("text", &self.text)
+            .field("ink", &self.ink.len())
+            .finish()
+    }
+}
+
+impl Painter {
+    pub fn new(text: TextCache) -> Self {
+        Self {
+            text,
+            ink: HashMap::new(),
+            shapes: HashMap::new(),
+            tables: HashMap::new(),
+            mindmaps: HashMap::new(),
+            kanbans: HashMap::new(),
+            router: Router::default(),
+            order: Vec::new(),
+            glyphs: Vec::new(),
+            text_spent: Duration::ZERO,
+            // No board has been painted yet. `Editor` counts epochs up from zero, so
+            // this cannot collide with a real one, and the first `sync` clears caches
+            // that are already empty.
+            painted_board: BoardEpoch(u64::MAX),
+            pruned_generation: 0,
+            // Not a real zoom, so the first frame evicts an empty cache and records
+            // the scale it actually rasterised at.
+            last_scale: f32::NAN,
+            edited_origin: None,
+        }
+    }
+
+    pub fn text_mut(&mut self) -> &mut TextCache {
+        &mut self.text
+    }
+
+    /// Where the block being edited was drawn last frame, in physical pixels.
+    ///
+    /// The one thing a click on a caret needs and cannot work out for itself. `None`
+    /// before the block has been painted with a caret in it, or once the caret has moved
+    /// to another slot — both of which mean "there is nothing on screen to click into".
+    pub fn edited_origin(&self, key: BlockKey) -> Option<ScreenPoint> {
+        self.edited_origin.filter(|(painted, _)| *painted == key).map(|(_, origin)| origin)
+    }
+
+    /// Cached text layouts. For the flight recorder — a count that climbs while the
+    /// board does not is a cache that has stopped being pruned.
+    pub fn text_layouts(&self) -> usize {
+        self.text.len()
+    }
+
+    /// Tessellated ink strokes held between frames.
+    pub fn ink_meshes(&self) -> usize {
+        self.ink.len()
+    }
+
+    /// Rasterised glyph bitmaps held by the text engine.
+    pub fn glyph_bitmaps(&self) -> usize {
+        self.text.glyph_bitmaps()
+    }
+
+    /// Drops everything cached for items the board no longer holds.
+    ///
+    /// Driven by the projection's generation rather than by a flag the caller has to
+    /// remember to set: a rebuild is the only thing that can retire an item, and it
+    /// always bumps the counter. Call once per frame — it costs one comparison until
+    /// something actually changed.
+    ///
+    /// # Why the board's identity is a separate argument
+    ///
+    /// These caches are keyed on [`SceneId`], and **a `SceneId` only means anything
+    /// within one board**: every [`Projection`] interns from zero
+    /// (`Projection::intern`) and every freshly-opened board sits at generation 1,
+    /// because `Editor::in_memory` reprojects exactly once. So two untouched boards
+    /// collide on *both* halves of the old key, and switching between them returned
+    /// the first board's laid-out text — `TextCache::layout` sees a matching
+    /// generation and hands back the entry — for the second board's items. Same for
+    /// tessellated ink.
+    ///
+    /// A switch therefore **clears** rather than retains. Retaining cannot work here:
+    /// `projection.get(id)` answers for the *incoming* board, so the outgoing board's
+    /// entries at the same ids look alive and survive the prune. Clearing is also what
+    /// releases the parked board's layouts and meshes, which is the point — nothing
+    /// else ever freed them.
+    pub fn sync(&mut self, board: BoardEpoch, projection: &Projection) {
+        if self.painted_board != board {
+            self.painted_board = board;
+            self.pruned_generation = projection.generation();
+            self.text.clear();
+            self.ink.clear();
+            // The structured widgets' layouts hang off a `SceneId` exactly as the ink
+            // meshes do, and were being neither cleared here nor pruned below — so a
+            // parked board's tables and mind maps stayed resident, and a deleted one's
+            // never came back. Found while adding the third such cache; the entries are
+            // small, but "small and unbounded" is how the texture leak started too.
+            self.tables.clear();
+            self.mindmaps.clear();
+            self.kanbans.clear();
+            self.shapes.clear();
+            return;
+        }
+        if self.pruned_generation == projection.generation() {
+            return;
+        }
+        self.pruned_generation = projection.generation();
+        self.text.retain(|id| projection.get(id).is_some());
+        self.ink.retain(|id, _| projection.get(*id).is_some());
+        self.tables.retain(|id, _| projection.get(*id).is_some());
+        self.mindmaps.retain(|id, _| projection.get(*id).is_some());
+        self.kanbans.retain(|id, _| projection.get(*id).is_some());
+        self.shapes.retain(|key, _| projection.get(key.id).is_some());
+    }
+
+    /// Builds the frame's draw list.
+    ///
+    /// The renderer is borrowed mutably because two of its caches have to be filled
+    /// *before* the list that references them is built: the glyph atlas, and the
+    /// texture manager by way of [`Assets`].
+    pub fn paint(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut Renderer,
+        assets: &mut Assets,
+        list: &mut DrawList,
+        ctx: &DrawContext<'_>,
+    ) -> PaintStats {
+        let mut stats = PaintStats::default();
+        list.clear();
+        self.text_spent = Duration::ZERO;
+
+        // Images the decode workers finished, onto the GPU — **before** the list that
+        // references them is built, so one that arrived since the last frame is drawn
+        // this frame rather than next. This is the only place that holds the device, the
+        // queue, the texture manager and `Assets` at once, which is why it lives here
+        // rather than in `app`'s frame loop.
+        assets.collect(device, queue, renderer.textures_mut());
+
+        let camera = ctx.camera;
+        let board = list.view(View::board(camera));
+        let screen = list.view(View::screen(camera.viewport()));
+
+        self.order.clear();
+        self.order.extend(
+            ctx.projection
+                .scene()
+                .query_viewport(camera)
+                .map(|item| (item.z, item.id)),
+        );
+        // Back to front, ties by id, matching `Scene::hit_test` so what the user
+        // clicks is what they can see. Frames sort behind everything else because
+        // `crate::project` gives them a negative `z`, not because of anything here —
+        // doing it here instead would paint a frame behind a sticky while leaving the
+        // hit-test picking the frame, and the click would land on the thing underneath.
+        self.order.sort_unstable();
+        stats.visible = self.order.len();
+
+        // Before any item: the grid is the field things sit *on*, so drawing it after
+        // would put dots on top of the stickies.
+        if ctx.pattern != Pattern::Plain {
+            push_grid(list, ctx, screen);
+        }
+
+        // Pass one: make sure every glyph this frame needs is in the atlas. It has
+        // to finish before a single glyph is pushed, because `push_layout` looks
+        // slots up rather than requesting them.
+        self.prepare_text(device, queue, renderer.atlas_mut(), ctx, &mut stats);
+
+        // Pass two: geometry and glyphs, strictly in paint order.
+        for index in 0..self.order.len() {
+            let (_, id) = self.order[index];
+            let Some(projected) = ctx.projection.get(id) else { continue };
+            if clipped_by_frame(projected, ctx.projection) {
+                continue;
+            }
+            stats.drawn += 1;
+            self.push_item(
+                device,
+                queue,
+                renderer,
+                assets,
+                list,
+                ctx,
+                id,
+                projected,
+                (board, screen),
+                &mut stats,
+            );
+        }
+
+        push_stroke(list, ctx, board);
+        push_placing(list, ctx, board);
+        push_pending_connector(list, ctx, board);
+        self.push_selection(list, ctx, board);
+        push_card_drop(list, ctx, board);
+        // After the selection ring, so a guide running along an item's edge is not hidden
+        // under the ring that is on the same edge; before the marquee, which is a different
+        // gesture and cannot be up at the same time.
+        push_guides(list, ctx, screen);
+        push_marquee(list, ctx, screen);
+        push_minimap(list, ctx, screen);
+
+        stats.draws = list.stats();
+        stats
+    }
+
+    /// Rasterises whatever the atlas is missing for this frame's text.
+    fn prepare_text(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        atlas: &mut GlyphAtlas,
+        ctx: &DrawContext<'_>,
+        stats: &mut PaintStats,
+    ) {
+        self.glyphs.clear();
+        let scale = ctx.camera.zoom() as f32;
+
+        // A glyph bitmap is keyed by its *device* size, so every bitmap cached at a
+        // different scale is unreachable the moment the zoom moves — no future key can
+        // match one. Neither of the engine's bitmap caches evicts on its own, so
+        // without this a zoom gesture leaves a fresh set resident per frame for the
+        // life of the process. Dropping them costs nothing: during a gesture every key
+        // is new anyway, so the rasterising below already runs regardless, and while
+        // the zoom is still this never fires and the cache does its job.
+        if scale != self.last_scale {
+            self.text.forget_glyph_bitmaps();
+            self.last_scale = scale;
+        }
+
+        for index in 0..self.order.len() {
+            let (_, id) = self.order[index];
+            let Some(projected) = ctx.projection.get(id) else { continue };
+            if clipped_by_frame(projected, ctx.projection) {
+                continue;
+            }
+            for slot in 0..self.slots_of(id, projected, projected.generation) {
+                let block = match self.block(id, projected, slot, ctx) {
+                    Some(Painted::Glyphs(block)) => block,
+                    // A greeked block rasterises nothing — that is the point of it.
+                    Some(Painted::Greeked(_)) => {
+                        stats.text_skipped += 1;
+                        continue;
+                    }
+                    None => continue,
+                };
+                let origin = (block.origin.x as f32, block.origin.y as f32);
+                let key = BlockKey::new(id, slot);
+                // Asking the engine for entries is a rasterise; only do it when the
+                // atlas is actually short of something, which after the first frame
+                // at a given zoom is never.
+                let missing = self.text.layout_of(key).is_some_and(|layout| {
+                    layout.glyphs().any(|glyph| {
+                        let key = glyph.physical(origin, scale).key;
+                        atlas.slot(key).is_none() && !atlas.is_blank(key)
+                    })
+                });
+                if missing {
+                    self.text.rasterise_into(key, origin, scale, &mut self.glyphs);
+                }
+            }
+        }
+
+        if !self.glyphs.is_empty()
+            && let Err(error) = atlas.prepare(device, queue, &self.glyphs)
+        {
+            // Not fatal: the frame draws with whatever is resident, which is text
+            // with holes in it rather than no frame at all.
+            log::warn!("glyph atlas: {error}");
+        }
+    }
+
+    /// Emits one item.
+    #[allow(clippy::too_many_arguments)]
+    fn push_item(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut Renderer,
+        assets: &mut Assets,
+        list: &mut DrawList,
+        ctx: &DrawContext<'_>,
+        id: SceneId,
+        projected: &Projected,
+        views: (u32, u32),
+        stats: &mut PaintStats,
+    ) {
+        let (board, screen) = views;
+        let camera = ctx.camera;
+        let theme = ctx.theme;
+        let (origin, (width, height)) = projected.rect();
+        let position = camera.to_camera_relative(origin);
+        let size = [width as f32, height as f32];
+        let rotation = projected.rotation();
+        let opacity = projected.opacity();
+
+        list.use_view(board);
+        match &projected.item.kind {
+            ItemKind::Sticky { background, .. } => {
+                let fill = background.map_or(theme.sticky, theme::convert);
+                list.push_quad(
+                    QuadInstance::solid(position, size, fill)
+                        .with_corner_radius(STICKY_RADIUS)
+                        .with_rotation(rotation)
+                        .with_opacity(opacity),
+                );
+            }
+
+            ItemKind::Text { .. } => {}
+
+            ItemKind::Frame { .. } => {
+                // A frame is opaque white unless it was given a colour of its own.
+                // The board behind it now carries a grid by default, and a frame that
+                // took the surface tint let the grid read straight through it — so the
+                // thing a frame exists to do, mark off a region as its own, stopped
+                // working the moment the grid arrived. White is the contrast.
+                let fill = projected
+                    .item
+                    .style
+                    .fill
+                    .map_or(theme.frame_fill, theme::convert);
+                // A frame's edge is chrome, so like the selection ring its world width
+                // has to shrink as the board is zoomed in. `HAIRLINE` is one device
+                // pixel at 100% — used raw it is invisible at a fitted zoom, which is
+                // how a whole board is normally looked at, and a slab at 8×.
+                let hairline = (f64::from(HAIRLINE) / camera.zoom()) as f32;
+                list.push_quad(
+                    QuadInstance::solid(position, size, fill)
+                        .with_border(theme.border, hairline)
+                        .with_rotation(rotation)
+                        .with_opacity(opacity),
+                );
+            }
+
+            ItemKind::Shape { form, .. } => {
+                // Analytic wherever the shape allows it, which `vellum-shapes` says is
+                // everything polygonal — a star included, because `sdf_params` falls
+                // back to the outline's own vertices. The pipeline, the polygon arena
+                // and the instance were already live on this board through the cards
+                // above; this arm supplies a shape and a style and nothing else.
+                let shape = crate::shapes::decode(form);
+                let fill = projected.item.style.fill.map_or(theme.surface, theme::convert);
+                let border = projected.item.style.stroke.map_or(theme.border, theme::convert);
+                // A stroke width is in world units and the SDF border is drawn inside
+                // the edge, so it needs no zoom compensation — unlike the frame's
+                // hairline, which is chrome rather than part of the drawing.
+                let border_width = projected.item.style.stroke_width.unwrap_or(f64::from(HAIRLINE));
+
+                let size = Size::new(size[0], size[1]);
+                if let Some(params) = shape.sdf_params(size) {
+                    list.push_shape(
+                        &params,
+                        [position[0] + size.width / 2.0, position[1] + size.height / 2.0],
+                        &ShapeStyle {
+                            fill,
+                            border,
+                            border_width: border_width as f32,
+                            rotation,
+                            opacity,
+                        },
+                    );
+                } else {
+                    // The handful whose parameters do not survive a non-uniform scale
+                    // — cloud, heart, cylinder, speech bubble, the document wave, arcs
+                    // and wedges. Tessellated rather than skipped.
+                    let band = lod_band(camera.zoom());
+                    let key = ShapeMeshKey { id, band };
+                    let mesh = self.shapes.entry(key).or_insert_with(|| {
+                        let aspect = size.aspect();
+                        shape
+                            .tessellate(
+                                aspect,
+                                ShapeTessellation::for_size(size.width.max(size.height)),
+                            )
+                            .unwrap_or_else(|error| {
+                                log::warn!("shape tessellation failed: {error}");
+                                vellum_shapes::ShapeMesh::default()
+                            })
+                    });
+                    let transform = list.meshes_mut().push_transform(MeshTransform::unit_box(
+                        position,
+                        [size.width, size.height],
+                        rotation,
+                    ));
+                    let start = list.meshes().indices().len() as u32;
+                    list.meshes_mut().push_shape_fill(
+                        &mesh.fill,
+                        fill.with_alpha(fill.a * opacity),
+                        transform,
+                    );
+                    // The stroke mesh carries a normal per vertex and is widened here,
+                    // so a border width is a uniform rather than a re-tessellation.
+                    // The width is in unit-box space, hence the division.
+                    let unit_width = border_width as f32 / size.width.max(size.height).max(1.0);
+                    list.meshes_mut().push_shape_stroke(
+                        &mesh.stroke,
+                        unit_width,
+                        border.with_alpha(border.a * opacity),
+                        transform,
+                    );
+                    let end = list.meshes().indices().len() as u32;
+                    list.push_meshes(start..end);
+                }
+            }
+
+            ItemKind::Table { .. } => {
+                // The same grid the text pass already built and shaped against, not a
+                // second layout: one table, one layout, per frame. `Fit::Width` spreads
+                // the item's width across the columns, and the row heights come from
+                // real shaping — which is why this needs `crate::table`'s measurer and
+                // not the stand-in `vellum-table` ships for headless use.
+                //
+                // Copied out rather than borrowed across the pushes below: the layout
+                // lives in `self.tables` and `list` needs `self` free.
+                let (ground, cells, borders) = {
+                    let laid = &self
+                        .table_layout(id, projected, projected.generation)
+                        .layout;
+                    let cells: Vec<(vellum_table::Rect, Option<vellum_table::Rgba>)> =
+                        laid.cells.iter().map(|c| (c.rect, c.style.fill)).collect();
+                    // Borders are drawn **on** a boundary rather than between two
+                    // cells; `vellum-table` has already coalesced them, so an interior
+                    // edge is one segment claimed by one side rather than two
+                    // overlapping hairlines.
+                    let borders: Vec<(f64, f64, f64, f64, Option<vellum_table::Rgba>)> = laid
+                        .borders
+                        .iter()
+                        .map(|b| {
+                            let (x, y) =
+                                (b.from.x.min(b.to.x), b.from.y.min(b.to.y));
+                            let thickness =
+                                b.side.width.max(f64::from(HAIRLINE) / camera.zoom());
+                            let (w, h) = match b.orientation {
+                                vellum_table::Orientation::Vertical => (thickness, b.length()),
+                                vellum_table::Orientation::Horizontal => (b.length(), thickness),
+                            };
+                            (x, y, w, h, b.side.color)
+                        })
+                        .collect();
+                    (laid.fill, cells, borders)
+                };
+
+                // Camera-relative already, as above.
+                let at = |x: f64, y: f64| [position[0] + x as f32, position[1] + y as f32];
+
+                // The table's own ground, behind every cell.
+                if let Some(fill) = ground {
+                    list.push_quad(
+                        QuadInstance::solid(position, size, table_colour(fill))
+                            .with_rotation(rotation)
+                            .with_opacity(opacity),
+                    );
+                }
+                for (rect, fill) in &cells {
+                    let Some(fill) = fill else { continue };
+                    list.push_quad(
+                        QuadInstance::solid(
+                            at(rect.origin.x, rect.origin.y),
+                            [rect.size.width as f32, rect.size.height as f32],
+                            table_colour(*fill),
+                        )
+                        .with_rotation(rotation)
+                        .with_opacity(opacity),
+                    );
+                }
+                for (x, y, w, h, colour) in &borders {
+                    let colour = colour.map_or(theme.border, table_colour);
+                    list.push_quad(
+                        QuadInstance::solid(at(*x, *y), [*w as f32, *h as f32], colour)
+                            .with_rotation(rotation)
+                            .with_opacity(opacity),
+                    );
+                }
+
+                stats.tables += 1;
+            }
+
+            ItemKind::Chart { spec } => {
+                // Rebuilt per frame rather than cached. A chart's geometry is a few
+                // hundred marks at most and the layout is pure arithmetic over already
+                // shaped labels — unlike a table, whose every cell is a shaping call.
+                let chart = crate::chart::decode(spec);
+                let geometry = crate::chart::build(
+                    &chart,
+                    self.text.engine_mut(),
+                    (f64::from(size[0]), f64::from(size[1])),
+                );
+
+                // `position` is **already camera-relative** — see where it is computed
+                // at the top of this method — so a chart-local offset is a plain
+                // addition. Converting again subtracts the camera's centre twice, which
+                // put every bar off-screen while the tessellated marks, which reach the
+                // GPU through a transform rather than a quad, drew correctly.
+                let at = |x: f32, y: f32| [position[0] + x, position[1] + y];
+                let tint = |c: vellum_chart::Colour| {
+                    Rgba::from_rgb8(c.r, c.g, c.b).with_alpha(f32::from(c.a) / 255.0 * opacity)
+                };
+
+                // The chart's own ground. Every gap and ring between marks is this
+                // showing through rather than paint, so it has to be drawn first.
+                list.push_quad(
+                    QuadInstance::solid(position, size, tint(geometry.surface))
+                        .with_rotation(rotation),
+                );
+
+                // Axes and the zero rule, under the marks: a bar sitting on the
+                // baseline should cover it, not be cut by it.
+                for axis in &geometry.axes {
+                    for tick in &axis.ticks {
+                        if let Some(grid) = tick.gridline {
+                            push_chart_segment(list, &at, grid, GRID_WIDTH, tint(axis.colour));
+                        }
+                    }
+                }
+                if let Some(baseline) = geometry.baseline {
+                    let colour = tint(geometry.baseline_colour);
+                    push_chart_segment(list, &at, baseline, GRID_WIDTH * 1.5, colour);
+                }
+
+                for mark in &geometry.marks {
+                    match mark {
+                        vellum_chart::Mark::Bar(bar) => {
+                            list.push_quad(
+                                QuadInstance::solid(
+                                    at(bar.rect.x, bar.rect.y),
+                                    [bar.rect.width, bar.rect.height],
+                                    tint(bar.colour),
+                                )
+                                .with_corner_radius(bar.radius)
+                                .with_rotation(rotation),
+                            );
+                        }
+                        vellum_chart::Mark::Dot(dot) => {
+                            let d = dot.radius * 2.0;
+                            list.push_quad(
+                                QuadInstance::solid(
+                                    at(dot.centre.x - dot.radius, dot.centre.y - dot.radius),
+                                    [d, d],
+                                    tint(dot.colour),
+                                )
+                                // A full-radius corner on a square is a circle, which
+                                // saves a second pipeline for a scatter point.
+                                .with_corner_radius(dot.radius)
+                                .with_rotation(rotation),
+                            );
+                        }
+                        vellum_chart::Mark::Line(line) => push_local_mesh(
+                            list,
+                            position,
+                            &crate::chart::polyline_mesh(&line.path, line.width),
+                            tint(line.colour),
+                            rotation,
+                        ),
+                        vellum_chart::Mark::Area(area) => push_local_mesh(
+                            list,
+                            position,
+                            &crate::chart::ring_mesh(&area.outline),
+                            tint(area.fill),
+                            rotation,
+                        ),
+                        vellum_chart::Mark::Slice(slice) => push_local_mesh(
+                            list,
+                            position,
+                            &crate::chart::slice_mesh(&slice.arc),
+                            tint(slice.colour),
+                            rotation,
+                        ),
+                    }
+                }
+
+                stats.charts += 1;
+            }
+
+            ItemKind::MindMap { .. } => {
+                // The same tree the text pass laid out and shaped against, not a second
+                // layout: one map, one tidy pass, per frame.
+                //
+                // Copied out rather than borrowed across the pushes below, as the table
+                // arm does: the layout lives in `self.mindmaps` and `list` needs `self`
+                // free.
+                let (scale, nodes, branches) = {
+                    let cached = self.mindmap_layout(id, projected, projected.generation);
+                    let scale = cached.scale((f64::from(size[0]), f64::from(size[1])));
+                    let nodes: Vec<_> = cached
+                        .layout
+                        .placements()
+                        .iter()
+                        .filter_map(|p| cached.model.map.get(p.node).map(|n| (p.rect, n.style)))
+                        .collect();
+                    // A branch's colour and width live on the **child**, which is what
+                    // `vellum-mindmap`'s connector module says: a link belongs to the
+                    // branch it feeds, not to the parent it leaves.
+                    let branches: Vec<_> = cached
+                        .connectors
+                        .iter()
+                        .filter_map(|path| {
+                            let style = cached.model.map.get(path.child)?.style;
+                            #[expect(
+                                clippy::cast_possible_truncation,
+                                reason = "a mind map's own space is screen-scale"
+                            )]
+                            let points: Vec<[f32; 2]> = path
+                                .points
+                                .iter()
+                                .map(|p| [(p.x * scale) as f32, (p.y * scale) as f32])
+                                .collect();
+                            Some((points, style.connector, style.connector_width * scale))
+                        })
+                        .collect();
+                    (scale, nodes, branches)
+                };
+
+                // `position` is already camera-relative — the same trap the chart arm
+                // records — so a map-local offset is a plain addition.
+                let at = |x: f64, y: f64| [position[0] + x as f32, position[1] + y as f32];
+                let tint = |c: vellum_mindmap::Color| {
+                    Rgba::from_rgb8(c.r, c.g, c.b).with_alpha(f32::from(c.a) / 255.0 * opacity)
+                };
+
+                // Branches under the nodes: a link runs to a node's border, and a node
+                // with a fill should cover the last hairline of it rather than be cut.
+                for (points, colour, width) in &branches {
+                    if !colour.is_visible() {
+                        continue;
+                    }
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a branch's width is screen-scale"
+                    )]
+                    let mesh = crate::mesh::ribbon(points, (*width as f32).max(MIN_BRANCH_WIDTH));
+                    push_local_mesh(list, position, &mesh, tint(*colour), rotation);
+                }
+
+                for (rect, style) in &nodes {
+                    // An unstyled node is text on a branch rather than a box —
+                    // `NodeStyle`'s default is transparent both ways and its own test
+                    // pins that — so a node with neither fill nor border draws nothing
+                    // and costs no quad.
+                    if !style.fill.is_visible() && !style.border.is_visible() {
+                        continue;
+                    }
+                    let quad = QuadInstance::solid(
+                        at(rect.min.x * scale, rect.min.y * scale),
+                        [(rect.width() * scale) as f32, (rect.height() * scale) as f32],
+                        tint(style.fill),
+                    )
+                    .with_corner_radius((style.corner_radius * scale) as f32)
+                    .with_rotation(rotation)
+                    .with_opacity(opacity);
+                    let quad = if style.border.is_visible() {
+                        quad.with_border(tint(style.border), (style.border_width * scale) as f32)
+                    } else {
+                        quad
+                    };
+                    list.push_quad(quad);
+                }
+
+                stats.mindmaps += 1;
+            }
+
+            ItemKind::Kanban { .. } => {
+                // The same layout the text pass shaped against. Copied out before the
+                // pushes, as every other structured arm does.
+                let (columns, cards, overflowing) = {
+                    let cached = self.kanban_layout(id, projected, projected.generation);
+                    let columns: Vec<_> = cached
+                        .layout
+                        .columns
+                        .iter()
+                        .map(|c| (c.rect, c.header, c.wip.limit.is_some_and(|l| c.wip.count > l)))
+                        .collect();
+                    let cards: Vec<_> = cached
+                        .layout
+                        .columns
+                        .iter()
+                        .flat_map(|c| c.cards.iter().map(|card| card.rect))
+                        .collect();
+                    // A breach is state, not colour — `vellum-flow` says so explicitly
+                    // and holds no hex literal — so the decision of what a breach *looks*
+                    // like is made here, against the theme.
+                    (columns, cards, cached.layout.overflows())
+                };
+
+                // `position` is already camera-relative, as above.
+                let at = |r: vellum_flow::Rect| {
+                    (
+                        [position[0] + r.left() as f32, position[1] + r.top() as f32],
+                        [r.width() as f32, r.height() as f32],
+                    )
+                };
+                let hairline = (f64::from(HAIRLINE) / camera.zoom()) as f32;
+
+                // The board's own ground, then a column's, then its cards — three
+                // surfaces a step apart, which is how the design language asks for
+                // hierarchy: a luminance step and a hairline, not a shadow.
+                list.push_quad(
+                    QuadInstance::solid(position, size, theme.frame_fill)
+                        .with_corner_radius(STICKY_RADIUS)
+                        .with_border(theme.border, hairline)
+                        .with_rotation(rotation)
+                        .with_opacity(opacity),
+                );
+                for (rect, header, over) in &columns {
+                    let (origin, extent) = at(*rect);
+                    list.push_quad(
+                        QuadInstance::solid(origin, extent, theme.canvas)
+                            .with_corner_radius(STICKY_RADIUS)
+                            .with_rotation(rotation)
+                            .with_opacity(opacity),
+                    );
+                    // A breached column is marked on its header rather than by tinting
+                    // the whole column: the accent is meant to be scarce, and the header
+                    // is where the count that breached is written.
+                    let (origin, extent) = at(*header);
+                    let tint = if *over { theme.accent } else { theme.border };
+                    list.push_quad(
+                        QuadInstance::solid(origin, [extent[0], hairline.max(1.0)], tint)
+                            .with_rotation(rotation)
+                            .with_opacity(opacity),
+                    );
+                }
+                for rect in &cards {
+                    let (origin, extent) = at(*rect);
+                    list.push_quad(
+                        QuadInstance::solid(origin, extent, theme.frame_fill)
+                            .with_corner_radius(STICKY_RADIUS)
+                            .with_border(theme.border, hairline)
+                            .with_rotation(rotation)
+                            .with_opacity(opacity),
+                    );
+                }
+                if overflowing {
+                    // `vellum-flow` lays overflow out past the edge on purpose and
+                    // nothing here scrolls, so this draws outside its own item. Logged
+                    // rather than clamped: shrinking the columns is the behaviour that
+                    // crate explicitly refuses, and resizing the item is the remedy.
+                    log::debug!("a kanban board overflows its box; nothing here scrolls");
+                }
+
+                stats.kanbans += 1;
+            }
+
+            // A group is a container, not a drawing. `vellum_doc::ItemKind::Group`
+            // is explicit that it has no visual payload of its own.
+            ItemKind::Group => {}
+
+            ItemKind::Image { asset_id, crop } => {
+                match assets.texture(device, queue, renderer.textures_mut(), asset_id) {
+                    Some((texture, source)) => {
+                        renderer.textures_mut().mark(texture, 0.0);
+                        let uv = match crop {
+                            Some(crop) => {
+                                assets::crop_uv(*crop, (f64::from(source.0), f64::from(source.1)))
+                            }
+                            None => vellum_render::UvRect::FULL,
+                        };
+                        list.push_image(
+                            texture,
+                            ImageInstance::new(position, size, uv)
+                                .with_rotation(rotation)
+                                .with_opacity(opacity),
+                        );
+                    }
+                    None => {
+                        stats.images_pending += 1;
+                        push_placeholder(list, position, size, rotation, opacity, &theme);
+                    }
+                }
+            }
+
+            ItemKind::Ink { color, thickness, points } => {
+                let stroke_color = color.map_or(theme.stroke, theme::convert);
+                // **The item's own scale belongs in the band, and its absence was invisible
+                // on every stroke this app drew itself.**
+                //
+                // The mesh is tessellated in stroke-local space and then magnified on the
+                // GPU by `placement.scale` (see the transform below), so what a viewer
+                // actually sees is `zoom × scale` — while the tolerance was derived from the
+                // zoom alone. Velm's own strokes carry scale 1.0, so they were always right;
+                // **imported Miro ink does not** (`vellum_import::pipeline` keeps the scale
+                // out of the points on purpose, because the renderer applies it), so a stroke
+                // at scale 2 was tessellated exactly twice as coarsely as it is drawn, at
+                // scale 4 four times. The user's comparison was of an imported board, which
+                // is why the difference was so much starker than a stroke drawn here.
+                let band = lod_band(camera.zoom() * projected.item.placement.scale);
+                let generation = projected.generation;
+                let entry = self.ink.entry(id).or_insert_with(|| CachedInk {
+                    generation,
+                    band,
+                    mesh: tessellate_ink(points, *thickness, band),
+                });
+                if entry.generation != generation || entry.band != band {
+                    entry.generation = generation;
+                    entry.band = band;
+                    entry.mesh = tessellate_ink(points, *thickness, band);
+                }
+
+                // The stroke's points are relative to the item's centre, which is
+                // also what the placement is — so the transform is the centre, and
+                // the vertices never carry the board's absolute extent.
+                let centre = WorldPoint::new(projected.item.placement.x, projected.item.placement.y);
+                let transform = list.meshes_mut().push_transform(MeshTransform::scale_rotate_at(
+                    projected.item.placement.scale as f32,
+                    rotation,
+                    camera.to_camera_relative(centre),
+                ));
+                let start = list.meshes().indices().len() as u32;
+                list.meshes_mut().push_ink(
+                    &entry.mesh,
+                    stroke_color.with_alpha(stroke_color.a * opacity),
+                    transform,
+                );
+                let end = list.meshes().indices().len() as u32;
+                list.push_meshes(start..end);
+            }
+
+            ItemKind::Connector { color, .. } => {
+                let Some(routed) = connector::route(
+                    &projected.item.kind,
+                    &projected.item.placement,
+                    |target| ctx.projection.placement_of(target),
+                    &self.router,
+                    &[],
+                ) else {
+                    return;
+                };
+                let options = vellum_connect::TessellationOptions {
+                    // A curve only has to be smooth to the pixel the viewer can see;
+                    // tessellating a board-spanning bezier to 0.05 world px when it
+                    // is 40 px on screen is thousands of wasted triangles.
+                    tolerance: (0.5 / camera.zoom()).clamp(0.05, 64.0),
+                };
+                let Ok(mesh) = vellum_connect::tessellate(&routed.path, &routed.style, &options)
+                else {
+                    return;
+                };
+                let line = color.map_or(theme.stroke, theme::convert);
+                let transform = list.meshes_mut().push_transform(MeshTransform::at(
+                    camera.to_camera_relative(WorldPoint::new(mesh.origin.x, mesh.origin.y)),
+                ));
+                let start = list.meshes().indices().len() as u32;
+                list.meshes_mut().push_connector(
+                    &mesh,
+                    line.with_alpha(line.a * opacity),
+                    transform,
+                );
+                let end = list.meshes().indices().len() as u32;
+                list.push_meshes(start..end);
+            }
+
+            // Both card kinds draw the same way, which is the point of them carrying the same
+            // display fields: the difference between a Miro `preview` and a Miro `embed` is
+            // which provider it came from, not what it looks like.
+            ItemKind::LinkPreview { url, thumbnail, favicon, mode, .. }
+            | ItemKind::Embed { url, thumbnail, favicon, mode, .. } => {
+                push_shape_card(list, position, size, rotation, opacity, &theme);
+
+                // The same layout the two text blocks use, so the picture and the words cannot
+                // end up on top of each other. See `card_layout`.
+                let (w, h) = projected.item.placement.scaled_size();
+                let font = card_font_size(w);
+                let laid = card_layout(
+                    w,
+                    h,
+                    font,
+                    *mode,
+                    thumbnail.is_some(),
+                    favicon.is_some(),
+                    url.is_some(),
+                    url.as_deref().is_some_and(vellum_link::plays_video),
+                );
+                // A box in the item's own space becomes one in whatever space this list is
+                // drawing in, as a **fraction of the item**: `position` and `size` are already
+                // the item's top-left and extent in that space, so the offsets scale by
+                // `size / item size` and nothing needs to know what the space is.
+                //
+                // Multiplying by `camera.zoom()` instead is wrong and looked *nearly* right —
+                // the card was correct and the image overflowed its right edge while the favicon
+                // landed on top of the title. The list is in the board view here, where a unit
+                // is already a world unit; the zoom is baked into `size`.
+                let scale = (
+                    if w > 0.0 { size[0] / w as f32 } else { 0.0 },
+                    if h > 0.0 { size[1] / h as f32 } else { 0.0 },
+                );
+                let to_screen = |(x, y, bw, bh): (f64, f64, f64, f64)| {
+                    (
+                        [position[0] + x as f32 * scale.0, position[1] + y as f32 * scale.1],
+                        [bw as f32 * scale.0, bh as f32 * scale.1],
+                    )
+                };
+                // One device pixel in this list's units, for the badge's minimum stroke. See
+                // `push_open_badge`'s `pixel` parameter: the list is in the board view, so a
+                // literal 1.0 is one *world* unit and goes sub-pixel on any fitted board.
+                let pixel = (1.0 / ctx.camera.zoom()) as f32;
+
+                // The preview image, in the one mode that has room for it. `Card` and `Link`
+                // deliberately draw no image even when one has been fetched — that is what
+                // makes them smaller, and switching modes must not need a re-fetch.
+                if let Some(box_) = laid.image
+                    && let Some(hash) = thumbnail
+                    && let Some((texture, source)) =
+                        assets.texture(device, queue, renderer.textures_mut(), hash)
+                {
+                    renderer.textures_mut().mark(texture, 0.0);
+                    let (at, extent) = to_screen(box_);
+                    list.push_image(
+                        texture,
+                        // Cropped to the band's aspect rather than stretched into it. The
+                        // *layout* box is the right thing to measure against, not `extent`:
+                        // both are the same shape, but the layout box is in world units and
+                        // is not rounded to device pixels, so it does not make the crop
+                        // shiver by a texel as the board is zoomed.
+                        ImageInstance::new(at, extent, cover_uv(source, (box_.2, box_.3)))
+                            // Its own radius, slightly tighter than the card's, which is what
+                            // makes a picture read as sitting *in* the card rather than as the
+                            // card's own face.
+                            .with_corner_radius(CARD_RADIUS * 0.75)
+                            .with_rotation(rotation)
+                            .with_opacity(opacity),
+                    );
+                }
+
+                // The site's icon, at the head of the provider row. Miro leads every card and
+                // every collapsed row with one, and it is the fastest thing on a card to read:
+                // a favicon is recognised before any of the words are.
+                //
+                // # The `else` is the fix, and it is why the layout was left alone
+                //
+                // `card_layout` reserves this box on `favicon.is_some()` — on a *hash* existing,
+                // which is not the same as bytes that draw. The user photographed the gap that
+                // makes: an imported Alibaba card whose icon fetched fine, failed to decode
+                // (it is an ICO, and the `image` crate was built without that feature), and was
+                // recorded `Undecodable` for the session — so the row stayed indented around an
+                // empty square with nothing in it.
+                //
+                // Reserving on *drawability* instead was the obvious repair and is the wrong
+                // one twice over: `Painter::block` computes the same layout to place the text
+                // and cannot see `Assets` — it is borrowed mutably by this very pass — and an
+                // icon that arrives mid-session would then reflow the words out from under the
+                // reader. A placeholder in the box that was already reserved has neither
+                // problem, and it covers *pending* and *never-fetched* with the same paint
+                // rather than leaving a hole for each.
+                if let Some(box_) = laid.favicon
+                    && let Some(hash) = favicon
+                {
+                    let (at, extent) = to_screen(box_);
+                    if let Some((texture, source)) =
+                        assets.texture(device, queue, renderer.textures_mut(), hash)
+                    {
+                        renderer.textures_mut().mark(texture, 0.0);
+                        list.push_image(
+                            texture,
+                            // Cropped too. A favicon is square and its box is square, so this
+                            // is almost always the identity — but "almost always" is why it is
+                            // here: a site serving a wide wordmark as its icon would otherwise
+                            // squash it into a square, and that is one site away rather than
+                            // impossible.
+                            ImageInstance::new(at, extent, cover_uv(source, (box_.2, box_.3)))
+                                .with_corner_radius(FAVICON_RADIUS)
+                                .with_rotation(rotation)
+                                .with_opacity(opacity),
+                        );
+                    } else {
+                        push_favicon_placeholder(list, at, extent, rotation, opacity, &theme);
+                    }
+                }
+
+                // The ▶, over the poster, for a card whose page is a video.
+                if let Some(box_) = laid.play {
+                    let hovered = ctx.hovered_badge == Some(id);
+                    push_play_button(list, to_screen(box_), rotation, opacity, &theme, hovered);
+                }
+
+                // The open-page badge, last, so it is on top of the picture it sits over.
+                if let Some(box_) = laid.badge {
+                    let hovered = ctx.hovered_badge == Some(id);
+                    push_open_badge(list, to_screen(box_), rotation, opacity, &theme, hovered, pixel);
+                }
+            }
+
+            ItemKind::Document { .. } => {
+                push_shape_card(list, position, size, rotation, opacity, &theme);
+            }
+        }
+
+        // Text last. Glyphs go in the screen view, so they are rasterised at the size
+        // they occupy rather than scaled by the camera; greeked bars stay in the board
+        // view, where they coalesce with the geometry above instead of paying for the
+        // view flip.
+        for slot in 0..self.slots_of(id, projected, projected.generation) {
+            match self.block(id, projected, slot, ctx) {
+                Some(Painted::Glyphs(block)) => {
+                    list.use_view(screen);
+                    let atlas = renderer.atlas();
+                    let layout = self
+                        .text
+                        .layout_of(BlockKey::new(id, slot))
+                        .expect("the block was just laid out");
+                    // The selection goes *under* the glyphs, so the text stays legible
+                    // through it, and the caret goes over — which is only visible where
+                    // the two coincide, at a caret sitting on a glyph's stem.
+                    if let Some(cursor) = ctx.editing.filter(|c| c.scene == id && c.slot == slot) {
+                        push_selection_boxes(list, ctx, &block, layout, cursor);
+                    }
+                    stats.glyphs_missing += list.push_layout(
+                        atlas,
+                        layout,
+                        [block.origin.x as f32, block.origin.y as f32],
+                        camera.zoom() as f32,
+                        block.color.with_alpha(block.color.a * opacity),
+                    );
+                    if let Some(cursor) = ctx.editing.filter(|c| c.scene == id && c.slot == slot) {
+                        push_caret(list, ctx, &block, layout, cursor);
+                        // Kept for the *next* click to resolve against. See the field.
+                        self.edited_origin = Some((BlockKey::new(id, slot), block.origin));
+                    }
+                }
+                Some(Painted::Greeked(greek)) => {
+                    list.use_view(board);
+                    self.push_greek(list, camera, &greek, opacity);
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Emits the bars that stand in for text too small to read.
+    ///
+    /// Board view, so they coalesce into the run of quads the items around them are
+    /// already pushing — a greeked item is *cheaper* than a drawn one, not dearer.
+    fn push_greek(&self, list: &mut DrawList, camera: &Camera, greek: &Greek, opacity: f32) {
+        let color = greek.color.with_alpha(greek.color.a * GREEK_ALPHA * opacity);
+        match greek.lines {
+            // Nothing shaped, or the lines are too close to tell apart: one bar for
+            // the whole block.
+            GreekLines::Single { width, height } => {
+                let origin = camera.to_camera_relative(greek.origin);
+                list.push_quad(QuadInstance::solid(origin, [width as f32, height as f32], color));
+            }
+            // Real lines, read straight off the cached layout: the bars sit where the
+            // lines sit and are as wide as the lines are, so a wrapped paragraph keeps
+            // its ragged right edge.
+            GreekLines::PerLine { key, bar } => {
+                let Some(layout) = self.text.layout_of(key) else { return };
+                for line in &layout.lines {
+                    let width = f64::from(line.width).min(greek.column);
+                    if width <= 0.0 {
+                        continue;
+                    }
+                    // `LaidOutLine::width` is the advance before alignment, so the
+                    // block's own alignment has to be reapplied here or a centred
+                    // sticky greeks hard against its left edge.
+                    let indent = match greek.align {
+                        Align::Center => (greek.column - width) / 2.0,
+                        Align::Right => greek.column - width,
+                        Align::Left => 0.0,
+                    };
+                    // Centre the bar in its line box: an x-height stripe sitting on
+                    // the line's own baseline band.
+                    let slack = (f64::from(line.height) - bar).max(0.0) / 2.0;
+                    let at = WorldPoint::new(
+                        greek.origin.x + indent,
+                        greek.origin.y + f64::from(line.top) + slack,
+                    );
+                    let origin = camera.to_camera_relative(at);
+                    list.push_quad(QuadInstance::solid(origin, [width as f32, bar as f32], color));
+                }
+            }
+            // A block that was never shaped, so the bars are laid on the type's own rhythm.
+            GreekLines::Estimated { lines, bar, spacing, width } => {
+                for line in 0..lines {
+                    // The last bar is short, the way the last line of a paragraph is. Without
+                    // it a stack of identical full-width bars reads as a table or a barcode
+                    // rather than as text — which is the whole job of a greeked block, since
+                    // nobody can read it either way.
+                    let width = if line + 1 == lines && lines > 1 { width * 0.62 } else { width };
+                    let slack = (spacing - bar).max(0.0) / 2.0;
+                    let indent = match greek.align {
+                        Align::Center => (greek.column - width) / 2.0,
+                        Align::Right => greek.column - width,
+                        Align::Left => 0.0,
+                    };
+                    let at = WorldPoint::new(
+                        greek.origin.x + indent,
+                        greek.origin.y + line as f64 * spacing + slack,
+                    );
+                    let origin = camera.to_camera_relative(at);
+                    list.push_quad(QuadInstance::solid(origin, [width as f32, bar as f32], color));
+                }
+            }
+        }
+    }
+
+    /// Lays out one of an item's text slots and decides what it contributes.
+    ///
+    /// Returns `None` when the slot is empty for this kind, which is the common case
+    /// — most items have no secondary block and several have no text at all — and
+    /// [`Painted::Greeked`] when the text is real but too small to read, which is what
+    /// stops a zoomed-out board from looking empty.
+    ///
+    /// This is the *only* place the readable-size decision is made. It used to be
+    /// taken here and then re-taken by both callers against
+    /// [`MIN_DEVICE_FONT_SIZE`], which is exactly the sort of triplicated threshold
+    /// that drifts.
+    fn block(
+        &mut self,
+        id: SceneId,
+        projected: &Projected,
+        slot: u16,
+        ctx: &DrawContext<'_>,
+    ) -> Option<Painted> {
+        let generation = projected.generation;
+        let key = BlockKey::new(id, slot);
+        let (_, (width, height)) = projected.rect();
+        let placement = &projected.item.placement;
+        let theme = ctx.theme;
+
+        // A table's cells come first, because they are the one case keyed by an index
+        // rather than by a named slot.
+        if let ItemKind::Table { .. } = &projected.item.kind
+            && slot >= CELL_SLOT_BASE
+        {
+            return self.table_cell_block(id, projected, slot, ctx);
+        }
+        if let ItemKind::MindMap { .. } = &projected.item.kind
+            && slot >= CELL_SLOT_BASE
+        {
+            return self.mindmap_node_block(id, projected, slot, ctx);
+        }
+        if let ItemKind::Kanban { .. } = &projected.item.kind
+            && slot >= CELL_SLOT_BASE
+        {
+            return self.kanban_run_block(id, projected, slot, ctx);
+        }
+
+        // Set by the card arm below; unused by every other kind.
+        let mut card_line_budget = usize::MAX;
+        // Whether the caret is in *this* slot right now.
+        //
+        // The arms below skip a slot with no words in it, which is right — a fresh table
+        // costs nothing to shape — and catastrophic while a caret is in one: no block means
+        // no origin, and `push_caret` has nothing to draw against, so the caret simply does
+        // not appear. `table_cell_block` and `kanban_run_block` were each taught this
+        // separately; a **sticky, a text box and a frame title were not**, which is
+        // *"when i double click on the notepad the writing status symbol … still does not
+        // work … it only starts flashing after i start typing"*: the first keystroke gives
+        // the item words, the words give it a block, and the block is what the caret was
+        // waiting for all along.
+        let caret_here = ctx.editing.is_some_and(|c| c.scene == id && c.slot == slot);
+        let (fit, anchor, color, style) = match (&projected.item.kind, slot) {
+            // A note's text is centred in the note, both ways — Miro's own vertical
+            // centring, which is what makes a one-word sticky look deliberate
+            // rather than top-heavy.
+            // A shape's label is centred in it, both ways, for the same reason a
+            // sticky's is: a shape is a container for one short phrase, and a phrase
+            // pinned to the top-left of a diamond reads as a mistake.
+            (ItemKind::Sticky { text, .. } | ItemKind::Shape { text, .. }, BlockKey::PRIMARY) => {
+                if text.is_empty() && !caret_here {
+                    return None;
+                }
+                (
+                    text::sticky_fit(width, height),
+                    Anchor::Centred,
+                    projected
+                        .item
+                        .style
+                        .text_color
+                        .map_or(theme.text, theme::convert),
+                    projected.item.style.clone(),
+                )
+            }
+
+            (ItemKind::Text { text }, BlockKey::PRIMARY) => {
+                if text.is_empty() && !caret_here {
+                    return None;
+                }
+                (
+                    FitBox::new(width.max(1.0) as f32, height.max(1.0) as f32),
+                    Anchor::TopLeft,
+                    projected
+                        .item
+                        .style
+                        .text_color
+                        .map_or(theme.text, theme::convert),
+                    projected.item.style.clone(),
+                )
+            }
+
+            (ItemKind::Frame { title, .. }, BlockKey::SECONDARY) => {
+                if title.is_empty() && !caret_here {
+                    return None;
+                }
+                let size = (height * FRAME_TITLE_FRACTION).clamp(FRAME_TITLE_MIN, FRAME_TITLE_MAX);
+                (
+                    FitBox::new(width.max(1.0) as f32, size as f32),
+                    Anchor::Above(size),
+                    theme.text_muted,
+                    Style { font_size: Some(size), ..projected.item.style.clone() },
+                )
+            }
+
+            (
+                ItemKind::LinkPreview { .. } | ItemKind::Embed { .. } | ItemKind::Document { .. },
+                BlockKey::PRIMARY | BlockKey::SECONDARY | CARD_BLURB_SLOT,
+            ) => {
+                let inset = width * CARD_PADDING;
+                // The image band is reserved only when there is an image to put in it. A
+                // `Large` card with nothing fetched yet would otherwise draw its text halfway
+                // down over 55% of empty surface, which reads as a broken card rather than as
+                // one waiting for a picture — and every card on a freshly imported board is in
+                // exactly that state.
+                let mode = match card_mode(&projected.item.kind) {
+                    CardMode::Large if !has_thumbnail(&projected.item.kind) => CardMode::Card,
+                    other => other,
+                };
+                // **An explicit size, not auto-fit.** A card's text is a *label* at a fixed
+                // size, the way it is in a browser's link preview and in Miro's own card —
+                // whereas auto-fit asks "how big can this be and still fit", which for a
+                // collapsed row holding six words answers 40pt and fills the whole box. That
+                // is what the first version of this drew.
+                //
+                // Scaled by the card's width so a deliberately enlarged card enlarges its
+                // text with it, rather than keeping 13pt type in a 1000-unit box.
+                let size = card_font_size(width);
+                // The collapsed row gets one line of room. Anything taller would let the
+                // title wrap, which is the one thing the mode exists to prevent.
+                let box_height = if matches!(mode, CardMode::Link) {
+                    size * CARD_LINE_HEIGHT
+                } else {
+                    // The rest of the card, less the image band in the mode that has one.
+                    let reserved =
+                        if mode.shows_image() { height * mode.image_fraction() } else { 0.0 };
+                    (height - reserved - inset * 2.0).max(size)
+                };
+                let laid = card_layout(
+                    width,
+                    height,
+                    size,
+                    mode,
+                    has_thumbnail(&projected.item.kind),
+                    has_favicon(&projected.item.kind),
+                    has_link(&projected.item.kind),
+                    is_video(&projected.item.kind),
+                );
+                // **Three slots, because a layout carries one colour and one size.** Miro's
+                // card is a muted site name, then a large title, then a smaller grey blurb.
+                // `DrawList::push_layout` takes a single colour for a whole run and `Style`
+                // a single `font_size`, and `SpanStyle` has no size field at all — so each
+                // tone-and-size pairing has to be its own block. Doing it in one would need
+                // per-span colour *and* per-span size in the glyph pass, which is a renderer
+                // change for a card.
+                let (x, y, w, h) = match slot {
+                    BlockKey::SECONDARY => laid.provider,
+                    CARD_BLURB_SLOT => laid.blurb,
+                    _ => laid.title,
+                };
+                // Each block is set at its own size, which is the half that makes the title
+                // read from a distance — colour alone left the card looking like one paragraph.
+                let size = match slot {
+                    BlockKey::SECONDARY => size,
+                    CARD_BLURB_SLOT => size * BLURB_SCALE,
+                    _ => size * TITLE_SCALE,
+                };
+                // How many characters this block can hold, which is what the text is clipped
+                // to. Estimated from the advance rather than measured: measuring needs a shaping
+                // pass, and this decides *what to shape*. Half the font size is the mean advance
+                // of a proportional face to within a few percent, and the clip ends in an
+                // ellipsis either way — a character out is invisible.
+                //
+                // **Clipped rather than allowed to overflow.** A card is a fixed box and a
+                // page's blurb is any length: without this, a forum page with a 400-character
+                // description drew its text straight out through the bottom of the card and on
+                // to the board, over whatever was beneath it.
+                let per_line = ((w / (size * 0.5)).floor() as usize).max(8);
+                let lines = ((h / (size * CARD_LINE_HEIGHT)).floor() as usize).max(1);
+                card_line_budget = per_line.saturating_mul(lines).max(per_line);
+                let _ = (box_height, inset);
+                (
+                    FitBox::new(w.max(1.0) as f32, h.max(1.0) as f32),
+                    Anchor::Inset(x, y),
+                    // The site name and the blurb are muted and the title is not, which is
+                    // most of what makes Miro's card read as a card rather than as a paragraph.
+                    if slot == BlockKey::PRIMARY { theme.text } else { theme.text_muted },
+                    Style {
+                        font_size: Some(size),
+                        line_height: Some(CARD_LINE_HEIGHT),
+                        align: Some(Align::Left),
+                        ..projected.item.style.clone()
+                    },
+                )
+            }
+
+            _ => return None,
+        };
+
+        // Bail out *before* shaping anything the viewer could not read.
+        //
+        // This is the difference between opening the reference board in a frame and
+        // opening it in a minute. Fitting the board puts it at 4% zoom, where all 236
+        // of its text blocks are sub-pixel — and finding that out by auto-fitting each
+        // one costs a dozen shaping passes apiece. `largest_font_size` is a bound that
+        // needs no layout: an auto-fitted block never exceeds the box it must fit
+        // into, and an explicit size is already known.
+        //
+        // # The bars are laid on the *type's* rhythm, not on the box
+        //
+        // This used to emit one bar of `0.45 × fit.height`, defended as "the whole block is
+        // under `MIN_DEVICE_FONT_SIZE` tall, so there is no room for a second bar anyone
+        // could tell apart". That premise holds only where `largest_font_size` **is**
+        // `fit.height` — an auto-fitted block, which is what a sticky is. A link card sets
+        // an *explicit* 13-unit size, so the guard tested 13 while the bar was drawn from a
+        // ~142-unit body box: a grey slab a third of the card tall, and the user's *"on Miro
+        // it's easier to see the titles, on Velm I have to zoom in a lot more"*.
+        //
+        // So the size the guard tested is the size the bars are built from. `Estimated`
+        // stacks them without shaping anything, which is what the guard exists to protect.
+        // **A box with no room draws nothing**, and it has to be said here rather than left to
+        // the arithmetic. `card_layout` snaps its title and blurb down to a whole number of
+        // lines and hands back a zero when a card is too short for one — the fix for *"the
+        // writing falls out of the card"* — but `FitBox::new(w.max(1.0), h.max(1.0))` clamps
+        // that zero back up to a full point, and the line-capacity estimate below floors at
+        // `max(1)`. So a box that was deliberately emptied still shaped and drew a line, which
+        // is the overflow arriving by the very route that was meant to close it.
+        //
+        // A caret is the exception, and the same one `Painter::block` already makes for a
+        // wordless sticky: an empty slot holding the cursor must still produce a block, or
+        // there is no origin to draw the caret against.
+        if fit.height <= 0.0 && !caret_here {
+            return None;
+        }
+
+        let size = largest_font_size(&style, fit);
+        if size * ctx.camera.zoom() < f64::from(MIN_DEVICE_FONT_SIZE) {
+            let zoom = ctx.camera.zoom();
+            let spacing = size * style.line_height.unwrap_or(CARD_LINE_HEIGHT);
+            let width = f64::from(fit.width);
+            let height = f64::from(fit.height);
+            // Bars closer together than they are thick are a smear, not a paragraph — the
+            // same collapse the post-shape path applies, for the same reason, and it is what
+            // keeps a 4%-zoom board from emitting a stack of sub-pixel quads per item.
+            let lines = if spacing > 0.0 && spacing * zoom >= GREEK_LINE_SPACING_MIN {
+                #[expect(clippy::cast_sign_loss, reason = "both are positive here")]
+                #[expect(clippy::cast_possible_truncation, reason = "clamped to a small count")]
+                let count = (height / spacing).floor().clamp(1.0, MAX_GREEK_LINES) as usize;
+                count
+            } else {
+                1
+            };
+            // A single bar keeps standing in for the *box* rather than for a line — with the
+            // lines indistinguishable there is nothing else it could honestly represent, and
+            // an auto-fitted block arrives here with a box that is one line tall anyway.
+            let lines = if lines > 1 {
+                GreekLines::Estimated { lines, bar: greek_bar_height(spacing, zoom), spacing, width }
+            } else {
+                GreekLines::Single { width, height: greek_bar_height(height, zoom) }
+            };
+            let origin = Self::locate_world(BlockRequest {
+                placement,
+                block_width: width,
+                block_height: height,
+                anchor,
+                font_size: 0.0,
+                color,
+            });
+            return Some(Painted::Greeked(Greek {
+                origin,
+                column: width,
+                align: style.align.unwrap_or(Align::Left),
+                color,
+                lines,
+            }));
+        }
+
+        // Shaping a block the cache does not hold is the expensive path, and it is
+        // rationed. A block that misses out this frame simply draws no text until a
+        // later one has room — never a stall, and never a wrong layout.
+        let fresh = !self.text.is_current(key, generation);
+        if fresh && self.text_spent >= TEXT_LAYOUT_BUDGET {
+            return None;
+        }
+        let started = fresh.then(Instant::now);
+
+        let kind = &projected.item.kind;
+        let (layout, font_size) = self.text.layout(key, generation, &style, Some(fit), || {
+            match (kind, slot) {
+                (ItemKind::Sticky { text, .. } | ItemKind::Shape { text, .. }, _) => {
+                    text::convert(text)
+                }
+                (ItemKind::Text { text }, _) => text::convert(text),
+                (ItemKind::Frame { title, .. }, _) => text::convert(title),
+                _ => card_text(kind, slot, card_line_budget),
+            }
+        });
+        let extent = layout.extent;
+        // Line spacing, taken from the layout rather than recomputed from the style:
+        // auto-fit chose the size, and `line_height` is a multiplier over it.
+        let spacing = layout
+            .lines
+            .first()
+            .map_or(f64::from(extent.height), |line| f64::from(line.height));
+        if let Some(started) = started {
+            self.text_spent += started.elapsed();
+        }
+
+        let request = BlockRequest {
+            placement,
+            block_width: f64::from(fit.width),
+            block_height: f64::from(extent.height),
+            anchor,
+            font_size,
+            color,
+        };
+
+        // Shaped, and still too small to read. The auto-fitted size is only knowable
+        // *after* the fit, so this is a second and genuinely different threshold from
+        // the one above: a sticky whose box clears it can easily hold 14 px text that
+        // does not. These are the blocks that used to vanish silently.
+        let zoom = ctx.camera.zoom();
+        if font_size * zoom as f32 >= MIN_DEVICE_FONT_SIZE {
+            return Some(Painted::Glyphs(self.locate(ctx, request)));
+        }
+
+        let origin = Self::locate_world(request);
+        let bar = greek_bar_height(spacing, zoom);
+        Some(Painted::Greeked(Greek {
+            origin,
+            column: f64::from(fit.width),
+            align: style.align.unwrap_or(Align::Left),
+            color,
+            // Bars closer together than they are thick are a smear, not a paragraph.
+            // Collapsing keeps the mark honest and bounds the quad count: a 40-line
+            // block never emits 40 sub-pixel bars.
+            lines: if layout.lines.len() > 1 && spacing * zoom >= GREEK_LINE_SPACING_MIN {
+                GreekLines::PerLine { key, bar }
+            } else {
+                GreekLines::Single {
+                    width: f64::from(extent.width).min(f64::from(fit.width)),
+                    height: greek_bar_height(f64::from(extent.height), zoom),
+                }
+            },
+        }))
+    }
+
+    /// One table cell's text, as a block.
+    ///
+    /// Positioned from the laid-out grid rather than from the item's own box: a cell's
+    /// rectangle is where `vellum-table` put it, after auto-fit sizing and any merges,
+    /// and there is no way to derive that from the placement alone.
+    ///
+    /// Cells with no words return `None` rather than an empty block, so an empty table
+    /// costs nothing to shape — which is what a freshly placed one is.
+    fn table_cell_block(
+        &mut self,
+        id: SceneId,
+        projected: &Projected,
+        slot: u16,
+        ctx: &DrawContext<'_>,
+    ) -> Option<Painted> {
+        let generation = projected.generation;
+        let index = usize::from(slot - CELL_SLOT_BASE);
+        let placement = projected.item.placement;
+        let theme = ctx.theme;
+
+        // Copied out of the cache before the engine is borrowed to shape: the layout
+        // lives in `self.tables` and the shaping needs `self.text`.
+        let cell = {
+            let cached = self.table_layout(id, projected, generation);
+            let cell = cached.layout.cells.get(index)?;
+            // The words live on the table, reached by the cell's anchor; the layout
+            // carries only where they go.
+            let content = cached.table.cell(cell.anchor)?.content();
+            // An empty cell is skipped so a fresh table costs nothing to shape — but not
+            // while a caret is in it, or clicking into an empty cell would put the caret
+            // somewhere with no block to be drawn against and it would simply not appear.
+            if content.is_empty()
+                && !ctx.editing.is_some_and(|c| c.scene == id && c.slot == slot)
+            {
+                return None;
+            }
+            (cell.content_rect, cell.style.text.clone(), crate::table::to_text(content))
+        };
+        let (rect, cell_style, content) = cell;
+
+        // The cell's rectangle is relative to the table's own origin, and the table's
+        // origin is the item's top-left — so the world position is one addition.
+        let (item_w, item_h) = placement.scaled_size();
+        let origin = WorldPoint::new(
+            placement.x - item_w / 2.0 + rect.origin.x,
+            placement.y - item_h / 2.0 + rect.origin.y,
+        );
+
+        let style = Style {
+            font_family: cell_style.font_family.clone(),
+            font_size: Some(cell_style.font_size),
+            line_height: Some(cell_style.line_height),
+            align: Some(match cell_style.align {
+                vellum_table::TextAlign::Left => Align::Left,
+                vellum_table::TextAlign::Center => Align::Center,
+                vellum_table::TextAlign::Right => Align::Right,
+            }),
+            ..Style::default()
+        };
+        let color = cell_style.color.map_or(theme.text, |c| {
+            Rgba::from_rgb8(c.r, c.g, c.b)
+        });
+        let fit = FitBox::new(rect.size.width.max(1.0) as f32, rect.size.height.max(1.0) as f32);
+
+        let key = BlockKey::new(id, slot);
+        let (_, font_size) =
+            self.text.layout(key, generation, &style, Some(fit), || content.clone());
+
+        // A cell is positioned absolutely rather than through `Anchor`, which describes
+        // where a block hangs off an *item*. Nothing about a cell hangs off the item.
+        let device = ctx.camera.world_to_screen(origin);
+        Some(Painted::Glyphs(Block {
+            origin: ScreenPoint::new(device.x.round(), device.y.round()),
+            font_size,
+            color,
+        }))
+    }
+
+    /// How many text slots an item has.
+    ///
+    /// Two for everything with a body and a label. A **table** has one per cell on top
+    /// of those, and a **mind map** one per visible node, because each is an
+    /// independently positioned, independently styled block — which is exactly what a
+    /// slot is for.
+    fn slots_of(&mut self, id: SceneId, projected: &Projected, generation: u64) -> u16 {
+        match &projected.item.kind {
+            ItemKind::Table { .. } => {
+                let cells = self.table_layout(id, projected, generation).layout.cells.len();
+                CELL_SLOT_BASE.saturating_add(u16::try_from(cells).unwrap_or(u16::MAX))
+            }
+            ItemKind::MindMap { .. } => {
+                let nodes = self.mindmap_layout(id, projected, generation).layout.len();
+                CELL_SLOT_BASE.saturating_add(u16::try_from(nodes).unwrap_or(u16::MAX))
+            }
+            ItemKind::Kanban { .. } => {
+                let runs = self.kanban_layout(id, projected, generation).runs.len();
+                CELL_SLOT_BASE.saturating_add(u16::try_from(runs).unwrap_or(u16::MAX))
+            }
+            // A card's blurb is a third block — see `CARD_BLURB_SLOT`. It reuses the first
+            // index past the two named slots, which is free here because a card has no cells:
+            // the table, mind-map and kanban arms above are the only things that read a slot
+            // as an index, and each is gated on its own kind.
+            ItemKind::LinkPreview { .. } | ItemKind::Embed { .. } => {
+                CELL_SLOT_BASE.saturating_add(1)
+            }
+            _ => CELL_SLOT_BASE,
+        }
+    }
+
+    /// The table's laid-out grid, built at most once per frame per table.
+    ///
+    /// Keyed on the projection generation *and* the box. The generation alone is not
+    /// enough for the same reason the text cache needed fixing: a resize changes every
+    /// column, and while `Projection::moved` does bump the generation for a non-
+    /// translation, holding the size too makes that a property of this cache rather
+    /// than a promise about another module.
+    fn table_layout(
+        &mut self,
+        id: SceneId,
+        projected: &Projected,
+        generation: u64,
+    ) -> &CachedTable {
+        let size = projected.item.placement.scaled_size();
+        let stale = self
+            .tables
+            .get(&id)
+            .is_none_or(|cached| cached.generation != generation || cached.size != size);
+        if stale {
+            let ItemKind::Table { model } = &projected.item.kind else {
+                unreachable!("only a table is asked for a table layout")
+            };
+            let table = crate::table::decode(model);
+            let layout = crate::table::layout(&table, self.text.engine_mut(), size);
+            self.tables.insert(id, CachedTable { generation, size, layout, table });
+        }
+        &self.tables[&id]
+    }
+
+    /// The mind map's laid-out tree, built at most once per frame per map.
+    ///
+    /// Keyed on the projection generation alone, unlike [`Self::table_layout`]: a tidy
+    /// tree's extent comes from the tree and the shaped labels, never from the item's
+    /// box, so a resize cannot change it. What a resize changes is the fit scale, and
+    /// that is derived from the box at the point of drawing rather than baked in here.
+    fn mindmap_layout(
+        &mut self,
+        id: SceneId,
+        projected: &Projected,
+        generation: u64,
+    ) -> &CachedMindMap {
+        let stale = self.mindmaps.get(&id).is_none_or(|cached| cached.generation != generation);
+        if stale {
+            let ItemKind::MindMap { model } = &projected.item.kind else {
+                unreachable!("only a mind map is asked for a mind-map layout")
+            };
+            let model = crate::mindmap::decode(model);
+            let layout = crate::mindmap::layout(&model, self.text.engine_mut());
+            let connectors = crate::mindmap::connectors(&model, &layout);
+            let natural = crate::mindmap::natural_size(&layout);
+            self.mindmaps
+                .insert(id, CachedMindMap { generation, layout, model, connectors, natural });
+        }
+        &self.mindmaps[&id]
+    }
+
+    /// The kanban board's laid-out columns, built at most once per frame per board.
+    ///
+    /// Keyed on the box as well as the generation, like [`Self::table_layout`]: a
+    /// column's width comes from the item's width and every card's height is measured at
+    /// that width, so a resize invalidates all of it.
+    fn kanban_layout(
+        &mut self,
+        id: SceneId,
+        projected: &Projected,
+        generation: u64,
+    ) -> &CachedKanban {
+        let size = projected.item.placement.scaled_size();
+        let stale = self
+            .kanbans
+            .get(&id)
+            .is_none_or(|cached| cached.generation != generation || cached.size != size);
+        if stale {
+            let ItemKind::Kanban { board } = &projected.item.kind else {
+                unreachable!("only a kanban is asked for a kanban layout")
+            };
+            let decoded = crate::kanban::decode(board);
+            let (board, layout) = crate::kanban::layout(&decoded, self.text.engine_mut(), size);
+            let runs = kanban_runs(&board, &layout);
+            self.kanbans.insert(id, CachedKanban { generation, size, layout, runs });
+        }
+        &self.kanbans[&id]
+    }
+
+    /// One kanban label — the board's title, a column's header or a card's — as a block.
+    ///
+    /// A slot is an index into the flattened [`KanbanRun`] list, so this needs to know
+    /// nothing about columns and cards; see that type for why.
+    fn kanban_run_block(
+        &mut self,
+        id: SceneId,
+        projected: &Projected,
+        slot: u16,
+        ctx: &DrawContext<'_>,
+    ) -> Option<Painted> {
+        let generation = projected.generation;
+        let index = usize::from(slot - CELL_SLOT_BASE);
+        let placement = projected.item.placement;
+        let theme = ctx.theme;
+
+        // Copied out before the engine is borrowed to shape, as the table and mind-map
+        // paths do.
+        let run = self.kanban_layout(id, projected, generation).runs.get(index)?.clone();
+        // While this run is the one being typed into, draw the *field* rather than the
+        // decorated label: a column header reads "To do  3/5" and the field behind it is
+        // "To do", so the count steps out of the way for as long as the caret is there.
+        let editing = ctx.editing.is_some_and(|c| c.scene == id && c.slot == slot);
+        let words = if editing { run.field.clone() } else { run.text.clone() };
+        // An empty run costs nothing to skip — except when a caret is in it, and then
+        // skipping it is what makes the caret invisible: no block, no origin, nothing to
+        // draw against. An empty card is exactly what a just-added one is.
+        if words.is_empty() && !editing {
+            return None;
+        }
+
+        let (item_w, item_h) = placement.scaled_size();
+        let origin = WorldPoint::new(
+            placement.x - item_w / 2.0 + run.rect.left(),
+            placement.y - item_h / 2.0 + run.rect.top(),
+        );
+
+        let style = Style { font_size: Some(run.font_size), ..Style::default() };
+        #[expect(clippy::cast_possible_truncation, reason = "a card's box is screen-scale")]
+        let fit = FitBox::new(
+            run.rect.width().max(1.0) as f32,
+            run.rect.height().max(1.0) as f32,
+        );
+
+        if run.font_size * ctx.camera.zoom() < f64::from(MIN_DEVICE_FONT_SIZE) {
+            return None;
+        }
+
+        let key = BlockKey::new(id, slot);
+        let text = vellum_text::StyledText::plain(&words);
+        let (_, font_size) = self.text.layout(key, generation, &style, Some(fit), || text.clone());
+
+        let device = ctx.camera.world_to_screen(origin);
+        Some(Painted::Glyphs(Block {
+            origin: ScreenPoint::new(device.x.round(), device.y.round()),
+            font_size,
+            color: if run.muted { theme.text_muted } else { theme.text },
+        }))
+    }
+
+    /// One mind-map node's label, as a block.
+    ///
+    /// Positioned from the laid-out tree rather than from the item's own box, exactly as
+    /// a table cell is: where a node sits is what the tidy pass computed, and nothing
+    /// about the placement alone can say.
+    ///
+    /// The label is inset by the same padding the node's box was measured with, so it
+    /// lands where the measurement said it would rather than being centred by a second,
+    /// disagreeing rule.
+    fn mindmap_node_block(
+        &mut self,
+        id: SceneId,
+        projected: &Projected,
+        slot: u16,
+        ctx: &DrawContext<'_>,
+    ) -> Option<Painted> {
+        let generation = projected.generation;
+        let index = usize::from(slot - CELL_SLOT_BASE);
+        let placement = projected.item.placement;
+        let theme = ctx.theme;
+
+        // Copied out of the cache before the engine is borrowed to shape, as the table
+        // path does: the layout lives in `self.mindmaps` and shaping needs `self.text`.
+        let node = {
+            let cached = self.mindmap_layout(id, projected, generation);
+            let scale = cached.scale(placement.scaled_size());
+            let node = cached.layout.placements().get(index)?;
+            let rect = node.rect;
+            let model = cached.model.map.get(node.node)?;
+            // As with a table cell: empty nodes are skipped, except the one holding a caret.
+            if model.text.is_empty()
+                && !ctx.editing.is_some_and(|c| c.scene == id && c.slot == slot)
+            {
+                return None;
+            }
+            (rect, model.style, crate::mindmap::label(&model.text, &model.style), scale)
+        };
+        let (rect, style, content, scale) = node;
+
+        // The map's rectangles start at the map's own top-left, which the fit scale then
+        // maps onto the item's box.
+        let (item_w, item_h) = placement.scaled_size();
+        let pad = (
+            crate::mindmap::NODE_PADDING_X * scale,
+            crate::mindmap::NODE_PADDING_Y * scale,
+        );
+        let origin = WorldPoint::new(
+            placement.x - item_w / 2.0 + rect.min.x * scale + pad.0,
+            placement.y - item_h / 2.0 + rect.min.y * scale + pad.1,
+        );
+
+        // Bold is not on `Style` — it rides on the span, which `crate::mindmap::label`
+        // has already folded the node's flag into, so it is not restated here.
+        let block_style = Style {
+            font_size: Some(style.font_size * scale),
+            align: Some(Align::Center),
+            ..Style::default()
+        };
+        let colour = Rgba::from_rgb8(style.text.r, style.text.g, style.text.b)
+            .with_alpha(f32::from(style.text.a) / 255.0);
+        let colour = if style.text.is_visible() { colour } else { theme.text };
+        #[expect(clippy::cast_possible_truncation, reason = "a node's box is screen-scale")]
+        let fit = FitBox::new(
+            (rect.width() * scale - pad.0 * 2.0).max(1.0) as f32,
+            (rect.height() * scale - pad.1 * 2.0).max(1.0) as f32,
+        );
+
+        // Nothing readable to draw. Checked here as well as in `block`'s shared bar
+        // because that bar is reached only by the named slots above it.
+        if style.font_size * scale * ctx.camera.zoom() < f64::from(MIN_DEVICE_FONT_SIZE) {
+            return None;
+        }
+
+        let key = BlockKey::new(id, slot);
+        let (_, font_size) =
+            self.text.layout(key, generation, &block_style, Some(fit), || content.clone());
+
+        let device = ctx.camera.world_to_screen(origin);
+        Some(Painted::Glyphs(Block {
+            origin: ScreenPoint::new(device.x.round(), device.y.round()),
+            font_size,
+            color: colour,
+        }))
+    }
+
+    /// Projects a text block's world rectangle onto the device pixel grid.
+    fn locate(&self, ctx: &DrawContext<'_>, request: BlockRequest<'_>) -> Block {
+        let font_size = request.font_size;
+        let color = request.color;
+        let device = ctx.camera.world_to_screen(Self::locate_world(request));
+        Block {
+            // Snapping to whole device pixels keeps a glyph's subpixel phase stable
+            // between frames, so text does not shimmer while the camera is still.
+            origin: ScreenPoint::new(device.x.round(), device.y.round()),
+            font_size,
+            color,
+        }
+    }
+
+    /// A text block's top-left corner, in world coordinates.
+    ///
+    /// Split out of [`Self::locate`] because greeked bars are *board*-view quads and
+    /// need the world point, where glyphs are screen-view and need the device one.
+    /// Sharing it means the four anchoring rules are written once — a bar sits exactly
+    /// where the text it replaces would have sat.
+    fn locate_world(request: BlockRequest<'_>) -> WorldPoint {
+        let BlockRequest {
+            placement,
+            block_width,
+            block_height,
+            anchor,
+            font_size: _,
+            color: _,
+        } = request;
+        let (width, height) = placement.scaled_size();
+        let left = placement.x - block_width / 2.0;
+        let top = match anchor {
+            Anchor::Centred => placement.y - block_height / 2.0,
+            Anchor::TopLeft => placement.y - height / 2.0,
+            // A frame's name sits above its top edge, clear of the frame's fill.
+            Anchor::Above(size) => placement.y - height / 2.0 - size * 1.4,
+            Anchor::Inset(_, dy) => placement.y - height / 2.0 + dy,
+        };
+        let world_left = match anchor {
+            Anchor::TopLeft | Anchor::Above(_) => placement.x - width / 2.0,
+            Anchor::Inset(dx, _) => placement.x - width / 2.0 + dx,
+            Anchor::Centred => left,
+        };
+
+        WorldPoint::new(world_left, top)
+    }
+
+    /// Draws a ring around every selected item.
+    fn push_selection(&self, list: &mut DrawList, ctx: &DrawContext<'_>, board: u32) {
+        if ctx.selection.is_empty() {
+            return;
+        }
+        list.use_view(board);
+        // A selection ring is chrome: constant on screen, so its world width has to
+        // shrink as the board is zoomed in.
+        let width = (SELECTION_WIDTH as f64 / ctx.camera.zoom()) as f32;
+        for id in ctx.selection {
+            let Some(projected) = ctx.projection.get(*id) else { continue };
+            let (origin, (w, h)) = projected.rect();
+            list.push_quad(
+                QuadInstance::solid(
+                    ctx.camera.to_camera_relative(origin),
+                    [w as f32, h as f32],
+                    Rgba::TRANSPARENT,
+                )
+                .with_border(ctx.theme.accent, width)
+                .with_corner_radius(STICKY_RADIUS)
+                .with_rotation(projected.rotation()),
+            );
+        }
+        push_handles(list, ctx, board);
+    }
+}
+
+/// The resize and rotate handles, on a single selection.
+///
+/// Only one item, matching what `crate::actions` will actually grab: handles on a
+/// multi-selection would have to resize every member against a shared box and move each
+/// centre as well as its angle, which is a different operation rather than a bigger
+/// version of this one. A multi-selection keeps its ring and still drags.
+///
+/// Drawn in the **board** view so they sit on the item as it is drawn — including when
+/// it is rotated, where a screen-space handle would be visibly off the corner it names
+/// — with every size divided by the zoom so they stay constant on screen. That is the
+/// same trade the selection ring makes directly above.
+fn push_handles(list: &mut DrawList, ctx: &DrawContext<'_>, board: u32) {
+    let zoom = ctx.camera.zoom();
+    let size = f64::from(crate::handle::HANDLE_SIZE) / zoom;
+    let border = (SELECTION_WIDTH as f64 / zoom) as f32;
+
+    // More than one item: the handles belong to the *group's* box, which is axis-aligned and
+    // offers corners and rotate only. See `handle::GROUP_HANDLES` for why there are no edge
+    // handles on a group — an edge drag shears a rotated member, and no `Placement` is a
+    // sheared rectangle.
+    if ctx.selection.len() > 1 {
+        let placements: Vec<vellum_doc::Placement> = ctx
+            .selection
+            .iter()
+            .filter_map(|id| ctx.projection.get(*id))
+            .map(|projected| projected.item.placement)
+            .collect();
+        let Some(group) = crate::handle::group_bounds(&placements) else { return };
+        list.use_view(board);
+        // The group's own outline, so it is visible what is about to be transformed. Each
+        // member already draws its own ring; this is the box the handles act on, which is
+        // not the same thing and is otherwise invisible.
+        push_group_outline(list, ctx, &group);
+        for (handle, at) in crate::handle::group_positions(&group, zoom) {
+            let origin = WorldPoint::new(at.x - size / 2.0, at.y - size / 2.0);
+            list.push_quad(
+                QuadInstance::solid(
+                    ctx.camera.to_camera_relative(origin),
+                    [size as f32, size as f32],
+                    ctx.theme.surface,
+                )
+                .with_border(ctx.theme.accent, border)
+                .with_corner_radius(if handle.is_rotate() { (size / 2.0) as f32 } else { 0.0 }),
+            );
+        }
+        return;
+    }
+
+    let [id] = ctx.selection[..] else { return };
+    let Some(projected) = ctx.projection.get(id) else { return };
+    let placement = projected.item.placement;
+    list.use_view(board);
+
+    for (handle, at) in crate::handle::positions(&placement, zoom) {
+        let origin = WorldPoint::new(at.x - size / 2.0, at.y - size / 2.0);
+        let quad = QuadInstance::solid(
+            ctx.camera.to_camera_relative(origin),
+            [size as f32, size as f32],
+            ctx.theme.surface,
+        )
+        .with_border(ctx.theme.accent, border)
+        // Square handles, per `docs/05-design-language.md` §4 — "square handles, no
+        // glow" — except the rotate one, which is round so that it reads as a
+        // different verb before it is touched rather than after.
+        .with_corner_radius(if handle.is_rotate() { (size / 2.0) as f32 } else { 0.0 })
+        .with_rotation(projected.rotation());
+        list.push_quad(quad);
+    }
+}
+
+/// The multi-selection's shared box, as four hairlines.
+///
+/// Four edges rather than one bordered quad because a filled quad — even a transparent one —
+/// would sit over the items inside it and take their clicks in the hit-test the *painter*
+/// does not do but the debug reader assumes. Hairlines are also what the design language
+/// asks for: one line does the work.
+fn push_group_outline(list: &mut DrawList, ctx: &DrawContext<'_>, group: &crate::handle::Group) {
+    let zoom = ctx.camera.zoom();
+    let width = (f64::from(SELECTION_WIDTH) / zoom) as f32;
+    let (left, top) = (group.x - group.width / 2.0, group.y - group.height / 2.0);
+    let corners = [
+        (left, top, group.width, 0.0),
+        (left, top + group.height, group.width, 0.0),
+        (left, top, 0.0, group.height),
+        (left + group.width, top, 0.0, group.height),
+    ];
+    for (x, y, w, h) in corners {
+        let origin = ctx.camera.to_camera_relative(WorldPoint::new(x, y));
+        list.push_quad(QuadInstance::solid(
+            origin,
+            [(w as f32).max(width), (h as f32).max(width)],
+            // Muted against the members' own accent rings, so the group box reads as the
+            // frame around them rather than as a sixth selected thing.
+            ctx.theme.accent.with_alpha(0.45),
+        ));
+    }
+}
+
+/// A chart's grid hairline, in world units before the zoom divides it.
+const GRID_WIDTH: f32 = 1.0;
+
+/// The thinnest a mind map's branch is drawn, in world units.
+///
+/// A fit scale below about 0.3 would otherwise take a 2px branch under half a world
+/// unit, and a map shrunk into a small box would lose its lines before it lost its
+/// boxes — which reads as broken rather than as small.
+const MIN_BRANCH_WIDTH: f32 = 0.75;
+
+/// One axis rule or baseline, as a quad.
+///
+/// Chart segments are always axis-aligned — a grid line, a zero rule, an axis spine —
+/// so a quad is exact rather than an approximation, and cheaper than a mesh.
+fn push_chart_segment(
+    list: &mut DrawList,
+    at: &impl Fn(f32, f32) -> [f32; 2],
+    segment: vellum_chart::Segment,
+    width: f32,
+    colour: Rgba,
+) {
+    let (from, to) = (segment.from, segment.to);
+    let (x, y) = (from.x.min(to.x), from.y.min(to.y));
+    let (w, h) = ((to.x - from.x).abs().max(width), (to.y - from.y).abs().max(width));
+    list.push_quad(QuadInstance::solid(at(x, y), [w, h], colour));
+}
+
+/// One tessellated mark, in its item's own space.
+///
+/// The vertices start at the item's top-left — which is how both a chart's marks and a
+/// mind map's branches are laid out — so the transform is that corner and the mesh
+/// needs no per-vertex offset.
+fn push_local_mesh(
+    list: &mut DrawList,
+    position: [f32; 2],
+    mesh: &vellum_shapes::Mesh,
+    colour: Rgba,
+    rotation: f32,
+) {
+    if mesh.indices.is_empty() {
+        return;
+    }
+    let transform = list.meshes_mut().push_transform(MeshTransform::scale_rotate_at(
+        1.0,
+        rotation,
+        position,
+    ));
+    let start = list.meshes().indices().len() as u32;
+    list.meshes_mut().push_shape_fill(mesh, colour, transform);
+    let end = list.meshes().indices().len() as u32;
+    list.push_meshes(start..end);
+}
+
+/// Every label a kanban board draws, flattened in the order slots are handed out:
+/// the board's title, then each column's header, then that column's cards.
+///
+/// Built with the layout rather than on demand so that a slot index is stable for a
+/// frame, and so the *count* is known without a second walk — `slots_of` needs it.
+pub(crate) fn kanban_runs(
+    board: &vellum_flow::Kanban,
+    laid: &vellum_flow::KanbanLayout,
+) -> Vec<KanbanRun> {
+    use vellum_flow::Rect as FlowRect;
+    let pad = crate::kanban::CARD_PADDING;
+    let mut runs = Vec::with_capacity(1 + laid.columns.len() + board.card_count());
+
+    runs.push(KanbanRun {
+        rect: laid.title.inset_by(pad),
+        text: board.title().to_owned(),
+        part: crate::edit::EditPart::KanbanTitle,
+        field: board.title().to_owned(),
+        font_size: crate::kanban::TITLE_FONT_SIZE,
+        muted: false,
+    });
+
+    for column in &laid.columns {
+        let Some(model) = board.column(column.id) else { continue };
+        // The header carries the count — and the limit when there is one, which is what
+        // makes a WIP limit visible rather than merely enforced. `vellum-flow` computes
+        // the numbers; the wording is the only thing decided here.
+        let wip = column.wip;
+        let label = match wip.limit {
+            Some(limit) => format!("{}  {}/{}", model.title(), wip.count, limit),
+            None => format!("{}  {}", model.title(), wip.count),
+        };
+        runs.push(KanbanRun {
+            rect: column.header.inset_by(pad * 0.5),
+            text: label,
+            part: crate::edit::EditPart::KanbanColumn(column.id),
+            field: model.title().to_owned(),
+            font_size: crate::kanban::HEADER_FONT_SIZE,
+            muted: true,
+        });
+
+        for card in &column.cards {
+            let Some(model) = board.card(card.id) else { continue };
+            runs.push(KanbanRun {
+                // Insetting rather than using the rect keeps the label off the card's
+                // rounded corner. The same padding the height was measured with, so the
+                // text fits the box that was sized for it.
+                rect: FlowRect::new(
+                    card.rect.left() + pad,
+                    card.rect.top() + pad,
+                    (card.rect.width() - pad * 2.0).max(1.0),
+                    (card.rect.height() - pad * 2.0).max(1.0),
+                ),
+                text: model.label().to_owned(),
+                part: crate::edit::EditPart::KanbanCard(card.id),
+                field: model.label().to_owned(),
+                font_size: crate::kanban::CARD_FONT_SIZE,
+                muted: false,
+            });
+        }
+    }
+    runs
+}
+
+/// A `vellum-table` colour as the renderer's.
+///
+/// Its own type rather than a shared one because `vellum-table` has no renderer
+/// dependency — it is a layout crate, and `docs/01-architecture.md` keeps it that way.
+fn table_colour(c: vellum_table::Rgba) -> Rgba {
+    Rgba::from_rgb8(c.r, c.g, c.b).with_alpha(f32::from(c.a) / 255.0)
+}
+
+/// The largest font size a block could possibly be shaped at, without shaping it.
+///
+/// An explicit size is itself; an auto-fitted one is bounded by the height of the box
+/// it has to fit inside, because a single line is at least as tall as its font size.
+/// Conservative in the safe direction: it can only over-estimate, so nothing readable
+/// is ever skipped.
+fn largest_font_size(style: &Style, fit: FitBox) -> f64 {
+    match style.font_size {
+        Some(size) if size.is_finite() && size > 0.0 => size,
+        _ => f64::from(fit.height),
+    }
+}
+
+/// A laid-out block and where on its item it belongs, on the way to being placed.
+struct BlockRequest<'a> {
+    placement: &'a vellum_doc::Placement,
+    /// The width the block was laid out against — its wrap width, not its extent,
+    /// because alignment is already baked into the glyph positions.
+    block_width: f64,
+    block_height: f64,
+    anchor: Anchor,
+    font_size: f32,
+    color: Rgba,
+}
+
+/// Where a text block hangs off its item.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Anchor {
+    /// Centred in the item, both ways. A sticky.
+    Centred,
+    /// The item's own top-left corner. A text widget.
+    TopLeft,
+    /// Above the item's top edge, by the given font size. A frame's name.
+    Above(f64),
+    /// An explicit offset from the item's top-left, in world units — `(dx, dy)`.
+    ///
+    /// For a link card, whose four pieces are positioned by [`card_layout`] rather than by a
+    /// named rule. A named anchor per piece would be four rules that have to agree.
+    Inset(f64, f64),
+}
+
+/// A laid-out block, placed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Block {
+    /// Device pixels, snapped to the grid.
+    origin: ScreenPoint,
+    /// World-pixel size the block was shaped at.
+    font_size: f32,
+    color: Rgba,
+}
+
+/// What one of an item's text slots contributes to the frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Painted {
+    /// Shaped, and big enough to read: real glyphs.
+    Glyphs(Block),
+    /// Real text, too small to read: bars standing in for it.
+    ///
+    /// Dropping it instead — which is what happened before this existed — leaves a
+    /// zoomed-out board looking empty where it is full, and a `ItemKind::Text` has no
+    /// geometry of its own to fall back on, so it disappeared completely.
+    Greeked(Greek),
+}
+
+/// A text block reduced to bars, in world coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Greek {
+    /// Top-left of the text column. World coordinates, before the camera rebase.
+    origin: WorldPoint,
+    /// The column the text was wrapped into — what alignment is measured against.
+    column: f64,
+    align: Align,
+    /// The colour the text itself would have used, before [`GREEK_ALPHA`].
+    color: Rgba,
+    lines: GreekLines,
+}
+
+/// How a greeked block's bars are laid out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GreekLines {
+    /// One bar for the whole block: either nothing was shaped, or the lines are too
+    /// close together to tell apart.
+    Single { width: f64, height: f64 },
+    /// One bar per laid-out line, read back from the cached layout at push time.
+    ///
+    /// Carries the key rather than the lines so that a greeked block allocates
+    /// nothing — the layout it names is already resident and already paid for.
+    PerLine { key: BlockKey, bar: f64 },
+    /// A stack of bars for a block that was **never shaped**, sized from the type rather
+    /// than from a layout.
+    ///
+    /// # Why this variant has to exist
+    ///
+    /// [`Painter::block`]'s pre-shape guard bails out before any layout exists, and it used
+    /// to emit `Single` sized from `fit.height` — the whole text box. That is right for an
+    /// *auto-fitted* block, where `largest_font_size` **is** `fit.height` and the box really
+    /// is one line tall. It is wrong for a block with an **explicit** size, where the guard
+    /// tests 13 units and the bar is drawn from the ~142-unit body: one grey slab a third of
+    /// the card tall, which is what the user photographed and described as having to zoom in
+    /// to see any titles at all. A sticky never showed it, because a sticky auto-fits and so
+    /// takes the post-shape path into `PerLine`.
+    ///
+    /// Estimated rather than measured, and that is the point: shaping is exactly what the
+    /// guard exists to avoid on a board where every block is sub-pixel. The line count comes
+    /// from the box and the line height, which is an upper bound on what could be in there —
+    /// at this size the difference between the bound and the truth is well under a pixel.
+    Estimated { lines: usize, bar: f64, spacing: f64, width: f64 },
+}
+
+/// The most bars an unshaped block will stand in for.
+///
+/// A bound rather than a budget: the line count is estimated from the box, and a box can be
+/// dragged to any height at all, so without this a 100,000-unit frame at a low zoom would ask
+/// for thousands of quads to represent text nobody can read. Twelve is past what any card or
+/// sticky on the reference board holds, and a stack that long already reads as "a paragraph".
+const MAX_GREEK_LINES: f64 = 12.0;
+
+/// How tall a bar standing in for a line of `line_height` world pixels should be.
+///
+/// The fraction alone goes sub-pixel exactly where greeking starts mattering, so it
+/// carries a floor of one *device* pixel — a screen-space budget divided by the zoom,
+/// the same shape as `vellum_ink::Lod::world_tolerance` and the selection ring, and
+/// guarded against a nonsense zoom the same way.
+fn greek_bar_height(line_height: f64, zoom: f64) -> f64 {
+    let floor = if zoom.is_finite() && zoom > 0.0 {
+        GREEK_MIN_DEVICE_HEIGHT / zoom
+    } else {
+        GREEK_MIN_DEVICE_HEIGHT
+    };
+    (line_height * GREEK_BAR_FRACTION).max(floor)
+}
+
+/// Fraction of a card's height taken by its thumbnail.
+/// A link card's text size, in world units, at [`LINK_CARD_REFERENCE_WIDTH`].
+///
+/// Fixed rather than auto-fitted, which is the whole difference between a card and a poster:
+/// a card's job is to be legible and small, and auto-fit makes a six-word title fill 190
+/// units of height. 13 is the design language's body size, and a browser's own link preview
+/// and Miro's card are both within a point of it.
+const CARD_FONT_SIZE: f64 = 13.0;
+/// The card width `CARD_FONT_SIZE` is calibrated for — Miro's own 250, which is also what
+/// `crate::actions::LINK_CARD_SIZE` places and what the reference board's previews are.
+const LINK_CARD_REFERENCE_WIDTH: f64 = 250.0;
+/// A card's text size at its own width, so the painter and `block` agree on one number.
+pub(crate) fn card_font_size(width: f64) -> f64 {
+    CARD_FONT_SIZE * (width / LINK_CARD_REFERENCE_WIDTH).clamp(1.0, 6.0)
+}
+
+/// A favicon's corner rounding, in device pixels. Small: an icon is nearly square and a
+/// generous radius turns a logo into a blob.
+const FAVICON_RADIUS: f32 = 2.0;
+
+/// Paints the open-page badge: a round plate and a `↗` on it.
+///
+/// # Why the arrow is geometry rather than a character
+///
+/// `↗` is U+2197, which lives in *Noto Sans Symbols* rather than in Noto Sans — and Noto
+/// Whether a card's page is a video, so its poster gets a ▶.
+pub(crate) fn is_video(kind: &ItemKind) -> bool {
+    link_url(kind).is_some_and(vellum_link::plays_video)
+}
+
+/// The ▶ over a video card's poster frame.
+///
+/// # Three quads, and a triangle drawn as a fan of them
+///
+/// The same reasoning as `push_open_badge`'s arrow, arrived at for a harder glyph: `▶` is
+/// U+25B6, which lives outside the plain sans faces (trap 10), so a card asked to shape it
+/// draws tofu wherever the fallback chain misses a symbols face. A triangle has no such
+/// problem — it is an outline, and this pass already pushes tessellated meshes for ink.
+///
+/// Drawn as a **mesh**, unlike the badge's arrow: an arrow is three bars and a triangle is
+/// not expressible as axis-aligned rectangles at all. It goes through the same `MeshBatch`
+/// that carries ink, which as of this round is multisampled — so its diagonals are smooth
+/// rather than stepped, which a triangle at this size would otherwise show badly.
+///
+/// The plate is deliberately **dark and semi-transparent** rather than the accent: it sits on
+/// an arbitrary photograph, and every video player in the world draws this mark that way, so
+/// it is the one place where following the convention beats following the palette.
+fn push_play_button(
+    list: &mut DrawList,
+    (at, extent): ([f32; 2], [f32; 2]),
+    rotation: f32,
+    opacity: f32,
+    theme: &crate::theme::Theme,
+    hovered: bool,
+) {
+    let side = extent[0].min(extent[1]);
+    if side <= 0.0 {
+        return;
+    }
+    // Hover fills the plate with the accent, matching what the ↗ badge does — the two are the
+    // only buttons on the board and they must not answer a pointer differently.
+    let plate = if hovered { theme.accent } else { PLAY_PLATE };
+    list.push_quad(
+        QuadInstance::solid(at, extent, plate.with_alpha(plate.a * opacity))
+            .with_corner_radius(side * 0.5)
+            .with_rotation(rotation),
+    );
+
+    // The triangle, inset and nudged right so it sits optically centred: a triangle centred on
+    // its bounding box reads as left-of-centre, because its mass is toward the flat edge.
+    let centre = [at[0] + extent[0] * 0.5, at[1] + extent[1] * 0.5];
+    #[expect(clippy::cast_possible_truncation, reason = "a glyph is screen-scale")]
+    let reach = (f64::from(side) * 0.5 * PLAY_GLYPH) as f32;
+    let nudge = reach * 0.18;
+    // **Relative to the centre, because the transform below translates by it.** These were
+    // absolute, so `scale_rotate_at`'s translation added the centre a *second* time and flung
+    // the triangle to twice its own offset — the user photographed it as a stray play mark in
+    // the empty board above the card, with the plate sitting correctly on the poster. The ink
+    // path has always had this right: `vellum-ink` stores its points relative to the item's
+    // centre and passes that centre as the translation.
+    let tip = [reach + nudge, 0.0];
+    let top = [-reach + nudge, -reach];
+    let bottom = [-reach + nudge, reach];
+    let ink = theme.surface.with_alpha(opacity);
+    // **Rotated about the card's own centre**, like the plate above it. An identity transform
+    // left the triangle upright inside a plate that turned, so a rotated video card drew a
+    // play button lying on its side inside an upright ring — which reads as a rendering fault
+    // rather than as a rotated card. `scale_rotate_at` takes the centre it turns about, and
+    // for a circle that is its own middle.
+    let transform = list
+        .meshes_mut()
+        .push_transform(MeshTransform::scale_rotate_at(1.0, rotation, centre));
+    let start = list.meshes().indices().len() as u32;
+    list.meshes_mut().push_indexed(&[top, tip, bottom], &[0, 1, 2], ink, transform);
+    let end = list.meshes().indices().len() as u32;
+    list.push_meshes(start..end);
+}
+
+/// The play button's plate. Charcoal at 62%, the convention every video player uses.
+const PLAY_PLATE: vellum_render::Rgba = vellum_render::Rgba::new(0.06, 0.07, 0.08, 0.62);
+
+/// How much of the plate the triangle spans.
+const PLAY_GLYPH: f64 = 0.44;
+
+/// A tile where a site's icon should be, when its icon is not there to draw.
+///
+/// # Why a placeholder rather than nothing
+///
+/// `card_layout` reserves the favicon's box whenever the item carries a favicon *hash*, and
+/// a hash can outlive its picture in three ordinary ways: the fetch has not landed yet, the
+/// bytes were an encoding the decoder does not hold, or the texture has been evicted under
+/// the residency budget. In all three the row was indented around an empty square, which the
+/// user photographed on an Alibaba card and read — correctly — as the card being broken.
+///
+/// A muted tile at the favicon's own radius says "a site icon belongs here" without claiming
+/// to be one. Deliberately **not** a letter or a globe: both need a glyph, and this pass
+/// pushes quads (see `push_open_badge` for the same reasoning about `↗`, and `CLAUDE.md`
+/// trap 10 for what asking for a character nothing has bundled actually draws).
+///
+/// It is drawn faintly rather than in the border colour at full strength, so a board of
+/// unfetched cards reads as quiet rather than as a grid of grey chips.
+fn push_favicon_placeholder(
+    list: &mut DrawList,
+    at: [f32; 2],
+    extent: [f32; 2],
+    rotation: f32,
+    opacity: f32,
+    theme: &crate::theme::Theme,
+) {
+    if extent[0] <= 0.0 || extent[1] <= 0.0 {
+        return;
+    }
+    list.push_quad(
+        QuadInstance::solid(at, extent, theme.border)
+            .with_corner_radius(FAVICON_RADIUS)
+            .with_rotation(rotation)
+            .with_opacity(opacity * FAVICON_PLACEHOLDER_ALPHA),
+    );
+}
+
+/// How present the stand-in favicon is. Enough to hold the space, quiet enough not to be
+/// mistaken for an icon that failed to load into a box that was meant to be dark.
+const FAVICON_PLACEHOLDER_ALPHA: f32 = 0.7;
+
+/// Sans is what `font_family: None` resolves to through fontdb's `sans-serif` alias on this
+/// machine (`CLAUDE.md` trap 10). Nothing is bundled, so a card asked to shape that
+/// character would draw a tofu box on any machine whose fallback chain does not happen to
+/// reach a symbols face. Three quads always draw.
+///
+/// The arrowhead is the reason it is only three: for a `↗` the two barbs run **straight left
+/// and straight down** from the tip, so only the shaft needs rotating.
+///
+/// # `pixel` is one device pixel in the units this list is drawing in
+///
+/// A card is pushed into the **board view**, where a unit is a *world* unit — so the arrow's
+/// minimum weight cannot be the literal `1.0` it used to be. That floored it at one world
+/// unit, which below zoom 1 is less than a pixel, and a fitted board is typically well under
+/// zoom 1. On exactly the view a whole board is normally looked at, the round plate survived
+/// and the arrow inside it went sub-pixel and disappeared: the *"a badge with no glyph looks
+/// like a rendering fault"* state the comment on `weight` claims to prevent, produced by the
+/// line that claims it. Passed in rather than derived here, because this function does not
+/// know which view it is being pushed into.
+fn push_open_badge(
+    list: &mut DrawList,
+    (at, extent): ([f32; 2], [f32; 2]),
+    rotation: f32,
+    opacity: f32,
+    theme: &crate::theme::Theme,
+    hovered: bool,
+    pixel: f32,
+) {
+    let side = extent[0].min(extent[1]);
+    if side <= 0.0 {
+        return;
+    }
+    // Hovering **inverts** the badge: the accent fills the plate and the arrow is drawn in
+    // the colour the plate used to be. A tint or a shadow would be the softer choice and
+    // is the wrong one here — the badge sits on photographs, so any treatment that depends
+    // on the background showing through is invisible on half the cards this board is made
+    // of. An inversion is legible on anything.
+    //
+    // A step rather than a fade: an eased hover needs a per-item clock and repaints while
+    // the pointer sits still, which is the cost `docs/05-design-language.md` weighs against
+    // every animation in this app. The state changes the instant the pointer crosses the
+    // badge, which is what "I am on it" has to mean anyway.
+    let (plate, ink) =
+        if hovered { (theme.accent, theme.surface) } else { (theme.surface, theme.accent) };
+    // The plate. Round rather than rounded-square: it has to sit on a photograph without
+    // reading as a second card corner, and a circle is the one shape that never lines up
+    // with the picture's own edges.
+    list.push_quad(
+        QuadInstance::solid(at, extent, plate)
+            .with_corner_radius(side * 0.5)
+            .with_border(if hovered { theme.accent } else { theme.border }, 1.0)
+            .with_rotation(rotation)
+            .with_opacity(opacity),
+    );
+
+    #[expect(clippy::cast_possible_truncation, reason = "a glyph is screen-scale")]
+    let reach = (side as f64 * BADGE_GLYPH * 0.5) as f32;
+    // At least one device pixel: below that the arrow stops being drawn at all rather than
+    // being drawn faintly, and a badge with no glyph looks like a rendering fault.
+    let weight = (side * 0.10).max(pixel);
+    let centre = [at[0] + extent[0] * 0.5, at[1] + extent[1] * 0.5];
+    let tip = [centre[0] + reach, centre[1] - reach];
+    let bar = |origin: [f32; 2], size: [f32; 2], spin: f32| {
+        QuadInstance::solid(origin, size, ink)
+            .with_corner_radius(weight * 0.5)
+            .with_rotation(rotation + spin)
+            .with_opacity(opacity)
+    };
+
+    // The shaft, corner to corner. `hypot` because it spans both axes, plus one weight so
+    // the round caps land on the ends rather than short of them.
+    let shaft = (reach * 2.0).hypot(reach * 2.0) + weight;
+    list.push_quad(bar(
+        [centre[0] - shaft * 0.5, centre[1] - weight * 0.5],
+        [shaft, weight],
+        // Up and to the right. Screen y runs down, so this is negative.
+        -std::f32::consts::FRAC_PI_4,
+    ));
+    // The two barbs, from the tip. Each overlaps the tip by half a weight so the corner is
+    // filled rather than notched.
+    let barb = reach * 1.15 + weight * 0.5;
+    list.push_quad(bar([tip[0] - barb + weight * 0.5, tip[1] - weight * 0.5], [barb, weight], 0.0));
+    list.push_quad(bar([tip[0] - weight * 0.5, tip[1] - weight * 0.5], [weight, barb], 0.0));
+}
+
+/// The sub-rectangle of a texture to sample so it **fills** a box of `into` without being
+/// stretched — CSS's `object-fit: cover`, and the fix for *"the images are all distorted"*.
+///
+/// The card painter used to hand every image [`vellum_render::UvRect::FULL`], which maps the
+/// whole texture onto whatever box the layout reserved. A card's image band has a fixed
+/// aspect — the item's width against a fraction of its height — and a page's `og:image` does
+/// not: a 1200×630 banner is 1.90 wide and a product shot is 1.00, against a band that is
+/// about 1.47. So every picture on the board was scaled by a different amount horizontally
+/// and vertically, which is exactly what "distorted" looks like, and the squarer the source
+/// the worse it was.
+///
+/// **Cover rather than contain**, deliberately. Both fix the distortion; they differ in what
+/// they give up. `contain` fits the whole image and leaves empty bands, which on a card whose
+/// band was sized for a picture reads as a layout bug. `cover` fills the band and trims the
+/// overflow **equally from both sides**, so a centred subject stays centred — and the boards
+/// this exists for are full of product photography, which is centred on white by convention.
+/// It is also what Miro's own card does.
+///
+/// A degenerate box or texture answers `FULL`: a zero somewhere is a caller with nothing to
+/// draw, and cropping to nothing would be worse than not cropping.
+fn cover_uv(source: (u32, u32), into: (f64, f64)) -> vellum_render::UvRect {
+    let (sw, sh) = (f64::from(source.0), f64::from(source.1));
+    let (bw, bh) = into;
+    if sw <= 0.0 || sh <= 0.0 || bw <= 0.0 || bh <= 0.0 {
+        return vellum_render::UvRect::FULL;
+    }
+    // How much of each axis survives. Exactly one of these is 1.0 — the axis that already
+    // matches — and the other is the ratio of the two aspects.
+    let (source_aspect, box_aspect) = (sw / sh, bw / bh);
+    let (keep_u, keep_v) = if source_aspect > box_aspect {
+        (box_aspect / source_aspect, 1.0) // wider than the box: trim the sides
+    } else {
+        (1.0, source_aspect / box_aspect) // taller than the box: trim top and bottom
+    };
+    #[expect(clippy::cast_possible_truncation, reason = "a UV coordinate is 0..=1")]
+    let uv = {
+        let (u0, v0) = (((1.0 - keep_u) / 2.0) as f32, ((1.0 - keep_v) / 2.0) as f32);
+        vellum_render::UvRect::new([u0, v0], [1.0 - u0, 1.0 - v0])
+    };
+    uv
+}
+
+/// Line spacing inside a card, as a multiple of the font size. Tighter than prose: a card is
+/// a stack of short labels rather than a paragraph.
+const CARD_LINE_HEIGHT: f64 = 1.35;
+/// Fraction of a card's width used as padding around its contents.
+///
+/// **Measured off Miro's own card**, from the reference the user sent: *"i just want the card
+/// proportions very similar to miro's."* On a 422-unit-wide card its picture is inset about 14
+/// units a side — 3.3%. Velm's was 6%, nearly double, and because the inset is taken from all
+/// four sides *and* between every row, that difference compounded: the picture was visibly
+/// smaller, the text block narrower, and the whole card read as cramped while somehow also
+/// having too much air in it.
+///
+/// This is the single number that decides a card's proportions, which is why it is the one
+/// that had to move. Everything else — the image band's share, the type scale, the line
+/// height — was already close to the reference.
+const CARD_PADDING: f64 = 0.035;
+
+/// Shortens `text` to at most `budget` characters, ending in an ellipsis when it had to cut.
+///
+/// Characters, not bytes: the cut has to land on a boundary, and a budget in bytes would split
+/// a multi-byte one. A budget under two leaves no room for both a character and the ellipsis,
+/// so the whole string is kept — better a row that overruns slightly than one showing only "…".
+fn ellipsise(text: &str, budget: usize) -> String {
+    // **No room means nothing, not everything.** This used to return the whole string
+    // when `budget < 2`, on the reasoning that there was no room for an ellipsis — which
+    // is true and is the opposite of the right answer. A block with nothing left got the
+    // text in full, so a card whose title had already spent the budget then drew its
+    // entire 600-character URL underneath and out through the bottom. The guard meant to
+    // protect the ellipsis was the overflow.
+    if budget == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= budget {
+        return text.to_owned();
+    }
+    if budget == 1 {
+        return "…".to_owned();
+    }
+    let kept: String = text.chars().take(budget - 1).collect();
+    // Cut at the last word boundary in the kept part, so a row ends on a word rather than
+    // mid-syllable — unless that would throw most of it away.
+    let trimmed = kept.trim_end();
+    match trimmed.rsplit_once(' ') {
+        Some((head, _)) if head.chars().count() >= budget / 2 => format!("{head}…"),
+        _ => format!("{trimmed}…"),
+    }
+}
+
+/// Where a link card's pieces sit, in the item's own space with its top-left at `(0, 0)`.
+///
+/// One function so the four things that have to agree — the preview image, the favicon, the
+/// muted provider line and the title/blurb block — are laid out once. They are drawn by three
+/// different paths (an image instance, a second image instance, and two text blocks through
+/// `block`), and before this each worked out its own position from `CARD_PADDING`, which is how
+/// a card ends up with its text over its picture.
+///
+/// The order is **Miro's**, from the reference screenshots: the preview image at the top, then
+/// a row of favicon-plus-site-name, then the bold title, then the blurb. Every box is inset by
+/// the card's padding, and the image has padding *under* it too so the site name does not sit
+/// against it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CardLayout {
+    /// The preview image: `(x, y, width, height)`. `None` in the two modes that draw none, and
+    /// for a `Large` card whose image has not been fetched.
+    image: Option<(f64, f64, f64, f64)>,
+    /// The site icon, a square at the start of the provider row.
+    favicon: Option<(f64, f64, f64, f64)>,
+    /// The provider row's text box, already moved right of the favicon.
+    provider: (f64, f64, f64, f64),
+    /// The title, at [`TITLE_SCALE`], in the card's own ink.
+    title: (f64, f64, f64, f64),
+    /// The blurb, at [`BLURB_SCALE`], muted, under the title.
+    blurb: (f64, f64, f64, f64),
+    /// Title and blurb together.
+    ///
+    /// Kept alongside the two boxes it is the union of, because the *greeking* path stands in
+    /// for the whole text area with one stack of bars and has no business knowing the card is
+    /// split — at a zoom where nothing is shaped, a title bar and a blurb bar are the same
+    /// mark. Only the two shaped blocks read `title` and `blurb`.
+    body: (f64, f64, f64, f64),
+    /// The **open-page badge**, a square in the card's top-right corner. `None` when the card
+    /// carries no address, when the item is too small to hold one, or — deliberately — never
+    /// for anything that is not a link card.
+    ///
+    /// *"on the top right corner of each widget have an button that will take me to the
+    /// website itsel or the link itself"*. Until this, Open was in the properties panel and
+    /// on the right-button menu and nowhere on the card, which is the discoverability gap
+    /// `CLAUDE.md`'s known-defects list had recorded as *"there is no ↗ open badge on the
+    /// card itself"*.
+    ///
+    /// It is `pub(crate)` along with the rest of this type because the **press path reads
+    /// it** — `crate::actions::badge_under` asks this same function where the badge is rather
+    /// than reproducing the arithmetic, which is the rule `draw::kanban_runs` already
+    /// established: a second copy of a layout is a click that lands somewhere the paint is
+    /// not.
+    pub(crate) badge: Option<(f64, f64, f64, f64)>,
+    /// The **▶ play button**, centred on the poster of a card whose page is a video.
+    ///
+    /// *"the YouTube previews on Miro I like more because I can just open it and view the
+    /// video right then and there."* Velm cannot: playing it needs a browser engine, which
+    /// `docs/01-architecture.md` §1 rules out and which the user chose against once the cost
+    /// was named — a view that would not zoom with the board, would not be occluded by a
+    /// frame, would not export and could not be photographed by `--screenshot`. So this opens
+    /// the page in their own browser, exactly as the ↗ badge does.
+    ///
+    /// It is still worth drawing, and not as decoration: it is the difference between a card
+    /// you can *see* is a video and one you have to read to find out. `None` for every card
+    /// whose page is not a video, and for a card with no poster to centre it on — a ▶ over a
+    /// text block is a button pointing at nothing.
+    pub(crate) play: Option<(f64, f64, f64, f64)>,
+}
+
+/// The favicon's edge length, as a multiple of the card's font size. Miro's is about level
+/// with the cap height of the site name beside it.
+const FAVICON_SCALE: f64 = 1.15;
+
+/// The open-page badge's edge length, as a multiple of the card's font size.
+///
+/// Larger than the favicon because this one is a **target**, not a label: it has to be
+/// comfortable to hit with a mouse at a working zoom, where the favicon only has to be
+/// recognisable. At the reference card's 13-unit type this is ~23 units square.
+const BADGE_SCALE: f64 = 1.75;
+
+/// How much of the badge the arrow occupies, as a fraction of its edge.
+///
+/// The rest is the plate's margin. Small: an arrow that reaches the plate's rim reads as a
+/// box with a line in it rather than as a button with a glyph on it.
+const BADGE_GLYPH: f64 = 0.34;
+
+/// The title's size, as a multiple of the card's base size.
+///
+/// **Back to parity with the base size, from a third above it.** Enlarging it answered *"from
+/// a distance I want to be able to see more"* and overshot: against the Miro card the user
+/// then sent as a reference, a Velm title was two words filling the card. Miro's own title is
+/// close to its body size and earns its prominence from *colour* — near-black against the
+/// blurb's grey — rather than from scale.
+///
+/// The blurb is still set below this, so the hierarchy survives; it is the *distance* between
+/// them that shrank, which is what the reference shows.
+const TITLE_SCALE: f64 = 1.0;
+
+/// How many lines of title a card will give up before the blurb gets what is left.
+const TITLE_LINES: f64 = 3.0;
+
+/// …and how many a **video** card gets, where the picture is the point.
+///
+/// **One.** It was two, at the user's first request — *"there should only be 2 small lines of
+/// text"* — and they then sent a card with the reservation visible as a band of empty white
+/// under a one-line title, asking for the thumbnail to be *very* big. A title that needs a
+/// second line is ellipsised instead, which is what a grid of thumbnails does everywhere:
+/// every line reserved here is a line taken off the frame that says what the video is.
+const VIDEO_TITLE_LINES: f64 = 1.0;
+
+/// How much of the poster's short edge the ▶ takes.
+///
+/// A quarter: big enough to be an obvious target and to read as a play button at a fitted
+/// zoom, small enough that the frame behind it — which is what tells you *which* video it is —
+/// stays legible around it. Miro's sits at roughly the same fraction.
+const PLAY_FRACTION: f64 = 0.25;
+
+/// Air below the blurb, in blurb line-heights.
+///
+/// *"the paragraph should be fixed so that there is a little bit of spacing underneath them."*
+/// Half a line: enough that the last row of text is visibly *inside* the card rather than
+/// resting on its edge, and not so much that a short card loses a line of blurb to margin.
+const BLURB_BOTTOM_AIR: f64 = 0.5;
+
+/// The blurb's size, as a multiple of the card's base size.
+///
+/// Below the base rather than at it, so the hierarchy is carried by *two* differences — size
+/// and colour — rather than by colour alone. A muted blurb at the same size as the title still
+/// reads as one block of text at a glance, which is the state the user was describing.
+const BLURB_SCALE: f64 = 0.86;
+
+#[expect(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    reason = "one layout, and every caller must pass the same facts or the paint and the \
+              press disagree about where a card's pieces are"
+)]
+pub(crate) fn card_layout(
+    width: f64,
+    height: f64,
+    font_size: f64,
+    mode: CardMode,
+    has_image: bool,
+    has_favicon: bool,
+    has_link: bool,
+    is_video: bool,
+) -> CardLayout {
+    let pad = width * CARD_PADDING;
+    let line = font_size * CARD_LINE_HEIGHT;
+
+    // The badge, in every mode. Bounded by the card as well as by the type scale: on a card
+    // dragged down to nothing a badge sized purely from the font would be larger than the
+    // item it belongs to and would stick out of it.
+    let badge_side = (font_size * BADGE_SCALE).min(width * 0.22).min(height * 0.5);
+    // The inset is derived from the **width**, so on a wide, short card `pad` alone could
+    // push the badge out through the bottom even though `badge_side` itself was clamped by
+    // the height. Clamped to whatever room is actually left, and floored at zero so a
+    // degenerate card produces no badge rather than an inverted one.
+    let badge_top = pad.min((height - badge_side).max(0.0));
+    let badge_fits = has_link && badge_side >= 1.0 && height > badge_side;
+
+    // A collapsed row is one line and nothing else: no image, no second block. The favicon
+    // still leads it, which is what makes a row of them scannable.
+    if matches!(mode, CardMode::Link) {
+        let icon = font_size * FAVICON_SCALE;
+        let (favicon, text_left) = if has_favicon {
+            (Some((pad, pad + (line - icon) / 2.0, icon, icon)), pad + icon + pad * 0.5)
+        } else {
+            (None, pad)
+        };
+        // Centred on the row rather than pinned to the top: a collapsed card *is* one row,
+        // so its "top-right corner" and the row's right-hand end are the same place.
+        let badge = badge_fits.then(|| {
+            let y = (pad + (line - badge_side) / 2.0).min((height - badge_side).max(0.0));
+            (width - pad - badge_side, y, badge_side, badge_side)
+        });
+        // …and the text stops before it. Without this the site name runs underneath the
+        // badge, which on a row whose whole job is one legible line is the worst place for
+        // it to happen.
+        let text_right = badge.map_or(pad, |_| pad + badge_side + pad * 0.5);
+        // Nothing below the row. A zero-height box is what `block` reads as "draw nothing",
+        // and all three of these are that: a collapsed card *is* its provider row — title
+        // included — so the title, the blurb and their union are each empty here rather than
+        // each drawing a second copy of the one line the mode exists to be.
+        let nothing = (pad, pad + line, (width - pad * 2.0).max(1.0), 0.0);
+        return CardLayout {
+            image: None,
+            favicon,
+            provider: (text_left, pad, (width - text_left - text_right).max(1.0), line),
+            title: nothing,
+            blurb: nothing,
+            body: nothing,
+            badge,
+            // A collapsed row draws no picture, so there is nothing to centre a ▶ on.
+            play: None,
+        };
+    }
+
+    // The image, inset on all four sides rather than bled to the card's edge — Miro's is a
+    // picture *in* a card, with the card's surface visible around it and its own rounded
+    // corners. A full-bleed one reads as a photo with a caption stuck underneath.
+    // **A video card is a poster with a caption**, and its picture is sized from what the
+    // caption needs rather than from a fraction of the card.
+    //
+    // *"for youtube thumbnails there should only be 2 small lines of text, the rest should be
+    // the thumbnail, and the 2 lines should be bolded."* A fraction cannot promise that: at
+    // `Large`'s 62% the text block is whatever 38% comes to, which is three title lines and a
+    // blurb on a tall card and one clipped line on a short one. Measuring the *text* and
+    // giving the picture the remainder is the only arrangement where "exactly two lines, and
+    // the rest is the thumbnail" is true at every card size.
+    //
+    // The blurb goes with it — a video's `og:description` is the uploader's sponsor read
+    // (*"Get the sponsor's app here: https://exmpl.co/07-Abcd…"* on a real card), which is the least
+    // useful text on the board and was taking room from the frame that says what the video is.
+    let title_line_for = |scale: f64| font_size * scale * CARD_LINE_HEIGHT;
+    let poster = is_video && has_image && mode.shows_image();
+    let image = (mode.shows_image() && has_image).then(|| {
+        let h = if poster {
+            // **Everything the caption does not need.** *"make the image thumbnail very big
+            // on only the youtube cards"*, and *"put the writing all the way down"* — so the
+            // caption is measured, pinned to the bottom, and the poster takes the rest.
+            //
+            // The caption is a provider row and *one* title line rather than two: a video
+            // title that needs a second line gets an ellipsis instead, which is what a
+            // thumbnail grid does everywhere. Two lines was reserved whether or not the title
+            // used them, and on a real card that reservation was visible as a band of
+            // empty white under the words.
+            // Three pads, not two and a half: above the picture, between it and the caption,
+            // and below the last line. Shorting it by half a pad made the title box come out
+            // at *zero* — the caption did not fit, so `whole_lines` correctly offered no line
+            // at all and the card drew a poster and a provider row with no title under it.
+            let caption = line + title_line_for(TITLE_SCALE) * VIDEO_TITLE_LINES + pad;
+            (height - caption - pad * 2.0).max(1.0)
+        } else {
+            // Per mode: a `Large` card is mostly picture, a `Card` is about half. See
+            // `CardMode::image_fraction`.
+            (height * mode.image_fraction() - pad).max(1.0)
+        };
+        (pad, pad, (width - pad * 2.0).max(1.0), h)
+    });
+    let mut y = image.map_or(pad, |(_, iy, _, ih)| iy + ih + pad);
+
+    let icon = font_size * FAVICON_SCALE;
+    let (favicon, text_left) = if has_favicon {
+        (Some((pad, y + (line - icon) / 2.0, icon, icon)), pad + icon + pad * 0.5)
+    } else {
+        (None, pad)
+    };
+
+    // Top-right, which over a picture is exactly where Miro puts it. It sits *on* the image
+    // rather than beside it — the badge draws its own plate, so it stays legible over
+    // whatever the page's `og:image` happens to be.
+    let badge = badge_fits.then_some((width - pad - badge_side, badge_top, badge_side, badge_side));
+
+    // The site name has to stop before the badge, but **only when they share a row**. With a
+    // picture above, the provider sits well below the badge and clipping it there would throw
+    // away characters for a collision that cannot happen — which is precisely the kind of
+    // unconditional safety margin that reads as a layout bug once you notice the titles are
+    // short for no reason.
+    let collides = |top: f64| badge.is_some_and(|(bx, by, _, bh)| top < by + bh && pad < bx);
+    let text_right = if collides(y) { pad + badge_side + pad * 0.5 } else { pad };
+    let provider = (text_left, y, (width - text_left - text_right).max(1.0), line);
+    y += line;
+
+    // **The body has to yield too**, and this is the half the first version missed. The
+    // badge is `BADGE_SCALE` (1.75) line-heights tall against a provider row of one, so on
+    // a card with no picture it reaches *past* the site name into the first line of the
+    // title — which is the line the user is most likely to be reading. Asked of the body's
+    // own top rather than assumed from the provider's answer, because the two rows are at
+    // different heights and only one of them may be under the badge.
+    let body_right = if collides(y) { pad + badge_side + pad * 0.5 } else { pad };
+
+    // **The body splits into a title and a blurb**, because Miro's card is a large bold title
+    // over a smaller grey description and one block cannot be both: `DrawList::push_layout`
+    // takes a single colour *and a single size* for the whole run, and `SpanStyle` has no size
+    // field at all — which is the same constraint that already put the provider row in its own
+    // block. Two tones was the reason for the second block; two *sizes* is the reason for the
+    // third.
+    //
+    // The title takes as many lines as it needs up to `TITLE_LINES`, and the blurb gets what
+    // is left. Title-first rather than a fixed share, because on this board the title is the
+    // part that carries the meaning — the reference board's Alibaba cards have sixty-word
+    // titles and a blurb that repeats them — and a card too short for both should lose the
+    // blurb rather than truncate the name of the thing.
+    let body_w = (width - pad - body_right).max(1.0);
+    let body_h = (height - y - pad).max(0.0);
+    let title_line = font_size * TITLE_SCALE * CARD_LINE_HEIGHT;
+
+    // **Both boxes hold a whole number of lines, and that is what keeps the words inside the
+    // card.** *"the writing falls out of the card here"* — the blurb was given whatever height
+    // was left over, and a box 2.4 lines tall draws a third line that is 40% inside the card
+    // and the rest of the way out through the bottom of it. The character-capacity clip
+    // upstream cannot prevent this: it estimates from the *advance*, so it decides roughly how
+    // much text to shape and never where the last line lands.
+    //
+    // Snapping down is the whole fix. A box that is an exact multiple of its own line height
+    // either fits a line or does not offer the room for one.
+    let whole_lines = |available: f64, line_height: f64| {
+        if line_height <= 0.0 {
+            return available.max(0.0);
+        }
+        // **The nudge is not defensive; an exact fit is the common case.** These heights are
+        // built by adding and subtracting the same line height and padding several times, so a
+        // box sized to hold exactly one line arrives as 22.463999999999874 against a line of
+        // 22.464000000000002 — and `floor` answers **zero**. Measured, on the video card the
+        // user asked to have its caption pinned to the foot: the title box came out empty and
+        // the card drew a poster and a provider row with no title under it.
+        //
+        // A relative epsilon rather than an absolute one, because the line height scales with
+        // the card: an absolute tolerance that works at 13 units is either useless or far too
+        // generous at 78.
+        const SNAP: f64 = 1e-6;
+        (((available / line_height) + SNAP).floor() * line_height).max(0.0)
+    };
+
+    // Two lines on a poster card, three otherwise — and on a poster card there is no blurb
+    // beneath them, so the picture above got the room instead.
+    let lines = if poster { VIDEO_TITLE_LINES } else { TITLE_LINES };
+    let title_h = whole_lines(body_h.min(title_line * lines), title_line);
+    let blurb_line = font_size * BLURB_SCALE * CARD_LINE_HEIGHT;
+    // …and the blurb keeps a line's worth of air beneath it. The bottom `pad` alone is derived
+    // from the card's *width*, so on a tall narrow card it is a hairline — and text that ends
+    // flush against an edge reads as clipped even when every glyph is inside the box.
+    // A poster card has no blurb at all — a zero-height box is what `block` reads as "draw
+    // nothing", so `card_text`'s blurb arm is never asked for one.
+    let blurb_room =
+        if poster { 0.0 } else { (body_h - title_h - blurb_line * BLURB_BOTTOM_AIR).max(0.0) };
+    // Centred on the **poster**, not on the card: Miro puts it over the picture, and a ▶
+    // floating in a block of text is a button aimed at nothing. Sized from the band rather
+    // than from the type, because it is a target on an image and has to stay proportionate to
+    // it — a 250-wide card's poster gives about 34 units, comfortably hittable at a working
+    // zoom and still small enough to leave the picture readable behind it.
+    let play = image.filter(|_| is_video).map(|(ix, iy, iw, ih)| {
+        // Clamped to the card, the way `badge_top` is. The image band is derived from the
+        // card's height and its own padding, and on a wide, short card that arithmetic can
+        // put the band — and so the button centred on it — past the card's own edge, where it
+        // is painted outside the item and can never be pressed.
+        let side = (iw.min(ih) * PLAY_FRACTION).clamp(1.0, height.max(1.0));
+        let x = (ix + (iw - side) / 2.0).clamp(0.0, (width - side).max(0.0));
+        let y = (iy + (ih - side) / 2.0).clamp(0.0, (height - side).max(0.0));
+        (x, y, side, side)
+    });
+    CardLayout {
+        image,
+        favicon,
+        provider,
+        title: (pad, y, body_w, title_h),
+        blurb: (pad, y + title_h, body_w, whole_lines(blurb_room, blurb_line)),
+        body: (pad, y, body_w, body_h),
+        badge,
+        play,
+    }
+}
+
+/// Whether a card has a preview image in the blob store.
+///
+/// Asked separately from the mode because the two answer different questions: the mode is what
+/// the user chose, and this is what there is to draw. A `Large` card with no image falls back
+/// to the `Card` layout rather than reserving a band for a picture that is not there.
+pub(crate) fn has_thumbnail(kind: &ItemKind) -> bool {
+    match kind {
+        ItemKind::LinkPreview { thumbnail, .. } | ItemKind::Embed { thumbnail, .. } => {
+            thumbnail.is_some()
+        }
+        _ => false,
+    }
+}
+
+/// Whether a card has somewhere to open, which is what decides whether it wears a badge.
+///
+/// A card with no `url` is reachable: an `Embed` imported from a widget Miro had already
+/// failed to resolve carries a title and nothing else. A badge on one would be a button that
+/// answers *"that card's address is not a web page"* when pressed, which is worse than no
+/// button at all.
+pub(crate) fn has_link(kind: &ItemKind) -> bool {
+    // `host_of`, not `is_some`. The badge is a button, and `ActiveState::open_in_browser`
+    // refuses anything that is not http(s) — so gating on the field alone drew a badge on
+    // `mailto:` and on Miro's own `about:`-shaped placeholders whose only response to a
+    // press is a toast saying no. That is precisely the dead button this function's own
+    // doc comment says it exists to prevent, arrived at by trusting the wrong predicate.
+    link_url(kind).is_some_and(|url| vellum_link::host_of(url).is_some())
+}
+
+/// Removes the site's own name from the front or the back of a page title.
+///
+/// # Why the row above makes it redundant
+///
+/// *"for amazon.com you dont have to write the amazon.com at the beginning."* Pages name
+/// themselves in their `<title>` because a browser tab has nowhere else to say it — so the
+/// reference board carries *"Amazon.com : Superbat 3G/6G/12G SDI Cable…"* and
+/// *"IQL-IMX678/FF | DigiKey Electronics"*. A card has already said the site, in its own row,
+/// with the site's own icon beside it. Repeating it spends the first line of the title — the
+/// one line that survives being small on screen — on a word the user is not reading.
+///
+/// Both ends, because pages do both: American retailers lead with it, and most of the rest of
+/// the web trails it after a pipe or a dash.
+///
+/// # What it refuses to do
+///
+/// It only ever strips across a **separator**, and never leaves a title shorter than
+/// [`SHORTEST_TITLE`]. Both guards earn their place: without the separator a page called
+/// *"Amazonian Fish"* on `amazon.com` loses its first word, and without the length floor a
+/// DigiKey page titled simply *"DigiKey"* is left with nothing at all — a card with an empty
+/// title where the real one was is much worse than a card that repeats itself.
+fn strip_site_affix<'a>(title: &'a str, provider: Option<&str>) -> &'a str {
+    /// A title this short is very likely *only* the site's name, and the site's name is the
+    /// most useful thing left to show.
+    const SHORTEST_TITLE: usize = 3;
+    /// What a page puts between its own name and its title.
+    const SEPARATORS: [char; 6] = [':', '|', '-', '\u{2013}', '\u{2014}', '\u{00BB}'];
+
+    let Some(provider) = provider.map(str::trim).filter(|p| !p.is_empty()) else { return title };
+    // `Amazon` against a title leading `Amazon.com` — the row says the short name and the page
+    // writes the domain, so the comparison is on the provider as a *prefix* of the run rather
+    // than on equality.
+    //
+    // **`get`, never `[..]`.** This function is on the paint path and `[profile.release]` sets
+    // `panic = "abort"`, so a bad index here does not throw — it kills the application on the
+    // frame a card first becomes visible. Two ways in, both found by an adversarial review of
+    // this very change and neither reachable from the tests that shipped with it:
+    //
+    // - **A non-boundary.** `provider.len()` is a boundary in *the provider*, which the old
+    //   comment here reasoned about — and says nothing about `text`. An Alibaba listing whose
+    //   title opens with CJK puts a continuation byte at index 7, and `Alibaba` is 7 bytes.
+    //   The user's board is largely Alibaba.
+    // - **A reversed range**, below.
+    //
+    // `str::get` answers `None` for both rather than aborting, which is the difference between
+    // a card that declines to shorten its title and a board that will not open.
+    let matches_here = |text: &str| {
+        text.get(..provider.len()).is_some_and(|head| head.eq_ignore_ascii_case(provider))
+    };
+
+    let trimmed = title.trim();
+    // Every index below comes from `match_indices`, which yields the separator itself — so the
+    // text after it starts at `at + sep.len()`. Adding 1 works for `:` and `|` and **panics on
+    // an en dash**, which is three bytes and is what most of the web actually uses.
+    // Caught by a test on a real title: `Sony Imx678 Camera – Sincerefirst`.
+    let after = |at: usize, sep: &str| &trimmed[at + sep.len()..];
+
+    // Leading: "Amazon.com : Superbat …"
+    if matches_here(trimmed)
+        && let Some((at, sep)) = trimmed.match_indices(SEPARATORS).next()
+        // **The separator has to come *after* the provider.** A provider is only a name until
+        // it contains one of these: `provider_for` falls back to capitalising the registrable
+        // domain label, and a hyphen is legal in one — so `acme-parts.com` yields `Acme-parts`,
+        // whose own hyphen is the first match in the title, and `trimmed[9..3]` is a reversed
+        // range. Guaranteed, not occasional: `matches_here` has just established that the
+        // title *starts with* the provider, so the separator inside it is always found first.
+        && let Some(between) = trimmed.get(provider.len()..at).map(str::trim)
+    {
+        let tail = after(at, sep).trim();
+        // Only across a separator, and only when what sits *between* the name and it is the
+        // rest of a domain rather than words — so "Amazon Basics: …" keeps its first word.
+        if tail.chars().count() >= SHORTEST_TITLE && between.len() <= 4 {
+            return tail;
+        }
+    }
+    // Trailing: "IQL-IMX678/FF | DigiKey Electronics"
+    for (at, sep) in trimmed.match_indices(SEPARATORS).collect::<Vec<_>>().into_iter().rev() {
+        if matches_here(after(at, sep).trim()) {
+            let head = trimmed[..at].trim();
+            if head.chars().count() >= SHORTEST_TITLE {
+                return head;
+            }
+        }
+    }
+    trimmed
+}
+
+/// A card's address, for the badge and for the press that lands on it.
+pub(crate) fn link_url(kind: &ItemKind) -> Option<&str> {
+    match kind {
+        ItemKind::LinkPreview { url, .. } | ItemKind::Embed { url, .. } => url.as_deref(),
+        _ => None,
+    }
+}
+
+/// Whether a card has a site icon to draw. Decides how far the provider row is indented.
+pub(crate) fn has_favicon(kind: &ItemKind) -> bool {
+    match kind {
+        ItemKind::LinkPreview { favicon, .. } | ItemKind::Embed { favicon, .. } => {
+            favicon.is_some()
+        }
+        _ => false,
+    }
+}
+
+/// Which display mode a card is in — [`CardMode::Card`] for anything that is not one.
+///
+/// A `Document` reaches the card painter too and has no mode of its own; it draws as an
+/// ordinary card, which is what a PDF placeholder should look like.
+pub(crate) fn card_mode(kind: &ItemKind) -> CardMode {
+    match kind {
+        ItemKind::LinkPreview { mode, .. } | ItemKind::Embed { mode, .. } => *mode,
+        _ => CardMode::Card,
+    }
+}
+
+/// The text a card shows: its title, then its link, as two styled runs.
+///
+/// Built here rather than stored on the item because it is a *presentation* of
+/// several document fields — `vellum_doc::ItemKind::LinkPreview` deliberately keeps
+/// them apart, and an absent description is a different thing from an empty one.
+fn card_text(kind: &ItemKind, slot: u16, line_budget: usize) -> vellum_text::StyledText {
+    let (title, url, description, provider, mode) = match kind {
+        ItemKind::LinkPreview { title, url, description, provider, mode, .. } => {
+            (title.clone(), url.clone(), description.clone(), provider.clone(), *mode)
+        }
+        ItemKind::Embed { title, url, description, provider, mode, .. } => {
+            (title.clone(), url.clone(), description.clone(), provider.clone(), *mode)
+        }
+        ItemKind::Document { page_count, .. } => (
+            Some(format!("PDF · {page_count} page{}", if *page_count == 1 { "" } else { "s" })),
+            None,
+            None,
+            None,
+            CardMode::Card,
+        ),
+        _ => (None, None, None, None, CardMode::Card),
+    };
+
+    // **Decoded here as well as at the two doors, because the doors do not reach what is
+    // already inside.** The importer decodes what a paste brings in and `vellum-link` decodes
+    // what a fetch brings back — and neither touches the text already written into the cards
+    // on the ~58 boards on disk. The user photographed a YouTube card reading
+    // `I built the device that Apple wouldn&#39;t…` on a build carrying both of those fixes.
+    //
+    // Doing it at paint time repairs every existing board with **no migration and no write**,
+    // which matters more than the tidiness of a single decode point: RULE ZERO's whole
+    // posture is that a board is production data belonging to someone else, and a display-time
+    // fix cannot corrupt one. It is idempotent — a decoded string holds no entity for a second
+    // pass to find — and it is cheap: three short strings on the cards that are on screen.
+    let decode = |value: Option<String>| value.map(|v| vellum_link::decode_entities(&v));
+    let (title, url, description, provider) =
+        (decode(title), decode(url), decode(description), decode(provider));
+
+    let mut spans = Vec::new();
+    match slot {
+        // The provider row: the site's name, on its own, so it can be drawn in its own muted
+        // colour. A **collapsed** card puts its title here too, because the row *is* the card's
+        // one line and there is no second block beneath it to hold one.
+        BlockKey::SECONDARY => {
+            let name = provider.unwrap_or_default();
+            // The row is one line by construction, so its budget is the per-line one — the
+            // caller's `line_budget` is the *block's* capacity, which for this block is a line.
+            if matches!(mode, CardMode::Link) {
+                let lead = title.or_else(|| url.clone()).unwrap_or_default();
+                let prefix = if name.is_empty() { String::new() } else { format!("{name}  ") };
+                // Clipped, not wrapped. One line is the entire point of the collapsed row, and
+                // a title long enough to wrap would otherwise make it two — at which point it
+                // is a small `Card` with no blurb rather than a row.
+                let room = line_budget.saturating_sub(prefix.chars().count());
+                if !prefix.is_empty() {
+                    spans.push(DocSpan::plain(prefix));
+                }
+                spans.push(DocSpan::new(ellipsise(&lead, room), vellum_doc::SpanStyle::bold()));
+            } else if !name.is_empty() {
+                spans.push(DocSpan::plain(ellipsise(&name, line_budget)));
+            }
+        }
+
+        // The title, then the page's own blurb. The **site name is not here** — it is the row
+        // above, in its own colour. The URL is not repeated either: the title and the site
+        // already say what this is, and a wrapped URL is three lines of tracking parameters. It
+        // is still in the document, still in the panel, and still where a click goes.
+        BlockKey::PRIMARY => match mode {
+            // Drawn entirely by the row above. Nothing here, rather than a duplicate of it.
+            CardMode::Link => {}
+            CardMode::Card | CardMode::Large => {
+                // **Every span is clipped against the block, not just the blurb.**
+                //
+                // The blurb was the only one that was, and the other two overflow just as
+                // readily — Miro's imported cards routinely carry a *title* that is the
+                // raw address, and the `else` branch below appended a whole URL with no
+                // clip at all. An Amazon link is 400 characters of tracking parameters
+                // with no spaces in it, so it cannot wrap at a word boundary and pours
+                // straight out through the bottom of the card and down the board.
+                // Reported twice: once as *"the images are all distoreted"*'s neighbour,
+                // and again as *"i still have the links overflowing problem"* after a fix
+                // that only addressed the font size.
+                //
+                // `room` is what the block has left after what is already in it, so the
+                // three spans share one budget rather than each assuming the whole of it.
+                fn room(spans: &[DocSpan], budget: usize) -> usize {
+                    let used: usize = spans.iter().map(|s| s.text.chars().count()).sum();
+                    budget.saturating_sub(used)
+                }
+                // The title alone. Its blurb moved to `CARD_BLURB_SLOT` when the card gained a
+                // third block, so that the two can be set at different sizes — `room` is kept
+                // because the fallback below still shares this block's budget.
+                let _ = room(&spans, line_budget);
+                match (&title, &url) {
+                    (Some(title), _) => {
+                        let trimmed = strip_site_affix(title, provider.as_deref());
+                        let clipped = ellipsise(trimmed, line_budget);
+                        spans.push(DocSpan::plain(clipped));
+                    }
+                    // No title: the URL is the only name it has.
+                    (None, Some(url)) => {
+                        let clipped = ellipsise(url, line_budget);
+                        spans.push(DocSpan::plain(clipped));
+                    }
+                    (None, None) => {}
+                }
+            }
+        },
+
+        // The blurb, under the title and set smaller — see `CARD_BLURB_SLOT`.
+        CARD_BLURB_SLOT => {
+            // **A video card has none**, and this is a content decision rather than a layout
+            // one, which is why it is here and not left to a zero-height box: `FitBox::new`
+            // clamps to 1.0, so an empty box still shapes a line and draws it clipped. A
+            // video's `og:description` is the uploader's sponsor read — *"Get Opera here:
+            // https://exmpl.co/07-Abcd…"* on a real card — which is the least useful
+            // text on the board, and the room it was taking now belongs to the poster.
+            let is_video = url.as_deref().is_some_and(vellum_link::plays_video);
+            if !is_video && matches!(mode, CardMode::Card | CardMode::Large) {
+                match description.filter(|d| !d.trim().is_empty()) {
+                    // Skipped when it only repeats the title, which is 18 of the 91 cards on
+                    // the reference board — see `says_the_same_as`.
+                    Some(description) if !says_the_same_as(title.as_deref(), &description) => {
+                        spans.push(DocSpan::plain(ellipsise(&description, line_budget)));
+                    }
+                    // Nothing to say about the page, so the address is worth the room. Only
+                    // when there *is* a title, or this repeats what the title block just drew.
+                    _ if title.is_some() => {
+                        if let Some(url) = url {
+                            spans.push(DocSpan::plain(ellipsise(&url, line_budget)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // A card has two slots and no more.
+        _ => {}
+    }
+    text::convert(&DocText::from_spans(spans))
+}
+
+/// Whether a card's blurb is just its title again, in which case it is not drawn.
+///
+/// # This is Miro's data, not a bug of ours — but the card is ours
+///
+/// Measured from the reference capture (`captures/reference-board.html`): **18 of the 91
+/// `preview` widgets carry an `openGraph.description` that is the `openGraph.title`**, and
+/// 15 of those are alibaba.com. Miro renders one of them; we rendered both, and the user
+/// photographed a card saying the same sixty-word sentence twice.
+///
+/// # Why equality is not enough, and where the line is
+///
+/// The second shape is the one a naive `==` misses and is just as common in that capture: a
+/// description that is the title **truncated** to ~256 characters and ended with an ellipsis,
+/// sometimes differing in HTML entity spelling as well (`&#43;` against `+`). It reads as the
+/// same sentence twice just as plainly. So the test is a prefix on normalised text, with a
+/// floor: a genuinely short blurb that happens to open with the title's first few words is a
+/// real blurb, and suppressing it would lose the only description the card has. Sixteen
+/// characters is enough to be past "Buy" and "Amazon.com:" and short enough to catch the
+/// truncated case, which diverges only at its very end.
+fn says_the_same_as(title: Option<&str>, description: &str) -> bool {
+    /// Case-folded, entity-and-punctuation-agnostic, whitespace-collapsed.
+    fn normalise(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut spaced = true;
+        for character in text.chars() {
+            if character.is_alphanumeric() {
+                out.extend(character.to_lowercase());
+                spaced = false;
+            } else if !spaced {
+                out.push(' ');
+                spaced = true;
+            }
+        }
+        out.trim_end().to_owned()
+    }
+
+    const ENOUGH: usize = 16;
+    let Some(title) = title else { return false };
+    let (title, description) = (normalise(title), normalise(description));
+    // Either direction: Miro stores the truncated one in `description` on some cards and a
+    // description that runs *past* the title on others.
+    if !(title.starts_with(&description) || description.starts_with(&title)) {
+        return false;
+    }
+    let (shorter, longer) = (title.len().min(description.len()), title.len().max(description.len()));
+    // **Both halves of this guard earn their place.** Without the floor, a card whose title
+    // is a bare site name suppresses nothing useful but a card with a two-word title would
+    // eat a real description. Without the ratio, a title of `Alibaba.com` swallows the blurb
+    // *"Alibaba.com is the world's largest…"* — a real description, thrown away for sharing
+    // eleven characters with the title. The duplicate this exists for is two strings of
+    // nearly the same length; a prefix that is a small fraction of the whole is a blurb that
+    // happens to open with the title, which is ordinary and worth keeping.
+    shorter >= ENOUGH && shorter * 2 >= longer
+}
+
+/// A card body: a rounded rectangle drawn through the SDF pipeline.
+///
+/// Deliberately the analytic path rather than the quad one. It is the same shape
+/// either way today, and routing cards through `vellum_shapes` means the day
+/// `ItemKind` grows a shape variant the plumbing — parameters, arena, instance — is
+/// already exercised on a real board rather than only in a unit test.
+fn push_shape_card(
+    list: &mut DrawList,
+    position: [f32; 2],
+    size: [f32; 2],
+    rotation: f32,
+    opacity: f32,
+    theme: &Theme,
+) {
+    // `Shape::RoundedRectangle`'s radius is a fraction of the **shorter** side, which
+    // is what keeps the corners circular however the card is stretched.
+    let radius = (CARD_RADIUS / size[0].min(size[1]).max(1.0)).clamp(0.0, 0.5);
+    let shape = Shape::RoundedRectangle { radius };
+    let Some(params) = shape.sdf_params(Size::new(size[0], size[1])) else {
+        return;
+    };
+    let style = ShapeStyle {
+        fill: theme.surface,
+        border: theme.border,
+        border_width: HAIRLINE,
+        rotation,
+        opacity,
+    };
+    list.push_shape(
+        &params,
+        [position[0] + size[0] / 2.0, position[1] + size[1] / 2.0],
+        &style,
+    );
+}
+
+/// What an image draws before its pixels arrive: the card surface plus a hairline,
+/// so the item's place on the board is visible immediately rather than as a hole.
+fn push_placeholder(
+    list: &mut DrawList,
+    position: [f32; 2],
+    size: [f32; 2],
+    rotation: f32,
+    opacity: f32,
+    theme: &Theme,
+) {
+    list.push_quad(
+        QuadInstance::solid(position, size, theme.surface)
+            .with_border(theme.border, HAIRLINE)
+            .with_rotation(rotation)
+            .with_opacity(opacity),
+    );
+}
+
+/// The pen stroke in flight, drawn exactly as the committed one will be.
+///
+/// Tessellated fresh every frame rather than cached. The point list grows with every
+/// pointer sample, so a cache would miss on each one anyway — and the cache the
+/// committed strokes use keys on [`Projection::generation`], which deliberately does
+/// not move for anything the document has not seen yet.
+fn push_stroke(list: &mut DrawList, ctx: &DrawContext<'_>, board: u32) {
+    let Some(stroke) = ctx.stroke else { return };
+    // One sample is a press that has not travelled, not a mark. `commit_stroke`
+    // applies the same floor, so nothing is previewed that would not be kept.
+    if stroke.points.len() < 2 {
+        return;
+    }
+
+    // Tessellated about the stroke's own first point rather than the board origin.
+    // `vellum_ink::Mesh` holds f32 positions and is only safe in stroke-local space —
+    // a stroke is a few hundred units across, a board is tens of thousands — so the
+    // offset stays in f64 here and reaches the GPU through the transform, which is
+    // the same division of labour the committed path and the connectors use.
+    let origin = stroke.points[0];
+    let relative: Vec<vellum_doc::Point> = stroke
+        .points
+        .iter()
+        .map(|point| vellum_doc::Point { x: point.x - origin.x, y: point.y - origin.y })
+        .collect();
+    let mesh = tessellate_ink(&relative, stroke.thickness, lod_band(ctx.camera.zoom()));
+
+    list.use_view(board);
+    let transform = list
+        .meshes_mut()
+        .push_transform(MeshTransform::at(ctx.camera.to_camera_relative(origin)));
+    let start = list.meshes().indices().len() as u32;
+    list.meshes_mut().push_ink(&mesh, stroke.color, transform);
+    let end = list.meshes().indices().len() as u32;
+    list.push_meshes(start..end);
+}
+
+/// The marquee rectangle, in screen pixels so it stays crisp at any zoom.
+/// The device-pixel width of the caret, and of a selection edge.
+///
+/// One logical pixel scaled by the display, not by the camera: a caret is chrome, and one
+/// that fattened with the zoom would look like a highlighted column rather than a caret.
+const CARET_WIDTH: f32 = 2.0;
+
+/// The caret, in the screen view where the glyphs are.
+///
+/// Screen view rather than board view because the caret has to line up with glyphs, and
+/// those are rasterised at their drawn size and pushed at device coordinates. `Caret`'s
+/// numbers are block-relative *logical* px — the same space the layout's glyph positions
+/// are in — so the camera's zoom is the only conversion needed.
+/// How long the caret stays solid after a keystroke before it starts blinking.
+///
+/// Every text field on both platforms does this: a caret that blinked *while* you typed
+/// would flicker under your own hands, and the blink is there to be found when you stop.
+const CARET_SOLID_FOR: f32 = 0.5;
+
+/// One full on-then-off cycle. macOS's own rate.
+const CARET_BLINK_PERIOD: f32 = 1.06;
+
+/// Whether the caret is drawn this frame.
+///
+/// *"i want there to be appearing and disappearing this sign | that indicates that i
+/// started typing"*. `CLAUDE.md` recorded no-blink as deliberate — *"a blink needs a timer
+/// driving redraws while nothing is happening, which is what this app exists not to do"* —
+/// and the reasoning does not apply here: the loop already presents every frame while the
+/// window is visible, and a caret only exists while a session is open, which is an active
+/// state by definition. Nothing new is woken up.
+///
+/// Pure, and a function rather than an expression inline, so the phase is testable without
+/// a window.
+fn caret_is_visible(idle_for: f32) -> bool {
+    if idle_for < CARET_SOLID_FOR {
+        return true;
+    }
+    (idle_for - CARET_SOLID_FOR) % CARET_BLINK_PERIOD < CARET_BLINK_PERIOD / 2.0
+}
+
+fn push_caret(
+    list: &mut DrawList,
+    ctx: &DrawContext<'_>,
+    block: &Block,
+    layout: &vellum_text::Layout,
+    cursor: TextCursor<'_>,
+) {
+    if !caret_is_visible(cursor.idle_for) {
+        return;
+    }
+    let caret = layout.caret(cursor.text, cursor.cursor);
+    let zoom = ctx.camera.zoom() as f32;
+    let origin = [
+        block.origin.x as f32 + caret.x * zoom,
+        block.origin.y as f32 + caret.top * zoom,
+    ];
+    list.push_quad(QuadInstance::solid(
+        origin,
+        [CARET_WIDTH, (caret.height * zoom).max(CARET_WIDTH)],
+        ctx.theme.accent,
+    ));
+}
+
+/// The selection highlight, one quad per visual line, under the glyphs.
+fn push_selection_boxes(
+    list: &mut DrawList,
+    ctx: &DrawContext<'_>,
+    block: &Block,
+    layout: &vellum_text::Layout,
+    cursor: TextCursor<'_>,
+) {
+    if cursor.cursor == cursor.anchor {
+        return;
+    }
+    let range = cursor.cursor.min(cursor.anchor)..cursor.cursor.max(cursor.anchor);
+    let zoom = ctx.camera.zoom() as f32;
+    for box_ in layout.selection_boxes(cursor.text, range) {
+        list.push_quad(QuadInstance::solid(
+            [
+                block.origin.x as f32 + box_.x * zoom,
+                block.origin.y as f32 + box_.top * zoom,
+            ],
+            [(box_.width * zoom).max(1.0), (box_.height * zoom).max(1.0)],
+            // Light enough that the glyphs on top of it still meet contrast, which is the
+            // rule `docs/05-design-language.md` §3a states for glass and which applies
+            // just as much here: legibility wins over the marker.
+            ctx.theme.accent.with_alpha(0.22),
+        ));
+    }
+}
+
+/// The connector being drawn, as a straight accent line with a blob at each end.
+///
+/// Straight rather than routed: the routing mode is a property of the finished item and the
+/// router needs both endpoints resolved against their targets, which is not decided until
+/// the button comes up. A straight line is honest about that — it shows where the two ends
+/// are, which is the only thing in question mid-drag.
+fn push_pending_connector(list: &mut DrawList, ctx: &DrawContext<'_>, board: u32) {
+    let Some((from, to)) = ctx.pending_connector else { return };
+    list.use_view(board);
+    let camera = ctx.camera;
+    let a = camera.to_camera_relative(from);
+    let b = camera.to_camera_relative(to);
+    // World units, so the line keeps a constant thickness on screen as the camera zooms —
+    // the same division the selection ring and a frame's hairline already do.
+    let width = (f64::from(SELECTION_WIDTH) * 1.5 / camera.zoom()) as f32;
+    let mesh = crate::mesh::ribbon(&[a, b], width.max(0.01));
+    push_local_mesh(list, [0.0, 0.0], &mesh, ctx.theme.accent, 0.0);
+
+    // A blob at each end, so it is visible where the line is going to attach even when the
+    // drag is only a few pixels long and the ribbon is a smear.
+    let blob = width * 2.5;
+    for at in [a, b] {
+        list.push_quad(
+            QuadInstance::solid([at[0] - blob / 2.0, at[1] - blob / 2.0], [blob, blob], ctx.theme.accent)
+                .with_corner_radius(blob / 2.0),
+        );
+    }
+}
+
+/// The item a create tool is sweeping out, drawn as it will look when the button comes up.
+///
+/// Board view, like the pen's live stroke and the kanban card's placeholder: it is a
+/// rectangle in the board's own space, and a camera that moved mid-gesture would leave a
+/// screen-space preview behind.
+///
+/// Drawn **before** the selection ring and after the items, so it sits on the board like
+/// the thing it is previewing rather than over the chrome.
+fn push_placing(list: &mut DrawList, ctx: &DrawContext<'_>, board: u32) {
+    let Some(placing) = ctx.placing else { return };
+    list.use_view(board);
+    let camera = ctx.camera;
+    let theme = ctx.theme;
+
+    // A `Placement` is a **centre** and an extent, so the top-left is derived rather than
+    // read. Through `project::placement_bounds`, which is the function every item on the
+    // board is already positioned by — reading `x`/`y` as a top-left draws the preview
+    // half its own size up and to the left of where the item lands, and at a placing
+    // tool's default sizes that is most of a screen.
+    let rect = crate::project::placement_bounds(&placing.placement);
+    let origin = camera.to_camera_relative(rect.min);
+    let size = [(rect.max.x - rect.min.x) as f32, (rect.max.y - rect.min.y) as f32];
+    // One device pixel at any zoom, like the selection ring and a frame's own edge: a
+    // preview outline that fattened as the board was zoomed in would stop reading as an
+    // edge and start reading as part of the item.
+    let hairline = (f64::from(HAIRLINE) / camera.zoom()) as f32;
+
+    match placing.look {
+        PlacingLook::Frame => {
+            list.push_quad(
+                QuadInstance::solid(origin, size, theme.frame_fill)
+                    .with_border(theme.border, hairline),
+            );
+        }
+        PlacingLook::Sticky => {
+            list.push_quad(
+                QuadInstance::solid(origin, size, theme.sticky)
+                    .with_corner_radius(STICKY_RADIUS),
+            );
+        }
+        PlacingLook::Shape(shape) => {
+            let extent = Size::new(size[0], size[1]);
+            let centre = [origin[0] + size[0] / 2.0, origin[1] + size[1] / 2.0];
+            let style = ShapeStyle {
+                fill: theme.surface,
+                border: theme.border,
+                border_width: hairline,
+                rotation: 0.0,
+                opacity: 1.0,
+            };
+            // Analytic where the form allows it, tessellated where it does not — the same
+            // two paths the placed shape takes, chosen the same way. A form with neither
+            // is drawn as a ghost rather than skipped: an empty preview is the bug being
+            // fixed.
+            if let Some(params) = shape.sdf_params(extent) {
+                list.push_shape(&params, centre, &style);
+            } else {
+                push_ghost(list, &theme, origin, size, hairline);
+            }
+        }
+        PlacingLook::Ghost => push_ghost(list, &theme, origin, size, hairline),
+    }
+
+    // An accent outline on top of every one of them, at the marquee's weight. Two jobs:
+    // it says *this is a gesture, not an item yet* — a bare white rectangle mid-drag is
+    // indistinguishable from a frame that has already been placed — and it keeps a
+    // sticky's own fill from being the only thing on screen when the sweep is a few
+    // pixels across.
+    list.push_quad(
+        QuadInstance::solid(origin, size, Rgba::TRANSPARENT)
+            .with_border(theme.accent, (f64::from(SELECTION_WIDTH) / camera.zoom()) as f32),
+    );
+}
+
+/// Miro's alignment guides: the lines that say *this lines up with that*.
+///
+/// **Screen view**, unlike almost everything else a gesture draws. A guide is chrome — it
+/// describes the board rather than being part of it — so its weight has to be one device
+/// pixel at every zoom, and the segment ends and tick marks of a spacing hint have to be a
+/// readable size whatever the board's scale is. In the board view all three would shrink
+/// with the zoom and a guide at 4% would be invisible.
+///
+/// The **span** matters as much as the line. Miro draws a guide only across the items it
+/// joins, and so does this: a line from edge to edge of the screen says *something over
+/// there lines up*, which is a weaker and much less useful statement than *these two do*.
+fn push_guides(list: &mut DrawList, ctx: &DrawContext<'_>, screen: u32) {
+    if ctx.guides.is_empty() {
+        return;
+    }
+    list.use_view(screen);
+    let camera = ctx.camera;
+    // **Dashed and translucent**, and both halves are the owner's call: *"they are too
+    // bright, so make those into dotted dashed lines and turn transparency down a bit so i
+    // can see the difference between the alignment line and an object"*.
+    //
+    // The complaint is exact and it is about *category*, not taste. A solid accent hairline
+    // is what a selection ring is and what a shape's border is — so a guide drawn that way
+    // reads as an edge belonging to something, and on a board of stickies it is one more
+    // line among many. A dash belongs to no object: nothing else on the canvas is dashed
+    // except a connector that was asked to be. The alpha then puts it behind the board
+    // rather than on it.
+    let colour = ctx.theme.accent.with_alpha(GUIDE_ALPHA);
+    // A hairline, and a hair over one pixel so it survives the rounding either way.
+    let weight = HAIRLINE.max(1.0);
+
+    for guide in ctx.guides {
+        // Both ends in screen space, so the guide is drawn from the same two points the
+        // board is — no separate scaling to get wrong.
+        let (a, b) = match guide.axis {
+            crate::snap::Axis::Vertical => (
+                camera.world_to_screen(WorldPoint::new(guide.at, guide.from)),
+                camera.world_to_screen(WorldPoint::new(guide.at, guide.to)),
+            ),
+            crate::snap::Axis::Horizontal => (
+                camera.world_to_screen(WorldPoint::new(guide.from, guide.at)),
+                camera.world_to_screen(WorldPoint::new(guide.to, guide.at)),
+            ),
+        };
+        push_dashed(list, ctx, guide.axis, a, b, colour, weight);
+
+        // An equal-spacing hint is a *measurement*, so it gets a tick at each end — the
+        // difference between "these are the same distance apart" and "this line runs
+        // through both of them". Without them a gap hint is indistinguishable from an
+        // alignment guide that happens to be short.
+        //
+        // The caps stay **solid**: they are four pixels long, and a dash pattern at that
+        // size is a dot. They are what says the dashed line between them is a span.
+        if guide.gap.is_some() {
+            let tick = GUIDE_TICK;
+            for end in [a, b] {
+                let (tx, ty, tw, th) = match guide.axis {
+                    crate::snap::Axis::Vertical => {
+                        (end.x as f32 - tick, end.y as f32, tick * 2.0, weight)
+                    }
+                    crate::snap::Axis::Horizontal => {
+                        (end.x as f32, end.y as f32 - tick, weight, tick * 2.0)
+                    }
+                };
+                list.push_quad(QuadInstance::solid([tx, ty], [tw, th], colour));
+            }
+        }
+    }
+}
+
+/// One guide line, as a run of dashes in **screen** pixels.
+///
+/// Clipped to the viewport first, and that is not an optimisation. A guide spans the items
+/// it joins, and those are in *world* units — two stickies a hundred thousand units apart on
+/// a zoomed-in board produce a segment whose on-screen length is enormous and almost
+/// entirely off screen. Dashing that unclipped is a quad per six pixels of a line nobody can
+/// see, sixty times a second. [`GUIDE_MAX_DASHES`] is the backstop for whatever this misses.
+fn push_dashed(
+    list: &mut DrawList,
+    ctx: &DrawContext<'_>,
+    axis: crate::snap::Axis,
+    a: ScreenPoint,
+    b: ScreenPoint,
+    colour: Rgba,
+    weight: f32,
+) {
+    let viewport = ctx.camera.viewport();
+    let (limit_min, limit_max) = match axis {
+        // A little past the edge on each side, so a dash is never cut in a way that reads
+        // as the line stopping short of the window.
+        crate::snap::Axis::Vertical => (-GUIDE_DASH, viewport.height as f32 + GUIDE_DASH),
+        crate::snap::Axis::Horizontal => (-GUIDE_DASH, viewport.width as f32 + GUIDE_DASH),
+    };
+    let (along_a, along_b, across) = match axis {
+        crate::snap::Axis::Vertical => (a.y as f32, b.y as f32, a.x as f32),
+        crate::snap::Axis::Horizontal => (a.x as f32, b.x as f32, a.y as f32),
+    };
+    let start = along_a.min(along_b).max(limit_min);
+    let end = along_a.max(along_b).min(limit_max);
+    if end <= start {
+        return;
+    }
+
+    let step = GUIDE_DASH + GUIDE_GAP;
+    let dashes = (((end - start) / step).ceil() as usize).min(GUIDE_MAX_DASHES);
+    for index in 0..dashes {
+        let from = start + index as f32 * step;
+        let to = (from + GUIDE_DASH).min(end);
+        if to <= from {
+            break;
+        }
+        let (x, y, w, h) = match axis {
+            crate::snap::Axis::Vertical => (across, from, weight, to - from),
+            crate::snap::Axis::Horizontal => (from, across, to - from, weight),
+        };
+        list.push_quad(QuadInstance::solid([x, y], [w, h], colour));
+    }
+}
+
+/// Half the length of the cap at each end of a spacing hint, in device pixels.
+const GUIDE_TICK: f32 = 4.0;
+
+/// How opaque a guide is against the board.
+///
+/// Low enough to read as chrome rather than as an edge belonging to something, high enough
+/// to survive the pale canvas `docs/05` §1 whitened — *"turn transparency down a bit"*, and
+/// *a bit* is the operative word. Under about a third the line disappears over a sticky.
+const GUIDE_ALPHA: f32 = 0.45;
+
+/// The dash and the gap between dashes, in device pixels.
+///
+/// Screen pixels, like the guide's weight, so the pattern is the same density at every zoom
+/// — a world-unit dash would be a solid line when zoomed out and three dashes across the
+/// window when zoomed in, which is the failure `push_grid` already documents for the board's
+/// own dots.
+const GUIDE_DASH: f32 = 5.0;
+const GUIDE_GAP: f32 = 4.0;
+
+/// A backstop on the dashes one guide may emit.
+///
+/// The viewport clip above should make this unreachable; it is here because the alternative
+/// to being wrong about that is a frame that emits a hundred thousand quads and stops.
+const GUIDE_MAX_DASHES: usize = 512;
+
+/// The accent wash a preview falls back to when the finished item's look is not known.
+fn push_ghost(
+    list: &mut DrawList,
+    theme: &Theme,
+    origin: [f32; 2],
+    size: [f32; 2],
+    hairline: f32,
+) {
+    list.push_quad(
+        QuadInstance::solid(origin, size, theme.accent.with_alpha(0.12))
+            .with_border(theme.accent, hairline),
+    );
+}
+
+/// The placeholder a dragged kanban card would drop into.
+///
+/// Board view, not screen view: it is a rectangle in the board's own space that has to
+/// stay put under the pointer as the camera moves, and it may be rotated with its item.
+/// Drawn as four edges rather than one quad because a rotated placeholder is not
+/// axis-aligned and `QuadInstance` takes an origin and an extent.
+fn push_card_drop(list: &mut DrawList, ctx: &DrawContext<'_>, board: u32) {
+    let Some(corners) = ctx.card_drop else { return };
+    list.use_view(board);
+    let camera = ctx.camera;
+    // One device pixel at any zoom, like the selection ring: a placeholder that
+    // fattened as the board was zoomed in would stop reading as an insertion line.
+    let width = (f64::from(SELECTION_WIDTH) / camera.zoom()) as f32;
+    for pair in 0..4 {
+        let from = corners[pair];
+        let to = corners[(pair + 1) % 4];
+        let a = camera.to_camera_relative(WorldPoint::new(from.0, from.1));
+        let b = camera.to_camera_relative(WorldPoint::new(to.0, to.1));
+        // Each edge as a thin quad along itself. Axis-aligned in the common case —
+        // an unrotated board — and a stair-step of one pixel otherwise, which at a
+        // placeholder's weight is not visible.
+        let (x, y) = (a[0].min(b[0]), a[1].min(b[1]));
+        let (w, h) = ((b[0] - a[0]).abs().max(width), (b[1] - a[1]).abs().max(width));
+        list.push_quad(QuadInstance::solid([x, y], [w, h], ctx.theme.accent));
+    }
+}
+
+fn push_marquee(list: &mut DrawList, ctx: &DrawContext<'_>, screen: u32) {
+    let Some((from, to)) = ctx.marquee else { return };
+    list.use_view(screen);
+    let origin = [from.x.min(to.x) as f32, from.y.min(to.y) as f32];
+    let size = [(to.x - from.x).abs() as f32, (to.y - from.y).abs() as f32];
+    list.push_quad(
+        QuadInstance::solid(origin, size, ctx.theme.accent.with_alpha(0.12))
+            .with_border(ctx.theme.accent, SELECTION_WIDTH),
+    );
+}
+
+/// The board's background pattern — dots, crosses or graph lines.
+///
+/// Drawn in [`Theme::grid`], **not** in `frost`/`border` as `docs/05-design-language.md`
+/// §4 originally specified. Against `canvas` that is a 2.4% channel delta — a contrast
+/// ratio of 1.05:1 — so a 2px dot rendered perfectly and could not be seen at all,
+/// while lines survived only because a full-height bar lays down some thirty-five times
+/// the ink per cell at the same colour. That asymmetry is the whole reason the two
+/// patterns appeared to behave differently.
+///
+/// Dots rather than lines, and in **screen** space rather than world space. Both
+/// follow from the same requirement: the grid has to stay a constant, quiet texture
+/// at every zoom. A world-space grid would fatten into stripes as you zoomed in and
+/// alias into moiré as you zoomed out, and lines at any zoom read as graph paper
+/// rather than as a datum field.
+///
+/// The spacing is the world step whose on-screen size lands inside a comfortable
+/// band, chosen from the 1-2-5 decade sequence a technical drawing would use, so
+/// zooming steps the grid between densities instead of sliding it continuously.
+fn push_grid(list: &mut DrawList, ctx: &DrawContext<'_>, screen: u32) {
+    let viewport = ctx.camera.viewport();
+    let zoom = ctx.camera.zoom();
+    let Some(step) = grid_step(zoom) else { return };
+
+    let visible = ctx.camera.visible_world_rect();
+    let first_x = (visible.min.x / step).floor() * step;
+    let first_y = (visible.min.y / step).floor() * step;
+    let columns = ((visible.max.x - first_x) / step).ceil() as i64 + 1;
+    let rows = ((visible.max.y - first_y) / step).ceil() as i64 + 1;
+    if columns <= 0 || rows <= 0 {
+        return;
+    }
+
+    let dot = GRID_DOT * ctx.camera.viewport().height.max(1.0) as f32 / 900.0;
+    // Rounded, not just clamped: a dot is drawn on whole pixels below, and a whole
+    // number of them is the only size that lands on them exactly.
+    let dot = dot.clamp(1.0, 3.0).round().max(1.0);
+    // The board's ink if it chose one, otherwise the theme's. Both branches go through the
+    // same variable, so nothing below has to know which it got — a second `if` at each of
+    // the three drawing sites is how a cross ends up a different colour from a dot.
+    //
+    // `convert` carries the document colour's alpha straight through, which is the whole
+    // transparency control: `vellum-render`'s `Rgba` is *straight* alpha and its shaders
+    // premultiply on output, so nothing here has to.
+    let colour = ctx.grid_color.map_or(ctx.theme.grid, crate::theme::convert);
+    // A grid dragged to zero opacity draws nothing, so it should not be *walked* either.
+    // Note precisely what this saves and what it does not: `DrawList::push_quad` already
+    // discards an invisible quad, so nothing was reaching the buffer — what was happening
+    // was the `columns × rows` loop below, up to `MAX_GRID_DOTS` iterations of
+    // `world_to_screen` and rounding, every frame, to produce nothing. The snap path refuses
+    // on the same condition, which is what makes zero opacity mean *off* rather than merely
+    // *unseen*.
+    if colour.a <= 0.0 {
+        return;
+    }
+    list.use_view(screen);
+
+    // Lines are two runs of full-length quads rather than a dot per intersection: the
+    // same spacing costs `columns + rows` quads instead of `columns × rows`, and it
+    // is the only way graph paper stays inside the same budget the dots have.
+    //
+    // Which is also why the budget below is checked *after* this returns. It used to
+    // gate both, so on a display dense enough for `columns × rows` to pass twenty
+    // thousand — a 5K panel at the tight end of the spacing band — graph paper
+    // vanished, charged for a cost only the dots ever pay.
+    if ctx.pattern == Pattern::Lines {
+        let (width, height) = (viewport.width as f32, viewport.height as f32);
+        for column in 0..columns {
+            let world = vellum_scene::WorldPoint::new(first_x + column as f64 * step, first_y);
+            let x = ctx.camera.world_to_screen(world).x as f32;
+            if x >= 0.0 && x <= width {
+                list.push_quad(QuadInstance::solid([x - dot * 0.5, 0.0], [dot, height], colour));
+            }
+        }
+        for row in 0..rows {
+            let world = vellum_scene::WorldPoint::new(first_x, first_y + row as f64 * step);
+            let y = ctx.camera.world_to_screen(world).y as f32;
+            if y >= 0.0 && y <= height {
+                list.push_quad(QuadInstance::solid([0.0, y - dot * 0.5], [width, dot], colour));
+            }
+        }
+        return;
+    }
+
+    // Everything below is one quad per intersection, so it is the branch the budget
+    // is actually about.
+    if columns * rows > MAX_GRID_DOTS {
+        return;
+    }
+
+    // A cross is the intersection stated with direction rather than as a speck: two
+    // short bars through the point. Four times the quads of a dot field and still
+    // `columns × rows`, so the same on-screen budget that bounds the dots bounds this.
+    let arm = if ctx.pattern == Pattern::Crosses { (dot * 3.0).clamp(3.0, 9.0) } else { 0.0 };
+
+    for row in 0..rows {
+        for column in 0..columns {
+            let world = vellum_scene::WorldPoint::new(
+                first_x + column as f64 * step,
+                first_y + row as f64 * step,
+            );
+            let at = ctx.camera.world_to_screen(world);
+            if at.x < 0.0 || at.y < 0.0 || at.x > viewport.width || at.y > viewport.height {
+                continue;
+            }
+            // Snapped to whole device pixels, size included. A mark this small spends
+            // most of its area on its own edge: left unsnapped, a 1.5px dot straddles
+            // two pixels, each takes partial coverage, and it composited to #CFD4D8
+            // rather than the #C8CED2 it was asked for — a fifth of the contrast given
+            // away to antialiasing, on the one element with least to spare. Measured
+            // on a 1440×900 shot before and after. Whole pixels, whole colour.
+            //
+            // Those two hexes are from before the ramp was whitened; the token is
+            // `#D0D6DA` now. The arithmetic is the same and so is the reason — the
+            // grid kept its 27/255 distance from the canvas rather than its value.
+            let (left, top) = ((at.x as f32 - dot * 0.5).round(), (at.y as f32 - dot * 0.5).round());
+            if ctx.pattern == Pattern::Crosses {
+                let (bar_x, bar_y) =
+                    ((left + (dot - arm) * 0.5).round(), (top + (dot - arm) * 0.5).round());
+                list.push_quad(QuadInstance::solid([bar_x, top], [arm, dot], colour));
+                list.push_quad(QuadInstance::solid([left, bar_y], [dot, arm], colour));
+            } else {
+                list.push_quad(QuadInstance::solid([left, top], [dot, dot], colour));
+            }
+        }
+    }
+}
+
+/// The world spacing of the grid at a given zoom.
+///
+/// Walks the 1-2-5 decades until one lands in the on-screen band. `None` when no
+/// decade does, which only happens at the extremes of the 1%–6400% clamp and is the
+/// right answer there: a grid nobody can resolve is noise.
+///
+/// **`pub(crate)` because Snap to grid reads it.** The spacing a gesture lands on and the
+/// spacing that is drawn have to be the same number, or the board says one thing and the
+/// pointer does another — the `draw::kanban_runs` rule again, and the reason
+/// `crate::snap::snap_to_grid` takes a step rather than working one out.
+pub(crate) fn grid_step(zoom: f64) -> Option<f64> {
+    if !zoom.is_finite() || zoom <= 0.0 {
+        return None;
+    }
+    for decade in -3..=7 {
+        for multiple in [1.0, 2.0, 5.0] {
+            let step = multiple * 10f64.powi(decade);
+            let on_screen = step * zoom;
+            if (GRID_MIN_PIXELS..=GRID_MAX_PIXELS).contains(&on_screen) {
+                return Some(step);
+            }
+        }
+    }
+    None
+}
+
+/// The band a grid step's on-screen spacing has to land in, in physical pixels.
+/// Below the first the dots merge into a wash; above the second they stop reading as
+/// a grid at all.
+/// The closest together the dots may sit, in device pixels.
+///
+/// *"make the dots closer to one another."* The grid walks the 1-2-5 sequence and takes the
+/// first step whose on-screen spacing lands in this band, so lowering the floor lets it keep a
+/// finer step for longer before stepping up — which is what makes the dots closer rather than
+/// simply making them appear at more zooms. 14 against the 24 it was: at a typical working
+/// zoom that is one step finer through most of the range.
+const GRID_MIN_PIXELS: f64 = 14.0;
+/// …and the furthest apart, before it steps down to a finer one.
+///
+/// Lowered with the floor, and it has to be: the band is what selects the step, so leaving the
+/// ceiling at 120 while dropping the floor to 14 would widen the band rather than shift it, and
+/// the same step would still be chosen at most zooms.
+const GRID_MAX_PIXELS: f64 = 70.0;
+
+/// Dot size at a nominal 900px-tall viewport, scaled with the viewport so a Retina
+/// display gets a 2px dot rather than a half-visible one.
+const GRID_DOT: f32 = 1.0;
+
+/// A hard ceiling on the grid, so a pathological zoom cannot emit a million quads.
+/// At the band above, a 5K display needs about 3,000.
+const MAX_GRID_DOTS: i64 = 20_000;
+
+/// The minimap: the whole board in a corner, with the viewport marked on it.
+///
+/// Every item is drawn as a filled rectangle in its own colour rather than as a
+/// generic dot, because the thing a minimap is *for* is recognising the shape of your
+/// own board at a glance, and on the reference board the yellow field of stickies and
+/// the dark mass of ink are what make it recognisable.
+///
+/// It is capped, and the cap is not a detail: the map is drawn every frame from the
+/// whole document rather than from the viewport query, so it is the one place in this
+/// file where cost does *not* follow the viewport. Beyond the cap it draws the
+/// closest items to the camera and stops — which is exactly the part being looked at.
+fn push_minimap(list: &mut DrawList, ctx: &DrawContext<'_>, screen: u32) {
+    let Some([x, y, width, height]) = ctx.minimap else { return };
+    let Some(content) = ctx.projection.content_bounds() else { return };
+    let (content_w, content_h) = (content.max.x - content.min.x, content.max.y - content.min.y);
+    if content_w <= 0.0 || content_h <= 0.0 || width <= 0.0 || height <= 0.0 {
+        return;
+    }
+
+    list.use_view(screen);
+    list.push_quad(
+        QuadInstance::solid([x, y], [width, height], ctx.theme.surface.with_alpha(0.92))
+            .with_border(ctx.theme.border, 1.0)
+            .with_corner_radius(MINIMAP_RADIUS),
+    );
+
+    // Fit the content into the panel, keeping its shape, and centre it.
+    let inset = MINIMAP_INSET;
+    let scale = ((width - inset * 2.0) / content_w as f32)
+        .min((height - inset * 2.0) / content_h as f32);
+    let offset_x = x + (width - content_w as f32 * scale) * 0.5;
+    let offset_y = y + (height - content_h as f32 * scale) * 0.5;
+    let project = |wx: f64, wy: f64| {
+        [
+            offset_x + (wx - content.min.x) as f32 * scale,
+            offset_y + (wy - content.min.y) as f32 * scale,
+        ]
+    };
+
+    for (drawn, (_, projected)) in ctx.projection.iter().enumerate() {
+        if drawn >= MAX_MINIMAP_ITEMS {
+            break;
+        }
+        let at = project(projected.bounds.min.x, projected.bounds.min.y);
+        let size = [
+            ((projected.bounds.max.x - projected.bounds.min.x) as f32 * scale).max(1.0),
+            ((projected.bounds.max.y - projected.bounds.min.y) as f32 * scale).max(1.0),
+        ];
+        let colour = crate::project::swatch(projected, ctx.theme);
+        if colour.a <= 0.0 {
+            continue;
+        }
+        list.push_quad(QuadInstance::solid(at, size, colour.with_alpha(colour.a * 0.85)));
+    }
+
+    // The viewport, as an outline. `xr-red`, the same token the selection wears,
+    // because both answer "where am I".
+    let visible = ctx.camera.visible_world_rect();
+    let top_left = project(visible.min.x, visible.min.y);
+    let bottom_right = project(visible.max.x, visible.max.y);
+    list.push_quad(
+        QuadInstance::solid(
+            top_left,
+            [
+                (bottom_right[0] - top_left[0]).max(2.0),
+                (bottom_right[1] - top_left[1]).max(2.0),
+            ],
+            Rgba::TRANSPARENT,
+        )
+        .with_border(ctx.theme.accent, 1.0),
+    );
+}
+
+const MINIMAP_RADIUS: f32 = 6.0;
+const MINIMAP_INSET: f32 = 6.0;
+
+/// How many items the minimap will draw. Past this the map is a solid block of
+/// colour anyway, and the reference board's 596 fit comfortably inside it.
+const MAX_MINIMAP_ITEMS: usize = 2_000;
+
+/// Whether an ancestor frame clips this item away entirely.
+///
+/// Item granularity, not per pixel — see the module's gap note. It is still worth
+/// doing: an item dragged out of a frame stops leaking across the board, which is
+/// the case a viewer actually notices.
+fn clipped_by_frame(projected: &Projected, projection: &Projection) -> bool {
+    let mut parent = projected.parent;
+    // Bounded rather than `while let`: a corrupt document could in principle
+    // describe a cycle, and a render loop is the worst place to discover one.
+    for _ in 0..MAX_NESTING {
+        let Some(id) = parent else { return false };
+        let Some(ancestor) = projection.get(id) else { return false };
+        if matches!(ancestor.item.kind, ItemKind::Frame { .. })
+            && !ancestor.bounds.intersects(&projected.bounds)
+        {
+            return true;
+        }
+        parent = ancestor.parent;
+    }
+    false
+}
+
+/// How deep the containment chain is walked before giving up. Miro's own nesting is
+/// a frame containing a group containing items; 64 is far past anything real.
+const MAX_NESTING: usize = 64;
+
+/// The zoom band an ink stroke is tessellated for, as a power of two.
+///
+/// Quantised so that a pan or a small zoom change does not re-tessellate 219 strokes
+/// every frame. Whole octaves because `vellum_ink::Lod`'s tolerance is already
+/// proportional to `1/zoom`: within a band the mesh is at worst twice as detailed as
+/// it needs to be, which costs vertices and never costs quality.
+///
+/// # `ceil`, not `round` — the comment above was describing a different function
+///
+/// It rounded to the *nearest* octave, which lands **below** the required detail for any
+/// zoom in the upper half of a band: at zoom 1.4 the band answers 1.0, so the stroke is
+/// tessellated to a 0.5-world-unit tolerance where 0.357 was needed. That is a real
+/// under-tessellation of up to √2, i.e. a 0.71-device-pixel error budget instead of 0.5 —
+/// visible faceting on round caps and joins, and precisely the *"so much more pixelated"*
+/// the user reported. Rounding up costs vertices in the worst case and cannot cost quality,
+/// which is what the paragraph above always claimed.
+fn lod_band(zoom: f64) -> i32 {
+    if !zoom.is_finite() || zoom <= 0.0 {
+        return 0;
+    }
+    zoom.log2().ceil().clamp(-8.0, 8.0) as i32
+}
+
+fn tessellate_ink(points: &[vellum_doc::Point], thickness: f64, band: i32) -> vellum_ink::Mesh {
+    let coordinates: Vec<(f64, f64)> = points.iter().map(|p| (p.x, p.y)).collect();
+    let stroke = Stroke::from_miro(&coordinates, Some(thickness));
+    stroke
+        .render(Lod::new(2f64.powi(band)))
+        .unwrap_or_else(|error| {
+            log::warn!("ink tessellation failed: {error}");
+            vellum_ink::Mesh::default()
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vellum_doc::{Board, ItemKind, NewItem, Placement, StyledText};
+    use vellum_scene::{ScreenSize, WorldRect};
+
+    fn projection_with(items: impl IntoIterator<Item = NewItem>) -> Projection {
+        let mut board = Board::new();
+        for item in items {
+            board.add(item).unwrap();
+        }
+        let mut projection = Projection::new();
+        projection.rebuild(&board).unwrap();
+        projection
+    }
+
+    /// A chosen grid ink is drawn, and it changes the colour rather than how many marks
+    /// there are.
+    ///
+    /// **What this deliberately does not assert**: that a zero-opacity grid emits no quads.
+    /// It does not, and it never did — `DrawList::push_quad` discards an invisible quad on
+    /// the way in, so that assertion would pass against a build with the early return
+    /// removed and would be a test of nothing. What the early return actually saves is the
+    /// `columns × rows` loop, which no `DrawList` can observe. Said here rather than left
+    /// implied, because an assertion that cannot fail reads exactly like one that holds.
+    #[test]
+    fn a_chosen_grid_ink_draws_the_same_marks_as_the_theme_s() {
+        let projection = projection_with([]);
+        let camera = Camera::new(ScreenSize::new(1440.0, 900.0));
+
+        let count = |ink: Option<vellum_doc::Color>| {
+            let mut ctx = context(&camera, &projection);
+            ctx.pattern = Pattern::Dots;
+            ctx.grid_color = ink;
+            let mut list = DrawList::new();
+            // A view first: `push_quad` drops everything until there is one, so a list
+            // without one counts zero however well the grid works — which is exactly what
+            // the first draft of this test measured.
+            let screen = list.view(vellum_render::View::screen(camera.viewport()));
+            push_grid(&mut list, &ctx, screen);
+            list.stats().quads
+        };
+
+        let theme_grid = count(None);
+        assert!(theme_grid > 0, "the default grid draws");
+        assert_eq!(
+            count(Some(vellum_doc::Color::rgba(0x2D, 0x6B, 0xD4, 0x80))),
+            theme_grid,
+            "a chosen ink changes the colour, not how many marks there are"
+        );
+    }
+
+    /// A camera at `zoom`, centred on the origin, with everything a `block()` call
+    /// needs around it.
+    fn context<'a>(camera: &'a Camera, projection: &'a Projection) -> DrawContext<'a> {
+        DrawContext {
+            camera,
+            projection,
+            theme: Theme::LIGHT,
+            selection: &[],
+            hovered_badge: None,
+            marquee: None,
+            placing: None,
+            guides: &[],
+            stroke: None,
+            pending_connector: None,
+            editing: None,
+            card_drop: None,
+            pattern: Pattern::Plain,
+            grid_color: None,
+            minimap: None,
+        }
+    }
+
+    fn camera_at(zoom: f64) -> Camera {
+        let mut camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+        camera.set_zoom_about(zoom, ScreenPoint::new(800.0, 450.0));
+        camera
+    }
+
+    fn painter() -> Painter {
+        Painter::new(TextCache::new().expect("the test machine has fonts"))
+    }
+
+    /// The whole point of the feature. A text item has no geometry of its own —
+    /// `ItemKind::Text` pushes nothing in the board view — so before greeking existed
+    /// it left a blank hole in a zoomed-out board. It must now leave a mark, and it
+    /// must still draw real glyphs when there is room for them.
+    #[test]
+    fn text_too_small_to_read_greeks_rather_than_vanishing() {
+        let projection = projection_with([NewItem::new(
+            ItemKind::Text { text: StyledText::plain("Coolant System") },
+            Placement::new(0.0, 0.0, 400.0, 40.0),
+        )
+        .with_style(Style { font_size: Some(32.0), ..Style::default() })]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let mut painter = painter();
+
+        // 32 world px at 4% is 1.3 device px — unreadable, and the zoom that fits the
+        // reference board.
+        let camera = camera_at(0.04);
+        assert!(matches!(
+            painter.block(id, projected, BlockKey::PRIMARY, &context(&camera, &projection)),
+            Some(Painted::Greeked(_)),
+        ));
+
+        // 32 world px at 100% is 32 device px. Real glyphs.
+        let camera = camera_at(1.0);
+        assert!(matches!(
+            painter.block(id, projected, BlockKey::PRIMARY, &context(&camera, &projection)),
+            Some(Painted::Glyphs(_)),
+        ));
+    }
+
+    /// A card too small to read greeks as a **stack of title bars**, not as one grey slab.
+    ///
+    /// *"on Miro it's easier to see the titles immediately; on Velm I have to zoom in a lot
+    /// more"*, with a screenshot of cards carrying a single mid-grey block where the wrapped
+    /// title should be.
+    ///
+    /// The old code emitted `Single` sized `0.45 × fit.height` — the height of the **whole
+    /// title-and-blurb box**. That reasoning was sound for an auto-fitted block, where the
+    /// tested size and the box height are the same number, and a sticky is auto-fitted, so
+    /// nothing here ever showed the fault. A card sets an explicit 13-unit size against a
+    /// ~142-unit body, so the guard tested 13 and drew 64.
+    ///
+    /// **The assertion is on the bar height, not on the variant**, because that is the number
+    /// the user was looking at: a stack of `Estimated` bars each as tall as the box would be
+    /// the same slab in more pieces.
+    #[test]
+    fn a_card_too_small_to_read_greeks_as_lines_rather_than_one_slab() {
+        let projection = projection_with([NewItem::new(
+            ItemKind::LinkPreview {
+                title: Some("Jtld Mufflers Performance Universal Electric Valve Muffler".into()),
+                url: Some("https://www.alibaba.com/product-detail/x.html".into()),
+                description: Some("Buy exhaust cutout valves at wholesale prices.".into()),
+                provider: Some("Alibaba".into()),
+                thumbnail: None,
+                favicon: None,
+                mode: CardMode::Card,
+            },
+            Placement::new(0.0, 0.0, 250.0, 190.0),
+        )]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let mut painter = painter();
+
+        // **The zoom at which a title becomes real glyphs, recorded rather than assumed.**
+        //
+        // It was ~38.5%, then ~29% when `TITLE_SCALE` was raised to answer *"from a distance I
+        // want to be able to see more"*, and it is ~38.5% again now that the user has seen the
+        // enlarged title against a Miro card and asked for it back down. That is a real
+        // trade-off and it is theirs to make: the title is legible over a smaller range of
+        // zooms and is not oversized at a working one. What survives from that round is the
+        // *greeking*, below — the reason a small card was unreadable was never only the size.
+        let camera = camera_at(0.45);
+        let ctx = context(&camera, &projection);
+        assert!(
+            matches!(painter.block(id, projected, BlockKey::PRIMARY, &ctx), Some(Painted::Glyphs(_))),
+            "the title should be readable at 45%"
+        );
+
+        // Below that, it greeks — as a stack of line bars, not as one slab. The slab was the
+        // defect: the pre-shape guard tested the *font size* and then drew a bar sized from
+        // the whole body box, which for a 250x190 card is ~64 units against a ~17.6-unit line.
+        let camera = camera_at(0.12);
+        let painted = painter.block(id, projected, BlockKey::PRIMARY, &context(&camera, &projection));
+        let Some(Painted::Greeked(greek)) = painted else {
+            panic!("a card at 12% must greek, not shape");
+        };
+
+        let line = card_font_size(250.0) * TITLE_SCALE * CARD_LINE_HEIGHT;
+        match greek.lines {
+            GreekLines::Estimated { lines, bar, .. } => {
+                assert!(lines > 1, "a card body holds several lines; got {lines}");
+                assert!(
+                    bar <= line,
+                    "a bar standing in for one line must not be taller than a line: \
+                     {bar:.1} against a {line:.1}-unit line"
+                );
+            }
+            // The number the old code produced was ~64 units against a ~17.6-unit line, so
+            // this arm is what fails on it rather than a variant check that could be
+            // satisfied by a slab under a different name.
+            other => panic!("expected a stack of line bars, got {other:?}"),
+        }
+    }
+
+    /// A caret in an **empty** sticky has to have something to be drawn against.
+    ///
+    /// *"when i double click on the notpad the writing status symbol which flashes this
+    /// symbol | in the middle of the notepad still does not work … it only starts flashing
+    /// after i start typing."* Exactly that: a wordless slot is skipped, so there was no
+    /// block, no origin and nothing for `push_caret` to measure from — and the first
+    /// keystroke gave the sticky words, which gave it a block, which is why the caret
+    /// appeared only once typing had started.
+    ///
+    /// `table_cell_block` and `kanban_run_block` had each been taught this separately. The
+    /// three plain kinds had not, which is the shape of the bug worth remembering: a fix
+    /// applied at two of three call sites reads as done from either of them.
+    #[test]
+    fn an_empty_slot_holding_the_caret_still_gets_a_block() {
+        let projection = projection_with([NewItem::new(
+            ItemKind::Sticky { text: StyledText::default(), background: None },
+            Placement::new(0.0, 0.0, 200.0, 200.0),
+        )]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let camera = camera_at(1.0);
+        let mut painter = painter();
+
+        // With no caret in it an empty sticky is still skipped, which is what keeps a
+        // board of blank notes free to shape.
+        assert!(
+            painter.block(id, projected, BlockKey::PRIMARY, &context(&camera, &projection)).is_none(),
+            "an empty sticky nobody is typing into should cost nothing",
+        );
+
+        let mut ctx = context(&camera, &projection);
+        ctx.editing = Some(TextCursor {
+            scene: id,
+            slot: BlockKey::PRIMARY,
+            idle_for: 0.0,
+            cursor: 0,
+            anchor: 0,
+            text: "",
+        });
+        assert!(
+            painter.block(id, projected, BlockKey::PRIMARY, &ctx).is_some(),
+            "the caret has nothing to be drawn against",
+        );
+    }
+
+    /// A greeked text item now puts quads on the board where it used to put nothing
+    /// at all, and it does it *without* flipping to the screen view — so the bars
+    /// coalesce with the surrounding geometry instead of splitting the batch the way
+    /// glyphs do.
+    #[test]
+    fn a_greeked_block_draws_board_quads_and_never_leaves_the_board_view() {
+        let projection = projection_with([NewItem::new(
+            ItemKind::Text { text: StyledText::plain("Wiring") },
+            Placement::new(0.0, 0.0, 400.0, 40.0),
+        )
+        .with_style(Style { font_size: Some(32.0), ..Style::default() })]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let mut painter = painter();
+        let camera = camera_at(0.04);
+        let ctx = context(&camera, &projection);
+
+        let Some(Painted::Greeked(greek)) = painter.block(id, projected, BlockKey::PRIMARY, &ctx)
+        else {
+            panic!("32 px text at 4% zoom is unreadable and must greek");
+        };
+
+        let mut list = DrawList::new();
+        let board = list.view(View::board(&camera));
+        list.use_view(board);
+        painter.push_greek(&mut list, &camera, &greek, 1.0);
+
+        assert!(list.stats().quads >= 1, "a greeked block must leave a mark");
+        assert_eq!(list.stats().glyphs, 0, "greeking rasterises nothing");
+        // One view, so one draw call: the bars did not split the batch.
+        assert_eq!(list.stats().draw_calls, 1);
+    }
+
+    /// A bar that is sub-pixel is exactly as invisible as the glyphs it replaces, so
+    /// the floor is the thing that makes this work at all.
+    #[test]
+    fn a_greeked_bar_never_falls_below_a_device_pixel() {
+        for zoom in [1.0f64, 0.25, 0.04, 0.01] {
+            let height = greek_bar_height(14.0, zoom);
+            assert!(
+                height * zoom >= GREEK_MIN_DEVICE_HEIGHT - 1e-9,
+                "zoom {zoom} gave {height} world px, {} device px",
+                height * zoom,
+            );
+        }
+        // Where there is room, the bar is an x-height rather than the floor.
+        assert!((greek_bar_height(100.0, 1.0) - 45.0).abs() < 1e-9);
+    }
+
+    /// A zoom of zero or NaN reaches here through the same camera as any other, and
+    /// a NaN bar height propagates into quad geometry rather than failing loudly.
+    #[test]
+    fn a_nonsense_zoom_does_not_produce_nan_bars() {
+        for zoom in [0.0f64, -1.0, f64::NAN, f64::INFINITY] {
+            let height = greek_bar_height(14.0, zoom);
+            assert!(height.is_finite() && height > 0.0, "zoom {zoom} gave {height}");
+        }
+    }
+
+    /// Bars closer together than they are thick are a smear. The collapse is what
+    /// bounds the quad count too: a long block never emits one bar per line at a zoom
+    /// where they would overlap.
+    #[test]
+    fn a_stack_of_bars_collapses_to_one_when_the_lines_get_too_close() {
+        let projection = projection_with([NewItem::new(
+            ItemKind::Sticky {
+                text: StyledText::plain("one two three four five six seven eight nine ten"),
+                background: None,
+            },
+            Placement::new(0.0, 0.0, 200.0, 200.0),
+        )]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let mut painter = painter();
+
+        let mut seen_per_line = false;
+        let mut seen_single = false;
+        for zoom in [0.2f64, 0.12, 0.08, 0.05, 0.03, 0.02, 0.01] {
+            let camera = camera_at(zoom);
+            let ctx = context(&camera, &projection);
+            let Some(painted) = painter.block(id, projected, BlockKey::PRIMARY, &ctx) else {
+                panic!("a sticky with text always paints something at zoom {zoom}");
+            };
+            match painted {
+                // Above the threshold the sticky is still readable; below it, greeked.
+                Painted::Glyphs(_) => {}
+                Painted::Greeked(greek) => match greek.lines {
+                    GreekLines::PerLine { .. } => seen_per_line = true,
+                    // An auto-fitted block reaches the pre-shape guard with a box that is one
+                    // line tall by construction — `largest_font_size` *is* `fit.height` — so
+                    // a sticky must never estimate a stack. A card does; that is the split
+                    // `a_card_too_small_to_read_greeks_as_lines_rather_than_one_slab` covers.
+                    GreekLines::Estimated { lines, .. } => {
+                        panic!("an auto-fitted sticky estimated {lines} lines at zoom {zoom}")
+                    }
+                    GreekLines::Single { width, height } => {
+                        seen_single = true;
+                        assert!(width > 0.0 && height > 0.0, "zoom {zoom}");
+                    }
+                },
+            }
+        }
+        assert!(seen_per_line, "a wrapped sticky greeks per line while the lines are apart");
+        assert!(seen_single, "and collapses to one bar once they are not");
+    }
+
+    /// The pre-shaping bail is the hot path — it exists so that fitting the reference
+    /// board does not auto-fit 236 blocks — and it must keep bailing. Greeking it
+    /// cannot be allowed to start shaping what it was built to avoid.
+    #[test]
+    fn greeking_a_tiny_block_still_shapes_nothing() {
+        let projection = projection_with([NewItem::new(
+            ItemKind::Sticky { text: StyledText::plain("sample note"), background: None },
+            Placement::new(0.0, 0.0, 200.0, 200.0),
+        )]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let mut painter = painter();
+        // 200 px tall at 1% is 2 device px: under the bound `largest_font_size` gives,
+        // so this returns before the auto-fit binary search.
+        let camera = camera_at(0.01);
+        let ctx = context(&camera, &projection);
+
+        assert!(matches!(
+            painter.block(id, projected, BlockKey::PRIMARY, &ctx),
+            Some(Painted::Greeked(Greek { lines: GreekLines::Single { .. }, .. })),
+        ));
+        assert_eq!(painter.text.len(), 0, "the pre-shaping bail must not shape");
+    }
+
+    /// Greeking stands in for text that exists. An empty slot has none, and must stay
+    /// empty rather than growing a bar out of nothing.
+    #[test]
+    fn an_empty_text_slot_greeks_nothing() {
+        let projection = projection_with([
+            NewItem::new(
+                ItemKind::Sticky { text: StyledText::default(), background: None },
+                Placement::new(0.0, 0.0, 200.0, 200.0),
+            ),
+            NewItem::new(
+                ItemKind::Image { asset_id: "x".into(), crop: None },
+                Placement::new(600.0, 0.0, 200.0, 200.0),
+            ),
+        ]);
+        let mut painter = painter();
+        let camera = camera_at(0.04);
+        let ctx = context(&camera, &projection);
+
+        for (&id, projected) in projection.iter() {
+            for slot in 0..painter.slots_of(id, projected, projected.generation) {
+                assert!(
+                    painter.block(id, projected, slot, &ctx).is_none(),
+                    "no text means no block, and no bar",
+                );
+            }
+        }
+    }
+
+    /// The bars have to land where the glyphs would have, or a board pops sideways as
+    /// it crosses the threshold. Both paths run through `locate_world`, so this pins
+    /// that they agree.
+    #[test]
+    fn a_bar_sits_where_the_text_it_replaces_would_have_sat() {
+        let projection = projection_with([NewItem::new(
+            ItemKind::Text { text: StyledText::plain("ECU") },
+            Placement::new(120.0, -80.0, 400.0, 40.0),
+        )
+        .with_style(Style { font_size: Some(32.0), ..Style::default() })]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let mut painter = painter();
+
+        let readable = camera_at(1.0);
+        let Some(Painted::Glyphs(block)) =
+            painter.block(id, projected, BlockKey::PRIMARY, &context(&readable, &projection))
+        else {
+            panic!("32 px text at 100% is readable");
+        };
+        let glyph_origin = readable.screen_to_world(block.origin);
+
+        let tiny = camera_at(0.04);
+        let Some(Painted::Greeked(greek)) =
+            painter.block(id, projected, BlockKey::PRIMARY, &context(&tiny, &projection))
+        else {
+            panic!("32 px text at 4% is not");
+        };
+
+        // Left edges coincide; the tops differ only by the shaped-versus-bounding
+        // height the two paths have available, which is under a device pixel here.
+        assert!((greek.origin.x - glyph_origin.x).abs() < 1.0, "{greek:?} vs {glyph_origin:?}");
+    }
+
+    #[test]
+    fn the_lod_band_is_a_whole_octave_and_survives_nonsense() {
+        assert_eq!(lod_band(1.0), 0, "an exact octave is its own band");
+        assert_eq!(lod_band(2.0), 1);
+        assert_eq!(lod_band(0.25), -2);
+        assert_eq!(lod_band(0.0), 0);
+        assert_eq!(lod_band(f64::NAN), 0);
+        assert!((-8..=8).contains(&lod_band(1e30)));
+    }
+
+    /// The band must **round up**, never down.
+    ///
+    /// It used to round to the nearest octave, which for any zoom in the upper half of a
+    /// band answers a band *below* the one needed — at 1.3 it said 1.0, so the stroke was
+    /// tessellated to a 0.5-world-unit tolerance where 0.385 was required. Rounding up costs
+    /// vertices in the worst case; rounding down costs visible faceting on every cap and
+    /// join, which is what the user saw as *"so much more pixelated"*.
+    ///
+    /// This is the assertion that fails on the old `round()`, and it is deliberately phrased
+    /// as the *property* rather than as a table of answers, because a table is what let the
+    /// old behaviour look intentional: `lod_band(1.3) == 0` was written down as expected.
+    #[test]
+    fn the_lod_band_never_under_tessellates() {
+        for zoom in [0.03f64, 0.3, 0.7, 1.0, 1.3, 1.41, 1.99, 2.0, 5.0, 64.0] {
+            let band = lod_band(zoom);
+            let tolerance_for = 2f64.powi(band);
+            assert!(
+                tolerance_for >= zoom - 1e-9,
+                "at zoom {zoom} the band answers {tolerance_for}, which is coarser than the \
+                 zoom it is drawn at"
+            );
+        }
+    }
+
+    /// A band change is what re-tessellates; a pan must not. If this stops holding,
+    /// panning a board of ink re-runs 219 stroke pipelines every frame.
+    #[test]
+    fn zooming_within_a_band_does_not_change_the_band() {
+        // Both inside the (1, 2] octave, which `ceil` maps to band 1.
+        assert_eq!(lod_band(1.1), lod_band(1.9));
+        assert_ne!(lod_band(1.9), lod_band(2.1));
+    }
+
+    #[test]
+    fn ink_tessellates_into_finite_triangles() {
+        let points = vec![
+            vellum_doc::Point::new(-50.0, -20.0),
+            vellum_doc::Point::new(0.0, 30.0),
+            vellum_doc::Point::new(50.0, -20.0),
+        ];
+        let mesh = tessellate_ink(&points, 6.0, 0);
+        assert!(mesh.triangle_count() > 0);
+        assert!(mesh.is_finite());
+    }
+
+    /// A stroke with no points, or one point, is a shape a Miro import really
+    /// produces — a tap of the pen. Neither may panic, and a single point still has
+    /// to draw the dot the user made.
+    #[test]
+    fn a_degenerate_stroke_produces_finite_geometry_rather_than_a_panic() {
+        assert!(tessellate_ink(&[], 4.0, 0).is_empty());
+
+        let dot = tessellate_ink(&[vellum_doc::Point::new(0.0, 0.0)], 4.0, 0);
+        assert!(dot.is_finite());
+        for position in &dot.positions {
+            assert!(position[0].abs() <= 2.5 && position[1].abs() <= 2.5, "{position:?}");
+        }
+    }
+
+    /// An item wholly outside its frame is clipped away; one inside it, or one with
+    /// no frame at all, is not.
+    #[test]
+    fn a_frame_clips_only_what_has_left_it() {
+        let mut board = Board::new();
+        let frame = board
+            .add(NewItem::new(
+                ItemKind::Frame {
+                    title: StyledText::plain("Engine bay"),
+                    order: None,
+                    speaker_notes: None,
+                },
+                Placement::new(0.0, 0.0, 1000.0, 800.0),
+            ))
+            .unwrap();
+        let inside = board
+            .add(
+                NewItem::new(
+                    ItemKind::Sticky { text: StyledText::plain("in"), background: None },
+                    Placement::new(100.0, 100.0, 199.0, 228.0),
+                )
+                .with_parent(frame),
+            )
+            .unwrap();
+        let escaped = board
+            .add(
+                NewItem::new(
+                    ItemKind::Sticky { text: StyledText::plain("out"), background: None },
+                    Placement::new(9_000.0, 9_000.0, 199.0, 228.0),
+                )
+                .with_parent(frame),
+            )
+            .unwrap();
+        let loose = board
+            .add(NewItem::new(
+                ItemKind::Sticky { text: StyledText::plain("loose"), background: None },
+                Placement::new(9_000.0, 9_000.0, 199.0, 228.0),
+            ))
+            .unwrap();
+
+        let mut projection = Projection::new();
+        projection.rebuild(&board).unwrap();
+        let clipped = |doc_id| {
+            let id = projection.scene_id(doc_id).unwrap();
+            clipped_by_frame(projection.get(id).unwrap(), &projection)
+        };
+
+        assert!(!clipped(inside));
+        assert!(clipped(escaped), "an item outside its frame was not clipped");
+        assert!(!clipped(loose), "an unparented item was clipped by someone's frame");
+        assert!(!clipped(frame));
+    }
+
+    /// A group is not a frame and does not clip; conflating the two would hide
+    /// anything dragged out of a group.
+    #[test]
+    fn a_group_does_not_clip_its_members() {
+        let mut board = Board::new();
+        let group = board
+            .add(NewItem::new(ItemKind::Group, Placement::new(0.0, 0.0, 100.0, 100.0)))
+            .unwrap();
+        let far = board
+            .add(
+                NewItem::new(
+                    ItemKind::Sticky { text: StyledText::default(), background: None },
+                    Placement::new(9_000.0, 9_000.0, 100.0, 100.0),
+                )
+                .with_parent(group),
+            )
+            .unwrap();
+
+        let mut projection = Projection::new();
+        projection.rebuild(&board).unwrap();
+        let id = projection.scene_id(far).unwrap();
+        assert!(!clipped_by_frame(projection.get(id).unwrap(), &projection));
+    }
+
+    /// The three blocks hold three different things, and none of them holds another's.
+    ///
+    /// The card was two blocks and is now three — a muted provider row, a large dark title
+    /// and a smaller grey blurb — because a block carries one colour *and* one size, so
+    /// Miro's arrangement is not expressible in fewer. The separation is what this asserts:
+    /// a title that also appears in the blurb block is the card drawing its own name twice,
+    /// which is the fault the user photographed arriving by a different route.
+    #[test]
+    fn a_cards_three_blocks_each_hold_their_own_part() {
+        let kind = ItemKind::link_preview(
+            Some("Compact cooling fan".into()),
+            Some("https://example.com/cooling".into()),
+            None,
+        );
+        let title = card_text(&kind, BlockKey::PRIMARY, usize::MAX).to_plain();
+        let blurb = card_text(&kind, CARD_BLURB_SLOT, usize::MAX).to_plain();
+
+        assert!(title.contains("Compact cooling fan"), "the title block holds the title: {title}");
+        assert!(!title.contains("example.com"), "the address is not the title's: {title}");
+        // With no blurb to show, the link is worth the room after all — in the blurb's block.
+        assert!(blurb.contains("https://example.com/cooling"), "{blurb}");
+        // Empty, because this card carries no `provider` — the host-derived name is filled in
+        // by `vellum_import::pipeline::link_kind` and by the fetch pool, not here. Worth
+        // asserting rather than skipping: it is the row that must *not* pick up the title.
+        assert!(card_text(&kind, BlockKey::SECONDARY, usize::MAX).is_empty());
+    }
+
+    /// What each mode says, and what it leaves out. The three are different amounts of card,
+    /// so this is the assertion that keeps them from collapsing into one appearance.
+    #[test]
+    fn each_card_mode_shows_a_different_amount() {
+        let card = |mode| ItemKind::LinkPreview {
+            title: Some("Widget Pro 2.0".into()),
+            url: Some("https://www.aliexpress.us/item/1.html".into()),
+            description: Some("A low-profile switch.".into()),
+            thumbnail: None,
+            provider: Some("AliExpress".into()),
+            favicon: None,
+            mode,
+        };
+
+        // Collapsed: the site and the title, on one line, and no blurb.
+        let link = card_text(&card(CardMode::Link), BlockKey::SECONDARY, usize::MAX).to_plain();
+        assert!(link.contains("AliExpress") && link.contains("Widget Pro 2.0"), "{link}");
+        assert!(!link.contains("low-profile"), "a collapsed row carries no blurb: {link}");
+        assert!(!link.contains('\n'), "and it is one line: {link:?}");
+        for slot in [BlockKey::PRIMARY, CARD_BLURB_SLOT] {
+            assert!(
+                card_text(&card(CardMode::Link), slot, usize::MAX).is_empty(),
+                "a collapsed row is its provider row and nothing else"
+            );
+        }
+
+        // Card and Large put the title and the blurb in *separate* blocks, so they can be set
+        // at different sizes, and neither repeats the URL when there is a blurb to show.
+        for mode in [CardMode::Card, CardMode::Large] {
+            let title = card_text(&card(mode), BlockKey::PRIMARY, usize::MAX).to_plain();
+            let blurb = card_text(&card(mode), CARD_BLURB_SLOT, usize::MAX).to_plain();
+            assert!(title.contains("Widget Pro 2.0"), "{mode:?} title: {title}");
+            assert!(blurb.contains("A low-profile switch."), "{mode:?} blurb: {blurb}");
+            assert!(
+                !blurb.contains("Widget Pro 2.0"),
+                "{mode:?} drew the title again under itself: {blurb}"
+            );
+            assert!(
+                !blurb.contains("aliexpress.us/item"),
+                "{mode:?} repeated the URL over the blurb: {blurb}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_embed_names_its_provider_and_a_document_its_page_count() {
+        let embed = ItemKind::embed(
+            Some("Assembly".into()),
+            None,
+            None,
+            Some("YouTube".into()),
+            None,
+        );
+        // The provider is the `SECONDARY` row, in its own muted colour — not part of the
+        // title's block. That two-tone split is most of what makes Miro's card read as a card.
+        assert!(card_text(&embed, BlockKey::SECONDARY, usize::MAX).to_plain().contains("YouTube"));
+        let primary = card_text(&embed, BlockKey::PRIMARY, usize::MAX).to_plain();
+        assert!(primary.contains("Assembly"), "{primary}");
+        assert!(!primary.contains("YouTube"), "the site is not repeated in the title: {primary}");
+
+        let one = ItemKind::Document { asset_id: "h".into(), page_count: 1, current_page: 0 };
+        assert!(card_text(&one, BlockKey::PRIMARY, usize::MAX).to_plain().contains("1 page"));
+        let many = ItemKind::Document { asset_id: "h".into(), page_count: 12, current_page: 0 };
+        assert!(card_text(&many, BlockKey::PRIMARY, usize::MAX).to_plain().contains("12 pages"));
+    }
+
+    /// The collapsed row is one line, and a long title is cut rather than wrapped.
+    #[test]
+    fn the_collapsed_row_clips_to_its_budget() {
+        let card = ItemKind::LinkPreview {
+            title: Some("Widget Pro 2.0 Mechanical Keyboard".into()),
+            url: Some("https://www.aliexpress.us/item/1.html".into()),
+            description: None,
+            thumbnail: None,
+            provider: Some("AliExpress".into()),
+            favicon: None,
+            mode: CardMode::Link,
+        };
+        let clipped = card_text(&card, BlockKey::SECONDARY, 30).to_plain();
+        assert!(clipped.chars().count() <= 30, "{clipped:?} is {} chars", clipped.chars().count());
+        assert!(clipped.starts_with("AliExpress"), "{clipped:?}");
+        assert!(clipped.ends_with('…'), "a cut row says so: {clipped:?}");
+        assert!(!clipped.contains('\n'), "still one line: {clipped:?}");
+
+        // Room to spare means no ellipsis at all.
+        let whole = card_text(&card, BlockKey::SECONDARY, 200).to_plain();
+        assert!(whole.ends_with("Keyboard"), "{whole:?}");
+    }
+
+    /// The card's internal geometry, which four separate draw paths have to agree on.
+    ///
+    /// Asserted as *relationships* rather than as numbers — the image above the site name, the
+    /// name above the title, everything inside the card — so a change to the padding or the
+    /// image fraction does not have to be mirrored here to keep the test true.
+    #[test]
+    fn a_cards_pieces_stack_in_miros_order_and_stay_inside_it() {
+        let (w, h, font) = (250.0, 190.0, 13.0);
+
+        // Large, with a picture: image, then favicon and site name, then the title block.
+        let large = card_layout(w, h, font, CardMode::Large, true, true, true, false);
+        let (ix, iy, iw, ih) = large.image.expect("a large card with an image draws one");
+        let (fx, fy, fw, fh) = large.favicon.expect("and its site's icon");
+        let (px, py, ..) = large.provider;
+        let (bx, by, bw, bh) = large.body;
+
+        assert!(ix > 0.0 && iy > 0.0, "the image is inset, not bled to the edge: {:?}", large.image);
+        assert!(ix + iw < w && iy + ih < h, "and stays inside the card");
+        assert!(fy >= iy + ih, "the icon sits below the image, not on it");
+        assert!(px > fx + fw * 0.9, "the site name starts right of its icon");
+        assert!((py - fy).abs() < fh, "and on the same row");
+        assert!(by > py, "the title is below the site name");
+        assert!(bx + bw <= w && by + bh <= h, "the body stays inside the card");
+
+        // No image fetched: nothing reserves the band, so the text starts at the top.
+        let unfetched = card_layout(w, h, font, CardMode::Large, false, true, true, false);
+        assert!(unfetched.image.is_none(), "no picture, no band");
+        assert!(
+            unfetched.provider.1 < py,
+            "the site name moves up to where the picture would have been"
+        );
+
+        // A plain `Card` shows its picture too — that is the mode a pasted link is in, so
+        // restricting the image to `Large` meant a fetched YouTube poster frame sat on disk
+        // while the card drew a box of text. The two differ in how much of the card it takes.
+        let ordinary = card_layout(w, h, font, CardMode::Card, true, true, true, false);
+        let (_, _, _, card_image_h) = ordinary.image.expect("a Card with an image draws it");
+        assert!(card_image_h < ih, "and gives it less room than Large: {card_image_h} vs {ih}");
+        assert!(ordinary.body.3 > large.body.3, "leaving more room for the blurb");
+
+        // Collapsed: one line, an icon, and no body at all.
+        let row = card_layout(w, h, font, CardMode::Link, true, true, true, false);
+        assert!(row.image.is_none(), "a collapsed row draws no picture even when one exists");
+        assert!(row.favicon.is_some(), "but it keeps its icon — that is what makes rows scannable");
+        assert_eq!(row.body.3, 0.0, "and has no second block");
+        assert!(row.provider.3 <= font * CARD_LINE_HEIGHT + 0.01, "one line tall");
+
+        // Without an icon the row is not indented for one.
+        let bare = card_layout(w, h, font, CardMode::Card, false, false, true, false);
+        assert!(bare.favicon.is_none());
+        assert!(bare.provider.0 < px, "no icon, no indent: {} vs {px}", bare.provider.0);
+    }
+
+    /// *"on the top right corner of each widget have an button that will take me to the
+    /// website"* — where that badge is, in all three card forms.
+    ///
+    /// The corner it is in is the whole feature, so it is asserted as a corner rather than as
+    /// a pair of numbers: right of centre, above centre, and inside the card.
+    #[test]
+    fn every_card_form_carries_an_open_badge_in_its_top_right_corner() {
+        let (w, h, font) = (250.0, 190.0, 13.0);
+        for mode in CardMode::ALL {
+            let laid = card_layout(w, h, font, mode, true, true, true, false);
+            let (bx, by, bw, bh) = laid.badge.unwrap_or_else(|| panic!("{mode:?} has no badge"));
+
+            assert!(bx > w / 2.0, "{mode:?}: not in the right half");
+            assert!(by < h / 2.0, "{mode:?}: not in the top half");
+            assert!(bx + bw <= w && by + bh <= h, "{mode:?}: hangs outside the card");
+            assert!(bx > 0.0 && by > 0.0, "{mode:?}: flush against the edge, not inset");
+            assert!((bw - bh).abs() < 1e-9, "{mode:?}: a badge is square");
+            assert!(bw > font, "{mode:?}: smaller than the type it sits beside");
+
+            // Nothing to open, no button. A badge that answers "that card's address is not a
+            // web page" is worse than no badge.
+            assert!(
+                card_layout(w, h, font, mode, true, true, false, false).badge.is_none(),
+                "{mode:?}: a card with no address still offered one"
+            );
+        }
+    }
+
+    /// The badge and the site name must not end up on top of each other — and the fix for
+    /// that must not cost every card characters it did not need to lose.
+    ///
+    /// Both halves matter. Clipping the provider row unconditionally is the easy version and
+    /// is wrong: on a card with a picture the badge is up on the image and the site name is
+    /// far below it, so an unconditional margin just makes titles mysteriously short.
+    #[test]
+    fn the_site_name_yields_to_the_badge_only_when_they_share_a_row() {
+        let (w, h, font) = (250.0, 190.0, 13.0);
+
+        // Sharing: a collapsed row *is* one row, and a card whose picture has not arrived
+        // has its provider at the top.
+        for (name, laid) in [
+            ("collapsed", card_layout(w, h, font, CardMode::Link, true, true, true, false)),
+            ("unfetched", card_layout(w, h, font, CardMode::Card, false, true, true, false)),
+        ] {
+            let (px, _, pw, _) = laid.provider;
+            let (bx, ..) = laid.badge.expect("a badge");
+            assert!(px + pw <= bx, "{name}: the site name runs under the badge");
+            let without = match name {
+                "collapsed" => card_layout(w, h, font, CardMode::Link, true, true, false, false),
+                _ => card_layout(w, h, font, CardMode::Card, false, true, false, false),
+            };
+            assert!(pw < without.provider.2, "{name}: the row did not actually yield");
+        }
+
+        // Not sharing: a picture pushes the site name below the badge entirely, so the row
+        // keeps its full width.
+        let with_picture = card_layout(w, h, font, CardMode::Large, true, true, true, false);
+        let no_badge = card_layout(w, h, font, CardMode::Large, true, true, false, false);
+        assert!(
+            (with_picture.provider.2 - no_badge.provider.2).abs() < 1e-9,
+            "the badge shortened a row it does not touch"
+        );
+        let (_, by, _, bh) = with_picture.badge.expect("a badge");
+        assert!(with_picture.provider.1 >= by + bh, "…but they really are on different rows");
+    }
+
+    /// Three ways the badge's geometry was wrong, all found by review rather than by use.
+    ///
+    /// Each is a case the first version's own tests walked straight past, because they all
+    /// used one comfortable card shape and asked only about the badge itself.
+    #[test]
+    fn the_badge_stays_inside_awkward_cards_and_off_the_words() {
+        let font = 13.0;
+
+        // 1. A wide, short card. `pad` is derived from the **width**, so a card 600 wide and
+        //    26 tall put the badge's top at 36 — ten points below its own bottom edge.
+        for (w, h) in [(600.0, 26.0), (600.0, 8.0), (120.0, 400.0), (40.0, 40.0)] {
+            for mode in CardMode::ALL {
+                let laid = card_layout(w, h, font, mode, true, true, true, false);
+                if let Some((bx, by, bw, bh)) = laid.badge {
+                    assert!(
+                        bx >= 0.0 && by >= 0.0 && bx + bw <= w + 1e-9 && by + bh <= h + 1e-9,
+                        "{mode:?} on a {w}x{h} card put the badge at {:?}",
+                        laid.badge
+                    );
+                }
+            }
+        }
+
+        // 2. The body yields to the badge. Without a picture the provider is at the top and
+        //    the badge — 1.75 line-heights tall against a one-line row — reaches past it into
+        //    the *title*, which is the line most worth reading.
+        let bare = card_layout(250.0, 190.0, font, CardMode::Card, false, true, true, false);
+        let (bx, ..) = bare.badge.expect("a badge");
+        let (px, _, pw, _) = bare.provider;
+        let (bodyx, _, bodyw, _) = bare.body;
+        assert!(px + pw <= bx, "the site name runs under the badge");
+        assert!(bodyx + bodyw <= bx, "the title runs under the badge");
+        // …and with a picture, neither is shortened: the badge is up on the image.
+        let with_picture = card_layout(250.0, 190.0, font, CardMode::Large, true, true, true, false);
+        let no_badge = card_layout(250.0, 190.0, font, CardMode::Large, true, true, false, false);
+        assert_eq!(with_picture.body.2, no_badge.body.2, "the title lost width for nothing");
+
+        // 3. A card too short to hold one gets none at all, rather than a sliver.
+        assert!(card_layout(250.0, 1.0, font, CardMode::Card, false, false, true, false).badge.is_none());
+    }
+
+    /// *"the images are all distorted"* — and what the fix has to guarantee.
+    ///
+    /// The assertion is about the **shape the pixels end up**, not about the numbers: whatever
+    /// crop is chosen, the sampled region's aspect has to equal the box's, because that is the
+    /// definition of "not stretched". Asserting the UV values themselves would pass just as
+    /// happily on a crop that was wrong in a different way.
+    #[test]
+    fn a_cards_picture_is_cropped_to_its_band_rather_than_stretched_into_it() {
+        // A card's real image band, from the layout above.
+        let laid = card_layout(250.0, 190.0, 13.0, CardMode::Card, true, true, true, false);
+        let (_, _, bw, bh) = laid.image.expect("a Card with an image");
+        let box_aspect = bw / bh;
+
+        // The three shapes the board actually holds: a wide `og:image` banner, a square
+        // product shot, and a tall poster. The square one is the case that was worst — it was
+        // being stretched by the full difference between 1.00 and the band's aspect.
+        for (name, source) in
+            [("banner", (1200, 630)), ("product", (1000, 1000)), ("poster", (600, 900))]
+        {
+            let uv = cover_uv(source, (bw, bh));
+            let (u, v) = (f64::from(uv.max[0] - uv.min[0]), f64::from(uv.max[1] - uv.min[1]));
+            assert!(u > 0.0 && v > 0.0, "{name}: sampled nothing");
+            assert!(
+                uv.min[0] >= 0.0 && uv.min[1] >= 0.0 && uv.max[0] <= 1.0 && uv.max[1] <= 1.0,
+                "{name}: sampled outside the texture: {uv:?}"
+            );
+
+            // The sampled region, in texels, has the band's aspect. This is the whole claim.
+            let sampled = (u * f64::from(source.0)) / (v * f64::from(source.1));
+            assert!(
+                (sampled - box_aspect).abs() < 1e-6,
+                "{name}: sampled {sampled:.4} into a {box_aspect:.4} band — still distorted"
+            );
+
+            // Exactly one axis is trimmed, and it is trimmed equally at both ends so a
+            // centred subject stays centred. A product photo is centred on white by
+            // convention, which is what makes cover safe here rather than merely conventional.
+            assert!(u == 1.0 || v == 1.0, "{name}: both axes cropped, so it was scaled twice");
+            assert!(
+                (uv.min[0] - (1.0 - uv.max[0])).abs() < 1e-6
+                    && (uv.min[1] - (1.0 - uv.max[1])).abs() < 1e-6,
+                "{name}: the crop is off-centre: {uv:?}"
+            );
+        }
+
+        // The control. Without the fix every one of those was `FULL`, and `FULL` only has the
+        // band's aspect when the source already does — so this is the case that used to pass
+        // by accident, and it is the reason the assertions above measure the *sampled* aspect
+        // rather than the UV numbers.
+        //
+        // Approximately, not exactly: a texel count is an integer and the band's is not, so
+        // the nearest whole-texel source is a hair off the band and is correctly trimmed by a
+        // fraction of a texel. Demanding `== FULL` here would be demanding that the function
+        // round in the caller's favour.
+        // **Derived from the band, not hardcoded.** It used to be a literal `(2200, 724)`,
+        // chosen because it matched the band's aspect at the padding of the day — so changing
+        // `CARD_PADDING` to Miro's proportions made a control that is *supposed* to need no
+        // crop get trimmed by 1.4%, and the test failed for a reason that had nothing to do
+        // with cropping. A control computed from the thing it is a control for cannot drift.
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a texel count")]
+        let matching = cover_uv((((724.0 * box_aspect).round()) as u32, 724), (bw, bh));
+        assert!(
+            matching.min[0] < 0.005 && matching.max[0] > 0.995,
+            "a source already the right shape was cropped: {matching:?}"
+        );
+
+        // Degenerate inputs answer `FULL` rather than dividing by zero: a zero-sized item is
+        // one resize-handle drag away.
+        assert_eq!(cover_uv((0, 0), (bw, bh)), vellum_render::UvRect::FULL);
+        assert_eq!(cover_uv((100, 100), (0.0, 0.0)), vellum_render::UvRect::FULL);
+    }
+
+    /// The two shapes of duplicate that Miro's own metadata actually contains.
+    ///
+    /// Both taken from `captures/reference-board.html`, where **18 of 91 preview widgets**
+    /// carry a description that says what the title already said. The truncated one is the
+    /// case a plain `==` misses, and it is the more common of the two.
+    #[test]
+    fn a_blurb_that_repeats_the_title_is_not_drawn_twice() {
+        let title = "Competition Intercooler For M5 M6 F10 F12 F13 Intercooler - Buy M5 F10 \
+                     Intercooler for M6 Custom Intercooler Product on Alibaba.com";
+        assert!(says_the_same_as(Some(title), title), "byte-identical");
+
+        let truncated = "Competition Intercooler For M5 M6 F10 F12 F13 Intercooler - Buy M5 \
+                         F10 Intercooler for M6 Custom Interc…";
+        assert!(says_the_same_as(Some(title), truncated), "a truncated prefix of the title");
+
+        // Punctuation differs between the two fields on the real board — an em dash against a
+        // hyphen, a trailing full stop, `&` against `and` — so the comparison cannot be on
+        // raw bytes.
+        assert!(
+            says_the_same_as(
+                Some("Exhaust Rubber Hanger — Buy Rubber Hangers on Alibaba.com"),
+                "Exhaust Rubber Hanger - Buy Rubber Hangers on Alibaba.com."
+            ),
+            "punctuation must not defeat it"
+        );
+
+        // **Entities are decoded upstream, not here**, and this pins the division so nobody
+        // adds a second decoder to this function. The reference board stores `&#43;` in the
+        // title where the description has `+`, and `&#43;` normalises to the *digits* `43` —
+        // so undecoded, these two genuinely are different strings and this correctly says so.
+        // `vellum_import::pipeline::link_kind` runs `decode_entities` over both fields, which
+        // is what makes them meet; a fetched card never carries entities at all, because
+        // `vellum-link` parses real HTML.
+        assert!(
+            !says_the_same_as(
+                Some("For 2018&#43; Acme M5 M8 G90 F90 Product"),
+                "For 2018+ Acme M5 M8 G90 F90 Product"
+            ),
+            "raw entities are the importer's job; this must not grow a second decoder"
+        );
+    }
+
+    /// A real blurb survives — which is the half that would be silently lost.
+    ///
+    /// A suppressed duplicate is invisible when it is wrong: the card simply has no
+    /// description and looks fine. So these are the assertions that matter, and both name a
+    /// guard that a simpler `starts_with` would fail.
+    #[test]
+    fn a_real_blurb_is_kept_even_when_it_opens_with_the_title() {
+        assert!(
+            !says_the_same_as(
+                Some("Alibaba.com"),
+                "Alibaba.com is the world's largest marketplace for wholesale goods, \
+                 connecting buyers with millions of suppliers."
+            ),
+            "a short site-name title must not swallow the page's actual description"
+        );
+        assert!(
+            !says_the_same_as(Some("Acme M5 Competition Intercooler"), "Fits F90 chassis only."),
+            "a genuinely different blurb is kept"
+        );
+        assert!(!says_the_same_as(None, "Any description at all"), "no title, nothing to repeat");
+        assert!(
+            !says_the_same_as(Some("Exhaust"), "Exhaust"),
+            "too short to tell a duplicate from a one-word blurb"
+        );
+    }
+
+    /// A video card gets a ▶ on its poster; nothing else does.
+    ///
+    /// *"the YouTube previews on Miro I like more because I can just open it and view the
+    /// video right then and there."* It opens the browser rather than playing inline — that
+    /// needs an engine `docs/01-architecture.md` §1 rules out — but the mark is what makes a
+    /// video card recognisable as one from across the board.
+    ///
+    /// **The negatives are the assertions that matter.** Nearly every card has a poster and
+    /// almost none are videos, so a predicate that answers "has a picture" would put a play
+    /// button on every product photo on this board — promising playback that pressing it
+    /// cannot deliver, which is the dead-button failure `has_link` already exists to prevent
+    /// one class of.
+    #[test]
+    fn only_a_video_card_gets_a_play_button() {
+        let laid = |video, image| {
+            card_layout(250.0, 190.0, 13.0, CardMode::Large, image, true, true, video)
+        };
+        let (px, py, pw, ph) = laid(true, true).play.expect("a YouTube card plays");
+        let (ix, iy, iw, ih) = laid(true, true).image.expect("a Large card with a picture");
+        assert!(pw > 0.0 && (pw - ph).abs() < f64::EPSILON, "square: {pw} x {ph}");
+        // Centred on the **poster**, not on the card — a ▶ in the text block aims at nothing.
+        assert!(
+            (px + pw / 2.0 - (ix + iw / 2.0)).abs() < 0.5
+                && (py + ph / 2.0 - (iy + ih / 2.0)).abs() < 0.5,
+            "the play button is not centred on the image band"
+        );
+
+        assert!(laid(false, true).play.is_none(), "an ordinary card with a photo gets no ▶");
+        assert!(laid(true, false).play.is_none(), "no poster is nothing to centre it on");
+        assert!(
+            card_layout(250.0, 40.0, 13.0, CardMode::Link, true, true, true, true).play.is_none(),
+            "a collapsed row draws no picture"
+        );
+    }
+
+    /// A video card is a poster with a two-line caption, and nothing else.
+    ///
+    /// *"for youtube thumbnails there should only be 2 small lines of text, the rest should be
+    /// the thumbnail, and the 2 lines should be bolded."*
+    ///
+    /// The picture is sized from what the caption needs rather than from
+    /// `CardMode::image_fraction`, which is the only arrangement where that sentence is true at
+    /// every card size — at a fixed 62% the text block is three title lines and a blurb on a
+    /// tall card and one clipped line on a short one.
+    #[test]
+    fn a_video_card_is_mostly_poster_with_its_caption_at_the_foot() {
+        // Tall enough that an *ordinary* card still has room for a blurb after its three title
+        // lines — otherwise the control below passes for the wrong reason, having no blurb
+        // because the card is small rather than because it is a video.
+        let (w, h, font) = (320.0, 600.0, card_font_size(320.0));
+        let video = card_layout(w, h, font, CardMode::Large, true, true, true, true);
+        let ordinary = card_layout(w, h, font, CardMode::Large, true, true, true, false);
+
+        let (_, _, _, video_image) = video.image.expect("a poster");
+        let (_, _, _, plain_image) = ordinary.image.expect("a picture");
+        assert!(
+            video_image > plain_image,
+            "a video's poster should take the room its blurb gave up: {video_image:.0} \
+             against {plain_image:.0}"
+        );
+        assert!(
+            video_image / h > 0.7,
+            "'make the image thumbnail very big' — the poster is {:.0}% of the card",
+            video_image / h * 100.0
+        );
+
+        // One line of title, ellipsised past it, and no blurb at all.
+        let line = font * TITLE_SCALE * CARD_LINE_HEIGHT;
+        assert!(
+            (video.title.3 - line * VIDEO_TITLE_LINES).abs() < 0.5,
+            "expected {VIDEO_TITLE_LINES} title line(s) ({:.1}), got {:.1}",
+            line * VIDEO_TITLE_LINES,
+            video.title.3
+        );
+        // …and the caption ends at the foot of the card rather than floating under the
+        // picture: *"put the writing all the way down"*. Within a pad of the bottom edge.
+        let foot = video.title.1 + video.title.3;
+        assert!(
+            (h - foot) <= w * CARD_PADDING + 1.0,
+            "the caption stops {:.0} short of the card's foot",
+            h - foot
+        );
+        assert_eq!(video.blurb.3, 0.0, "a video card has no blurb");
+        assert!(ordinary.blurb.3 > 0.0, "an ordinary card still does");
+
+        // …and the blurb text is not produced either, because a 0-height box still shapes:
+        // `FitBox::new` clamps to 1.0, so an empty box would draw one clipped line.
+        let kind = ItemKind::LinkPreview {
+            title: Some("I built an ADVANCED Battery Bank".into()),
+            url: Some("https://www.youtube.com/watch?v=abc".into()),
+            description: Some("Get the sponsor's app here: https://exmpl.co/07-Abcd".into()),
+            provider: Some("YouTube".into()),
+            thumbnail: Some("hash".into()),
+            favicon: None,
+            mode: CardMode::Large,
+        };
+        assert!(
+            card_text(&kind, CARD_BLURB_SLOT, usize::MAX).is_empty(),
+            "a video card's sponsor read must not be drawn"
+        );
+    }
+
+    /// Which hosts count as video, and — more importantly — which do not.
+    #[test]
+    fn the_video_hosts_are_the_ones_that_play_something() {
+        for url in [
+            "https://www.youtube.com/watch?v=abc",
+            "https://youtu.be/abc",
+            "https://m.youtube.com/watch?v=abc",
+            "https://vimeo.com/12345",
+        ] {
+            assert!(vellum_link::plays_video(url), "{url} is a video");
+        }
+        for url in [
+            "https://www.alibaba.com/product-detail/x.html",
+            "https://github.com/rust-lang/rust",
+            "https://www.amazon.com/dp/B01",
+            "not-a-url",
+        ] {
+            assert!(!vellum_link::plays_video(url), "{url} is not a video");
+        }
+    }
+
+    /// The site's own name comes off the title, at either end.
+    ///
+    /// Both examples are the reference screenshots: *"Amazon.com : Superbat 3G/6G/12G SDI
+    /// Cable"* and *"IQL-IMX678/FF | DigiKey Electronics"*, on cards whose provider row was
+    /// already saying Amazon and DigiKey beside the site's own icon.
+    #[test]
+    fn a_title_does_not_repeat_the_site_the_row_above_names() {
+        let strip = |title, provider| strip_site_affix(title, Some(provider));
+        assert_eq!(
+            strip("Amazon.com : Superbat 3G/6G/12G SDI Cable 2ft", "Amazon"),
+            "Superbat 3G/6G/12G SDI Cable 2ft"
+        );
+        assert_eq!(strip("IQL-IMX678/FF | DigiKey Electronics", "DigiKey"), "IQL-IMX678/FF");
+        assert_eq!(strip("Sony Imx678 Camera – Sincerefirst", "Sincerefirst"), "Sony Imx678 Camera");
+    }
+
+    /// …and the two guards that stop it eating a real title.
+    ///
+    /// A suppressed prefix is invisible when it is wrong — the card just shows a slightly
+    /// shorter title — so these are the assertions that matter. Both name a case a plain
+    /// `strip_prefix` fails.
+    #[test]
+    fn stripping_the_site_name_never_eats_the_title_itself() {
+        assert_eq!(
+            strip_site_affix("Amazonian Fish Species", Some("Amazon")),
+            "Amazonian Fish Species",
+            "there is no separator, so nothing was the site's name"
+        );
+        assert_eq!(
+            strip_site_affix("DigiKey", Some("DigiKey")),
+            "DigiKey",
+            "a title that is only the site name keeps it — an empty title is worse"
+        );
+        assert_eq!(
+            strip_site_affix("Alibaba.com : A", Some("Alibaba")),
+            "Alibaba.com : A",
+            "what is left is too short to be a title"
+        );
+        assert_eq!(
+            strip_site_affix("Untitled", None),
+            "Untitled",
+            "no provider, nothing to compare against"
+        );
+    }
+
+    /// **The inputs that used to abort the process**, found by an adversarial review rather
+    /// than by the tests that shipped with the function.
+    ///
+    /// `[profile.release]` sets `panic = "abort"` and this runs inside `Painter::block`'s
+    /// layout closure, so neither of these threw — they killed the app on the frame a card
+    /// became visible, and again on relaunch, because a board reopens at the same camera.
+    #[test]
+    fn a_title_that_used_to_abort_the_painter_is_merely_left_alone() {
+        // A provider containing a separator. `provider_for` capitalises the registrable domain
+        // label when the host is not in its table, and a hyphen is legal in one — so
+        // `acme-parts.com` really does yield `Acme-parts`. The separator inside the provider is
+        // then the *first* match in the title, and `trimmed[9..3]` is a reversed range.
+        assert_eq!(
+            strip_site_affix("Acme-parts.com | Genuine Acme Parts", Some("Acme-parts")),
+            "Acme-parts.com | Genuine Acme Parts",
+            "left whole — nothing after a separator is the provider — and, crucially, no abort"
+        );
+        assert_eq!(strip_site_affix("Acme-parts", Some("Acme-parts")), "Acme-parts");
+        for separator in [':', '|', '-', '\u{2013}', '\u{2014}', '\u{00BB}'] {
+            let provider = format!("A{separator}B");
+            let title = format!("{provider}.com : Something Worth Reading");
+            let _ = strip_site_affix(&title, Some(&provider));
+        }
+
+        // A title whose byte at `provider.len()` is a continuation byte. `Alibaba` is 7 bytes
+        // and a CJK character is 3, so a title of Chinese product text puts one at index 7 —
+        // and this board is largely Alibaba.
+        assert_eq!(
+            strip_site_affix("汽车排气管 - Alibaba", Some("Alibaba")),
+            "汽车排气管",
+            "the trailing branch works on multibyte text"
+        );
+        for title in ["日本語のタイトル", "汽", "Ω≈ç√∫˜µ", "🚗🚗🚗 : Cars"] {
+            for provider in ["Alibaba", "A", "汽车", "🚗"] {
+                let _ = strip_site_affix(title, Some(provider));
+            }
+        }
+    }
+
+    /// A degenerate card must not produce negative or NaN boxes — a zero-sized item is
+    /// reachable by dragging a resize handle onto itself.
+    #[test]
+    fn a_zero_sized_card_still_lays_out() {
+        for mode in CardMode::ALL {
+            let laid = card_layout(0.0, 0.0, 13.0, mode, true, true, true, false);
+            for (label, (x, y, w, h)) in [
+                ("provider", laid.provider),
+                ("body", laid.body),
+            ] {
+                assert!(x.is_finite() && y.is_finite(), "{label} at ({x}, {y})");
+                assert!(w >= 0.0 && h >= 0.0, "{label} is {w}x{h}");
+            }
+            if let Some((_, _, w, h)) = laid.image {
+                assert!(w > 0.0 && h > 0.0, "an image box is never zero: {w}x{h}");
+            }
+        }
+    }
+
+    /// The ellipsis helper's own edges: a budget too small to cut, and a word boundary.
+    ///
+    /// **The tiny-budget answer changed, and the old one was the bug.** This used to
+    /// assert `ellipsise("hello", 1) == "hello"`, reasoned as *"no room for a cut and an
+    /// ellipsis"* — true about the ellipsis and exactly backwards about the text. Every
+    /// caller uses this to *bound* a string to a block, so returning more than the budget
+    /// defeats the only thing it is for: a card whose title had spent its block then drew
+    /// its whole 600-character URL underneath and out through the bottom, which is what
+    /// *"i still have the links overflowing problem"* was looking at.
+    ///
+    /// Nothing for no room, a bare ellipsis for one character. Both are honest about
+    /// there being more text; neither can overflow.
+    #[test]
+    fn ellipsising_cuts_on_a_word_and_survives_a_tiny_budget() {
+        assert_eq!(ellipsise("hello world again", 12), "hello world…");
+        assert_eq!(ellipsise("short", 12), "short", "nothing to cut");
+        assert_eq!(ellipsise("hello", 1), "…", "one character of room is the ellipsis");
+        assert_eq!(ellipsise("hello", 0), "", "no room is nothing, never everything");
+        assert_eq!(ellipsise("", 0), "", "empty in, empty out");
+        // A single long word has no boundary to cut on, so it is cut mid-word rather than
+        // thrown away entirely.
+        assert_eq!(ellipsise("aaaaaaaaaaaa", 5), "aaaa…");
+        // Multi-byte: the cut lands on a character boundary.
+        let cut = ellipsise("héllo wörld ägain", 8);
+        assert!(cut.ends_with('…') && cut.chars().count() <= 8, "{cut:?}");
+    }
+
+    /// A card with no metadata at all — Miro serves plenty — must produce an empty
+    /// block rather than the word "None".
+    #[test]
+    fn a_card_with_no_metadata_has_no_text() {
+        let bare = ItemKind::link_preview(None, None, None);
+        assert!(card_text(&bare, BlockKey::PRIMARY, usize::MAX).is_empty());
+    }
+
+    /// A table gets a text slot per cell, on top of the two every kind has. Without
+    /// this the loop stops at 2 and a table draws its grid with nothing in it — which
+    /// is exactly what it did before the slot count became per-kind.
+    #[test]
+    fn a_table_claims_a_text_slot_for_every_cell() {
+        let table = crate::table::default_table();
+        let projection = projection_with([NewItem::new(
+            ItemKind::Table { model: crate::table::encode(&table) },
+            Placement::new(0.0, 0.0, 480.0, 220.0),
+        )]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let mut painter = painter();
+        let camera = camera_at(1.0);
+        let ctx = context(&camera, &projection);
+
+        let slots = painter.slots_of(id, projected, ctx.projection.generation());
+        let cells = crate::table::DEFAULT_ROWS * crate::table::DEFAULT_COLUMNS;
+        assert_eq!(usize::from(slots), 2 + cells, "a 3x3 table needs 9 cell slots");
+
+        // A sticky beside it still claims only its two, so the count is per kind
+        // rather than a blanket widening.
+        let plain = projection_with([NewItem::new(
+            ItemKind::Sticky { text: StyledText::plain("hi"), background: None },
+            Placement::new(0.0, 0.0, 200.0, 200.0),
+        )]);
+        let (&sid, sprojected) = plain.iter().next().unwrap();
+        let sctx = context(&camera, &plain);
+        assert_eq!(painter.slots_of(sid, sprojected, sctx.projection.generation()), 2);
+    }
+
+    /// Cells with words produce blocks; empty cells produce none, so a freshly placed
+    /// table costs nothing to shape.
+    #[test]
+    fn only_the_cells_with_words_are_shaped() {
+        use vellum_table::{CellRef, StyledText as TableText};
+        let mut table = crate::table::default_table();
+        table.set_content(CellRef::new(0, 0), TableText::plain("Item")).unwrap();
+        table.set_content(CellRef::new(1, 1), TableText::plain("2")).unwrap();
+
+        let projection = projection_with([NewItem::new(
+            ItemKind::Table { model: crate::table::encode(&table) },
+            Placement::new(0.0, 0.0, 480.0, 220.0),
+        )]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let mut painter = painter();
+        let camera = camera_at(1.0);
+        let ctx = context(&camera, &projection);
+
+        let slots = painter.slots_of(id, projected, ctx.projection.generation());
+        let drawn = (2..slots)
+            .filter(|slot| painter.block(id, projected, *slot, &ctx).is_some())
+            .count();
+        assert_eq!(drawn, 2, "two filled cells should give two blocks");
+    }
+
+    /// A mind map gets a text slot per visible node, and every node in the default map
+    /// has a label — so all nine shape. Without the per-kind count the loop stops at 2
+    /// and a map draws its boxes and branches with no words in them.
+    #[test]
+    fn a_mind_map_claims_a_text_slot_for_every_node() {
+        let model = crate::mindmap::default_mindmap();
+        let nodes = model.map.node_count();
+        let projection = projection_with([NewItem::new(
+            ItemKind::MindMap { model: crate::mindmap::encode(&model) },
+            Placement::new(0.0, 0.0, crate::mindmap::DEFAULT_SIZE.0, crate::mindmap::DEFAULT_SIZE.1),
+        )]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let mut painter = painter();
+        let camera = camera_at(1.0);
+        let ctx = context(&camera, &projection);
+
+        let slots = painter.slots_of(id, projected, ctx.projection.generation());
+        assert_eq!(usize::from(slots), 2 + nodes, "a nine-node map needs nine node slots");
+
+        let drawn = (2..slots)
+            .filter(|slot| painter.block(id, projected, *slot, &ctx).is_some())
+            .count();
+        assert_eq!(drawn, nodes, "every node in the default map is labelled");
+    }
+
+    /// A collapsed branch is not laid out, so it claims no slots and shapes no text —
+    /// the thing that makes folding a large map cheap rather than merely tidy.
+    #[test]
+    fn a_folded_branch_costs_no_slots() {
+        let mut model = crate::mindmap::default_mindmap();
+        let root = model.map.root();
+        let branch = model.map.children(root)[0];
+        let hidden = 1 + model.map.descendant_count(branch);
+        model.map.set_collapsed(branch, true).unwrap();
+
+        let projection = projection_with([NewItem::new(
+            ItemKind::MindMap { model: crate::mindmap::encode(&model) },
+            Placement::new(0.0, 0.0, 520.0, 260.0),
+        )]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let mut painter = painter();
+        let camera = camera_at(1.0);
+        let ctx = context(&camera, &projection);
+
+        // The branch itself stays visible; its two children do not.
+        let slots = painter.slots_of(id, projected, ctx.projection.generation());
+        assert_eq!(usize::from(slots), 2 + 9 - (hidden - 1), "folding freed no slots");
+    }
+
+    /// Resizing the item scales the map rather than re-flowing it, and the scale is
+    /// uniform: a map stretched to a dragged box would put its text at one aspect and
+    /// its branches at another. Halving the box halves the scale.
+    #[test]
+    fn resizing_a_mind_map_scales_it_uniformly() {
+        let model = crate::mindmap::default_mindmap();
+        let projection = projection_with([NewItem::new(
+            ItemKind::MindMap { model: crate::mindmap::encode(&model) },
+            Placement::new(0.0, 0.0, 520.0, 260.0),
+        )]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let mut painter = painter();
+        let camera = camera_at(1.0);
+        let ctx = context(&camera, &projection);
+
+        let cached = painter.mindmap_layout(id, projected, ctx.projection.generation());
+        let (nw, nh) = cached.natural;
+        assert!((cached.scale((nw, nh)) - 1.0).abs() < 1e-9, "the natural box is 1:1");
+        assert!((cached.scale((nw / 2.0, nh / 2.0)) - 0.5).abs() < 1e-9);
+        // The smaller ratio wins, so a box wide in one axis only does not stretch.
+        assert!((cached.scale((nw * 4.0, nh / 2.0)) - 0.5).abs() < 1e-9);
+        // A degenerate box falls back to 1 rather than to zero or NaN, so a map that
+        // somehow lost its size still draws instead of vanishing.
+        assert!((cached.scale((0.0, 0.0)) - 1.0).abs() < 1e-9);
+    }
+
+    /// A stroke in flight exists only between the press and the release, which is
+    /// exactly the window `--screenshot` cannot photograph — it renders one frame of a
+    /// board nobody is touching. So the check that the pen draws *while* it is drawing
+    /// has to live here.
+    #[test]
+    fn a_stroke_in_flight_draws_before_it_is_ever_an_item() {
+        let projection = projection_with([]);
+        let camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+        let mut list = DrawList::new();
+        let board = list.view(View::board(&camera));
+
+        let points = [
+            WorldPoint::new(10.0, 10.0),
+            WorldPoint::new(40.0, 25.0),
+            WorldPoint::new(70.0, 60.0),
+        ];
+        let ctx = DrawContext {
+            camera: &camera,
+            projection: &projection,
+            theme: Theme::LIGHT,
+            selection: &[],
+            hovered_badge: None,
+            marquee: None,
+            placing: None,
+            guides: &[],
+            stroke: Some(LiveStroke { points: &points, color: Rgba::BLACK, thickness: 4.0 }),
+            pending_connector: None,
+            editing: None,
+            card_drop: None,
+            pattern: Pattern::Plain,
+            grid_color: None,
+            minimap: None,
+        };
+        push_stroke(&mut list, &ctx, board);
+
+        // The document is empty — every triangle here belongs to the uncommitted path.
+        assert!(list.meshes().indices().len() >= 3, "the stroke tessellated to nothing");
+        assert_eq!(list.stats().draw_calls, 1, "one mesh batch, in the board view");
+    }
+
+    /// The floor `commit_stroke` applies, applied to the preview too: a press that has
+    /// not travelled must not flash a mark that will never be kept.
+    #[test]
+    fn a_single_sample_previews_nothing() {
+        let projection = projection_with([]);
+        let camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+        let mut list = DrawList::new();
+        let board = list.view(View::board(&camera));
+
+        let points = [WorldPoint::new(10.0, 10.0)];
+        let ctx = DrawContext {
+            camera: &camera,
+            projection: &projection,
+            theme: Theme::LIGHT,
+            selection: &[],
+            hovered_badge: None,
+            marquee: None,
+            placing: None,
+            guides: &[],
+            stroke: Some(LiveStroke { points: &points, color: Rgba::BLACK, thickness: 4.0 }),
+            pending_connector: None,
+            editing: None,
+            card_drop: None,
+            pattern: Pattern::Plain,
+            grid_color: None,
+            minimap: None,
+        };
+        push_stroke(&mut list, &ctx, board);
+
+        assert_eq!(list.meshes().indices().len(), 0);
+        assert_eq!(list.stats().draw_calls, 0);
+    }
+
+    /// Vertices are f32 and only safe in stroke-local space. A stroke drawn far from
+    /// the origin must still tessellate about its own first point, or the mesh carries
+    /// the board's whole extent and shimmers — and it must land in the same place the
+    /// committed item will, which is what stops a stroke jumping on mouse-up.
+    #[test]
+    fn a_stroke_far_from_the_origin_keeps_its_vertices_small() {
+        let projection = projection_with([]);
+        let camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+        let mut list = DrawList::new();
+        let board = list.view(View::board(&camera));
+
+        let far = 41_282.0;
+        let points = [
+            WorldPoint::new(far, far),
+            WorldPoint::new(far + 30.0, far + 15.0),
+            WorldPoint::new(far + 60.0, far + 50.0),
+        ];
+        let ctx = DrawContext {
+            camera: &camera,
+            projection: &projection,
+            theme: Theme::LIGHT,
+            selection: &[],
+            hovered_badge: None,
+            marquee: None,
+            placing: None,
+            guides: &[],
+            stroke: Some(LiveStroke { points: &points, color: Rgba::BLACK, thickness: 4.0 }),
+            pending_connector: None,
+            editing: None,
+            card_drop: None,
+            pattern: Pattern::Plain,
+            grid_color: None,
+            minimap: None,
+        };
+        push_stroke(&mut list, &ctx, board);
+
+        let bound = 200.0;
+        for vertex in list.meshes().vertices() {
+            let [x, y] = vertex.position;
+            assert!(
+                x.abs() < bound && y.abs() < bound,
+                "vertex ({x}, {y}) carries the board's extent, not the stroke's",
+            );
+        }
+    }
+
+    #[test]
+    fn a_marquee_is_drawn_in_screen_pixels_whichever_way_it_was_dragged() {
+        let projection = projection_with([]);
+        let camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+        let mut list = DrawList::new();
+        let screen = list.view(View::screen(camera.viewport()));
+
+        let ctx = DrawContext {
+            camera: &camera,
+            projection: &projection,
+            theme: Theme::LIGHT,
+            selection: &[],
+            hovered_badge: None,
+            marquee: Some((ScreenPoint::new(400.0, 300.0), ScreenPoint::new(100.0, 100.0))),
+            placing: None,
+            guides: &[],
+            stroke: None,
+            pending_connector: None,
+            editing: None,
+            card_drop: None,
+            pattern: Pattern::Plain,
+            grid_color: None,
+            minimap: None,
+        };
+        push_marquee(&mut list, &ctx, screen);
+
+        assert_eq!(list.stats().quads, 1);
+        assert_eq!(list.stats().draw_calls, 1);
+    }
+
+    /// *"when i am trying to draw a frame i do not see it as i draw … it just spawns."*
+    ///
+    /// A placing drag writes nothing to the document until the button comes up, so the
+    /// preview is the only thing that can put the gesture on screen. Every look draws —
+    /// including [`PlacingLook::Shape`], where the point is that it goes down the SDF path
+    /// rather than the quad one, and the ghost fallback, where the point is that a form the
+    /// SDF cannot express still draws *something*: an empty preview is the reported bug.
+    #[test]
+    fn every_placing_look_puts_the_gesture_on_screen() {
+        let projection = projection_with([]);
+        let camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+
+        for look in [
+            PlacingLook::Frame,
+            PlacingLook::Sticky,
+            PlacingLook::Shape(Shape::Ellipse),
+            PlacingLook::Ghost,
+        ] {
+            let mut list = DrawList::new();
+            let board = list.view(View::board(&camera));
+            let ctx = DrawContext {
+                camera: &camera,
+                projection: &projection,
+                theme: Theme::LIGHT,
+                selection: &[],
+                hovered_badge: None,
+                marquee: None,
+                guides: &[],
+                placing: Some(Placing {
+                    placement: Placement::new(0.0, 0.0, 400.0, 200.0),
+                    look,
+                }),
+                stroke: None,
+                pending_connector: None,
+                editing: None,
+                card_drop: None,
+                pattern: Pattern::Plain,
+                grid_color: None,
+                minimap: None,
+            };
+            push_placing(&mut list, &ctx, board);
+
+            let stats = list.stats();
+            assert!(
+                stats.quads + stats.shapes > 0,
+                "{look:?} drew nothing, which is the bug this exists to fix",
+            );
+            // The accent outline that says *this is a gesture, not an item yet* is on top
+            // of every one of them, so a look that drew only its own fill is a miss.
+            assert!(stats.quads >= 1, "{look:?} has no outline: {stats:?}");
+        }
+    }
+
+    /// A guide is **dashed**, and a guide that runs off the world is still bounded.
+    ///
+    /// *"they are too bright, so make those into dotted dashed lines and turn transparency
+    /// down a bit so i can see the difference between the alignment line and an object."*
+    /// The first half is what this asserts — one quad is a solid line, and a solid accent
+    /// hairline is exactly what a selection ring and a shape's border already are.
+    ///
+    /// The second assertion is the one that would not have been written without looking:
+    /// a guide's span is in **world** units, so two items far apart on a zoomed-in board
+    /// give a segment that is mostly off screen. Dashing it unclipped is a quad per nine
+    /// pixels of a line nobody can see.
+    #[test]
+    fn a_guide_is_dashed_and_clipped_to_the_window() {
+        let projection = projection_with([]);
+        let camera = camera_at(1.0);
+
+        let count = |guide: crate::snap::Guide| {
+            let mut list = DrawList::new();
+            let screen = list.view(View::screen(camera.viewport()));
+            let mut ctx = context(&camera, &projection);
+            let guides = [guide];
+            ctx.guides = &guides;
+            push_guides(&mut list, &ctx, screen);
+            list.stats().quads
+        };
+
+        // A guide across most of the window: many dashes, not one bar.
+        let across = count(crate::snap::Guide {
+            axis: crate::snap::Axis::Vertical,
+            at: 0.0,
+            from: -400.0,
+            to: 400.0,
+            gap: None,
+        });
+        assert!(across > 10, "a dashed guide is a run of quads, not one bar: {across}");
+
+        // The same line, spanning a hundred thousand world units. The window has not grown,
+        // so neither may the quad count.
+        let enormous = count(crate::snap::Guide {
+            axis: crate::snap::Axis::Vertical,
+            at: 0.0,
+            from: -50_000.0,
+            to: 50_000.0,
+            gap: None,
+        });
+        // Bounded by the **window**, not by the shorter guide — a line that does cross the
+        // whole window legitimately needs more dashes than one that stops inside it. Derived
+        // from the constants rather than written down, so changing the dash pattern does not
+        // silently turn this into a assertion about nothing.
+        let full_window =
+            (camera.viewport().height as f32 / (GUIDE_DASH + GUIDE_GAP)).ceil() as usize + 2;
+        assert!(
+            enormous <= full_window,
+            "a guide 100k units long drew {enormous} quads; a full window needs {full_window} \
+             (one screenful of guide drew {across})",
+        );
+        assert!(enormous < GUIDE_MAX_DASHES, "the clip did nothing and the backstop caught it");
+    }
+
+    #[test]
+    fn no_marquee_draws_nothing() {
+        let projection = projection_with([]);
+        let camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+        let mut list = DrawList::new();
+        let screen = list.view(View::screen(camera.viewport()));
+        push_marquee(
+            &mut list,
+            &DrawContext {
+                camera: &camera,
+                projection: &projection,
+                theme: Theme::LIGHT,
+                selection: &[],
+                hovered_badge: None,
+                marquee: None,
+                placing: None,
+                guides: &[],
+                stroke: None,
+                pending_connector: None,
+                editing: None,
+                card_drop: None,
+                pattern: Pattern::Plain,
+                grid_color: None,
+                minimap: None,
+            },
+            screen,
+        );
+        // The view itself is still declared — the frame has one whether or not the
+        // marquee uses it — so it is the geometry that has to be empty.
+        assert_eq!(list.stats().quads, 0);
+        assert_eq!(list.stats().draw_calls, 0);
+    }
+
+    /// A selection ring is chrome: it has to hold its screen thickness as the board
+    /// is zoomed, or it becomes a slab at 64× and invisible at 1%.
+    #[test]
+    fn a_selection_ring_holds_its_screen_width_at_any_zoom() {
+        let projection = projection_with([NewItem::new(
+            ItemKind::Sticky { text: StyledText::default(), background: None },
+            Placement::new(0.0, 0.0, 200.0, 200.0),
+        )]);
+        let id = *projection.iter().next().unwrap().0;
+        let painter = Painter::new(TextCache::with_fonts([]).unwrap_or_else(|_| {
+            TextCache::new().expect("the test machine has fonts")
+        }));
+
+        for zoom in [0.25f64, 1.0, 16.0] {
+            let mut camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+            camera.set_zoom_about(zoom, ScreenPoint::new(800.0, 450.0));
+            let mut list = DrawList::new();
+            let board = list.view(View::board(&camera));
+            painter.push_selection(
+                &mut list,
+                &DrawContext {
+            hovered_badge: None,
+                    camera: &camera,
+                    projection: &projection,
+                    theme: Theme::LIGHT,
+                    selection: &[id],
+                    marquee: None,
+                    placing: None,
+                    guides: &[],
+                    stroke: None,
+                    pending_connector: None,
+                    editing: None,
+                    card_drop: None,
+                    pattern: Pattern::Plain,
+                    grid_color: None,
+                    minimap: None,
+                },
+                board,
+            );
+            // The ring, plus a handle apiece for eight edges and corners and the
+            // rotate handle above the top edge.
+            assert_eq!(list.stats().quads, 1 + crate::handle::Handle::ALL.len(), "zoom {zoom}");
+        }
+    }
+
+    /// Handles are chrome: a constant size on screen at every zoom, like the ring they
+    /// sit on. Drawn in the board view — so a rotated item's handles turn with it — but
+    /// with every dimension divided by the zoom.
+    #[test]
+    fn handles_hold_their_screen_size_at_any_zoom() {
+        let projection = projection_with([NewItem::new(
+            ItemKind::Sticky { text: StyledText::default(), background: None },
+            Placement::new(0.0, 0.0, 200.0, 200.0),
+        )]);
+        let id = *projection.iter().next().unwrap().0;
+
+        let mut sizes = Vec::new();
+        for zoom in [0.25f64, 1.0, 16.0] {
+            let mut camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+            camera.set_zoom_about(zoom, ScreenPoint::new(800.0, 450.0));
+            let mut list = DrawList::new();
+            let board = list.view(View::board(&camera));
+            let ctx = DrawContext {
+            hovered_badge: None,
+                camera: &camera,
+                projection: &projection,
+                theme: Theme::LIGHT,
+                selection: &[id],
+                marquee: None,
+                placing: None,
+                guides: &[],
+                stroke: None,
+                pending_connector: None,
+                editing: None,
+                card_drop: None,
+                pattern: Pattern::Plain,
+                grid_color: None,
+                minimap: None,
+            };
+            push_handles(&mut list, &ctx, board);
+            assert_eq!(list.stats().quads, crate::handle::Handle::ALL.len(), "zoom {zoom}");
+            // World size × zoom is the size in device pixels, which must not move.
+            let world = f64::from(crate::handle::HANDLE_SIZE) / zoom;
+            sizes.push((world * zoom).round() as i64);
+        }
+        assert!(sizes.windows(2).all(|w| w[0] == w[1]), "handles changed size on screen: {sizes:?}");
+    }
+
+    /// A multi-selection gets **five** handles on a shared box — four corners and rotate —
+    /// plus the box's own four hairlines. This test used to assert *zero* quads, back when
+    /// handles belonged to one item; the group transform is a genuinely different operation
+    /// (every member's size *and* centre move, and a rotation moves each member's angle as
+    /// well) rather than a bigger version of the single one, which is why it took its own
+    /// geometry in `handle`.
+    ///
+    /// **No edge handles**, and that is the load-bearing assertion: an edge drag scales one
+    /// axis, and one-axis scaling of a rotated member is a shear, which no `Placement` can
+    /// express.
+    #[test]
+    fn a_multi_selection_gets_handles_on_a_shared_box() {
+        let projection = projection_with([
+            NewItem::new(
+                ItemKind::Sticky { text: StyledText::default(), background: None },
+                Placement::new(0.0, 0.0, 100.0, 100.0),
+            ),
+            NewItem::new(
+                ItemKind::Sticky { text: StyledText::default(), background: None },
+                Placement::new(400.0, 0.0, 100.0, 100.0),
+            ),
+        ]);
+        let ids: Vec<_> = projection.iter().map(|(id, _)| *id).collect();
+        let camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+        let mut list = DrawList::new();
+        let board = list.view(View::board(&camera));
+        let ctx = DrawContext {
+            hovered_badge: None,
+            camera: &camera,
+            projection: &projection,
+            theme: Theme::LIGHT,
+            selection: &ids,
+            marquee: None,
+            placing: None,
+            guides: &[],
+            stroke: None,
+            pending_connector: None,
+            editing: None,
+            card_drop: None,
+            pattern: Pattern::Plain,
+            grid_color: None,
+            minimap: None,
+        };
+        push_handles(&mut list, &ctx, board);
+        // Four outline hairlines plus five handles.
+        assert_eq!(list.stats().quads, 4 + crate::handle::GROUP_HANDLES.len());
+
+        // And the box spans both stickies, so the handles are on its corners rather than on
+        // either member's.
+        let placements: Vec<Placement> = ids
+            .iter()
+            .filter_map(|id| projection.get(*id))
+            .map(|projected| projected.item.placement)
+            .collect();
+        let group = crate::handle::group_bounds(&placements).expect("two items have a box");
+        assert!((group.width - 500.0).abs() < 1e-9, "width {}", group.width);
+        assert!((group.x - 200.0).abs() < 1e-9, "centre {}", group.x);
+    }
+
+    #[test]
+    fn an_unknown_selected_id_is_skipped_rather_than_panicking() {
+        let projection = projection_with([]);
+        let camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+        let painter = Painter::new(TextCache::new().expect("the test machine has fonts"));
+        let mut list = DrawList::new();
+        let board = list.view(View::board(&camera));
+
+        painter.push_selection(
+            &mut list,
+            &DrawContext {
+            hovered_badge: None,
+                camera: &camera,
+                projection: &projection,
+                theme: Theme::LIGHT,
+                selection: &[42],
+                marquee: None,
+                placing: None,
+                guides: &[],
+                stroke: None,
+                pending_connector: None,
+                editing: None,
+                card_drop: None,
+                pattern: Pattern::Plain,
+                grid_color: None,
+                minimap: None,
+            },
+            board,
+        );
+        assert_eq!(list.stats().quads, 0);
+    }
+
+    /// Layouts and tessellated ink are the two things that survive between frames, so
+    /// they are also the two things that leak if a deleted item is never forgotten.
+    #[test]
+    fn deleting_an_item_retires_what_was_cached_for_it() {
+        let mut board = Board::new();
+        let doomed = board
+            .add(NewItem::new(
+                ItemKind::Sticky { text: StyledText::plain("fan"), background: None },
+                Placement::new(0.0, 0.0, 400.0, 400.0),
+            ))
+            .unwrap();
+        let mut projection = Projection::new();
+        projection.rebuild(&board).unwrap();
+
+        let mut painter = Painter::new(TextCache::new().expect("the test machine has fonts"));
+        // Adopt the board before filling its caches, which is the order a frame runs
+        // in: `sync` precedes `paint`. A painter that has never seen a board clears on
+        // first sight, and that must not eat the entries this test is about.
+        painter.sync(BoardEpoch(0), &projection);
+
+        let id = projection.scene_id(doomed).unwrap();
+        painter.text.layout(
+            BlockKey::primary(id),
+            projection.generation(),
+            &Style::default(),
+            None,
+            || vellum_text::StyledText::plain("fan"),
+        );
+        painter.ink.insert(
+            id,
+            CachedInk { generation: projection.generation(), band: 0, mesh: Default::default() },
+        );
+        // One board throughout, so the epoch is constant and `sync` takes the prune
+        // path rather than the board-switch path.
+        painter.sync(BoardEpoch(0), &projection);
+        assert_eq!(painter.text.len(), 1, "syncing dropped a live item");
+        assert_eq!(painter.ink.len(), 1);
+
+        board.remove(doomed).unwrap();
+        projection.rebuild(&board).unwrap();
+        painter.sync(BoardEpoch(0), &projection);
+
+        assert_eq!(painter.text.len(), 0, "a deleted item's layout stayed cached");
+        assert_eq!(painter.ink.len(), 0, "a deleted item's ink stayed cached");
+    }
+
+    /// Two freshly-opened boards agree on *both* halves of the old cache key: every
+    /// `Projection` interns `SceneId`s from zero, and every one of them is at
+    /// generation 1 because `Editor::in_memory` reprojects exactly once. So a switch
+    /// between them used to skip the prune entirely and `TextCache::layout` handed the
+    /// first board's words to the second board's sticky.
+    #[test]
+    fn switching_boards_clears_caches_even_when_generations_collide() {
+        let sticky = |text: &str| {
+            let mut board = Board::new();
+            board
+                .add(NewItem::new(
+                    ItemKind::Sticky { text: StyledText::plain(text), background: None },
+                    Placement::new(0.0, 0.0, 400.0, 400.0),
+                ))
+                .unwrap();
+            let mut projection = Projection::new();
+            projection.rebuild(&board).unwrap();
+            projection
+        };
+
+        let (first, second) = (sticky("alpha"), sticky("omega"));
+        assert_eq!(
+            first.generation(),
+            second.generation(),
+            "the collision this test exists for did not happen"
+        );
+
+        let mut painter = Painter::new(TextCache::new().expect("the test machine has fonts"));
+        painter.sync(BoardEpoch(1), &first);
+
+        let id = *first.iter().next().expect("the board has one sticky").0;
+        painter.text.layout(
+            BlockKey::primary(id),
+            first.generation(),
+            &Style::default(),
+            None,
+            || vellum_text::StyledText::plain("alpha"),
+        );
+        painter.ink.insert(
+            id,
+            CachedInk { generation: first.generation(), band: 0, mesh: Default::default() },
+        );
+        assert_eq!(painter.text.len(), 1);
+
+        // The switch. Retaining against `second` would keep both entries — its ids
+        // cover the same range — so only clearing is correct.
+        painter.sync(BoardEpoch(2), &second);
+
+        assert_eq!(painter.text.len(), 0, "the previous board's layout crossed a switch");
+        assert_eq!(painter.ink.len(), 0, "the previous board's ink crossed a switch");
+    }
+
+    #[test]
+    fn a_cards_body_becomes_an_analytic_shape() {
+        let mut list = DrawList::new();
+        list.view(View::screen(ScreenSize::new(800.0, 600.0)));
+        push_shape_card(&mut list, [0.0, 0.0], [320.0, 200.0], 0.0, 1.0, &Theme::LIGHT);
+        assert_eq!(list.stats().shapes, 1);
+    }
+
+    /// A degenerate item — zero width, which an import can produce — must not make
+    /// the shape parameters non-finite.
+    #[test]
+    fn a_zero_sized_card_does_not_produce_nan_geometry() {
+        let mut list = DrawList::new();
+        list.view(View::screen(ScreenSize::new(800.0, 600.0)));
+        push_shape_card(&mut list, [0.0, 0.0], [0.0, 0.0], 0.0, 1.0, &Theme::LIGHT);
+        assert!(list.stats().shapes <= 1);
+    }
+
+    /// The projection's own extent has to make sense before anything draws it —
+    /// a "fit to content" that fits nothing is the first thing a user hits.
+    #[test]
+    fn content_bounds_are_usable_for_a_fit() {
+        let projection = projection_with([
+            NewItem::new(
+                ItemKind::Sticky { text: StyledText::default(), background: None },
+                Placement::new(-500.0, -300.0, 200.0, 200.0),
+            ),
+            NewItem::new(
+                ItemKind::Sticky { text: StyledText::default(), background: None },
+                Placement::new(500.0, 300.0, 200.0, 200.0),
+            ),
+        ]);
+        let content: WorldRect = projection.content_bounds().unwrap();
+        let mut camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+        camera.fit_to_rect(content, 0.02);
+        assert_eq!(projection.scene().query_viewport(&camera).count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod caret_blink_tests {
+    use super::{CARET_BLINK_PERIOD, CARET_SOLID_FOR, caret_is_visible};
+
+    /// Solid while typing, then blinking — the behaviour of every native text field, and
+    /// the half that a naive `sin(t) > 0` gets wrong: the caret would flicker under the
+    /// user's own hands during a burst of typing.
+    #[test]
+    fn the_caret_is_solid_while_typing_and_blinks_once_idle() {
+        assert!(caret_is_visible(0.0), "invisible the instant a key lands");
+        assert!(caret_is_visible(CARET_SOLID_FOR - 0.01), "blinked before the grace ended");
+
+        // First off-phase begins as soon as the grace does.
+        let half = CARET_BLINK_PERIOD / 2.0;
+        assert!(caret_is_visible(CARET_SOLID_FOR + 0.01));
+        assert!(!caret_is_visible(CARET_SOLID_FOR + half + 0.01), "never went dark");
+        assert!(caret_is_visible(CARET_SOLID_FOR + CARET_BLINK_PERIOD + 0.01), "never came back");
+    }
+
+    /// It has to keep blinking, not settle. A phase built from a saturating or clamped
+    /// value looks right for one cycle and then stops, which reads as the caret vanishing.
+    #[test]
+    fn it_keeps_blinking_a_minute_in() {
+        let mut seen_on = false;
+        let mut seen_off = false;
+        let mut t = 60.0f32;
+        while t < 60.0 + CARET_BLINK_PERIOD * 2.0 {
+            if caret_is_visible(t) { seen_on = true } else { seen_off = true }
+            t += CARET_BLINK_PERIOD / 16.0;
+        }
+        assert!(seen_on && seen_off, "the blink stopped: on={seen_on} off={seen_off}");
+    }
+}
+
+#[cfg(test)]
+mod card_overflow_tests {
+    use super::*;
+
+    /// The Amazon shape: a title, **no blurb**, and a 400-character tracking URL.
+    ///
+    /// Every span in a card's body has to be clipped, not just the description. The
+    /// description was the only one that was, and both other paths overflow the same way —
+    /// an imported Miro card routinely carries the raw address as its *title*, and the
+    /// no-blurb branch appended the whole URL with no clip at all. A URL has no spaces, so
+    /// it cannot wrap at a word boundary: it pours out through the bottom of the card and
+    /// down the board, which is exactly what the user photographed twice.
+    #[test]
+    fn no_card_span_can_outrun_its_block() {
+        let url = format!("https://www.amazon.com/dp/B0EXAMPLE1?{}", "ref=sr_1_12&crid=26&".repeat(30));
+        assert!(url.len() > 400, "the fixture stopped being long");
+
+        for (title, description) in [
+            (Some("Superbat Precision Supports Monitor Surveillance".to_owned()), None),
+            (Some(url.clone()), None),
+            (None, Some(url.clone())),
+            (Some(url.clone()), Some(url.clone())),
+        ] {
+            let kind = ItemKind::LinkPreview {
+                title,
+                url: Some(url.clone()),
+                description,
+                thumbnail: None,
+                provider: Some("Amazon".to_owned()),
+                favicon: None,
+                mode: vellum_doc::CardMode::Card,
+            };
+            const BUDGET: usize = 120;
+            let text = card_text(&kind, BlockKey::PRIMARY, BUDGET);
+            let drawn = text.to_plain().chars().count();
+            // One newline joins the title to the blurb, so the budget may be exceeded by
+            // exactly that separator and no more.
+            assert!(
+                drawn <= BUDGET + 1,
+                "a card drew {drawn} characters into a {BUDGET}-character block"
+            );
+        }
+    }
+}

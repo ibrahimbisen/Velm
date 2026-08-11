@@ -1,0 +1,18 @@
+[package]
+name = "vellum-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-board search for Vellum: an incrementally-updatable inverted index with prefix, substring, phrase and bounded-Levenshtein matching, kind/colour/tag facets, and a compact on-disk form."
+
+# Versions are written out rather than inherited from `[workspace.dependencies]`
+# because this crate was built alongside concurrent work on the workspace manifest.
+# They are consolidated into the workspace table once that settles.
+#
+# There is exactly one dependency, and that is deliberate. An index format is a
+# file format: anything that serialises it becomes part of the compatibility
+# contract, and a `serde` derive would hand the byte layout to a crate whose
+# representation is free to change between minor versions. `persist` writes its
+# own varints instead — see that module for the format and its version gate.
+[dependencies]
+thiserror = "2"

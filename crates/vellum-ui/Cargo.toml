@@ -1,0 +1,19 @@
+[package]
+name = "vellum-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vellum's application chrome: menu bar, tool palette, properties panel, board library, colour picker and dialogs, as pure egui widgets with a data-in / events-out interface."
+
+[dependencies]
+egui.workspace = true
+# Item ids, placements, colours and alignment come from the document rather than
+# being redeclared here, so the app never translates between two spellings of the
+# same value on its way to a panel.
+vellum-doc.workspace = true
+# The shape flyout draws real silhouettes from the catalogue, so adding a shape to
+# `vellum-shapes` adds it to the picker with no change here.
+vellum-shapes.workspace = true
+# Connector styling — routing, dashes, arrowheads — is already modelled; the
+# properties panel edits those types directly.
+vellum-connect.workspace = true

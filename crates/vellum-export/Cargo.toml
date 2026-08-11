@@ -1,0 +1,40 @@
+[package]
+name = "vellum-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Board export for Vellum: vector SVG and PDF, CPU-rasterised PNG, and Miro-shaped CSV, over a minimal placed-item input trait."
+
+# Versions are written out rather than inherited from `[workspace.dependencies]`
+# because this crate was built alongside concurrent work on the workspace manifest.
+# They are consolidated into the workspace table once that settles.
+[dependencies]
+# Data URIs for images embedded in SVG.
+base64 = "0.22"
+# PDF object plumbing: cross-reference table, stream lengths, name/string escaping.
+# Deliberately low-level — page content and font dictionaries are written here, so
+# nothing about the document's structure is decided by a dependency.
+pdf-writer = "0.15"
+# Glyph ids, advances and outlines. Needed to embed a font in a PDF at all, and to
+# draw text on the CPU rasteriser, which has no shaper behind it.
+ttf-parser = "0.25"
+# The CPU rasteriser. `docs/01-architecture.md` §3 puts real rasterisation on the
+# GPU; this is the fallback for headless callers (thumbnails, tests, CI) and the
+# reference the GPU path is checked against.
+tiny-skia = "0.11"
+# PDF image streams are Flate-compressed. Raw RGB for a 4000×3000 photo is 36MB.
+miniz_oxide = "0.8"
+thiserror = "2"
+
+# Shapes are the one geometry the exporter does not define itself: `vellum-shapes`
+# already holds Miro's catalogue in a unit box, and mapping that box onto an item
+# rect is exactly what an exporter needs. Ink, connectors and anything else arrive
+# as an already-resolved `Path`, so no other geometry crate is pulled in.
+vellum-shapes = { path = "../vellum-shapes" }
+
+[dev-dependencies]
+# The round-trip check: SVG written here is read back by the Miro SVG oracle.
+vellum-import = { path = "../vellum-import" }
+# `tests/fonts.rs` measures a font independently of `crate::font`, so that a bug
+# shared between the measurement and the check cannot hide itself.
+ttf-parser = "0.25"

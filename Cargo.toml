@@ -1,0 +1,236 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ibrahim Bisen <33014532+ibrahimbisen@users.noreply.github.com>"]
+description = "A native infinite-canvas board app — a Miro alternative in Rust."
+repository = "https://github.com/ibrahimbisen/Velm"
+homepage = "https://github.com/ibrahimbisen/Velm"
+readme = "README.md"
+keywords = ["canvas", "whiteboard", "miro", "wgpu", "graphics"]
+categories = ["graphics", "gui"]
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+# Grapheme and word boundaries, for the on-canvas caret. Already in the tree behind
+# cosmic-text; a direct dependency so `crate::edit` does not reach through it.
+unicode-segmentation = "1"
+serde_json = "1"
+thiserror = "2"
+
+# Document + persistence. `loro` is pinned to an exact version because its API has
+# moved across releases and the encoded snapshot is our on-disk format; an
+# unreviewed bump is a file-format change.
+blake3 = "1.8"
+loro = "=1.13.7"
+# `rusqlite` is held at 0.39 rather than 0.40: 0.40 requires libsqlite3-sys 0.38,
+# whose build script uses the still-unstable `cfg_select!` macro and therefore does
+# not compile on stable Rust (1.94 as of writing). `bundled` compiles SQLite from
+# source so a Vellum install never depends on a system SQLite.
+rusqlite = { version = "0.39", features = ["bundled"] }
+tempfile = "3"
+
+# Rendering + windowing. `winit` is pinned to the 0.30 line rather than the 0.31
+# betas because the 0.31 window API is still churning; 0.30 already has the
+# `ApplicationHandler` trait loop, which is the part that matters.
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+pollster = "1"
+rstar = "0.13"
+wgpu = "30"
+winit = "0.30"
+
+# The system clipboard, for "paste a Miro board". `winit` deliberately owns no
+# clipboard, and Miro's payload rides on the **HTML flavour** — not text, not an
+# image — so a text-only clipboard crate cannot see it at all. `arboard` reads that
+# flavour on both target platforms (`NSPasteboardTypeHTML` and `CF_HTML`).
+# `image-data` is on, for "paste a screenshot". It was off, with a comment claiming
+# it "would pull the whole `image` decoder set in a second time"; that was wrong —
+# on macOS it adds exactly one decoder, `image/tiff`, which is what `NSPasteboard`
+# hands back for a bitmap. With it off, `Clipboard::get_image` does not exist at all,
+# which is why ⌘V on a copied picture did nothing whatever.
+arboard = { version = "3.6", features = ["image-data"] }
+# Image decoding. Board assets reach the blob store as the bytes Miro served —
+# PNG, JPEG, GIF or WebP — and the GPU wants RGBA8. Only the decoders a Miro board
+# can actually contain are enabled; `image`'s default feature set is every format
+# it supports plus their encoders, which is megabytes of binary for formats no
+# board has ever held.
+#
+# `png` earns its keep twice: `arboard` hands a pasted bitmap back as loose RGBA8
+# rather than as an encoded file, and the blob store holds encoded bytes — so the
+# paste path re-encodes, and PNG is the only lossless encoder here.
+# `tiff` is what macOS's pasteboard actually stores a bitmap as, and arrives via
+# `arboard/image-data` in any case; naming it here keeps the enabled set honest.
+#
+# `ico` is here because **favicons are still served as ICO in 2026** and leaving it out
+# was a silent, permanent failure. Measured: `alibaba.com/favicon.ico` answers 200 with
+# `image/x-icon` and the magic `00 00 01 00`; without this feature `load_from_memory`
+# returns `Unsupported`, `Assets` records `State::Undecodable`, and **the icon is never
+# retried for the life of the session**. So an imported Alibaba card fetched its icon
+# successfully and drew nothing, while a YouTube card — which declares a *PNG* icon in
+# its `<link rel=icon>` — worked, which is exactly the difference the user photographed.
+# Its own dependencies (`png`, `bmp`) were already enabled, so this costs nothing new.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+    "tiff",
+    "ico",
+] }
+
+# UI chrome. `egui` is immediate-mode and renderer-agnostic: `vellum-ui` depends on
+# this crate alone, so panels, pickers and dialogs build and test on a machine with
+# no graphics stack at all.
+#
+# `egui-wgpu` is deliberately NOT used. It pins `wgpu = "29.0"` while this workspace
+# is on 30, and two `wgpu` versions cannot share one `Device`. Adopting it would tie
+# our graphics stack to egui's release cadence — the same mistake as rendering inside
+# a webview, which docs/01-architecture.md §1 rejects for exactly this reason.
+#
+# Instead `vellum-render` draws egui itself. Its paint output is only
+# `Vec<ClippedPrimitive>` of position/uv/colour triangles plus a `TexturesDelta` for
+# the font atlas — both of which vellum-render already has pipelines for. A few
+# hundred lines buys permanent independence of egui's wgpu version.
+#
+# `egui-winit` has no such conflict: it targets winit 0.30, same as the workspace.
+egui = "0.35"
+egui-winit = "0.35"
+
+# The native menu bar: `NSMenu` on macOS, a window menu bar on Windows — the two
+# platforms Velm ships on. Default features off because the defaults are the Linux
+# ones (`gtk`, `libxdo`), which this workspace has no business pulling in.
+muda = { version = "0.19", default-features = false }
+
+# Import. `quick-xml` streams rather than building a DOM: Miro's SVG export of the
+# reference board is 36MB, and it is read to cross-check every import.
+quick-xml = "0.38"
+# Miro stores sticky and text content as rich-text HTML, so importing it faithfully
+# needs a real HTML parser rather than regex.
+tl = "0.7"
+
+# The one network dependency in the workspace, for link-card previews. Blocking and
+# `rustls`-backed: the fetch runs on a worker thread and posts its answer back through a
+# channel, the same shape autosave already uses. `reqwest` would bring `tokio` and a second
+# execution model in exchange for concurrency a handful of cached fetches does not need.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# The native file dialog, for **Board ▸ Import from Miro ▸ attach the `.rtb`**. Added
+# reluctantly and for one reason: "attach a file" has no honest implementation without a
+# real picker, and until now the only way to supply a backup was to put it in the app's
+# archives folder and restart — which works for a bulk migration and is useless for the
+# one board in front of you. The alternative considered was egui's `dropped_files`, i.e.
+# drag-and-drop only; that is a second way to do it rather than a substitute, since a
+# dialog with an Attach button that cannot be clicked is not a dialog with an Attach
+# button.
+#
+# `default-features = false` and **no features at all** on purpose. The default set pulls
+# **GTK3**, and the obvious replacement — `xdg-portal` — requires an async runtime feature
+# (`tokio` or `async-std`) to go with it. Both are Linux-only concerns and either would
+# drag in the execution model this workspace turned `reqwest` down to avoid, for a
+# platform we do not ship. macOS and Windows compile their native backend unconditionally,
+# so this is the OS dialog and no new native stack: `objc2` is already here twice over via
+# `arboard` and `winit`. A Linux build would add `xdg-portal` + a runtime *then*.
+rfd = { version = "0.15", default-features = false }
+
+# Geometry. `lyon` tessellates paths (ink strokes, connectors, non-analytic shapes)
+# into triangles for the GPU; analytic shapes stay in SDF shaders instead.
+lyon = "1"
+# Text shaping, layout and editing, including IME. The long pole of the project.
+cosmic-text = "0.14"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Local crates.
+vellum-chart = { path = "crates/vellum-chart" }
+vellum-connect = { path = "crates/vellum-connect" }
+vellum-doc = { path = "crates/vellum-doc" }
+vellum-export = { path = "crates/vellum-export" }
+vellum-flow = { path = "crates/vellum-flow" }
+vellum-link = { path = "crates/vellum-link" }
+vellum-import = { path = "crates/vellum-import" }
+vellum-ink = { path = "crates/vellum-ink" }
+vellum-mindmap = { path = "crates/vellum-mindmap" }
+vellum-render = { path = "crates/vellum-render" }
+vellum-scene = { path = "crates/vellum-scene" }
+vellum-shapes = { path = "crates/vellum-shapes" }
+vellum-store = { path = "crates/vellum-store" }
+vellum-table = { path = "crates/vellum-table" }
+vellum-text = { path = "crates/vellum-text" }
+vellum-ui = { path = "crates/vellum-ui" }
+
+# Release profile tuned for the size/speed goals in docs/01-architecture.md.
+# Tuned for the machine this is built on, not for a CI box.
+#
+# `lto = "fat"` here kernel-panicked an 8GB laptop twice: fat LTO loads every
+# crate's IR into a single process at link time, and across 17 crates and ~103k
+# lines that is several GB — before the agents also running `cargo` are counted.
+# `codegen-units = 1` made it worse by removing the only point at which that
+# memory would have been released.
+#
+# Thin LTO costs a few percent of runtime on an app that is GPU-bound anyway.
+# That is not a trade worth panicking a machine for. Use `--profile dist` for a
+# shipping build, deliberately, with nothing else running.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = true
+
+# A shipping build: every optimisation, and the memory cost that comes with it.
+# Run it alone, with nothing else compiling.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+# The edit-and-look-at-it loop. `update.py --quick` builds with this.
+#
+# **No LTO and no strip.** Measured on this machine, touching one file in `vellum-app` and
+# rebuilding: `release` **1m20s**, this **14.2s** — 5.6× faster. Link-time optimisation
+# across seventeen crates is nearly everything a small edit pays for, and it buys frame time
+# you cannot see while checking whether a menu opens in the right place.
+#
+# The *first* build on this profile is slower than release's, not faster — **3m14s**,
+# because a new profile means a new `target/` subdirectory and every dependency compiles
+# again. It pays for itself on the second edit and every one after.
+#
+# `opt-level = 2` rather than 3 costs very little and compiles faster; what it must **not**
+# do is drop to a debug build, which is why this is not `--profile dev`. `docs` records the
+# reference board managing *barely one frame a second* unoptimised, so a debug binary cannot
+# answer any question about how the app feels — which is the only reason to build one
+# quickly in the first place.
+#
+# **The runtime cost was assumed, then measured, and the assumption was wrong.** On the
+# synthetic bench at 20,000 items, 14 s each: release **53.7 fps / 25.42 ms**, quick
+# **53.4 fps / 26.49 ms** — 0.6% on average fps, and quick drew *more* frames (677 vs 642).
+# That is inside the noise of one run. So this is not a meaningful trade for the edit loop.
+#
+# Two honest limits on that number. It is **one workload** — a render-bound bench, where the
+# GPU sets the pace and cross-crate inlining has little to bite on; the import path, which is
+# CPU-bound in `image` and `loro`, was not measured and is where LTO would plausibly matter.
+# And it is **one run each**, on a machine that was not otherwise idle.
+#
+# Still never ship this: the binary is larger, unstripped, and unmeasured on the paths that
+# would show a difference. `python3 build.py` and `--profile dist` are the ones that ship.
+[profile.quick]
+inherits = "release"
+lto = false
+opt-level = 2
+strip = false
+
+# BLAKE3 is optimised even in debug builds. Hashing is not application logic that
+# anyone steps through; it is a bulk transform over every byte of every asset, and
+# the reference `.rtb` is 109MB. Unoptimised it runs at roughly 30MB/s, which turns
+# the blob-store tests from one second into twenty and makes importing a board in a
+# debug build feel broken.
+[profile.dev.package.blake3]
+opt-level = 3

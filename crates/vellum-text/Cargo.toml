@@ -1,0 +1,13 @@
+[package]
+name = "vellum-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Text for Vellum: Miro rich-text HTML to styled spans, cosmic-text shaping and layout, auto-fit sizing, and glyph rasterisation for a GPU atlas."
+
+[dependencies]
+cosmic-text.workspace = true
+thiserror.workspace = true
+# Miro stores sticky and text content as rich-text HTML, so importing it faithfully
+# needs a real HTML parser rather than regex.
+tl.workspace = true

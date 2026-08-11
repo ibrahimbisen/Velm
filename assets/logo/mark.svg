@@ -1,0 +1,13 @@
+<!-- Velm mark — "Viewport".
+     Four corner brackets around an implied frame that is never drawn: a bounded
+     view onto something with no edges. It is also exactly what a selection looks
+     like on the canvas, so the identity and the core interaction are one shape.
+     The accented corner gives the mark a reading order rather than anonymous
+     four-fold symmetry. It wears the primary accent, which is signal-teal now
+     rather than xr-red: the coral kept destruction and gave up selection, and a
+     mark is the one place the app's accent has to be the app's accent.
+     Grid 48x48, stroke 2.5, square caps, mitred joins. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" fill="none">
+  <path d="M8 20V8h12" stroke="#00A38C" stroke-width="2.5" stroke-linecap="square"/>
+  <path d="M28 8h12v12M40 28v12H28M20 40H8V28" stroke="#1A1D1F" stroke-width="2.5" stroke-linecap="square"/>
+</svg>

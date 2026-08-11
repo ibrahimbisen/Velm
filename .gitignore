@@ -1,0 +1,32 @@
+/target
+**/*.rs.bk
+
+# Reference Miro exports of a real board — a `.rtb` backup, an SVG oracle, a PDF and
+# a CSV. Hundreds of megabytes of someone's real work; kept locally as the import
+# oracle (see docs/02-miro-formats.md) and never committed.
+#
+# Anchored to the repo root so they only catch the exports sitting there — an
+# unanchored `*.svg` would also swallow assets/logo/. Exports whose filename has no
+# extension are not matched by these; put a pattern for those in `.git/info/exclude`,
+# which is local to your clone and never pushed.
+/*.rtb
+/*.svg
+/*.pdf
+/*.csv
+
+# Real board content captured from the clipboard for analysis.
+/captures
+
+# Reference screenshots of a real Miro account, kept locally as the UI reference
+# (see docs/04-ui-reference.md). They contain real board names.
+/Screenshots
+
+# The private working log. See RULES.md for the parts a contributor needs.
+/CLAUDE.md
+
+# macOS folder metadata.
+.DS_Store
+
+# Python bytecode, from scripts/ and build.py.
+__pycache__/
+*.pyc

@@ -1,0 +1,16 @@
+# A conservative default job count, sized for an 8-core / 8GB laptop.
+#
+# This file exists because the default — one `rustc` per core — twice took such a
+# machine down with a kernel panic during a release build. The cores are not the
+# constraint; memory is. A `rustc` compiling one of the larger crates here can hold
+# well over a gigabyte, and eight of those plus a link step does not fit in 8GB.
+#
+# Four is deliberately below `hw.ncpu`. It leaves headroom for the editor, the
+# window server, and the app itself when it is being tested, and on a machine
+# that is already swapping, more parallelism is slower rather than faster.
+#
+# **Raise it on a bigger machine** — this is a floor for the smallest supported
+# development machine, not a recommendation. Do not raise it without watching
+# memory pressure while a `--profile dist` build runs.
+[build]
+jobs = 4

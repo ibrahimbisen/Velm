@@ -1,0 +1,10 @@
+[package]
+name = "vellum-ink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Freehand ink for Vellum: Catmull-Rom smoothing, RDP level-of-detail, variable-width tessellation, exact bounds, hit-testing and partial erase."
+
+[dependencies]
+lyon.workspace = true
+thiserror.workspace = true

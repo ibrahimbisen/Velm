@@ -1,0 +1,33 @@
+<!-- The Velm mark in the three accents Preferences ▸ Accent colour offers.
+     Drawn on its own light card so it reads on a light or a dark README alike.
+     Only the accented bracket changes; the other three are always `ink`. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 210" width="720" height="210"
+     font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+
+  <rect x="0.5" y="0.5" width="719" height="209" rx="14" fill="#FCFDFE" stroke="#E5EAED"/>
+
+  <!-- signal-teal — the default -->
+  <g transform="translate(84 42) scale(1.5)">
+    <path d="M8 20V8h12" stroke="#00A38C" stroke-width="2.5" stroke-linecap="square" fill="none"/>
+    <path d="M28 8h12v12M40 28v12H28M20 40H8V28" stroke="#1A1D1F" stroke-width="2.5" stroke-linecap="square" fill="none"/>
+  </g>
+  <text x="120" y="158" text-anchor="middle" font-size="15" font-weight="600" fill="#1A1D1F">signal-teal</text>
+  <text x="120" y="178" text-anchor="middle" font-size="13" fill="#5C656B">#00A38C</text>
+  <text x="120" y="196" text-anchor="middle" font-size="11" fill="#8B959B">default</text>
+
+  <!-- xr-red -->
+  <g transform="translate(324 42) scale(1.5)">
+    <path d="M8 20V8h12" stroke="#E65B58" stroke-width="2.5" stroke-linecap="square" fill="none"/>
+    <path d="M28 8h12v12M40 28v12H28M20 40H8V28" stroke="#1A1D1F" stroke-width="2.5" stroke-linecap="square" fill="none"/>
+  </g>
+  <text x="360" y="158" text-anchor="middle" font-size="15" font-weight="600" fill="#1A1D1F">xr-red</text>
+  <text x="360" y="178" text-anchor="middle" font-size="13" fill="#5C656B">#E65B58</text>
+
+  <!-- cobalt -->
+  <g transform="translate(564 42) scale(1.5)">
+    <path d="M8 20V8h12" stroke="#1B62E8" stroke-width="2.5" stroke-linecap="square" fill="none"/>
+    <path d="M28 8h12v12M40 28v12H28M20 40H8V28" stroke="#1A1D1F" stroke-width="2.5" stroke-linecap="square" fill="none"/>
+  </g>
+  <text x="600" y="158" text-anchor="middle" font-size="15" font-weight="600" fill="#1A1D1F">cobalt</text>
+  <text x="600" y="178" text-anchor="middle" font-size="13" fill="#5C656B">#1B62E8</text>
+</svg>

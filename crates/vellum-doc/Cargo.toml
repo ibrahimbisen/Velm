@@ -1,0 +1,10 @@
+[package]
+name = "vellum-doc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vellum's board document: a Loro CRDT with a movable-tree item hierarchy, styled text, fractional z-order and undo/redo."
+
+[dependencies]
+loro.workspace = true
+thiserror.workspace = true

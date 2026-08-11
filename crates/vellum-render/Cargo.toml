@@ -1,0 +1,25 @@
+[package]
+name = "vellum-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vellum's GPU renderer: instanced quads, analytic SDF shapes, textured quads with residency management, a dynamic glyph atlas and batched triangle meshes."
+
+[dependencies]
+bytemuck.workspace = true
+log.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+
+# The geometry producers. Every one of them emits plain data — parameters, bitmaps,
+# indexed meshes — and this crate is the single place that turns any of it into GPU
+# resources. The dependency arrows all point this way, never back.
+vellum-connect.workspace = true
+vellum-ink.workspace = true
+vellum-scene.workspace = true
+vellum-shapes.workspace = true
+vellum-text.workspace = true
+
+[dev-dependencies]
+# The pixel tests drive a real adapter and block on the readback map.
+pollster.workspace = true

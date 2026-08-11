@@ -1,0 +1,21 @@
+[package]
+name = "vellum-flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vellum's board containers: kanban columns with WIP limits, two-axis user story maps, and timeline/roadmap lane packing with dependency cycle detection. Pure logic, no GPU."
+
+# Versions are spelled out rather than inherited from `[workspace.dependencies]`.
+# This crate landed while two other workflows were editing the workspace manifest,
+# and a crate that pins its own versions cannot be broken by that edit. Both are
+# already used at these versions elsewhere in the tree, so nothing new enters the
+# lockfile, and consolidating them back to `.workspace = true` is a two-line change
+# once everything is quiet.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+# The round-trip tests: a container that has been edited must survive save/load with
+# every rank, id and column order byte-identical.
+serde_json = "1"

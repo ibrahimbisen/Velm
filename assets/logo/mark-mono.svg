@@ -1,0 +1,8 @@
+<!-- Single-colour cut. Inherits `currentColor`, so it takes the surrounding text
+     colour — used in menus, disabled states, print, and anywhere the accent
+     would be wrong. A mark must work without colour before colour is allowed
+     to help it. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" fill="none">
+  <path d="M8 20V8h12M28 8h12v12M40 28v12H28M20 40H8V28"
+        stroke="currentColor" stroke-width="2.5" stroke-linecap="square"/>
+</svg>

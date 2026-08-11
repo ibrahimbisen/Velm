@@ -1,0 +1,95 @@
+[package]
+name = "vellum-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vellum's board editor: window, input, document, spatial index and the frame loop that assembles them."
+
+# A library plus a binary, not a binary alone. Everything below the window —
+# projection, input, draw-list assembly — is ordinary logic that has to be testable
+# without a GPU or an event loop, and an integration test cannot reach into a
+# bin-only crate.
+[lib]
+name = "vellum_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vellum-app"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+arboard.workspace = true
+rfd.workspace = true
+bytemuck.workspace = true
+env_logger.workspace = true
+image.workspace = true
+log.workspace = true
+pollster.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+# The **native** menu bar — macOS's own, along the top of the screen, which is a
+# different thing from the in-app `⋮` menu `vellum-ui` draws. Only the platform can
+# put one there, and only this crate talks to the platform.
+#
+# `muda` rather than raw `objc2-app-kit`, which is already in the tree: the menu bar
+# has to be built on the main thread, has to survive `NSApplication`'s own lifecycle,
+# and needs a target-action bridge for every custom item — and none of that can be
+# photographed by `--screenshot` or driven from a test. Three small crates against a
+# few hundred lines of `unsafe` that could only be verified by hand.
+muda.workspace = true
+
+# The chrome. `vellum-ui` builds the menus, toolbar, panels and library as pure
+# egui widgets; this crate is the only place that owns a GPU, so it is also the
+# only place that can draw them.
+#
+# `bytemuck` is turned on so `epaint::Vertex` is `Pod` and egui's tessellated
+# triangles reach the vertex buffer as a borrowed slice rather than being copied
+# into a second vertex type once per frame.
+egui = { workspace = true, features = ["bytemuck"] }
+# Platform input and IME, which is genuinely tedious to redo and has no version
+# conflict with the workspace: it targets winit 0.30, the same line as everything
+# else. Default features, which is where its `clipboard` feature lives — without it
+# egui's own text fields lose copy and paste, which the rename dialog and the find
+# bar both need.
+egui-winit.workspace = true
+vellum-ui.workspace = true
+
+# The board itself, and everything that draws it. The dependency arrows all point
+# down from here: nothing in the workspace depends on this crate.
+# Chart geometry: scales, nice-number ticks, marks, legends. `crate::chart`
+# supplies the shaping and the tessellation it does not do.
+vellum-chart.workspace = true
+vellum-connect.workspace = true
+# The SVG/PDF/CSV writers. `crate::export` is the adapter onto their scene model.
+vellum-export.workspace = true
+vellum-doc.workspace = true
+# Kanban, story mapping and timelines: the layout containers. `crate::kanban`
+# supplies the card measurement it deliberately does not do.
+vellum-flow.workspace = true
+vellum-import.workspace = true
+# Names a pasted link's site from its host, with no network.
+vellum-link.workspace = true
+vellum-ink.workspace = true
+# The tidy-tree layout, collapse and reparent. `crate::mindmap` supplies the label
+# measurement it deliberately does not do.
+vellum-mindmap.workspace = true
+vellum-render.workspace = true
+vellum-scene.workspace = true
+vellum-shapes.workspace = true
+vellum-store.workspace = true
+# Table layout: merges, auto-fit sizing, resize and hit-testing. `crate::table`
+# supplies the shaping it cannot do itself.
+vellum-table.workspace = true
+vellum-text.workspace = true
+unicode-segmentation.workspace = true
+
+# Spaces, stars and the window's last theme are the filing, not board
+# content, so they live in one small sidecar file beside the boards rather than
+# inside any of them.
+serde = { workspace = true }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

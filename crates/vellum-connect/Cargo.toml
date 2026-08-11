@@ -1,0 +1,11 @@
+[package]
+name = "vellum-connect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vellum's connectors: widget-bound endpoints, straight/curved/orthogonal routing with obstacle avoidance, arrowheads, jump-overs and lyon tessellation."
+
+[dependencies]
+lyon.workspace = true
+serde.workspace = true
+thiserror.workspace = true

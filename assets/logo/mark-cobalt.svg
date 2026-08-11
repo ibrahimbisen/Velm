@@ -1,0 +1,10 @@
+<!-- Velm mark — "Viewport", wearing the cobalt accent.
+     One of the three accents Preferences ▸ Accent colour offers. Only the accented
+     bracket changes; the other three stay `ink` #1A1D1F.
+     Cobalt #1B62E8 is the one accent whose `on_accent` is white rather than charcoal —
+     charcoal on it fails AA, which is why `on_accent` is derived and not a constant.
+     Grid 48x48, stroke 2.5, square caps, mitred joins. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" fill="none">
+  <path d="M8 20V8h12" stroke="#1B62E8" stroke-width="2.5" stroke-linecap="square"/>
+  <path d="M28 8h12v12M40 28v12H28M20 40H8V28" stroke="#1A1D1F" stroke-width="2.5" stroke-linecap="square"/>
+</svg>
