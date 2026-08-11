@@ -114,7 +114,7 @@ fn peek_rtb(path: &str) -> Result<()> {
         infected += usize::from(r.infected);
     }
     let mut exts: Vec<_> = by_ext.into_iter().collect();
-    exts.sort_by(|a, b| b.1.cmp(&a.1));
+    exts.sort_by_key(|ext| std::cmp::Reverse(ext.1));
     println!(
         "by extension : {}",
         exts.iter().map(|(e, n)| format!("{n} {e}")).collect::<Vec<_>>().join(", ")

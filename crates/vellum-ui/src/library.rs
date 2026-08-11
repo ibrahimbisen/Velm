@@ -475,7 +475,7 @@ pub(crate) fn show(
         if state.scope == Scope::Recent {
             visible.sort_by_key(|c| std::cmp::Reverse(c.modified));
         } else {
-            visible.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+            visible.sort_by_key(|card| card.title.to_lowercase());
         }
 
         if visible.is_empty() {

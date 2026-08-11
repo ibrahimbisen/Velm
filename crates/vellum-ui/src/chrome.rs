@@ -932,13 +932,19 @@ impl Chrome {
         // anything else sees it.
         for level in (0..=MAX_SPECIFICITY).rev() {
             for command in Command::ALL {
+                // Every binding at this level is consumed, not just the first that
+                // matched, so a key cannot fall through to a widget behind the chrome.
+                //
+                // NOTE Clippy offers `.any()` here and it is **wrong**: `any` short-circuits
+                // on the first `true`, so a command whose primary shortcut matched would
+                // leave its alternate un-consumed and that key would reach whatever is
+                // behind the chrome. The fold is deliberate, and `f(x) || hit` — not
+                // `hit || f(x)` — is what keeps `f` running on every element.
+                #[expect(clippy::unnecessary_fold, reason = "consuming every binding is the point")]
                 let pressed = [command.shortcut(), command.alternate_shortcut()]
                     .into_iter()
                     .flatten()
                     .filter(|s| specificity(s.modifiers) == level)
-                    // Every binding at this level is consumed, not just the first
-                    // that matched, so a key cannot fall through to a widget behind
-                    // the chrome.
                     .fold(false, |hit, shortcut| {
                         ctx.input_mut(|i| i.consume_shortcut(&shortcut)) || hit
                     });
@@ -955,6 +961,9 @@ impl Chrome {
         }
         for tool in Tool::ALL {
             let keys = [tool.shortcut(), tool.alternate_shortcut()];
+            // Both bindings are consumed, for the reason the shortcut loop above gives:
+            // `.any()` would short-circuit and leave the alternate key live.
+            #[expect(clippy::unnecessary_fold, reason = "consuming every binding is the point")]
             let pressed = keys.into_iter().flatten().fold(false, |hit, key| {
                 ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key)) || hit
             });
