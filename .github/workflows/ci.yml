@@ -8,7 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+  # Deliberately NOT `RUSTFLAGS: -D warnings`. The zero-warning rule is a *clippy* rule and
+  # is enforced on the clippy step below; setting it globally would also fail the build on
+  # any new rustc warning, and would give the build and clippy steps different flag sets,
+  # which busts the shared cache between them.
 
 jobs:
   check:
@@ -22,8 +25,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Clippy tracks stable, so a new toolchain can introduce a lint that fires on code
+      # nobody touched — that is how this job first went red, on clippy 1.97 against a tree
+      # that was clean on 1.94. That is working as intended: fix the lint. But it does mean
+      # a red CI here is not always a regression in the pull request that hit it.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --version
+          cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --workspace

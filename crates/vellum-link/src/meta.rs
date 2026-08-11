@@ -109,12 +109,12 @@ pub fn parse(html: &str, base: &str) -> LinkMeta {
                     oembed = oembed.or(Some(href));
                 }
             }
-            "title" => {
-                if doc_title.is_none() {
-                    let text = handle.inner_text(parser).trim().to_string();
-                    if !text.is_empty() {
-                        doc_title = Some(text);
-                    }
+            // Guarded rather than an `if` inside the arm: the first non-empty <title> wins,
+            // and a page with two of them should not re-shape the second one's text.
+            "title" if doc_title.is_none() => {
+                let text = handle.inner_text(parser).trim().to_string();
+                if !text.is_empty() {
+                    doc_title = Some(text);
                 }
             }
             _ => {}
@@ -128,7 +128,7 @@ pub fn parse(html: &str, base: &str) -> LinkMeta {
 
     // Largest declared icon first. A card draws a favicon at about 16pt, so any of them will
     // do — but a 16px source scaled up looks worse than a 180px one scaled down.
-    icons.sort_by(|a, b| b.0.unwrap_or(0).cmp(&a.0.unwrap_or(0)));
+    icons.sort_by_key(|icon| std::cmp::Reverse(icon.0.unwrap_or(0)));
 
     LinkMeta {
         title: first(&["og:title", "twitter:title"]).or(doc_title).map(|t| decode_entities(&t)),
