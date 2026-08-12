@@ -168,5 +168,7 @@ pub use tool::{
 // name a dependency it may not otherwise carry.
 pub use egui;
 pub use vellum_connect::{AnchorSide, Arrowhead, LineStyle, RoutingMode};
-pub use vellum_doc::{Align, Color, ItemId, Placement};
+// `CardMode` is here because `LinkSummary` carries one: a public struct whose field type
+// the caller cannot name is one they cannot build.
+pub use vellum_doc::{Align, CardMode, Color, ItemId, Placement};
 pub use vellum_shapes::{CATALOGUE as SHAPE_CATALOGUE, Shape};

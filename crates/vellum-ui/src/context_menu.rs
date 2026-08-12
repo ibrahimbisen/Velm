@@ -66,6 +66,9 @@ pub enum Row {
     /// Open the one selected card's page in the browser. Carries no URL — the
     /// renderer reads it from the model, which is the only place it is known.
     OpenPage,
+    /// Copy the one selected card's address to the pasteboard. Carries no URL, for the
+    /// same reason [`Row::OpenPage`] does not.
+    CopyLink,
 }
 
 /// Which rows a target gets.
@@ -89,6 +92,7 @@ pub fn rows(target: ContextTarget, model: &PanelModel, cmd_ctx: &CommandContext)
                 out.push(Row::Separator);
                 if model.link_url.is_some() {
                     out.push(Row::OpenPage);
+                    out.push(Row::CopyLink);
                 }
                 out.push(Row::CardMode);
                 out.push(Row::Command(Command::FetchLinkPreviews));
@@ -274,6 +278,14 @@ fn draw(
                 events.push(UiEvent::OpenLink(url));
             }
         }
+        Row::CopyLink => {
+            let Some(url) = model.link_url.clone() else { return };
+            let row =
+                crate::menu::row_button("Copy link").min_size(egui::vec2(crate::menu::row_width(ui), 0.0));
+            if ui.add(row).on_hover_text(url.clone()).clicked() {
+                events.push(UiEvent::CopyLink(url));
+            }
+        }
     }
 }
 
@@ -404,6 +416,7 @@ mod tests {
         let plain_rows = rows(ContextTarget::Selection, &model, &ctx_for(&plain));
         assert!(!plain_rows.contains(&Row::CardMode));
         assert!(!plain_rows.contains(&Row::OpenPage));
+        assert!(!plain_rows.contains(&Row::CopyLink));
         assert!(!commands(&plain_rows).contains(&Command::FetchLinkPreviews));
 
         let linked = [card(1, Some("https://example.com"))];
@@ -411,11 +424,13 @@ mod tests {
         let card_rows = rows(ContextTarget::Selection, &model, &ctx_for(&linked));
         assert!(card_rows.contains(&Row::CardMode));
         assert!(card_rows.contains(&Row::OpenPage));
+        assert!(card_rows.contains(&Row::CopyLink));
         assert!(commands(&card_rows).contains(&Command::FetchLinkPreviews));
     }
 
-    /// *Open page* acts on one address. Two cards have two, and a card that arrived
-    /// without one has none — neither is a thing the row can do, so it is not offered.
+    /// *Open page* and *Copy link* both act on one address. Two cards have two, and a card
+    /// that arrived without one has none — neither is a thing either row can do, so
+    /// neither is offered.
     #[test]
     fn open_page_needs_exactly_one_card_with_an_address() {
         for selection in [
@@ -425,6 +440,7 @@ mod tests {
             let model = PanelModel::derive(&selection);
             let rows = rows(ContextTarget::Selection, &model, &ctx_for(&selection));
             assert!(!rows.contains(&Row::OpenPage), "offered Open with {} cards", selection.len());
+            assert!(!rows.contains(&Row::CopyLink), "offered Copy with {} cards", selection.len());
             assert!(rows.contains(&Row::CardMode), "the mode rows still apply");
         }
     }

@@ -1818,6 +1818,98 @@ fn the_more_button_on_the_bar_opens_the_context_menu() {
     assert!(rows.len() >= 6, "the menu drew {} rows", rows.len());
 }
 
+/// A link card, with an address and a preview, as the app describes one to the chrome.
+fn linked_card(url: Option<&str>) -> vellum_ui::SelectionItem {
+    use vellum_ui::{CardMode, ItemFacet, LinkSummary, Placement, SelectionItem};
+    SelectionItem {
+        link: Some(LinkSummary {
+            url: url.map(str::to_owned),
+            provider: Some("Example".to_owned()),
+            mode: CardMode::Card,
+            has_image: true,
+        }),
+        opacity: Some(1.0),
+        ..SelectionItem::new(
+            "1@1".parse().expect("well-formed item id"),
+            ItemFacet::Link,
+            Placement::new(0.0, 0.0, 240.0, 140.0),
+        )
+    }
+}
+
+/// *"add an option to copy the link with a button right here in the menu"* — a card's bar
+/// carries **two** address buttons now, and they must be two.
+///
+/// Every control in the bar is clicked in turn, each on its own chrome, and what it emits
+/// is collected. Aiming at a position instead — "the fifth widget" — would pass on a bar
+/// that emitted `CopyLink` from the button drawn where *Open page* is, which is the one
+/// mistake that matters here: the two sit side by side and are told apart only by an icon.
+#[test]
+fn a_link_cards_bar_copies_its_address_as_well_as_opening_it() {
+    const URL: &str = "https://example.com/thing";
+
+    let ctx = Context::default();
+    let mut chrome = Chrome::new();
+    let selection = [linked_card(Some(URL))];
+    let state = selected_state(&selection, Some(SELECTED));
+    settle(&ctx, &mut chrome, &state);
+    let bar = bar_rect(&ctx).expect("a selected card gets a bar");
+    let controls = widgets(&ctx, |rect| bar.contains(rect.center()));
+    assert!(controls.len() >= 6, "the card's bar drew {} controls", controls.len());
+
+    // What each control answers, as (copies, opens). Counting *rects* would be wrong:
+    // egui registers a widget for the icon and another for the frame around it, so two
+    // rects can share one button. What has to be true is about the buttons, not the
+    // rectangles — some control copies and does not open, some opens and does not copy,
+    // and no control does both.
+    let answers: Vec<(bool, bool)> = controls
+        .iter()
+        .map(|control| {
+            let ctx = Context::default();
+            let mut chrome = Chrome::new();
+            settle(&ctx, &mut chrome, &state);
+            let events = frame(&ctx, &mut chrome, &state, click_at(control.center())).events;
+            (
+                events.contains(&UiEvent::CopyLink(URL.to_owned())),
+                events.contains(&UiEvent::OpenLink(URL.to_owned())),
+            )
+        })
+        .collect();
+
+    assert!(answers.contains(&(true, false)), "no control copied the address: {answers:?}");
+    assert!(answers.contains(&(false, true)), "no control opened the page: {answers:?}");
+    assert!(
+        !answers.contains(&(true, true)),
+        "one control did both, so they are not two buttons: {answers:?}"
+    );
+}
+
+/// A card that arrived without an address gets neither button. A copy button there would
+/// put an empty string on the pasteboard over whatever the user had on it.
+#[test]
+fn a_card_with_no_address_offers_neither_link_button() {
+    let ctx = Context::default();
+    let mut chrome = Chrome::new();
+    let selection = [linked_card(None)];
+    let state = selected_state(&selection, Some(SELECTED));
+    settle(&ctx, &mut chrome, &state);
+    let bar = bar_rect(&ctx).expect("a selected card still gets a bar");
+
+    for control in widgets(&ctx, |rect| bar.contains(rect.center())) {
+        let ctx = Context::default();
+        let mut chrome = Chrome::new();
+        settle(&ctx, &mut chrome, &state);
+        let events = frame(&ctx, &mut chrome, &state, click_at(control.center())).events;
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                UiEvent::CopyLink(_) | UiEvent::OpenLink(_)
+            )),
+            "a control on an address-less card emitted {events:?}"
+        );
+    }
+}
+
 /// A row in the menu emits its command *and* closes the menu. Both halves matter: a
 /// context menu that stays open after acting is one the user has to dismiss twice.
 #[test]

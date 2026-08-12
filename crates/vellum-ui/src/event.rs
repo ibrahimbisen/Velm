@@ -69,6 +69,15 @@ pub enum UiEvent {
     /// action this crate leaves to the app, for the same reason it does not touch files or
     /// the clipboard.
     OpenLink(String),
+    /// *Copy link* was clicked on a link card: the app should put this URL on the system
+    /// pasteboard.
+    ///
+    /// A separate event from [`UiEvent::OpenLink`] rather than a flag on it, because the
+    /// two are different verbs with different consequences — one leaves the application
+    /// and one does not — and because the app has to clear its own clipboard sentinel for
+    /// this one. Like opening a page, the chrome does not do it: this crate touches
+    /// neither the clipboard nor the filesystem.
+    CopyLink(String),
     /// The eraser flyout's mode changed: strokes or whole objects.
     ///
     /// A mode rather than only the ⇧ modifier it used to be. The app keeps the mode; ⇧

@@ -76,9 +76,28 @@ const CARD_RADIUS: f32 = 6.0;
 /// Hairline width for borders, in world pixels. One device pixel at 100%.
 const HAIRLINE: f32 = 1.0;
 
-/// Selection outline width, in **device** pixels: a selection ring is chrome and
+/// Gesture and handle chrome width, in **device** pixels: all of it is chrome and
 /// must stay the same thickness however far the board is zoomed.
+///
+/// This sizes the resize/rotate handles' outline, the multi-selection box, the marquee,
+/// the placing preview, the pending connector and the kanban drop placeholder. It no
+/// longer sizes the ring around a selected item — that is [`SELECTION_RING_WIDTH`], which
+/// is deliberately half of this.
 const SELECTION_WIDTH: f32 = 2.0;
+
+/// The ring around a selected item, in **device** pixels — half the weight of the rest of
+/// the selection chrome above, at the user's request: *"the border on the selected items
+/// are too thick"*.
+///
+/// A ring is constant on screen while the item it wraps shrinks with the zoom, so on a
+/// fitted board a 2px ring is a band *around* a small item rather than an outline *on* it.
+/// One device pixel is the `HAIRLINE` idiom this design already uses everywhere it would
+/// otherwise reach for a shadow.
+///
+/// **No test can see this value.** `DrawList` exposes no quad reader, so
+/// `a_selection_ring_holds_its_screen_width_at_any_zoom` asserts quad *counts*; the honest
+/// check is a `--screenshot` of `--demo shapes --select-all`, measured in pixels.
+const SELECTION_RING_WIDTH: f32 = 1.0;
 
 /// How long one frame may spend shaping text it has not laid out before.
 ///
@@ -2348,8 +2367,9 @@ impl Painter {
         }
         list.use_view(board);
         // A selection ring is chrome: constant on screen, so its world width has to
-        // shrink as the board is zoomed in.
-        let width = (SELECTION_WIDTH as f64 / ctx.camera.zoom()) as f32;
+        // shrink as the board is zoomed in. Its own constant, thinner than the handles
+        // and the gesture chrome — see `SELECTION_RING_WIDTH`.
+        let width = (f64::from(SELECTION_RING_WIDTH) / ctx.camera.zoom()) as f32;
         for id in ctx.selection {
             let Some(projected) = ctx.projection.get(*id) else { continue };
             let (origin, (w, h)) = projected.rect();
@@ -4185,7 +4205,7 @@ fn push_card_drop(list: &mut DrawList, ctx: &DrawContext<'_>, board: u32) {
     let Some(corners) = ctx.card_drop else { return };
     list.use_view(board);
     let camera = ctx.camera;
-    // One device pixel at any zoom, like the selection ring: a placeholder that
+    // Constant on screen at any zoom, at the gesture chrome's weight: a placeholder that
     // fattened as the board was zoomed in would stop reading as an insertion line.
     let width = (f64::from(SELECTION_WIDTH) / camera.zoom()) as f32;
     for pair in 0..4 {

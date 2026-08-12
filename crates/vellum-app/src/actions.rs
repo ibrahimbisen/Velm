@@ -493,6 +493,7 @@ impl ActiveState {
             }
             UiEvent::ZoomTo(zoom) => self.zoom_to(f64::from(zoom)),
             UiEvent::OpenLink(url) => self.open_in_browser(&url),
+            UiEvent::CopyLink(url) => self.copy_link(&url),
             UiEvent::Library(event) => self.library_event(event),
             // The strip has already moved itself — it owns the order and which tab is
             // in front. Both of these mean the same thing to the app: put the document
@@ -882,6 +883,40 @@ impl ActiveState {
             // block the frame loop for as long as it takes a cold browser to start.
             Ok(_) => self.ok("Opened in your browser"),
             Err(error) => self.failed("opening the page", &anyhow::anyhow!(error)),
+        }
+    }
+
+    /// Puts a card's address on the system pasteboard, for *Copy link*.
+    ///
+    /// **No scheme filter, unlike [`open_in_browser`](Self::open_in_browser).** That one
+    /// hands a string from a board file to the system opener, which is how a document
+    /// becomes a way to run things; this one only ever writes characters somewhere the
+    /// user then has to paste. So a `mailto:` card's address copies, which is the whole
+    /// point of having the button on it.
+    ///
+    /// **`clipboard_text` is cleared, and that is the load-bearing line.** It is the
+    /// sentinel meaning *the text on the pasteboard is the words of the items in
+    /// `self.clipboard`* — see [`copy`](Self::copy) — so leaving a board copy's string in
+    /// it while writing a URL over the top would make the very next `⌘V` paste those items
+    /// instead of the link. Cleared on a failed write too, for the reason `copy` gives:
+    /// whatever is on the pasteboard afterwards, it is not ours to claim.
+    ///
+    /// The session's one `arboard` handle, never a fresh one — `crate::editor` records
+    /// what building these per keystroke cost.
+    fn copy_link(&mut self, url: &str) {
+        let written = {
+            let clipboard = self
+                .system_clipboard
+                .get_or_insert_with(|| arboard::Clipboard::new().map_err(|error| error.to_string()));
+            match clipboard {
+                Ok(clipboard) => clipboard.set().text(url.to_owned()).map_err(|error| error.to_string()),
+                Err(error) => Err(error.clone()),
+            }
+        };
+        self.clipboard_text = None;
+        match written {
+            Ok(()) => self.ok("Link copied"),
+            Err(error) => self.failed("copying the link", &anyhow::anyhow!(error)),
         }
     }
 

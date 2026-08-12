@@ -60,6 +60,13 @@ pub enum Control {
     CardMode,
     /// Open the one selected card's page.
     OpenPage,
+    /// Put the one selected card's address on the pasteboard.
+    ///
+    /// Beside *Open page* rather than behind the `⋮`: a card's address is the thing it is
+    /// made of, and the two verbs anybody has for an address are *go there* and *send it
+    /// to someone*. It is in the `⋮` menu as well, since that list is what a right-click
+    /// gives and the bar is not the only way in.
+    CopyLink,
     /// The item's own fill colour.
     Fill,
     /// A shape's outline, an ink stroke, or a connector's line — all three are
@@ -113,6 +120,7 @@ pub fn controls(model: &PanelModel) -> Vec<Control> {
         out.push(Control::CardMode);
         if model.link_url.is_some() {
             out.push(Control::OpenPage);
+            out.push(Control::CopyLink);
         }
     }
 
@@ -354,6 +362,20 @@ fn draw(
                     .clicked()
             {
                 events.push(UiEvent::OpenLink(url));
+            }
+        }
+
+        // Two overlapping rectangles — `Icon::Duplicate`, which is the copy glyph
+        // everywhere else in this interface and needs no second drawing of its own. The
+        // hover text names the address, so the two link buttons are told apart by what
+        // they say they will do rather than by their icons alone.
+        Control::CopyLink => {
+            if let Some(url) = model.link_url.clone()
+                && icon_button(ui, palette, Icon::Duplicate, CONTROL, false)
+                    .on_hover_text(format!("Copy link · {url}"))
+                    .clicked()
+            {
+                events.push(UiEvent::CopyLink(url));
             }
         }
 
@@ -840,12 +862,19 @@ mod tests {
         assert!(!stroke.contains(&Control::Routing));
     }
 
-    /// *Open page* needs an address, exactly as the context menu's row does.
+    /// *Open page* and *Copy link* both need an address, exactly as the context menu's
+    /// rows do. A copy button on a card with no address would put an empty string on the
+    /// pasteboard over whatever the user had there, which is worse than no button.
     #[test]
     fn a_card_offers_its_page_only_when_it_has_one() {
-        assert!(of(&[card(Some("https://example.com"))]).contains(&Control::OpenPage));
-        assert!(!of(&[card(None)]).contains(&Control::OpenPage));
-        assert!(of(&[card(None)]).contains(&Control::CardMode), "the mode still applies");
+        let with = of(&[card(Some("https://example.com"))]);
+        assert!(with.contains(&Control::OpenPage));
+        assert!(with.contains(&Control::CopyLink));
+
+        let without = of(&[card(None)]);
+        assert!(!without.contains(&Control::OpenPage));
+        assert!(!without.contains(&Control::CopyLink));
+        assert!(without.contains(&Control::CardMode), "the mode still applies");
     }
 
     /// A separator with nothing on one side of it is a stray line. This is the failure
