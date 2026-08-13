@@ -733,19 +733,10 @@ impl Chrome {
             );
         }
 
-        // Hoisted out of the header so `ChromeOutput` can report them: the native menu
-        // bar ticks from exactly these, and a second derivation of "is the grid on" is
-        // how two menus come to disagree.
-        let flags = MenuFlags {
-            link_previews: state.link_previews,
-            align_objects: state.align_objects,
-            snap_to_grid: state.snap_to_grid,
-            minimap_visible: state.view.minimap_visible,
-            presenting: state.view.presenting,
-            starred: state.board.starred,
-            translucent: palette.translucent,
-            properties_panel: self.properties_open,
-        };
+        // `flags` was built above, before the presenting early return needed it. There used
+        // to be a second, identical construction here that shadowed it — harmless while the
+        // two agreed, and exactly the second derivation the comment above warns about the
+        // moment a field is added to only one of them.
 
         // Read by the menu bar and by the context menu, which is drawn after the canvas
         // rectangle is known — hence out here rather than inside the board's arm.

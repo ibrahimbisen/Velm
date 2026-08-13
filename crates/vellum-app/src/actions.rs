@@ -484,6 +484,26 @@ impl ActiveState {
             UiEvent::ShapeColorsChanged { .. }
             | UiEvent::PenChanged(_)
             | UiEvent::EraserChanged(_) => {}
+            // An agent edit **mutates the document**, and it arrives as a `UiEvent` rather
+            // than as a `Command` — so `Command::mutates_board`, which is what normally
+            // closes a live caret before a board-mutating verb, never sees it. Feedback 30
+            // recorded exactly this shape twice: `style()` and `transform()` bypass the
+            // command table the same way and leaked an undo group for the same reason.
+            // `settle()` first, or an agent reconfigured mid-edit raises
+            // `UndoGroupAlreadyStarted` and breaks every operation after it.
+            UiEvent::Agent(edit) => {
+                self.settle();
+                self.apply_agent_edit(&edit);
+            }
+            UiEvent::DefaultDisplayModeChanged(mode) => {
+                self.shell.library.set_default_display_mode(mode);
+                // Every node that never chose a mode follows this, so the views the painter
+                // reads are now stale — feature 2's second half is exactly that they move.
+                self.shell.invalidate_selection();
+            }
+            UiEvent::ProviderSignIn(provider) => self.ask_provider_key(provider),
+            UiEvent::ProviderForget(provider) => self.forget_provider_key(provider),
+            UiEvent::RevealPath(path) => self.reveal_path(&path),
             UiEvent::Style(edit) => self.style(&edit),
             UiEvent::Transform(edit) => self.transform(edit),
             UiEvent::TextEdited(text) => self.set_text(&text),
@@ -1145,6 +1165,7 @@ impl ActiveState {
             epoch: u64::MAX,
             items: usize::MAX,
             has_nodes: false,
+            has_notes: false,
         });
         key
     }
@@ -1195,6 +1216,7 @@ impl ActiveState {
         // and `<data-dir>/agents/<board-key>/notes` otherwise, and a board has no other way
         // of saying which it is — nothing else in the application knows a board's project.
         let mut project: Option<PathBuf> = None;
+        let mut has_notes = false;
 
         for (_, projected) in self.editor.projection().iter() {
             match &projected.item.kind {
@@ -1230,6 +1252,7 @@ impl ActiveState {
                         wires.push((a, b, start.arrowhead, end.arrowhead));
                     }
                 }
+                ItemKind::AgentNote { .. } => has_notes = true,
                 _ => {}
             }
         }
@@ -1263,6 +1286,7 @@ impl ActiveState {
             stamp.epoch = epoch;
             stamp.items = items;
             stamp.has_nodes = has_nodes;
+            stamp.has_notes = has_notes;
         }
     }
 
@@ -1272,7 +1296,8 @@ impl ActiveState {
     /// occluded tick as well — see [`crate::agent_runtime::AgentRuntime::drain`] for why
     /// hiding the window must not stop an agent's output reaching disk.
     ///
-    /// On a board with no agent nodes this is two comparisons and a `dormant()` check.
+    /// On a board with no agent nodes and no note nodes this is three comparisons and a
+    /// `dormant()` check — no clock read, no camera, no R-tree.
     pub(crate) fn poll_agents(&mut self) {
         let path = self.editor.path();
         let epoch = self.editor.projection().generation();
@@ -1284,11 +1309,26 @@ impl ActiveState {
         if stale {
             self.sync_agent_wiring();
         }
-        if self.agent_runtime.dormant() {
+
+        // The whole per-frame cost on an ordinary board ends here: two comparisons above,
+        // one `is_some_and`, and one `dormant()`. Nothing below runs — not even a clock
+        // read — for a board that has neither an agent node nor a note node.
+        let has_notes = self.agent_board.as_ref().is_some_and(|stamp| stamp.has_notes);
+        if !has_notes && self.agent_runtime.dormant() {
             return;
         }
 
         let now = crate::agent_runtime::unix_now();
+        // Notes first, and **outside** the `dormant` early-out below: a board can hold
+        // file-backed notes and no running agent at all, and that board still has to notice
+        // its files changing. Guarded by the same rule everything else here is — a reload
+        // writes the node's stamps into the document.
+        if has_notes && !self.busy_with_a_group() {
+            self.poll_agent_notes(now);
+        }
+        if self.agent_runtime.dormant() {
+            return;
+        }
         self.agent_runtime.drain(now);
         self.report_agent_runs();
 
@@ -1303,6 +1343,92 @@ impl ActiveState {
         }
         self.run_due_agents(now);
         self.serve_agent_jobs();
+    }
+
+    /// §8's *external edits win on a clean node*, for the notes that are on screen.
+    ///
+    /// Three bounds, the same three `poll_visible_link_previews` uses and for the same
+    /// reasons: **on screen only**, so a board of forty notes stats the handful you are
+    /// looking at; **rate limited** to [`crate::agent_runtime::NOTE_POLL_SECONDS`], so it is
+    /// a poll rather than a syscall per note per frame; and **changed only**, so a board
+    /// whose files nobody is editing does no work beyond the `stat`.
+    ///
+    /// ⚠ **The canvas-side half is not here.** A note being edited on the canvas is supposed
+    /// to hold its buffer until the caret leaves and then write, and a conflict is supposed to
+    /// keep both sides. `NoteStore::save` implements all of that — including the
+    /// `<slug>.velm-conflict.md` rule — and there is no caret path into a note's *body* to
+    /// call it from yet, because `ItemKind::AgentNote` answers `text()` with its **title**.
+    /// So this reloads and never writes, which is the safe half: it cannot lose an edit,
+    /// because it never makes one.
+    fn poll_agent_notes(&mut self, now: vellum_agent::Timestamp) {
+        let board = self.agent_board_key();
+        let Some(store) = self.agent_runtime.note_store(&board).cloned() else {
+            return;
+        };
+        let visible = self.camera.visible_world_rect();
+        let wanted: Vec<(DocId, vellum_agent::NoteModel)> = self
+            .editor
+            .projection()
+            .scene()
+            .query_rect(visible)
+            .filter_map(|item| {
+                let projected = self.editor.projection().get(item.id)?;
+                let ItemKind::AgentNote { model, .. } = &projected.item.kind else {
+                    return None;
+                };
+                Some((projected.doc_id, crate::note::decode(model)))
+            })
+            .collect();
+
+        for (doc, mut note) in wanted {
+            // A note whose model has never been through `NoteStore::create` addresses no
+            // file, and `resolve_stored` refuses an empty path rather than resolving to the
+            // notes *directory*. Skipped here so that is not an error every two seconds.
+            if note.path.trim().is_empty() {
+                continue;
+            }
+            let key = crate::agent_runtime::NodeKey::new(&board, doc.to_string());
+            if !self.agent_runtime.note_due(&key, now) {
+                continue;
+            }
+            let fresh = store
+                .freshness(&note)
+                .unwrap_or(vellum_agent::Freshness::Missing);
+            // `NeverSeen` counts: a node opened from a board saved by an earlier session has
+            // no stamp, and treating that as "unchanged" would leave it showing nothing.
+            if !matches!(
+                fresh,
+                vellum_agent::Freshness::Changed | vellum_agent::Freshness::NeverSeen
+            ) {
+                continue;
+            }
+            // `Requester::User`, and it is the only correct answer: this is the canvas
+            // reading a note on the user's behalf, and `access_check` never refuses them —
+            // §8's *"the user must keep full access"* is why the restriction is at the IPC
+            // boundary rather than in the filesystem.
+            match store.reload(&mut note, vellum_agent::Requester::User) {
+                Ok(text) => {
+                    self.agent_runtime.set_note_text(&key, text);
+                    // The stamps and the derived links go back into the token, so the next
+                    // poll can tell "unchanged" from "never seen" and a chain is traversable
+                    // without opening every note on the board.
+                    self.write_note_model(doc, &note);
+                }
+                // Not a toast: a note whose file has been moved is a thing the node itself
+                // should say, and saying it every two seconds in a toast is noise.
+                Err(error) => log::debug!("agents: reloading {}: {error}", note.path),
+            }
+        }
+    }
+
+    /// Write a note node's model back into its token, keeping its title.
+    fn write_note_model(&mut self, doc: DocId, model: &vellum_agent::NoteModel) {
+        let Ok(item) = self.editor.board().item(doc) else { return };
+        let ItemKind::AgentNote { title, .. } = item.kind else { return };
+        let kind = ItemKind::AgentNote { model: crate::note::encode(model), title };
+        if let Err(error) = self.editor.edit(|board| Ok(board.set_kind(doc, kind)?)) {
+            self.failed("saving a note's state", &error);
+        }
     }
 
     /// Put what a scheduled run found in front of the user.
@@ -1323,7 +1449,26 @@ impl ActiveState {
             let Some((config, role)) = self.agent_model(doc) else { continue };
             let Some(schedule) = config.schedule.clone() else { continue };
 
-            if !self.agent_trigger_holds(&schedule, &config) {
+            // **Checked before `last_run` moves**, because three of the four triggers ask
+            // "since when" and the answer is exactly that field.
+            let held = self.agent_trigger_holds(&schedule, &config);
+
+            // `last_run` goes in the document **whether or not the trigger held**, so the
+            // next fire time is computed from it and the scheduler is re-armed by the epoch
+            // change this write causes — which is what closes the loop without a second
+            // source of truth about when it last ran. Writing it only on a run was the first
+            // version and was wrong: a declined fire stayed past due, so every later edit to
+            // the board re-armed it, fired it again and wrote another skipped line.
+            let mut next = config.clone();
+            if let Some(schedule) = next.schedule.as_mut() {
+                schedule.last_run = Some(now);
+                if held {
+                    schedule.last_failed = false;
+                }
+            }
+            self.write_agent_model(doc, &next);
+
+            if !held {
                 // Not an error and not silent: a schedule that declined is a thing that
                 // happened, and a node that showed nothing would read as one that never fired.
                 let message = format!(
@@ -1337,16 +1482,6 @@ impl ActiveState {
                 );
                 continue;
             }
-
-            // `last_run` goes in the document, so the next fire time is computed from it and
-            // the scheduler is re-armed by the epoch change this write causes — which is what
-            // closes the loop without a second source of truth about when it last ran.
-            let mut next = config.clone();
-            if let Some(schedule) = next.schedule.as_mut() {
-                schedule.last_run = Some(now);
-                schedule.last_failed = false;
-            }
-            self.write_agent_model(doc, &next);
 
             self.agent_runtime
                 .expect_completion(&key, schedule.completion.clone());
@@ -1645,6 +1780,138 @@ impl ActiveState {
         }
     }
 
+}
+
+/// A prompt row with the keyboard in it: which node, and what has been typed.
+///
+/// Deliberately *not* a `crate::edit::Editing`. That type carries a `SceneId`, a `DocId` and
+/// a slot because it writes into the document; this writes into the session pool and nothing
+/// else. Sharing the type would have meant a document id on a thing that must never touch a
+/// document.
+#[derive(Debug)]
+pub struct Prompting {
+    /// The agent node being addressed.
+    pub doc: DocId,
+    pub buffer: crate::edit::TextBuffer,
+}
+
+impl ActiveState {
+    /// Puts the keyboard in one node's prompt row.
+    ///
+    /// # Why this is not the on-canvas caret
+    ///
+    /// `crate::edit`'s caret edits **an item's text in the document**: every keystroke is a
+    /// CRDT write, it merges into an undo group, and `⌘Z` puts it back. A prompt is none of
+    /// those things — it is not board content, it must not be an undo step, and it must not
+    /// reach the document at all (`docs/07-agent-canvas.md` §4: agent traffic never enters
+    /// the file RULE ZERO protects). Routing it through the caret would put every half-typed
+    /// instruction into the board's history.
+    ///
+    /// So it is its own small mode, held beside the caret rather than inside it, and the two
+    /// are mutually exclusive: `settle()` first, exactly as every other command does, so a
+    /// caret cannot be left open behind a prompt.
+    fn begin_prompting(&mut self, doc: DocId) {
+        self.settle();
+        let existing = self.agent_draft(doc);
+        self.prompting = Some(Prompting { doc, buffer: crate::edit::TextBuffer::at_end(existing) });
+    }
+
+    /// Whether the keyboard currently belongs to a prompt row.
+    pub(crate) const fn is_prompting(&self) -> bool {
+        self.prompting.is_some()
+    }
+
+    /// Ends the prompt session, keeping whatever was typed.
+    ///
+    /// The draft **survives**: clicking away from a half-written instruction and losing it is
+    /// the kind of small betrayal that stops people trusting a tool, which is why the runtime
+    /// holds the draft rather than this transient session.
+    pub(crate) fn end_prompting(&mut self) {
+        let Some(session) = self.prompting.take() else { return };
+        let text = session.buffer.text().to_owned();
+        self.set_agent_draft(session.doc, text);
+    }
+
+    /// A key pressed while a prompt row has the keyboard.
+    ///
+    /// Returns whether it was consumed, exactly as [`ActiveState::type_key`] does — and it is
+    /// asked **first**, so a prompt row swallows `V`, `N` and `T` rather than switching tools
+    /// under someone mid-sentence. That was the same trap `--demo typing` exists to catch for
+    /// the canvas caret.
+    pub(crate) fn type_prompt_key(
+        &mut self,
+        key: &winit::keyboard::Key,
+        text: Option<&str>,
+    ) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+
+        let Some(session) = self.prompting.as_mut() else { return false };
+        let doc = session.doc;
+        let modifiers = self.input.modifiers();
+        let command = modifiers.super_key() || modifiers.control_key();
+
+        match key {
+            // Enter sends. ⇧⏎ inserts a line break, because a prompt is often a paragraph
+            // and the chord everybody already knows from every chat box is the one to honour.
+            Key::Named(NamedKey::Enter) if !modifiers.shift_key() => {
+                let prompt = session.buffer.text().trim().to_owned();
+                self.prompting = None;
+                if prompt.is_empty() {
+                    return true;
+                }
+                self.set_agent_draft(doc, prompt);
+                self.run_agent(doc);
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                session.buffer.insert("\n");
+                true
+            }
+            // Escape leaves the row without sending, and keeps the draft.
+            Key::Named(NamedKey::Escape) => {
+                self.end_prompting();
+                true
+            }
+            Key::Named(NamedKey::Backspace) => {
+                session.buffer.backspace();
+                true
+            }
+            Key::Named(NamedKey::Delete) => {
+                session.buffer.delete();
+                true
+            }
+            // Motion goes through the same `Motion` vocabulary the canvas caret uses, so a
+            // prompt row moves the way every other field in the app does — including word
+            // motion, which is the one people notice missing.
+            Key::Named(NamedKey::ArrowLeft) => {
+                session.buffer.move_cursor(crate::edit::Motion::Left, modifiers.shift_key());
+                true
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                session.buffer.move_cursor(crate::edit::Motion::Right, modifiers.shift_key());
+                true
+            }
+            Key::Named(NamedKey::Home) => {
+                session.buffer.move_cursor(crate::edit::Motion::ParagraphStart, modifiers.shift_key());
+                true
+            }
+            Key::Named(NamedKey::End) => {
+                session.buffer.move_cursor(crate::edit::Motion::ParagraphEnd, modifiers.shift_key());
+                true
+            }
+            // A chord is not text. Without this guard ⌘S types an "s" into the prompt and
+            // never saves — the shape of trap 9, arrived at from the other side.
+            _ if command => false,
+            _ => match text {
+                Some(text) if !text.is_empty() && !text.chars().all(char::is_control) => {
+                    session.buffer.insert(text);
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+
     /// Start the agent under the Run button, or send it whatever is in its prompt row.
     pub(crate) fn run_agent(&mut self, doc: DocId) {
         // A caret or an eraser sweep is closed first, for the reason `run` closes one: this
@@ -1783,6 +2050,36 @@ impl ActiveState {
         self.ok(digest.headline());
     }
 
+    /// Which part of an agent node a world point is over, if any.
+    ///
+    /// The press path's single question, answered from **the same rectangles the painter
+    /// drew** — `crate::agent::layout`, which its own header says is called by both readers
+    /// precisely so a control cannot be drawn where it cannot be pressed.
+    fn agent_part_under(
+        &self,
+        scene: SceneId,
+        world: WorldPoint,
+    ) -> Option<crate::agent::AgentPart> {
+        let projected = self.editor.projection().get(scene)?;
+        if !matches!(projected.item.kind, ItemKind::Agent { .. }) {
+            return None;
+        }
+        let placement = projected.item.placement;
+        let (width, height) = placement.scaled_size();
+        // `placement.x`/`y` are the item's **centre**, so the top-left corner is half its
+        // size back from there — the arithmetic `badge_under` above spells out, and getting
+        // it backwards puts every control a whole node up and to the left.
+        //
+        // Unrotated, matching the painter: an agent node's pieces are positioned from the
+        // unrotated box and the node is spun in place, so undoing the rotation here would be
+        // tidier and would make the click disagree with what is on screen.
+        let (x, y) = (
+            world.x - placement.x + width / 2.0,
+            world.y - placement.y + height / 2.0,
+        );
+        crate::agent::layout(width, height).hit(x, y)
+    }
+
     /// Stop every agent. Called on quit, alongside the flush of every open board.
     pub(crate) fn shutdown_agents(&mut self) {
         self.agent_runtime.shutdown();
@@ -1836,6 +2133,56 @@ impl ActiveState {
             self.settle();
         }
         match command {
+            // --- the Agent Canvas ---
+            //
+            // The first three act on the selection and are gated by `CommandContext`, so
+            // reaching them with nothing selected is the chrome's bug rather than a state
+            // worth reporting. The last two are application settings and always apply.
+            Command::RunAgent => {
+                if let Some(doc) = self.selected_agent() {
+                    self.run_agent(doc);
+                }
+            }
+            Command::StopAgent => {
+                if let Some(doc) = self.selected_agent() {
+                    self.stop_agent(doc);
+                }
+            }
+            Command::ToggleAgentRaw => {
+                if let Some(doc) = self.selected_agent() {
+                    self.toggle_agent_display(doc);
+                }
+            }
+            Command::EditAgentRules => self.edit_agent_rules(),
+            Command::EditAgentSchedule => self.edit_agent_schedule(),
+            Command::ToggleBrowserNodes => {
+                let on = !self.shell.library.browser_nodes();
+                self.shell.library.set_browser_nodes(on);
+                // Turning the permission *off* must also stop whatever is already running,
+                // or the setting says one thing and the memory says another. Turning it on
+                // deliberately starts nothing: a node still needs its own `live` — see
+                // `crate::browser::should_run_engine` for why that is two switches.
+                if !on {
+                    self.stop_browser_engines();
+                }
+                self.ok(if on {
+                    "Browser nodes are on. A page loads when you press Load on one."
+                } else {
+                    "Browser nodes are off."
+                });
+            }
+            Command::ToggleWorktrees => {
+                let on = !self.shell.library.worktrees();
+                self.shell.library.set_worktrees(on);
+                // Deliberately does **not** remove existing worktrees: one may hold work
+                // that is not committed anywhere else, and `docs/07-agent-canvas.md` §9 is
+                // explicit that removal is confirmed and never implicit.
+                self.ok(if on {
+                    "New coding agents will get their own worktree."
+                } else {
+                    "New agents will work in the project directory. Existing worktrees are kept."
+                });
+            }
             // --- board ---
             Command::NewBoard => self.shell.ask(
                 |id| {
@@ -2101,6 +2448,8 @@ impl ActiveState {
             "frame-marquee" => self.demo_frame_marquee(),
             "grid-snap" => self.demo_grid_snap(),
             "agent" => self.demo_agent(),
+            "agent-transcript" => self.demo_agent_transcript(),
+            "agent-message" => self.demo_agent_message(),
             // Not a fixture, but the same "do it on the first frame so an unattended
             // run can check it" need — an export is a menu row and nothing else can
             // reach one.
@@ -2112,7 +2461,8 @@ impl ActiveState {
                 "--demo: no fixture called `{other}` \
                  (shapes, empty, table, chart, mindmap, kanban, card-drag, typing, caret, connector, placing, snapping, \
                   object-eraser, group-handles, locked-arrange, widget-edit, links, copy-paste, context-menu, \
-                  edit-then-delete, frame-marquee, grid-snap, agent, export-svg, export-pdf, export-png, present)"
+                  edit-then-delete, frame-marquee, grid-snap, agent, agent-transcript, agent-message, \
+                  export-svg, export-pdf, export-png, present)"
             ),
         }
     }
@@ -2223,6 +2573,295 @@ impl ActiveState {
             self.gap(&format!(
                 "the wiring produced {message} message link(s), {context} context link(s) \
                  and {plain} plain connector(s); expected 1, 1 and 0"
+            ));
+        }
+    }
+
+    /// Places one agent node with the **real** tool, through a real placement drag.
+    ///
+    /// Shared by the three agent fixtures rather than copied into each, because a copy is a
+    /// fixture that can quietly stop entering through the tool — which is the one thing they
+    /// all exist to prove.
+    fn place_agent(&mut self, x: f64) {
+        let (width, height) = crate::agent::DEFAULT_SIZE;
+        self.choose_tool(Tool::Agent);
+        let from = self.camera.world_to_screen(WorldPoint::new(x, 0.0));
+        let to = self
+            .camera
+            .world_to_screen(WorldPoint::new(x + width, height));
+        self.act_on(Intent::Place { at: from, to });
+    }
+
+    /// Every agent node on the board, in document order.
+    fn agent_ids(&self) -> Vec<DocId> {
+        self.editor
+            .board()
+            .item_ids()
+            .into_iter()
+            .filter(|id| {
+                matches!(
+                    self.editor.board().item(*id).map(|item| item.kind),
+                    Ok(ItemKind::Agent { .. })
+                )
+            })
+            .collect()
+    }
+
+    /// An agent node with a transcript in it, and the display mode filtering it.
+    ///
+    /// # Why a fixture and not a unit test
+    ///
+    /// `TranscriptEvent::visible_in_clean_mode` is pure and tested, and `agent_view.rs`'s own
+    /// tests prove a view can be filed and found. Neither says anything about the four things
+    /// that are wiring, and each of them has a way of being silently wrong:
+    ///
+    /// - **That a node on screen gets a view at all.** The runtime culls to the viewport, so
+    ///   a fixture that never fitted the board would assert about a node that was correctly
+    ///   skipped and read as a pass.
+    /// - **That the events reaching the painter are the filtered ones.** A build that handed
+    ///   the painter everything satisfies "the view has events" and shows a user the tool
+    ///   calls Clean mode exists to hide.
+    /// - **That the node's own mode overrides the global default**, which is
+    ///   `crate::agent::display_mode`'s whole job and is reached only through the toggle.
+    /// - **That none of it leaks an undo group.** Which is why the last thing this does is
+    ///   delete a *different* item: a leaked group breaks the operation *after* it, so a
+    ///   fixture that stopped at its own assertion would pass on an already-broken board.
+    ///   That is `--demo edit-then-delete`'s rule, applied here.
+    ///
+    /// It also leaves a rendered node on screen for `--screenshot`, which is the only way to
+    /// see that a transcript *draws* — no assertion here can.
+    fn demo_agent_transcript(&mut self) {
+        self.place_agent(-900.0);
+        // A second node, so the delete at the end has something to take that is not the node
+        // the screenshot is of.
+        self.place_agent(-100.0);
+        // A freshly placed agent takes the caret on its role, so the gesture leaves an
+        // editing session open. Feedback 27's rule: close it before dispatching anything.
+        self.settle();
+
+        let agents = self.agent_ids();
+        let [subject, spare] = agents.as_slice() else {
+            self.gap(&format!("the agent tool placed {} node(s), not 2", agents.len()));
+            return;
+        };
+        let (subject, spare) = (*subject, *spare);
+
+        // Scripted through the **real** store, at the real board key, so what the view is
+        // built from is a transcript on disk and not a fixture's private vector.
+        let key = self.agent_key(subject);
+        let at = crate::agent_runtime::unix_now();
+        let turn = vellum_agent::TurnId(1);
+        let call = vellum_agent::ToolCallId("t1".into());
+        let script = [
+            vellum_agent::TranscriptEvent::TurnStarted {
+                turn,
+                prompt: "check the workspace builds".into(),
+            },
+            vellum_agent::TranscriptEvent::Thought {
+                text: "I should run the tests before answering.".into(),
+            },
+            vellum_agent::TranscriptEvent::ToolCall {
+                id: call.clone(),
+                name: "bash".into(),
+                input: "cargo test --workspace".into(),
+            },
+            vellum_agent::TranscriptEvent::ToolResult {
+                id: call,
+                output: "2345 passed".into(),
+                ok: true,
+            },
+            vellum_agent::TranscriptEvent::Text {
+                text: "The workspace builds and every test passes.".into(),
+            },
+            vellum_agent::TranscriptEvent::TurnEnded {
+                turn,
+                outcome: vellum_agent::TurnOutcome::Completed,
+            },
+        ];
+        for (step, event) in script.iter().enumerate() {
+            self.agent_runtime.record(&key, at + step as u64, event);
+        }
+
+        self.fit_board();
+        // Through the real per-frame path: the wiring is derived from the document and the
+        // views are rebuilt from the runtime, exactly as a frame does it.
+        self.poll_agents();
+        self.rebuild_agent_views();
+
+        let Some(scene) = self.editor.projection().scene_id(subject) else {
+            self.gap("the agent node is not in the scene");
+            return;
+        };
+        let clean = self.agents.get(scene).map(|view| (view.mode, view.events.len()));
+        let Some((clean_mode, clean_shown)) = clean else {
+            self.gap("a visible agent node was given no view");
+            return;
+        };
+
+        // Raw shows everything; Clean hides the thought, the call and its result.
+        self.toggle_agent_display(subject);
+        self.poll_agents();
+        self.rebuild_agent_views();
+        let raw = self.agents.get(scene).map(|view| (view.mode, view.events.len()));
+        let Some((raw_mode, raw_shown)) = raw else {
+            self.gap("the node lost its view when its display mode changed");
+            return;
+        };
+
+        // What is on disk, which is what a restart would read back.
+        let on_disk = self
+            .agent_runtime
+            .sidecar()
+            .read_all(&key.board, &key.item)
+            .map_or(0, |tail| tail.records.len());
+
+        // The operation *after* the one being tested. See the doc comment.
+        self.editor.select([spare]);
+        self.shell.invalidate_selection();
+        self.run(Command::Delete);
+        let left = self.agent_ids().len();
+
+        let expected_clean = script
+            .iter()
+            .filter(|event| event.visible_in_clean_mode())
+            .count();
+        if clean_mode == vellum_agent::DisplayMode::Clean
+            && clean_shown == expected_clean
+            && raw_mode == vellum_agent::DisplayMode::Raw
+            && raw_shown == script.len()
+            && on_disk == script.len()
+            && left == 1
+        {
+            self.ok(format!(
+                "an agent node drew {clean_shown} of {} events in Clean mode and all {} in \
+                 Raw, with {on_disk} on disk — and a delete afterwards still worked",
+                script.len(),
+                raw_shown
+            ));
+        } else {
+            self.gap(&format!(
+                "clean showed {clean_shown} (expected {expected_clean}) in {clean_mode:?}, \
+                 raw showed {raw_shown} (expected {}) in {raw_mode:?}, {on_disk} reached disk, \
+                 and {left} node(s) survived the delete (expected 1)",
+                script.len()
+            ));
+        }
+    }
+
+    /// A message actually crossing a connector, and the direction the arrowhead derives.
+    ///
+    /// # Why a fixture and not a unit test
+    ///
+    /// `vellum_agent::bus` is pure and has its own tests for routing, the hop bound and the
+    /// direction rule. What none of them can say is that **the board's own connectors reach
+    /// it**: the topology is derived by walking the projection, an agent link is derived from
+    /// the two endpoints' kinds, and a connector that failed to bind reads as no link at all
+    /// — the feature would look switched off with every unit test green.
+    ///
+    /// Three things are asserted, and each rules out a build the other two would pass:
+    ///
+    /// - **Both transcripts, read back off disk.** The bus writes one line at each end so a
+    ///   conversation reads correctly from either; checking only the receiver would pass on a
+    ///   build where the sender's own record was never written.
+    /// - **The reply is refused.** A drawn connector carries an arrowhead on its *end* alone,
+    ///   so the link is one-way — and a build that ignored direction and let everything
+    ///   through would satisfy "a message crossed".
+    /// - **A second message still goes**, and a board edit after it still works. A refusal
+    ///   that broke the bus, or a message path that leaked an undo group, is only visible in
+    ///   the operation *after* the one being tested.
+    fn demo_agent_message(&mut self) {
+        self.place_agent(-900.0);
+        self.place_agent(-100.0);
+        self.settle();
+
+        let agents = self.agent_ids();
+        let [left, right] = agents.as_slice() else {
+            self.gap(&format!("the agent tool placed {} node(s), not 2", agents.len()));
+            return;
+        };
+        let (left, right) = (*left, *right);
+
+        self.fit_board();
+        // The real connector tool, so the endpoints are bound by the same path a user's drag
+        // takes — the derivation is on the endpoints, and a connector that bound to nothing
+        // would leave the two agents unlinked while looking joined.
+        self.choose_tool(Tool::Connector);
+        let from = self.camera.world_to_screen(WorldPoint::new(-640.0, 200.0));
+        let to = self.camera.world_to_screen(WorldPoint::new(160.0, 200.0));
+        self.act_on(Intent::Place { at: from, to });
+
+        // Derives the wiring from the document, exactly as a frame does.
+        self.poll_agents();
+
+        let sender = self.agent_key(left);
+        let receiver = self.agent_key(right);
+        let now_ms = crate::agent_runtime::unix_now().saturating_mul(1_000);
+        let forward = self
+            .agent_runtime
+            .send(&sender, &receiver.wire(), "start on the parser", now_ms);
+        // Against the arrow, which the arrowhead says is not a direction this link carries.
+        let backward = self
+            .agent_runtime
+            .send(&receiver, &sender.wire(), "no, you start", now_ms);
+        // A second one the right way round, *after* the refusal: a bus left in a bad state by
+        // a refusal is only visible here.
+        let again = self
+            .agent_runtime
+            .send(&sender, &receiver.wire(), "and then the lexer", now_ms);
+        self.poll_agents();
+
+        let count = |actions: &Self, key: &crate::agent_runtime::NodeKey, sent: bool| {
+            actions
+                .agent_runtime
+                .sidecar()
+                .read_all(&key.board, &key.item)
+                .map_or(0, |tail| {
+                    tail.records
+                        .iter()
+                        .filter(|record| {
+                            if sent {
+                                matches!(
+                                    record.event,
+                                    vellum_agent::TranscriptEvent::MessageSent { .. }
+                                )
+                            } else {
+                                matches!(
+                                    record.event,
+                                    vellum_agent::TranscriptEvent::Message { .. }
+                                )
+                            }
+                        })
+                        .count()
+                })
+        };
+        let sent = count(self, &sender, true);
+        let received = count(self, &receiver, false);
+
+        // The operation after: a board edit, to prove nothing leaked an undo group.
+        self.editor.select([right]);
+        self.shell.invalidate_selection();
+        self.run(Command::Delete);
+        let left_standing = self.agent_ids().len();
+
+        if forward.is_ok()
+            && again.is_ok()
+            && backward.is_err()
+            && sent == 2
+            && received == 2
+            && left_standing == 1
+        {
+            self.ok(
+                "2 messages crossed the connector and landed in both transcripts; the reply \
+                 against the arrow was refused, and a delete afterwards still worked",
+            );
+        } else {
+            self.gap(&format!(
+                "forward {:?}, again {:?}, backward {:?}; the sender recorded {sent} and the \
+                 receiver {received} (expected 2 and 2), and {left_standing} node(s) survived \
+                 the delete (expected 1)",
+                forward.is_ok(),
+                again.is_ok(),
+                backward.is_err()
             ));
         }
     }
@@ -4178,6 +4817,64 @@ impl ActiveState {
             return;
         }
 
+        // The controls on an agent node, by exactly the same argument as the badge above:
+        // they are inside the item's own bounds, so the hit test has already answered with
+        // the node and the question left is which part of it was pressed.
+        //
+        // **`crate::agent::layout` is asked, never re-derived.** That module's header states
+        // the rule this repo has paid for twice — `draw::kanban_runs` and `CardLayout::badge`
+        // both exist because a second copy of a layout is a click that lands where the paint
+        // is not — and `AgentLayout::hit` is the press path's single question.
+        //
+        // The two guards are the badge's, for the badge's measured reasons: a double click
+        // delivers two presses and would run the agent twice, and ⇧-click is how a node is
+        // added to a selection.
+        if !double
+            && !additive
+            && let Some(id) = hit
+            && let Some(part) = self.agent_part_under(id, world)
+        {
+            let doc = self.editor.projection().get(id).map(|projected| projected.doc_id);
+            if let Some(doc) = doc {
+                match part {
+                    // One button, two meanings — see `AgentLayout::run`. Stopping a turn and
+                    // starting one are never both available, and two buttons would leave one
+                    // of them permanently dead.
+                    crate::agent::AgentPart::Run => {
+                        self.input.resolve_press(true);
+                        // The key first, on its own line: `agent_key` needs `&mut self` for
+                        // its cache and `status` borrows the runtime, so nesting the two
+                        // would ask for both at once.
+                        let key = self.agent_key(doc);
+                        if self.agent_runtime.status(&key).is_busy() {
+                            self.stop_agent(doc);
+                        } else {
+                            self.run_agent(doc);
+                        }
+                        return;
+                    }
+                    crate::agent::AgentPart::ModeToggle => {
+                        self.input.resolve_press(true);
+                        self.toggle_agent_display(doc);
+                        return;
+                    }
+                    // The prompt row takes the keyboard. This is how anybody says anything
+                    // to an agent, and without it the whole layer is a configuration screen
+                    // for a thing you cannot talk to.
+                    crate::agent::AgentPart::Prompt => {
+                        self.input.resolve_press(true);
+                        self.begin_prompting(doc);
+                        return;
+                    }
+                    // Everything else on the node falls through: the role takes the caret
+                    // through the ordinary double-click path, and a press on the transcript,
+                    // the status dot or bare header is a press on the item — which has to
+                    // keep selecting and dragging it like any other.
+                    _ => {}
+                }
+            }
+        }
+
         // **A frame is a backdrop until you have picked it up.**
         //
         // *"when i try to drag select multiple things, if i start dragging while being on top
@@ -5868,6 +6565,363 @@ impl ActiveState {
     fn settle(&mut self) {
         self.commit_editing();
         self.finish_erase();
+    }
+
+    /// Writes a schedule onto one agent node, or clears it.
+    fn set_agent_schedule(&mut self, doc: DocId, schedule: Option<vellum_agent::Schedule>) {
+        self.update_agent(doc, |config| config.schedule = schedule);
+        // The scheduler's queue is rebuilt from the board's nodes, so it has to be told the
+        // board moved — otherwise the new time is on disk and nothing is waiting for it.
+        self.sync_agent_wiring();
+    }
+
+    /// Writes an agent's own rule layer.
+    ///
+    /// **`overrides` is a write-back cache, not something the editor authors.** It is filled
+    /// from the resolved cascade's own `override_names()` here, which is the only place that
+    /// can know what actually ended up overridden — the editor knows what the user typed,
+    /// which is a different question.
+    fn set_agent_rules(&mut self, doc: DocId, mut rules: vellum_agent::AgentRules) {
+        let Ok(item) = self.editor.board().item(doc) else { return };
+        let ItemKind::Agent { model, .. } = &item.kind else { return };
+        let mut probe = crate::agent::decode(model);
+        probe.rules = rules.clone();
+        rules.overrides = self.resolve_rules(&probe).override_names();
+        self.update_agent(doc, |config| config.rules = rules);
+    }
+
+    /// Reads one agent node's token, hands it to `change`, and writes it back as one undo
+    /// step.
+    ///
+    /// The shared middle of every "set a field on an agent" path. Written once because each
+    /// of them would otherwise repeat the decode/encode pair, and a decode that silently
+    /// produced a default on one path and not another is how a setting comes to reset its
+    /// neighbours.
+    fn update_agent(&mut self, doc: DocId, change: impl FnOnce(&mut vellum_agent::AgentModel)) {
+        let Ok(item) = self.editor.board().item(doc) else { return };
+        let ItemKind::Agent { model, label } = &item.kind else { return };
+        let mut config = crate::agent::decode(model);
+        change(&mut config);
+        let updated =
+            ItemKind::Agent { model: crate::agent::encode(&config), label: label.clone() };
+        if let Err(error) = self.editor.edit(|board| Ok(board.set_kind(doc, updated)?)) {
+            self.gap(&format!("that setting could not be saved: {error}"));
+            return;
+        }
+        self.shell.invalidate_selection();
+    }
+
+    /// The one selected agent node, or `None`.
+    ///
+    /// Single-selection by design: Run, Stop and the mode toggle all act on *an* agent, and
+    /// "run all four of these" is a different verb that nobody has asked for. The commands
+    /// are gated on `CommandContext::agents_selected`, so this returning `None` means the
+    /// gate and this disagreed — which is worth no toast, because the row was greyed.
+    fn selected_agent(&self) -> Option<DocId> {
+        let scene = self.editor.selection().first().copied()?;
+        let projected = self.editor.projection().get(scene)?;
+        crate::agent::is_agent(&projected.item.kind).then_some(projected.doc_id)
+    }
+
+    /// Opens the rules editor on the selected agent, seeded with its own layer **and** the
+    /// resolved cascade, so the editor can show inherited against set-here without
+    /// re-deriving either.
+    fn edit_agent_rules(&mut self) {
+        let Some(doc) = self.selected_agent() else { return };
+        let Ok(item) = self.editor.board().item(doc) else { return };
+        let ItemKind::Agent { model, label } = &item.kind else { return };
+        let config = crate::agent::decode(model);
+        let resolved = self.resolve_rules(&config);
+        let title = format!("Rules for {}", self.node_name(label, config.role_kind));
+        let own = config.rules.clone();
+        self.shell.ask(
+            move |id| vellum_ui::Dialog::rules(id, title, &own, resolved),
+            crate::shell::Ask::AgentRules(doc),
+        );
+    }
+
+    /// Opens the schedule editor. The hand-off targets are the agents this one is actually
+    /// connected to — a hand-off with no connector is refused when the schedule is *saved*,
+    /// not silently at six in the evening.
+    fn edit_agent_schedule(&mut self) {
+        let Some(doc) = self.selected_agent() else { return };
+        let Ok(item) = self.editor.board().item(doc) else { return };
+        let ItemKind::Agent { model, label } = &item.kind else { return };
+        let config = crate::agent::decode(model);
+        let title = format!("Schedule for {}", self.node_name(label, config.role_kind));
+        let schedule = config.schedule.clone().unwrap_or_default();
+        let targets = self.connected_agents(doc);
+        let offset = crate::agent_runtime::local_utc_offset();
+        self.shell.ask(
+            move |id| vellum_ui::Dialog::schedule(id, title, schedule, targets, offset),
+            crate::shell::Ask::AgentSchedule(doc),
+        );
+    }
+
+    /// What to call a node in a dialog title: its role if it has one, its kind otherwise.
+    fn node_name(&self, label: &vellum_doc::StyledText, kind: vellum_agent::RoleKind) -> String {
+        let name = label.to_plain();
+        if name.trim().is_empty() { kind.label().to_owned() } else { name }
+    }
+
+    /// The three-layer cascade for one node, resolved from the files on disk.
+    pub(crate) fn resolve_rules(
+        &self,
+        model: &vellum_agent::AgentModel,
+    ) -> vellum_agent::ResolvedRules {
+        let data_dir = self.agent_runtime.data_dir();
+        let global =
+            vellum_agent::RuleFile::read(&vellum_agent::rules::global_rules_path(data_dir));
+        let project = self
+            .editor
+            .path()
+            .and_then(std::path::Path::parent)
+            .and_then(vellum_agent::rules::project_rules_path)
+            .map_or_else(vellum_agent::RuleFile::default, |path| {
+                vellum_agent::RuleFile::read(&path)
+            });
+        vellum_agent::rules::resolve(&global, &project, &model.rules, "")
+    }
+
+    /// The agents reachable from one node along a connector, by id and label.
+    ///
+    /// Derived from the endpoints exactly as the painter derives the line's style — one rule,
+    /// so a hand-off can never be offered along a line the board does not draw as a link.
+    pub(crate) fn connected_agents(&self, from: DocId) -> Vec<vellum_ui::AgentLink> {
+        let board = self.editor.board();
+        let mut out = Vec::new();
+        for id in board.item_ids() {
+            let Ok(item) = board.item(id) else { continue };
+            let ItemKind::Connector { start, end, .. } = &item.kind else { continue };
+            let (Some(a), Some(b)) = (start.target, end.target) else { continue };
+            let other = if a == from {
+                b
+            } else if b == from {
+                a
+            } else {
+                continue;
+            };
+            let Ok(target) = board.item(other) else { continue };
+            let ItemKind::Agent { label, model } = &target.kind else { continue };
+            let name = self.node_name(label, crate::agent::decode(model).role_kind);
+            out.push(vellum_ui::AgentLink { id: other.to_string(), label: name });
+        }
+        out
+    }
+
+    /// Stops every browser engine on the board, because the permission was withdrawn.
+    ///
+    /// Clears each node's own `live` as well as releasing the engine: leaving it set would
+    /// mean that turning the preference back on silently reloaded every page at once, which
+    /// is the memory event the preference exists to prevent.
+    fn stop_browser_engines(&mut self) {
+        let live: Vec<_> = self
+            .editor
+            .board()
+            .item_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let item = self.editor.board().item(id).ok()?;
+                let ItemKind::Browser { model } = &item.kind else { return None };
+                let page = crate::browser::decode(model);
+                page.live.then(|| (id, page))
+            })
+            .collect();
+        if live.is_empty() {
+            return;
+        }
+        let _ = self.editor.edit(|board| {
+            for (id, mut page) in live {
+                page.live = false;
+                board.set_kind(id, ItemKind::Browser { model: crate::browser::encode(&page) })?;
+            }
+            Ok(())
+        });
+    }
+
+    /// Raises the sign-in dialog for one provider.
+    ///
+    /// The dialog is told only **whether** a key exists, never what it is: `Dialog::sign_in`
+    /// takes `has_key: bool` and seeds its field empty. A dialog that pre-filled the stored
+    /// key would put it on screen, in a screenshot, and in any recording of one.
+    fn ask_provider_key(&mut self, provider: vellum_agent::Provider) {
+        let has_key = self
+            .shell
+            .library
+            .provider_status()
+            .iter()
+            .find(|status| status.provider == provider)
+            .is_some_and(|status| status.has_key);
+        self.shell.ask(
+            |id| vellum_ui::Dialog::sign_in(id, provider, has_key),
+            crate::shell::Ask::SignIn(provider),
+        );
+    }
+
+    /// Writes a key for one provider, or removes it when the field came back empty.
+    pub(crate) fn store_provider_key(&mut self, provider: vellum_agent::Provider, key: &str) {
+        let data_dir = self.agent_runtime.data_dir().to_path_buf();
+        let mut credentials = match vellum_agent::transport::http::Credentials::load(&data_dir) {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                self.gap(&format!("the credentials file could not be read: {error}"));
+                return;
+            }
+        };
+        credentials.set_key(provider, key);
+        if let Err(error) = credentials.save(&data_dir) {
+            self.gap(&format!("the credentials file could not be written: {error}"));
+            return;
+        }
+        self.shell.refresh_providers();
+        // Deliberately does not name the provider's key, only the provider. Nothing in this
+        // application ever echoes credential material, including in a success message.
+        self.ok(format!("Signed in to {}", provider.label()));
+    }
+
+    fn forget_provider_key(&mut self, provider: vellum_agent::Provider) {
+        self.store_provider_key(provider, "");
+        self.ok(format!("Signed out of {}", provider.label()));
+    }
+
+    /// Shows a file in the platform's file manager.
+    ///
+    /// Reveal rather than open: these are `.md` notes the user may want to edit in their own
+    /// editor, and guessing which application should own a markdown file is how a click
+    /// launches something unexpected.
+    fn reveal_path(&mut self, path: &std::path::Path) {
+        if !path.exists() {
+            self.gap("that file has not been written yet");
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let mut c = std::process::Command::new("open");
+            c.arg("-R").arg(path);
+            c
+        };
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut c = std::process::Command::new("explorer");
+            c.arg("/select,").arg(path);
+            c
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let mut command = {
+            let mut c = std::process::Command::new("xdg-open");
+            c.arg(path.parent().unwrap_or(path));
+            c
+        };
+        if let Err(error) = command.spawn() {
+            self.gap(&format!("that file could not be revealed: {error}"));
+        }
+    }
+
+    /// Applies one inspector edit to the single selected node's token.
+    ///
+    /// Every variant is single-selection: the panel only offers these rows when exactly one
+    /// node is picked, because there is no useful mixed state for a working directory or a
+    /// rule set. So this reads the first selected item and does nothing when there is not
+    /// exactly one — silently, because the control was not drawn in that case and reaching
+    /// here at all would be the chrome's bug rather than something to tell the user about.
+    ///
+    /// **One `edit` call, therefore one undo step.** A user who changes a provider and then
+    /// ⌘Zs gets the provider back, not half of it.
+    fn apply_agent_edit(&mut self, edit: &vellum_ui::AgentEdit) {
+        use vellum_ui::AgentEdit as E;
+
+        let Some(scene) = self.editor.selection().first().copied() else { return };
+        if self.editor.selection().len() != 1 {
+            return;
+        }
+        let Some(projected) = self.editor.projection().get(scene) else { return };
+        let doc = projected.doc_id;
+        let kind = projected.item.kind.clone();
+
+        // A role is the item's own `StyledText`, not part of the token — which is what makes
+        // it searchable and editable on the canvas. So it takes the ordinary text path and
+        // never touches the model.
+        if let E::Role(role) = edit {
+            let _ = doc;
+            self.set_text(role);
+            return;
+        }
+
+        let updated = match kind {
+            ItemKind::Agent { model, label } => {
+                let mut config = crate::agent::decode(&model);
+                match edit {
+                    E::Role(_) => unreachable!("handled above"),
+                    E::Kind(role_kind) => {
+                        config.role_kind = *role_kind;
+                        // Promoting a worker to a role that may spawn gives it somewhere to
+                        // spawn *into*, for the reason `place` does at creation: a manager
+                        // with no territory refuses every request, which reads as broken
+                        // rather than as unconfigured.
+                        if config.role_kind.may_spawn() && config.territory.is_none() {
+                            config.territory =
+                                Some(crate::agent::default_territory(&projected.item.placement));
+                        }
+                    }
+                    E::Provider(choice) => config.provider = choice.clone(),
+                    E::Display(mode) => config.display = *mode,
+                    E::WorkingDir(dir) => config.working_dir = dir.clone(),
+                    E::Worktree(on) => config.worktree = *on,
+                    E::SpawnCap(cap) => config.spawn_cap = Some(*cap),
+                    E::Territory(region) => config.territory = *region,
+                    E::Rules(rules) => config.rules = rules.clone(),
+                    E::Schedule(schedule) => config.schedule = schedule.clone(),
+                    E::AcceptsMessages(on) => config.accepts_messages = *on,
+                    E::Voice(on) => config.voice = *on,
+                    // Indexes the list the panel drew. Bounds-checked here rather than
+                    // trusted: the panel's list and this one are a frame apart, and a stale
+                    // index would otherwise drop whichever source had moved into that slot.
+                    E::DropContext(index) => {
+                        if *index >= config.context.len() {
+                            return;
+                        }
+                        config.context.remove(*index);
+                    }
+                    E::NoteScope(_) | E::ShowIgnored(_) | E::BrowserUrl(_) | E::BrowserLive(_) => {
+                        return;
+                    }
+                }
+                ItemKind::Agent { model: crate::agent::encode(&config), label }
+            }
+            ItemKind::AgentNote { model, title } => {
+                let mut note = crate::note::decode(&model);
+                let E::NoteScope(scope) = edit else { return };
+                note.scope = scope.clone();
+                ItemKind::AgentNote { model: crate::note::encode(&note), title }
+            }
+            ItemKind::FileTree { model } => {
+                let mut tree = crate::filetree::decode(&model);
+                let E::ShowIgnored(on) = edit else { return };
+                tree.show_ignored = *on;
+                ItemKind::FileTree { model: crate::filetree::encode(&tree) }
+            }
+            ItemKind::Browser { model } => {
+                let mut page = crate::browser::decode(&model);
+                match edit {
+                    E::BrowserUrl(url) => {
+                        url.clone_into(&mut page.url);
+                        // A new address is not the old page, so its title is no longer true.
+                        // Clearing it is what stops a node claiming to be a site it left.
+                        page.title.clear();
+                    }
+                    E::BrowserLive(on) => page.live = *on,
+                    _ => return,
+                }
+                ItemKind::Browser { model: crate::browser::encode(&page) }
+            }
+            _ => return,
+        };
+
+        if let Err(error) = self.editor.edit(|board| Ok(board.set_kind(doc, updated)?)) {
+            self.gap(&format!("that setting could not be saved: {error}"));
+            return;
+        }
+        self.shell.invalidate_selection();
     }
 
     /// The button came up after an erase sweep: closes the undo group.
@@ -8481,6 +9535,23 @@ impl ActiveState {
             (Ask::ImportSteps, DialogEvent::Confirmed(_)) => self.begin_import_from_miro(),
             (Ask::ImportFromMiro, DialogEvent::Renamed(_, title)) => {
                 self.import_to_new_board(&title);
+            }
+            // The three Agent Canvas dialogs. Each carries its answer rather than a bare
+            // `Confirmed`, because the value is what was being asked for — and each is
+            // routed by the `Ask` that remembers *which node* the question was about.
+            //
+            // ⚠ Without these three arms every one of them falls into the `_ => {}` below
+            // and Save does nothing at all. That is not hypothetical: it was the state of
+            // this match until the arms were written, with the editors, the events and the
+            // dialogs all complete and tested. Trap 9's shape, one more time.
+            (Ask::AgentSchedule(doc), DialogEvent::ScheduleSet(_, schedule)) => {
+                self.set_agent_schedule(doc, schedule);
+            }
+            (Ask::AgentRules(doc), DialogEvent::RulesSet(_, rules)) => {
+                self.set_agent_rules(doc, rules);
+            }
+            (Ask::SignIn(provider), DialogEvent::SignedIn(_, key)) => {
+                self.store_provider_key(provider, key.expose());
             }
             // Cancelled, or an answer of the wrong shape. Both are "the user changed
             // their mind", and the question has already been forgotten.

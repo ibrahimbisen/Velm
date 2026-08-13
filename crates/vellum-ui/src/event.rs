@@ -187,7 +187,7 @@ pub enum UiEvent {
     /// writes the node's own token, and the app has to re-encode a
     /// [`vellum_agent::AgentModel`] rather than touch `vellum_doc::Style`.
     ///
-    /// ⚠ **It mutates the document, so the app must close an open text session first** —
+    /// **It mutates the document, so the app must close an open text session first** —
     /// exactly as it does for [`Self::Style`] and [`Self::Transform`]. `CLAUDE.md`'s
     /// feedback 30 records why: `apply_style` and `apply_transform` each open their own
     /// undo group, a group opened while the caret's is live fails, and that failure breaks
@@ -247,7 +247,7 @@ pub enum AgentEdit {
     WorkingDir(Option<String>),
     /// Whether this node gets a git worktree of its own.
     ///
-    /// ⚠ **Turning it off is not a removal.** An agent's worktree is never force-removed
+    /// **Turning it off is not a removal.** An agent's worktree is never force-removed
     /// with uncommitted work in it (`docs/07-agent-canvas.md` §9), so the app is expected
     /// to confirm — and to be able to refuse — rather than treat this as a plain write.
     Worktree(bool),
@@ -262,7 +262,7 @@ pub enum AgentEdit {
     /// background: the editor writes one value and cannot end up with front matter from one
     /// event and a body from another.
     ///
-    /// ⚠ `AgentRules::overrides` is a *cache of what resolution decided*. The app writes it
+    /// Note: `AgentRules::overrides` is a *cache of what resolution decided*. The app writes it
     /// back from `ResolvedRules::override_names()` after applying; nothing in the chrome
     /// authors it, because a hand-written provenance list is exactly the second source of
     /// truth `docs/07-agent-canvas.md` §7 exists to avoid.

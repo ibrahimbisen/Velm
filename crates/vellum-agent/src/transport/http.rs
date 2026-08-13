@@ -131,6 +131,76 @@ impl Credentials {
         Ok(Self { keys: serde_json::from_str(&text).unwrap_or_default() })
     }
 
+    /// Records a key for one provider, in memory. Persist with [`Credentials::save`].
+    ///
+    /// An empty key **removes** rather than storing nothing: a sign-in dialog confirmed with
+    /// a cleared field means "forget this", and storing `""` would leave a provider that
+    /// reports `has_key` and then fails every request with an empty `authorization` header —
+    /// a state that looks configured and is not.
+    pub fn set_key(&mut self, provider: Provider, key: &str) {
+        if key.trim().is_empty() {
+            self.remove_key(provider);
+        } else {
+            self.keys.insert(provider.tag().to_owned(), key.trim().to_owned());
+        }
+    }
+
+    pub fn remove_key(&mut self, provider: Provider) {
+        self.keys.remove(provider.tag());
+    }
+
+    /// Writes the file, mode `0600`, atomically.
+    ///
+    /// Three things this does deliberately, each because the alternative has a real failure:
+    ///
+    /// - **Permissions are set on the temporary file *before* the key is written into it**,
+    ///   not on the final file afterwards. Creating a world-readable file, writing a secret
+    ///   into it and then narrowing it leaves a window in which any process on the machine
+    ///   can read it, and that window is exactly when the interesting bytes are there.
+    /// - **Temp then rename**, so a crash mid-write cannot leave a truncated file that reads
+    ///   as "no keys" and silently signs the user out.
+    /// - The temp file is in the **same directory**, because a rename across filesystems is
+    ///   a copy and is not atomic.
+    pub fn save(&self, data_dir: impl AsRef<Path>) -> Result<()> {
+        let path = Self::path_in(&data_dir);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| AgentError::file(parent.display().to_string(), &error))?;
+        }
+        let temp = path.with_extension("json.tmp");
+        let body = serde_json::to_string_pretty(&self.keys)?;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        {
+            use std::io::Write;
+            let mut file = options
+                .open(&temp)
+                .map_err(|error| AgentError::file(temp.display().to_string(), &error))?;
+            file.write_all(body.as_bytes())
+                .map_err(|error| AgentError::file(temp.display().to_string(), &error))?;
+            file.sync_all()
+                .map_err(|error| AgentError::file(temp.display().to_string(), &error))?;
+        }
+        std::fs::rename(&temp, &path)
+            .map_err(|error| AgentError::file(path.display().to_string(), &error))?;
+
+        // Re-asserted after the rename as well: a file that already existed keeps its own
+        // permissions through a rename, so a credentials file that started life
+        // world-readable would stay that way for ever without this.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
     /// The key for one provider: the file first, then the environment.
     ///
     /// The environment is a genuine second source rather than a convenience — a user who

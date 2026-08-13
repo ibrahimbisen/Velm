@@ -68,6 +68,10 @@ pub struct PropertiesState {
     /// text field — a double click on the canvas, or a note that has just been
     /// placed. Consumed on the next frame.
     focus_text: bool,
+    /// The agent section's own free-text buffers — a role label, a working directory, a
+    /// model name, a browser address. Same reason [`Self::text`] exists: a field bound
+    /// straight to the model sends the caret to the end on every keystroke.
+    agent: crate::agent_panel::AgentPanelState,
 }
 
 impl PropertiesState {
@@ -192,6 +196,20 @@ pub(crate) fn show(
                 }
                 if model.has_link() {
                     link(ui, palette, model, events);
+                }
+                // The Agent Canvas section — an agent's provider, rules and schedule, or a
+                // note's, a file tree's or a browser node's own handful. Drawn from the same
+                // model as everything above it, and absent for a board that has none of
+                // them: `docs/07-agent-canvas.md` §0's second rule, applied to the chrome.
+                if model.has_agent_family() {
+                    crate::agent_panel::show(
+                        ui,
+                        palette,
+                        &mut state.agent,
+                        model,
+                        cmd_ctx,
+                        events,
+                    );
                 }
                 arrange(ui, palette, cmd_ctx, events);
                 geometry(ui, palette, model, events);

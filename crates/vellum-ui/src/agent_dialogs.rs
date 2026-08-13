@@ -106,7 +106,7 @@ impl RulesForm {
 
     /// Write the form back into a node's own layer.
     ///
-    /// ⚠ [`AgentRules::overrides`] is left **empty on purpose**. It is a cache of what
+    /// Note: [`AgentRules::overrides`] is left **empty on purpose**. It is a cache of what
     /// resolution decided, and the app writes it back from `ResolvedRules::override_names()`
     /// after applying the edit. Authoring it here would be a second, hand-written source of
     /// truth for provenance — and it would be the one the inspector believed while the agent
@@ -432,8 +432,7 @@ impl TriggerShape {
 pub fn schedule_problem(schedule: &Schedule, targets: &[AgentLink]) -> Option<String> {
     let Completion::HandOff { agent } = &schedule.completion else { return None };
 
-    if let Some(link) = targets.iter().find(|link| &link.id == agent) {
-        let _ = link;
+    if targets.iter().any(|link| &link.id == agent) {
         return None;
     }
     Some(if targets.is_empty() {
@@ -568,7 +567,7 @@ pub(crate) fn schedule_editor(
     ui.add_space(space::of(2));
     ui.label(egui::RichText::new(schedule.summary()).color(palette.muted));
 
-    // ⚠ Enter is **not** wired to Save here, and that is a decision rather than an omission.
+    // Note: Enter is **not** wired to Save here, and that is a decision rather than an omission.
     // `crate::dialog`'s rule is that Enter confirms a non-destructive dialog — but this form
     // has a multiline prompt in it, where Enter means a new line. A key that sometimes
     // submits and sometimes types is worse than one that only ever types.

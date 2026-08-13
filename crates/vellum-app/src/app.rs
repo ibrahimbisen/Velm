@@ -127,6 +127,12 @@ pub(crate) struct ActiveState {
     pub(crate) glass: GlassRenderer,
     /// egui's triangles on the GPU.
     pub(crate) chrome: ChromePass,
+    /// The prompt row that currently has the keyboard, if any.
+    ///
+    /// Beside the caret rather than inside it, and mutually exclusive with it. A prompt is
+    /// **not board content**: it must not be a CRDT write, must not join an undo group, and
+    /// must not reach the file RULE ZERO protects. See `ActiveState::begin_prompting`.
+    pub(crate) prompting: Option<crate::actions::Prompting>,
     /// What the painter is told about the agents on this board, rebuilt once per frame by
     /// `crate::agent_runtime`.
     ///
@@ -134,6 +140,19 @@ pub(crate) struct ActiveState {
     /// frame must allocate nothing, and on a board with no agent nodes this stays empty and
     /// costs one `is_empty` — see [`crate::agent_view::AgentViews`].
     pub(crate) agents: crate::agent_view::AgentViews,
+    /// The live agent sessions: processes, threads, transcripts. See
+    /// [`crate::agent_runtime`].
+    ///
+    /// Held here rather than per board for `links`' reason and one more: an agent on a
+    /// parked board keeps running, so switching tabs must not stop it or lose its output.
+    /// Empty until the user starts one — a board full of agent nodes nobody has run owns no
+    /// thread, no process and no socket.
+    pub(crate) agent_runtime: crate::agent_runtime::AgentRuntime,
+    /// What the hot board's agent identity was when its wiring was last derived.
+    ///
+    /// This is the gate that keeps the layer free on an ordinary board — see
+    /// [`crate::agent_runtime::BoardStamp`], which states the cost it guarantees.
+    pub(crate) agent_board: Option<crate::agent_runtime::BoardStamp>,
     /// Per-frame scratch, owned so a steady-state frame allocates nothing.
     pub(crate) list: DrawList,
     hud_quads: Vec<QuadInstance>,
@@ -321,6 +340,11 @@ impl Vellum {
         let surface = crate::surface::Surface::new(window.clone(), !self.options.no_vsync)?;
 
         let blobs = BlobStore::open(editor::blob_directory())?;
+        // The agent pool shares the board's own blob store, so a picture an agent posts is
+        // addressed and budgeted exactly like a pasted screenshot (`docs/07` §4). `BlobStore`
+        // is a bare `PathBuf`, so the clone is free.
+        let agent_runtime =
+            crate::agent_runtime::AgentRuntime::new(editor::data_directory(), blobs.clone());
         // Every backup the user has, searched as one set. The app's own `archives/`
         // folder loads unconditionally so a migration needs no flag at all; `--rtb`
         // adds to it rather than replacing it, and takes a file or a folder.
@@ -522,7 +546,10 @@ impl Vellum {
         crate::flight::prune(&data_directory);
 
         let mut state = ActiveState {
+            prompting: None,
             agents: crate::agent_view::AgentViews::new(),
+            agent_runtime,
+            agent_board: None,
             occluded: false,
             recorder,
             window,
@@ -706,6 +733,11 @@ impl ApplicationHandler for Vellum {
                 event_loop.exit();
             }
 
+            // Feature 15's app-side half, and the only half the app has: `vellum_agent`
+            // takes "since" as a parameter and does all the rest, precisely so that when
+            // the user was away is a fact the window knows and that crate never guesses.
+            WindowEvent::Focused(focused) => state.agent_focus_changed(focused),
+
             WindowEvent::Resized(size) => {
                 state.surface.resize(size.width, size.height);
                 let (width, height) = state.surface.size();
@@ -803,6 +835,18 @@ impl ApplicationHandler for Vellum {
                     state.editing.is_some(),
                     state.ime_on,
                 );
+                // An agent's prompt row claims the keyboard on exactly the same terms as the
+                // caret, and **before** it: the two are mutually exclusive, and asking the
+                // caret first would be asking a session that cannot be open. Without this
+                // the letters of a prompt reach `input.key` and switch tools — `V`, `N` and
+                // `T` are all tools, which is the trap `--demo typing` exists to catch for
+                // the canvas caret, arrived at in a second place.
+                if state.is_prompting()
+                    && event.state.is_pressed()
+                    && state.type_prompt_key(&event.logical_key, event.text.as_deref())
+                {
+                    return;
+                }
                 if state.editing.is_some()
                     && event.state.is_pressed()
                     && state.type_key(&event.logical_key, event.text.as_deref())
@@ -874,6 +918,11 @@ impl ApplicationHandler for Vellum {
         // another window is exactly the one with no other record, so the recorder has
         // to keep sampling. One tick a second is free; sixty thousand is the bug.
         if state.occluded {
+            // A hidden window drives no frames, so this once-a-second tick is the only thing
+            // left to move an agent's output onto disk. Without it a session spent behind
+            // another window ends with an empty transcript and an away-mode digest that says
+            // nothing happened.
+            state.poll_agents();
             state.log_stats(Instant::now());
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                 Instant::now() + STATS_LOG_INTERVAL,
@@ -1024,6 +1073,10 @@ impl ActiveState {
                 log::error!("saving {} on quit: {error:#}", parked.path().display());
             }
         }
+        // Every agent process, released — and the loopback server stopped in the order that
+        // cannot deadlock (`crate::agent_runtime`'s header). Before the recorder's own last
+        // line, so a hang here would be visible as a session with no `EXIT`.
+        self.shutdown_agents();
         // Last, and the whole point of it: the presence of this line is what tells the
         // next run that this session was quit rather than killed.
         self.recorder.finish("quit");
@@ -1055,6 +1108,12 @@ impl ActiveState {
         // was behind another one must still land, or the card stays blank until the next time
         // something happens to redraw.
         self.apply_link_fetches();
+
+        // The agent pool, for the same reason and one stronger. An occluded window is
+        // exactly when agents run longest unattended: events that piled up in a channel
+        // instead of reaching disk would grow without bound *and* leave the away-mode digest
+        // with nothing to read. On a board with no agent nodes this is two comparisons.
+        self.poll_agents();
 
         // Nothing of this window is on screen. Everything below — culling, text
         // shaping, image decoding, and a frame's worth of staged GPU uploads — would be
@@ -1167,6 +1226,9 @@ impl ActiveState {
 
         let screen = self.shell.screen();
         if screen == Screen::Board {
+            // Before the paint, because the painter reads `self.agents` and a view rebuilt
+            // afterwards would draw one frame behind every event.
+            self.rebuild_agent_views();
             self.paint_board();
         } else {
             // The library covers the window, so painting the board behind it would be
@@ -1403,9 +1465,107 @@ impl ActiveState {
             selection.len(),
             digest,
         );
-        let Self { shell, editor, .. } = self;
+        // The panel's agent rows need four things that are not in the document: whether a
+        // node is running, who it can hand off to, what its rule cascade resolved to, and
+        // what a private note's owner is *called*. Gathered here because this is the one
+        // place that holds the session pool and the projection at the same time.
+        //
+        // Built inside `sync_selection`'s guard rather than every frame: the closure runs
+        // only when the selection or the document actually changed, and resolving a cascade
+        // reads up to three files off disk.
+        let Self { shell, editor, agent_runtime, agent_board, .. } = self;
+        let board = agent_board.as_ref().map(|stamp| stamp.key.clone());
+        let project = agent_board.as_ref().and_then(|stamp| stamp.path.clone());
+        let data_dir = agent_runtime.data_dir().to_path_buf();
+
+        // A node's role label, by item-id string. Used for a private note's owner and a
+        // file tree's agent, both of which store an id — and a row that prints `42@7` at
+        // somebody has told them nothing.
+        let label_of = |wanted: &str| -> Option<String> {
+            let id: vellum_doc::ItemId = wanted.parse().ok()?;
+            let item = editor.board().item(id).ok()?;
+            let vellum_doc::ItemKind::Agent { label, .. } = &item.kind else { return None };
+            let name = label.to_plain();
+            Some(if name.trim().is_empty() { wanted.to_owned() } else { name })
+        };
+        let key_of = |id: vellum_doc::ItemId| {
+            board.as_ref().map(|board| crate::agent_runtime::NodeKey::new(board, id.to_string()))
+        };
+        let running = |id: vellum_doc::ItemId| {
+            key_of(id).is_some_and(|key| agent_runtime.is_running(&key))
+        };
+        // Reachability along a connector, derived from the board exactly as the painter
+        // derives the line's own style — `crate::agent::link_kind`, never a second rule.
+        let connected = |from: vellum_doc::ItemId| -> Vec<vellum_ui::AgentLink> {
+            let mut out = Vec::new();
+            for id in editor.board().item_ids() {
+                let Ok(item) = editor.board().item(id) else { continue };
+                let vellum_doc::ItemKind::Connector { start, end, .. } = &item.kind else {
+                    continue;
+                };
+                let (Some(a), Some(b)) = (start.target, end.target) else { continue };
+                let other = if a == from {
+                    b
+                } else if b == from {
+                    a
+                } else {
+                    continue;
+                };
+                let Ok(target) = editor.board().item(other) else { continue };
+                if !crate::agent::is_agent(&target.kind) {
+                    continue;
+                }
+                let id = other.to_string();
+                let label = label_of(&id).unwrap_or_else(|| id.clone());
+                out.push(vellum_ui::AgentLink { id, label });
+            }
+            out
+        };
+        let rules = |_: vellum_doc::ItemId, model: &vellum_agent::AgentModel| {
+            let global = vellum_agent::RuleFile::read(&vellum_agent::rules::global_rules_path(
+                &data_dir,
+            ));
+            let project = project
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .and_then(vellum_agent::rules::project_rules_path)
+                .map_or_else(vellum_agent::RuleFile::default, |path| {
+                    vellum_agent::RuleFile::read(&path)
+                });
+            vellum_agent::rules::resolve(&global, &project, &model.rules, "")
+        };
+        let note_state = |path: &str| -> (bool, bool) {
+            let Some(board) = board.as_ref() else { return (false, false) };
+            // Resolved against the store's own base — a note path is stored relative to
+            // the project where there is one, and absolute otherwise, so joining it onto
+            // the wrong root is how a note that exists reports that it does not.
+            let on_disk = agent_runtime.note_store(board).is_some_and(|store| {
+                store.base().map_or_else(
+                    || std::path::Path::new(path).exists(),
+                    |base| base.join(path).exists(),
+                )
+            });
+            (on_disk, false)
+        };
+
+        let facts = crate::inspect::AgentFacts {
+            project_dir: project
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .map(|p| p.display().to_string()),
+            inherited_display: shell.library.default_display_mode(),
+            inherited_provider: vellum_agent::ProviderChoice::new(
+                vellum_agent::Provider::default(),
+            ),
+            browser_nodes_allowed: shell.library.browser_nodes(),
+            running: &running,
+            connected: &connected,
+            rules: &rules,
+            label_of: &label_of,
+            note_state: &note_state,
+        };
         shell.sync_selection(key, || {
-            crate::inspect::selection_items(editor.projection(), editor.selection())
+            crate::inspect::selection_items(editor.projection(), editor.selection(), &facts)
         });
     }
 

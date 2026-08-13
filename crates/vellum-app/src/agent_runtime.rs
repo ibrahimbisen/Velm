@@ -73,7 +73,7 @@
 //! agents keep running while another tab is in front. The wire form the shim sees in
 //! `VELM_AGENT_ID` is that pair, so a request names exactly one node on exactly one board.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
@@ -118,6 +118,14 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 /// sentence rather than dropped, which is `Session::MAX_QUEUED`'s rule.
 const MAX_DEFERRED: usize = 64;
 
+/// How often a *visible* note node's file is stat'd.
+///
+/// §8's *"a low-frequency poll while it is visible"*. Two seconds, which is far below the
+/// rate at which a person notices a file has changed and far above the frame rate — a
+/// per-frame `stat` for every note on screen is a syscall storm for an answer that changes
+/// when somebody saves in another editor.
+pub const NOTE_POLL_SECONDS: u64 = 2;
+
 /// How long the window must have been unfocused before coming back raises a digest.
 ///
 /// A minute, because alt-tabbing to a browser and straight back is not "away", and a digest
@@ -129,6 +137,29 @@ pub const AWAY_THRESHOLD: u64 = 60;
 /// The one place in `vellum-app` that reads the clock for the agent layer. `vellum-agent`
 /// deliberately never reads it — every function there takes the time as a parameter — so
 /// that "does a daily 18:00 job fire at 17:59" is arithmetic rather than a wait.
+/// The machine's offset from UTC, in seconds.
+///
+/// The scheduler works entirely in UTC seconds and `vellum_agent::schedule` holds no timezone
+/// database on purpose — *"every day at 6 PM"* means six in the **user's** evening, and the
+/// offset is the one fact that turns one into the other. Supplied by the app because this is
+/// the layer that is allowed to ask the operating system what time it is.
+///
+/// Derived by asking for the same instant in both frames rather than by reading a timezone
+/// name: it needs no database, it is correct across a daylight-saving change the moment the
+/// system clock is, and it cannot be wrong about a half-hour zone.
+pub fn local_utc_offset() -> i32 {
+    // `%z` is the offset as `+HHMM`. Parsed rather than trusted as a number, because `+0530`
+    // is five and a half hours and reading it as an integer gives 530.
+    let Ok(output) = std::process::Command::new("date").arg("+%z").output() else { return 0 };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim();
+    let sign = if text.starts_with('-') { -1 } else { 1 };
+    let digits: String = text.chars().filter(char::is_ascii_digit).collect();
+    let Some(hours) = digits.get(..2).and_then(|h| h.parse::<i32>().ok()) else { return 0 };
+    let minutes = digits.get(2..4).and_then(|m| m.parse::<i32>().ok()).unwrap_or(0);
+    sign * (hours * 3600 + minutes * 60)
+}
+
 pub fn unix_now() -> Timestamp {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -203,8 +234,14 @@ pub struct BoardStamp {
     pub epoch: u64,
     /// How many items the board held then.
     pub items: usize,
-    /// Whether it had any agent-family node at all.
+    /// Whether it had any **agent** node at all. Drives both the wiring resync and whether
+    /// the painter is handed any view.
     pub has_nodes: bool,
+    /// Whether it had any **note** node. Separate from `has_nodes` because a board can have
+    /// notes and no agents — a set of file-backed markdown documents on a canvas is a
+    /// perfectly ordinary thing to want — and that board still has to poll its files while
+    /// costing nothing to the boards that have neither.
+    pub has_notes: bool,
 }
 
 impl BoardStamp {
@@ -212,7 +249,7 @@ impl BoardStamp {
     pub fn needs_resync(&self, path: Option<&Path>, epoch: u64, items: usize) -> bool {
         self.path.as_deref() != path
             || self.items != items
-            || (self.has_nodes && self.epoch != epoch)
+            || ((self.has_nodes || self.has_notes) && self.epoch != epoch)
     }
 }
 
@@ -430,6 +467,16 @@ pub struct AgentRuntime {
     /// the last one's.
     blob_names: HashMap<String, String>,
 
+    /// Each note node's file contents, as last read from disk.
+    ///
+    /// **The note's text is not in the document** — that is the whole of §8 — so it has to
+    /// live somewhere the painter can be handed it from, and this is that place. Keyed like
+    /// everything else here so a note on a parked board keeps what was read.
+    note_text: HashMap<NodeKey, String>,
+    /// When each note was last stat'd, so the freshness check is a low-frequency poll rather
+    /// than a syscall per note per frame.
+    note_checked: HashMap<NodeKey, Timestamp>,
+
     /// When the window last lost focus, for the away-mode digest.
     away_since: Option<Timestamp>,
 }
@@ -463,6 +510,8 @@ impl AgentRuntime {
             completions: HashMap::new(),
             reports: Vec::new(),
             blob_names: HashMap::new(),
+            note_text: HashMap::new(),
+            note_checked: HashMap::new(),
             away_since: None,
         }
     }
@@ -470,8 +519,8 @@ impl AgentRuntime {
     /// Whether there is nothing at all to do this frame.
     ///
     /// **The property the whole layer rests on.** A board with no agent nodes reaches this
-    /// and returns, so the cost of the Agent Canvas on an ordinary board is these five
-    /// `is_empty` calls. If this ever stops being cheap, every board in the application pays
+    /// and returns, so the cost of the Agent Canvas on an ordinary board is these six
+    /// length checks. If this ever stops being cheap, every board in the application pays
     /// for a feature it is not using.
     pub fn dormant(&self) -> bool {
         self.sessions.is_empty()
@@ -556,6 +605,40 @@ impl AgentRuntime {
             for (id, role) in roles {
                 table.insert(id, role);
             }
+        }
+
+        // **A node the user deleted takes its session with it**, and this is the only place
+        // that can notice: the wiring is derived from the document, so a node that is gone is
+        // simply absent from the list above. Without this a deleted running agent keeps its
+        // process forever — `dormant()` never becomes true again, the loopback server never
+        // comes down, and the Stop button went with the node, so there is no way left to stop
+        // it at all.
+        //
+        // **`release`, never `forget`.** Releasing keeps the transcript; forgetting deletes
+        // it. A node can be absent because the user pressed ⌘Z on the paste that made it, and
+        // an undo that silently destroyed the history is exactly the kind of thing RULE
+        // ZERO's posture is against. The transcript is disposable, but it is the *user's*
+        // Delete that disposes of it.
+        //
+        // Scoped to this board's ids, so an agent running on a board behind another tab is
+        // untouched — which is the whole reason a session is keyed by board and item.
+        // Owned rather than borrowed from `self.wiring`: the loop below takes `&mut self`,
+        // and one allocation per resync of a board that has agents on it is cheaper than
+        // relying on exactly where a borrow is considered to end.
+        let known: HashSet<String> = self
+            .wiring
+            .get(board)
+            .map(|wiring| wiring.nodes.iter().map(|(id, _, _)| id.clone()).collect())
+            .unwrap_or_default();
+        let orphaned: Vec<NodeKey> = self
+            .sessions
+            .keys()
+            .filter(|key| &key.board == board && !known.contains(&key.wire()))
+            .cloned()
+            .collect();
+        for key in orphaned {
+            log::info!("agents: releasing {} — its node is no longer on the board", key.item);
+            self.release(&key);
         }
     }
 
@@ -715,16 +798,23 @@ impl AgentRuntime {
     }
 
     /// Stop the server once the last session is gone.
+    ///
+    /// The same order the full shutdown uses, and for the same reason: a request that parked
+    /// between the last session exiting and this call would otherwise block the `join` for
+    /// [`REPLY_TIMEOUT`] — not a deadlock, because the handler waits with `recv_timeout`, but
+    /// a two-second hitch on the frame loop, which is worse than any frame this application
+    /// is allowed to drop. Answering what is parked first makes the join immediate.
     fn settle_ipc(&mut self) {
         if !self.sessions.is_empty() {
             return;
         }
-        if let Some(mut server) = self.ipc.take() {
-            // Safe from the frame loop: no session means no agent process, so nothing can be
-            // parked in the handler waiting for us. The full shutdown path is the one that
-            // has to be careful — see the module header.
-            server.stop();
+        let Some(mut server) = self.ipc.take() else { return };
+        while let Ok(job) = self.inbox.try_recv() {
+            let _ = job.reply.send(Err(AgentError::Refused(
+                "the agent that asked is no longer running".into(),
+            )));
         }
+        server.stop();
     }
 
     /// Where the runtime file lives, for a child's `VELM_IPC`.
@@ -782,10 +872,14 @@ impl AgentRuntime {
                     }
                 }
                 for mut event in live.session.poll() {
-                    if let TranscriptEvent::Image { blob, .. } = &mut event
-                        && let Some(hash) = blob_names.get(blob.as_str())
-                    {
-                        *blob = hash.clone();
+                    if let TranscriptEvent::Image { blob, .. } = &mut event {
+                        // Resolved to an owned value first: the placeholder is read out of
+                        // the same string that is about to be written over, and taking a
+                        // copy is what keeps that a plain assignment.
+                        let resolved = blob_names.get(blob.as_str()).cloned();
+                        if let Some(hash) = resolved {
+                            *blob = hash;
+                        }
                     }
                     // A turn ending is where a borrowed hop count stops applying: anything
                     // this agent sends after it is something it decided to do, which is hop
@@ -1181,6 +1275,36 @@ impl AgentRuntime {
             .map_or_else(String::new, |state| std::mem::take(&mut state.draft))
     }
 
+    // ----- notes -------------------------------------------------------------------
+
+    /// A note node's file, as last read.
+    ///
+    /// ⚠ **Nothing draws this yet.** `crate::agent_view` carries agent nodes only, so the
+    /// text a note node should show has no seam to reach the painter through — see the
+    /// handover. It is read and kept here so that adding one is a field rather than a
+    /// feature.
+    pub fn note_text(&self, key: &NodeKey) -> Option<&str> {
+        self.note_text.get(key).map(String::as_str)
+    }
+
+    pub fn set_note_text(&mut self, key: &NodeKey, text: String) {
+        self.note_text.insert(key.clone(), text);
+    }
+
+    /// Whether this note is due a freshness check, marking it checked if so.
+    ///
+    /// The rate limiter for §8's poll, kept here rather than at the call site because the
+    /// call site is a loop over what is on screen and a timer per node is exactly the sort of
+    /// bookkeeping that ends up per frame by accident.
+    pub fn note_due(&mut self, key: &NodeKey, now: Timestamp) -> bool {
+        let last = self.note_checked.get(key).copied().unwrap_or(0);
+        if now.saturating_sub(last) < NOTE_POLL_SECONDS {
+            return false;
+        }
+        self.note_checked.insert(key.clone(), now);
+        true
+    }
+
     // ----- views -------------------------------------------------------------------
 
     /// Fill in what the painter is told about this board's agents.
@@ -1302,21 +1426,25 @@ impl AgentRuntime {
             self.scheduler = None;
             return;
         }
-        match self.scheduler.as_mut() {
-            Some(scheduler) => scheduler.arm(queue),
-            None => self.scheduler = Some(Scheduler::start(queue)),
+        if let Some(scheduler) = self.scheduler.as_mut() {
+            scheduler.arm(queue);
+            return;
         }
+        self.scheduler = Some(Scheduler::start(queue));
     }
 
     /// Move anything the scheduler has fired into [`AgentRuntime::due`].
     fn collect_due(&mut self) {
-        let Some(scheduler) = self.scheduler.as_ref() else { return };
-        loop {
-            match scheduler.fires.try_recv() {
-                Ok(key) => self.due.push(key),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        // Collected into a local first: the receiver is inside `self.scheduler` and the
+        // queue it feeds is `self.due`, so reading straight into the second would hold a
+        // borrow of the first across it.
+        let mut fired: Vec<NodeKey> = Vec::new();
+        if let Some(scheduler) = self.scheduler.as_ref() {
+            while let Ok(key) = scheduler.fires.try_recv() {
+                fired.push(key);
             }
         }
+        self.due.append(&mut fired);
     }
 
     /// Take the schedules that have come due, for the caller to check their triggers and run
@@ -1411,7 +1539,7 @@ fn collect_notes(store: &NoteStore, dir: &Path, scope: &NoteScope, out: &mut Vec
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "md") {
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("md") {
             continue;
         }
         let title = std::fs::read_to_string(&path)
@@ -1700,8 +1828,12 @@ impl Scheduler {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *held = queue;
+            // **Notified while the lock is held.** The thread checks its flag and its queue
+            // under the same lock before waiting, so a notify sent without it can land in the
+            // gap between the check and the wait — and the next wake would then be up to
+            // `MAX_WAIT` away, which for a re-arm is an hour of a schedule not firing.
+            self.wake.notify_all();
         }
-        self.wake.notify_all();
 
         // The thread returns when its queue empties, which is what "does not exist while
         // nothing is scheduled" means in practice — so re-arming has to be able to start a
@@ -1735,7 +1867,15 @@ impl Scheduler {
 
     fn stop(&mut self) {
         self.stopping.store(true, Ordering::SeqCst);
-        self.wake.notify_all();
+        {
+            // Under the lock, for the reason `arm` gives — and here it is worse: a missed
+            // notify would make the `join` below wait out the thread's whole timeout.
+            let _held = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.wake.notify_all();
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -1804,12 +1944,24 @@ fn run_schedule(
 mod tests {
     use super::*;
 
+    /// A scratch directory of this test's own.
+    ///
+    /// ⚠ **Named from a counter, not the clock.** It used to be `pid`-`unix_now()`, and
+    /// `unix_now` is *seconds* — so any two tests that started within the same second got the
+    /// **same directory**, and the first one to finish ran `remove_dir_all` on the other's
+    /// data. `cargo test` runs these in parallel, so that is the common case rather than the
+    /// unlucky one.
+    ///
+    /// It presented as two unrelated failures — "the ring was not seeded from disk" and
+    /// "releasing a session destroyed its history" — both of which look exactly like a bug in
+    /// the sidecar. Neither was. The counter cannot collide, and it needs no clock, which
+    /// this crate is trying to avoid reading anyway.
     fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "velm-agent-runtime-{}-{}",
-            std::process::id(),
-            unix_now()
-        ));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("velm-agent-runtime-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         dir
     }
@@ -1945,6 +2097,119 @@ mod tests {
         runtime.set_schedules(Vec::new(), 1_000);
         assert!(runtime.scheduler.is_none(), "disarming left the thread running");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A transport that does nothing, so a `Session` can exist on a machine with no agent
+    /// installed. `Session::over` is public for exactly this.
+    struct Silent;
+
+    impl vellum_agent::AgentTransport for Silent {
+        fn kind(&self) -> vellum_agent::Transport {
+            vellum_agent::Transport::Acp
+        }
+
+        fn send_prompt(
+            &mut self,
+            _turn: vellum_agent::TurnId,
+            _prompt: &str,
+        ) -> vellum_agent::Result<()> {
+            Ok(())
+        }
+
+        fn cancel(&mut self) -> vellum_agent::Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> vellum_agent::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// **A node the user deleted must take its session with it.**
+    ///
+    /// The failure this guards is not subtle and has no other way out: a deleted running
+    /// agent keeps its process, `dormant()` never becomes true again, the loopback server
+    /// never comes down — and the Stop button went with the node, so nothing on screen can
+    /// stop it. It is only noticeable here, because the wiring is derived from the document
+    /// and a deleted node is simply absent from it.
+    ///
+    /// The last assertion is the other half: the transcript **survives**. A node can be
+    /// absent because the user pressed ⌘Z, and an undo that destroyed the history would be
+    /// unrecoverable.
+    #[test]
+    fn a_node_that_leaves_the_board_takes_its_session_with_it() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let board = board();
+        let key = NodeKey::new(&board, "9@1");
+
+        runtime.record(&key, 1, &TranscriptEvent::Text { text: "working".into() });
+        let (voice, events) = channel();
+        let session = Session::over(Box::new(Silent), voice, events, String::new());
+        runtime.sessions.insert(key.clone(), Live { session, hops: 0 });
+        assert!(runtime.is_running(&key));
+        assert!(!runtime.dormant());
+
+        // A resync that still names the node leaves it alone.
+        runtime.set_wiring(
+            &board,
+            1,
+            vec![(key.wire(), "Planner".into(), true)],
+            Vec::new(),
+            vec![(key.wire(), RoleKind::Worker)],
+        );
+        assert!(runtime.is_running(&key), "a node that is still on the board lost its session");
+
+        // A resync with the node gone releases it.
+        runtime.set_wiring(&board, 2, Vec::new(), Vec::new(), Vec::new());
+        assert!(!runtime.is_running(&key), "a deleted node left its process running");
+        assert!(runtime.dormant(), "the runtime never went quiet again");
+
+        let kept = runtime
+            .sidecar()
+            .read_all(&board, &key.item)
+            .expect("the transcript reads back");
+        assert_eq!(kept.records.len(), 1, "releasing a session destroyed its history");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cost guarantee, stated as an assertion rather than as a comment.
+    ///
+    /// A board with **no** agent nodes must not resync when the generation moves — that is
+    /// every keystroke, because `Projection::refresh_item` bumps it, and the fast path exists
+    /// precisely so typing does not cost a rebuild. It must still resync when the item count
+    /// moves, because that is the only way an agent node can appear.
+    #[test]
+    fn a_board_with_no_agents_does_not_resync_on_a_keystroke() {
+        let plain = BoardStamp {
+            path: Some(PathBuf::from("/tmp/x.vellum")),
+            key: board(),
+            epoch: 10,
+            items: 40,
+            has_nodes: false,
+            has_notes: false,
+        };
+        let here = Some(Path::new("/tmp/x.vellum"));
+
+        assert!(!plain.needs_resync(here, 10, 40), "nothing moved and it resynced anyway");
+        assert!(
+            !plain.needs_resync(here, 11, 40),
+            "a keystroke on a board with no agents cost a walk of the projection"
+        );
+        assert!(plain.needs_resync(here, 11, 41), "an item appeared and nothing noticed");
+        assert!(plain.needs_resync(Some(Path::new("/tmp/other.vellum")), 10, 40));
+        assert!(plain.needs_resync(None, 10, 40), "a board with no file read as the same board");
+
+        // A board that *has* agents follows the generation, because a role, a schedule or an
+        // arrowhead can change without the count moving.
+        let live = BoardStamp { has_nodes: true, ..plain.clone() };
+        assert!(live.needs_resync(here, 11, 40));
+        assert!(!live.needs_resync(here, 10, 40));
+
+        // And so does one with only notes — a set of file-backed documents on a canvas is an
+        // ordinary thing to want, and that board still has files to watch.
+        let noted = BoardStamp { has_notes: true, ..plain };
+        assert!(noted.needs_resync(here, 11, 40));
     }
 
     /// A note listing reads as a set of documents rather than a set of filenames, and a

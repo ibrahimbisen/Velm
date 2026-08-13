@@ -582,6 +582,15 @@ mod tests {
                 None,
                 None,
                 None,
+                // The Agent Canvas four. `A` is free — `⌘A` is Select all, and a bare
+                // letter is a different binding from a chord, exactly as bare `V`, `N`
+                // and `T` already are. The other three take no key: every letter that
+                // reads as one of them is already a tool the hand uses far more often,
+                // and a tool nobody places daily does not earn a scarce single key.
+                Some("A"),
+                None,
+                None,
+                None,
             ]
         );
         let mut keys: Vec<_> = Tool::ALL.iter().filter_map(|t| t.shortcut()).collect();
@@ -652,7 +661,12 @@ mod tests {
     fn only_the_tools_with_something_to_choose_open_a_flyout() {
         let with_flyout: Vec<_> =
             Tool::ALL.iter().copied().filter(|t| t.flyout().is_some()).collect();
-        assert_eq!(with_flyout, vec![Tool::Sticky, Tool::Shape, Tool::Pen, Tool::Eraser]);
+        // The agent tool joined when the three roles became a choice made *before*
+        // placement rather than a conversion afterwards — the sticky's own reasoning.
+        assert_eq!(
+            with_flyout,
+            vec![Tool::Sticky, Tool::Shape, Tool::Pen, Tool::Eraser, Tool::Agent]
+        );
     }
 
     #[test]

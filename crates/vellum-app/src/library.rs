@@ -109,6 +109,29 @@ struct Filing {
     /// to enable and disable it"*. A feature nobody can find is off for everyone, and this
     /// one announces itself the first time an edge lights up.
     align_objects: Option<bool>,
+    /// The Agent Canvas layer's four application-wide settings.
+    ///
+    /// In the sidecar rather than on a board, for the reason feedback 31 settled for the
+    /// grid: these are how *you* work, not what a board is. An agent's output style, whether
+    /// a browser engine may run at all, and whether coding agents get their own checkout are
+    /// all answers you give once — and putting any of them on the board would mean the answer
+    /// changing when you switched tabs.
+    ///
+    /// Every one is `Option` and every one resolves to a **conservative** default when unset,
+    /// so a `library.json` written before this layer existed reads exactly as it did: no
+    /// browser engine, no worktrees, clean output.
+    ///
+    /// `default_display` is a **string**, not the enum, for the reason `theme` and `accent`
+    /// already are: an enum serialised by variant order turns one value into another the day
+    /// somebody inserts a third in the middle. An unknown string degrades to the default
+    /// rather than failing the whole file to parse.
+    agent_display: Option<String>,
+    /// Whether browser nodes may instantiate an engine at all. Off unless asked: an engine is
+    /// 60–150MB idle and `docs/01-architecture.md` §1 rules a webview out of the canvas.
+    browser_nodes: Option<bool>,
+    /// Whether a coding agent gets its own git worktree. Off unless asked: it is a second
+    /// checkout of the repository per agent, which is disk the user did not agree to spend.
+    worktrees: Option<bool>,
     /// Miro's **Snap to grid**: whether a move, a resize or a placement lands on the
     /// board's own grid.
     ///
@@ -331,6 +354,103 @@ impl Library {
     pub fn set_align_objects(&mut self, on: bool) {
         self.filing.align_objects = Some(on);
         self.persist();
+    }
+
+    /// The mode a new agent node shows its output in — feature 2's second half, the global
+    /// default that every node inheriting follows.
+    ///
+    /// **Clean** unless the user has said otherwise: raw output is every tool call, every
+    /// shell command and every reasoning step, which is the right thing to *ask for* and the
+    /// wrong thing to be given.
+    pub fn default_display_mode(&self) -> vellum_agent::DisplayMode {
+        self.filing
+            .agent_display
+            .as_deref()
+            .and_then(|tag| {
+                vellum_agent::DisplayMode::ALL.into_iter().find(|mode| mode.tag() == tag)
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn set_default_display_mode(&mut self, mode: vellum_agent::DisplayMode) {
+        self.filing.agent_display = Some(mode.tag().to_owned());
+        self.persist();
+    }
+
+    /// Whether a browser node may run a real engine. **Off** unless turned on.
+    pub fn browser_nodes(&self) -> bool {
+        self.filing.browser_nodes.unwrap_or(false)
+    }
+
+    pub fn set_browser_nodes(&mut self, on: bool) {
+        self.filing.browser_nodes = Some(on);
+        self.persist();
+    }
+
+    /// Whether coding agents get their own git worktree. **Off** unless turned on.
+    pub fn worktrees(&self) -> bool {
+        self.filing.worktrees.unwrap_or(false)
+    }
+
+    pub fn set_worktrees(&mut self, on: bool) {
+        self.filing.worktrees = Some(on);
+        self.persist();
+    }
+
+    /// What each provider looks like from here: installed, credentialled, and one line
+    /// saying what was found.
+    ///
+    /// **Probed, not assumed.** `Provider::supports_subscription` says a CLI *exists to
+    /// delegate to*, which is a statement about the world and not about this machine — so a
+    /// missing binary has to degrade to a row that names it rather than to a provider that
+    /// silently never answers.
+    ///
+    /// **No key ever leaves this function.** `has_key` is a boolean and `detail` is built
+    /// from the command's own name; neither can carry credential material, which is enforced
+    /// by there being nowhere in `ProviderStatus` to put it.
+    pub fn provider_status(&self) -> Vec<vellum_ui::ProviderStatus> {
+        vellum_agent::Provider::ALL
+            .into_iter()
+            .map(|provider| {
+                let command = provider.default_command();
+                // `probe_command` answers `Result`, and a missing binary is not an error
+                // here — it is the row's whole content. Flattened to `Option` deliberately.
+                let found = command
+                    .map(vellum_agent::transport::probe_command)
+                    .and_then(Result::ok);
+                let available = match provider {
+                    // A local model is reachable when its endpoint is, which needs a request
+                    // — too expensive to answer once per frame. Reported as available and
+                    // allowed to fail loudly at the first turn, which is the honest order.
+                    vellum_agent::Provider::Local | vellum_agent::Provider::Custom => true,
+                    _ if command.is_some() => found.is_some(),
+                    _ => self.has_credential(provider),
+                };
+                let detail = match (command, &found) {
+                    (Some(name), Some(path)) => format!("{name} at {}", path.display()),
+                    (Some(name), None) => format!("{name} is not installed"),
+                    (None, _) if provider.needs_api_key() => "needs an API key".to_owned(),
+                    (None, _) => "your own endpoint".to_owned(),
+                };
+                vellum_ui::ProviderStatus {
+                    provider,
+                    available,
+                    has_key: self.has_credential(provider),
+                    detail,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether a credential is stored for a provider. **Never which.**
+    ///
+    /// The credentials file sits beside the boards directory rather than inside it — it is
+    /// the *application's*, not a board's, and a file under `boards/` is one a board-shaped
+    /// rescan has to learn to ignore. `docs/07-agent-canvas.md` §8a names the location.
+    fn has_credential(&self, provider: vellum_agent::Provider) -> bool {
+        let data_dir = self.root.parent().unwrap_or(&self.root);
+        vellum_agent::transport::http::Credentials::load(data_dir)
+            .is_ok_and(|creds| creds.has_key(provider))
     }
 
     /// Whether a move lands on the board's grid. **Off** unless the user has turned it on.

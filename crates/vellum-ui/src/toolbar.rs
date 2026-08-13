@@ -45,10 +45,20 @@ use vellum_shapes::Shape;
 /// Was fourteen buttons in five groups, which is a column tall enough to reach both
 /// edges of a laptop screen and long enough that finding the sticky note took a moment.
 /// *"i just dont use those enough"*: eight everyday tools stay, six fold.
-const GROUPS: [&[Tool]; 3] = [
+const GROUPS: [&[Tool]; 4] = [
     &[Tool::Select, Tool::Hand],
     &[Tool::Sticky, Tool::Text, Tool::Shape, Tool::Frame],
     &[Tool::Pen, Tool::Eraser],
+    // The Agent Canvas gets its own group rather than joining the content tools: it puts a
+    // *running process* on the board, which is a different kind of act from placing a note,
+    // and the separator is what says so without a label.
+    //
+    // It is on the palette at all because `every_tool_is_on_the_palette_or_behind_more_exactly_once`
+    // caught it not being: it was in `Tool::ALL` and in neither this list nor `OCCASIONAL`,
+    // so the headline tool of the whole layer was reachable only by its `A` shortcut. That
+    // is the "written, tested and unreachable" failure this repo keeps paying for, and the
+    // test found it before a person did.
+    &[Tool::Agent],
 ];
 
 /// The palette's own memory: which flyout is open and what each picker last chose.

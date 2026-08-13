@@ -1,17 +1,24 @@
-//! The three ways Velm runs an agent, behind one interface.
+//! The four ways Velm runs an agent, behind one interface.
 //!
 //! `docs/07-agent-canvas.md` §5 is the contract: **every transport produces the same
 //! [`TranscriptEvent`] stream**, so the painter, the two display modes, the sidecar and the
-//! away-mode digest know nothing about which kind of process is running. Adding a fourth
-//! transport is a new producer and no new consumer.
+//! away-mode digest know nothing about which kind of process is running. Adding a transport is
+//! a new producer and no new consumer — which is exactly what [`claude_cli`] was.
 //!
 //! ```text
-//!   LaunchSpec ──► transport::start ─┬─ acp   a child speaking JSON-RPC over stdio
-//!        │                           ├─ pty   a child in a real pseudo-terminal
-//!        │                           └─ http  an API, including one on this machine
-//!        │                                         │
-//!        └──────────► Sender<TranscriptEvent> ◄────┘
+//!   LaunchSpec ──► transport::start ─┬─ claude_cli  the `claude` CLI's own stream-json
+//!        │                           ├─ acp         a child speaking JSON-RPC over stdio
+//!        │                           ├─ pty         a child in a real pseudo-terminal
+//!        │                           └─ http        an API, including one on this machine
+//!        │                                               │
+//!        └──────────► Sender<TranscriptEvent> ◄──────────┘
 //! ```
+//!
+//! ⚠ **[`claude_cli`] supersedes [`acp`] for Claude, on measured evidence.** `claude` does not
+//! speak the Agent Client Protocol: it speaks a line-delimited JSON protocol of its own, and
+//! the capture that establishes that is quoted in `claude_cli`'s own tests. `acp` remains for
+//! agents that genuinely speak ACP; whether `codex` and `gemini` do is **unverified** — those
+//! two have never been run from here.
 //!
 //! # No async, and why that is not a limitation
 //!
@@ -39,6 +46,7 @@ use crate::transcript::{RequestId, TranscriptEvent, TurnId};
 use crate::{AgentError, Result};
 
 pub mod acp;
+pub mod claude_cli;
 pub mod http;
 pub mod pty;
 
@@ -177,13 +185,54 @@ pub(crate) fn park_blob(blobs: &Blobs, mime: &str, bytes: Vec<u8>) -> String {
     id
 }
 
+/// Base64, for the image bytes an agent sends inline.
+///
+/// Hand-rolled to keep this crate's dependency list at the `docs/07` §1 names, and short
+/// enough to read: four characters in, three bytes out, whitespace and padding skipped.
+/// Answers `None` on anything that is not base64 rather than producing bytes that are not the
+/// picture — a half-decoded image is a texture upload of garbage, not a smaller picture.
+///
+/// It lives here rather than in one transport because **two protocols carry pictures in
+/// different envelopes and the same encoding**: ACP's flat `data`/`mimeType` and Anthropic's
+/// `source.data`/`source.media_type`. [`acp`] still has its own private copy from before this
+/// one existed; collapsing it onto this is a one-line edit for whoever owns that file next.
+pub(crate) fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    fn sextet(byte: u8) -> Option<u32> {
+        match byte {
+            b'A'..=b'Z' => Some(u32::from(byte - b'A')),
+            b'a'..=b'z' => Some(u32::from(byte - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(byte - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut accumulator: u32 = 0;
+    let mut bits = 0;
+    for byte in text.bytes() {
+        if byte == b'=' || byte.is_ascii_whitespace() {
+            continue;
+        }
+        let value = sextet(byte)?;
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((accumulator >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// One running agent, whatever kind of process is behind it.
 ///
 /// Implementors are owned by [`crate::session::Session`], which is what serialises the calls:
 /// a prompt arriving mid-turn is queued there rather than interleaved here.
 pub trait AgentTransport: Send {
-    /// Which of the three this is. For the node's header — *"this one runs on your
-    /// subscription"* — without the caller matching on a concrete type.
+    /// Which kind this is. For the node's header — *"this one runs on your subscription"* —
+    /// without the caller matching on a concrete type.
     fn kind(&self) -> TransportKind;
 
     /// Starts a turn. **Returns immediately**; the answer arrives as events.
@@ -254,6 +303,7 @@ pub trait AgentTransport: Send {
 /// thing that decides — there is no second opinion in `vellum-app`.
 pub fn start(spec: &LaunchSpec, events: Sender<TranscriptEvent>) -> Result<Box<dyn AgentTransport>> {
     match spec.provider.effective_transport() {
+        TransportKind::ClaudeCli => Ok(Box::new(claude_cli::ClaudeCli::start(spec, events)?)),
         TransportKind::Acp => Ok(Box::new(acp::AcpTransport::start(spec, events)?)),
         TransportKind::Pty => Ok(Box::new(pty::PtyTransport::start(spec, events)?)),
         TransportKind::Http => Ok(Box::new(http::HttpTransport::start(spec, events)?)),
@@ -358,6 +408,18 @@ mod tests {
         let found = probe_command("sh").expect("`sh` is on PATH on every Unix");
         assert!(found.is_absolute(), "{}", found.display());
         assert!(probe_command("/bin/sh").is_ok());
+    }
+
+    /// A picture that half decodes is a texture upload of garbage rather than a smaller
+    /// picture, so anything that is not base64 must answer `None` rather than bytes.
+    #[test]
+    fn base64_decodes_a_picture_and_refuses_what_is_not_one() {
+        assert_eq!(decode_base64("aGk=").as_deref(), Some(&b"hi"[..]));
+        // Padding and line breaks are both legal in a wire payload.
+        assert_eq!(decode_base64("aGVsbG8gd29ybGQ=").as_deref(), Some(&b"hello world"[..]));
+        assert_eq!(decode_base64("aGVs\nbG8=").as_deref(), Some(&b"hello"[..]));
+        assert_eq!(decode_base64(""), Some(Vec::new()));
+        assert_eq!(decode_base64("not base64!"), None);
     }
 
     /// A launch spec must not have to be told what a Claude node already implies, and must

@@ -443,7 +443,9 @@ fn draw(
 
         AgentRow::NoteState => {
             let Some(note) = &model.note else { return };
-            let state = if note.conflicted {
+            // Named `phrase` rather than `state`, which is the parameter one scope out. A
+            // shadow there is legal and reads as a bug the next time somebody edits this arm.
+            let phrase = if note.conflicted {
                 "Changed here and on disk — both were kept"
             } else if note.on_disk {
                 "In step with the file"
@@ -452,7 +454,7 @@ fn draw(
             };
             row(ui, palette, "State", |ui| {
                 ui.label(
-                    egui::RichText::new(state)
+                    egui::RichText::new(phrase)
                         .color(if note.conflicted { palette.warning } else { palette.muted }),
                 );
             });

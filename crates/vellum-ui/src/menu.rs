@@ -1239,6 +1239,8 @@ mod tests {
             spaces: &spaces,
             glass_opacity: Palette::LIGHT.glass_opacity,
             accent: crate::theme::Accent::default(),
+            default_display: vellum_agent::DisplayMode::Clean,
+            providers: &[],
             flags: MenuFlags {
                 link_previews: false,
                 align_objects: true,
@@ -1248,6 +1250,9 @@ mod tests {
                 starred: true,
                 translucent: true,
                 properties_panel: false,
+                agent_raw: false,
+                browser_nodes: false,
+                worktrees: false,
             },
         };
         assert!(
@@ -1303,6 +1308,88 @@ mod tests {
         assert!(!crate::color::SWATCHES.is_empty());
     }
 
+    /// The provider list says who pays, and never says what the key is.
+    ///
+    /// Two rules, and the first is feature 17's whole point: a provider running through a
+    /// CLI the user is already signed in to needs **no key**, so offering *Sign in* on it
+    /// would collect a credential nothing would ever read. The second is
+    /// `docs/07-agent-canvas.md` §8a — this crate is told *whether* a key exists and is
+    /// never told what it is, so there is nothing here that could be shown by accident.
+    #[test]
+    fn the_provider_rows_say_who_pays_and_never_show_a_key() {
+        let installed = ProviderStatus {
+            provider: vellum_agent::Provider::Claude,
+            available: true,
+            has_key: false,
+            detail: "claude 2.1.4".to_owned(),
+        };
+        assert!(installed.on_subscription());
+        assert!(!installed.wants_a_key(), "a held subscription needs no key");
+        assert_eq!(installed.billing(), "Subscription");
+
+        // …and the same provider with its CLI missing does need one. `supports_subscription`
+        // says a CLI *exists to delegate to*, not that this machine has it — reporting an
+        // uninstalled `claude` as configured is the one lie this row exists to avoid.
+        let missing = ProviderStatus { available: false, ..installed.clone() };
+        assert!(!missing.on_subscription());
+        assert!(missing.wants_a_key());
+        assert_eq!(missing.billing(), "No key yet");
+
+        let local = ProviderStatus {
+            provider: vellum_agent::Provider::Local,
+            available: true,
+            has_key: false,
+            detail: "localhost:11434".to_owned(),
+        };
+        assert!(!local.wants_a_key(), "a model on your own GPU needs no key");
+        assert_eq!(local.billing(), "Your own machine");
+
+        let kimi = ProviderStatus {
+            provider: vellum_agent::Provider::Kimi,
+            available: true,
+            has_key: true,
+            detail: "api.moonshot.ai".to_owned(),
+        };
+        assert!(kimi.wants_a_key());
+        assert_eq!(kimi.billing(), "API key · billed per token");
+
+        // The whole list draws, and a passive frame chooses nothing.
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, crate::theme::Theme::Light);
+        let all = [installed, missing, local, kimi];
+        let header = MenuHeader { providers: &all, ..MenuHeader::default() };
+        let mut events = EventSink::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            providers(ui, Palette::LIGHT, &header, &mut events);
+        });
+        assert!(events.take().is_empty(), "a passive frame signed in to something");
+
+        // Nothing in this module can name a key, because nothing in this module is given
+        // one. Asserted on the type rather than on the drawing: a field that does not exist
+        // cannot be printed by a future edit either.
+        let empty = MenuHeader::default();
+        assert!(empty.providers.is_empty(), "the default roster is empty, not invented");
+    }
+
+    /// The app-wide default display mode — feature 2's second half. The rows tick what is
+    /// current and say, in as many words, that a node with its own mode keeps it.
+    #[test]
+    fn the_default_output_mode_offers_both_and_ticks_the_current_one() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, crate::theme::Theme::Light);
+        let header = MenuHeader {
+            default_display: vellum_agent::DisplayMode::Raw,
+            ..MenuHeader::default()
+        };
+        let mut events = EventSink::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            agent_display(ui, Palette::LIGHT, &header, &mut events);
+        });
+        assert!(events.take().is_empty(), "a passive frame changed the default");
+        assert_eq!(vellum_agent::DisplayMode::ALL.len(), 2);
+        assert_eq!(Submenu::AgentDisplay.parent(), Menu::Preferences);
+    }
+
     #[test]
     fn only_the_toggle_commands_ever_show_a_tick() {
         let flags = MenuFlags {
@@ -1314,6 +1401,9 @@ mod tests {
             starred: true,
             translucent: true,
             properties_panel: true,
+            agent_raw: true,
+            browser_nodes: true,
+            worktrees: true,
         };
         for command in Command::ALL {
             assert_eq!(

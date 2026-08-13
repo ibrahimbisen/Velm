@@ -36,6 +36,7 @@
 
 pub mod actions;
 pub mod agent;
+pub mod agent_runtime;
 pub mod agent_view;
 pub mod app;
 pub mod appearance;

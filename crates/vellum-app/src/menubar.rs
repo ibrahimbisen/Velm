@@ -472,6 +472,12 @@ const fn is_on(command: Command, flags: MenuFlags) -> bool {
         Command::ToggleTranslucency => flags.translucent,
         Command::ToggleLinkPreviews => flags.link_previews,
         Command::ToggleAlignObjects => flags.align_objects,
+        // The three Agent Canvas toggles. The test above is what caught these being absent:
+        // the native bar and the in-app menu tick from the same flags, so a row that is a
+        // toggle in one table and not the other is a menu that lies about its own state.
+        Command::ToggleAgentRaw => flags.agent_raw,
+        Command::ToggleBrowserNodes => flags.browser_nodes,
+        Command::ToggleWorktrees => flags.worktrees,
         _ => false,
     }
 }
@@ -583,6 +589,9 @@ mod tests {
             translucent: true,
             link_previews: true,
             align_objects: true,
+            agent_raw: true,
+            browser_nodes: true,
+            worktrees: true,
         };
         for command in Command::ALL {
             assert_eq!(

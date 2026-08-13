@@ -1495,6 +1495,10 @@ mod tests {
                 // Snapping is a preference too, and it is one you set *before* opening
                 // the board you want it on.
                 Command::ToggleAlignObjects,
+                // Browser nodes are an application preference living in the library
+                // sidecar, not a board's, so the row is offered with no board open —
+                // exactly as translucency and link previews are.
+                Command::ToggleBrowserNodes,
                 Command::KeyboardShortcuts,
                 Command::Documentation,
                 Command::About,

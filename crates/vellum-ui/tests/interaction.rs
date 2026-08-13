@@ -26,9 +26,14 @@ const STRIP: f32 = vellum_ui::theme::TAB_STRIP_HEIGHT;
 
 /// The top of the menu bar, which now starts under the strip.
 /// Translucent chrome · Align objects · Fetch link previews · Transparency ▸ ·
-/// Accent colour ▸ · Keyboard shortcuts · Documentation · About — the last group in the
-/// ☰ menu.
-const PREFERENCES_ROWS: usize = 8;
+/// Accent colour ▸ · Keyboard shortcuts · Documentation · About, plus the Agent Canvas's
+/// four — Agent output ▸ · Providers ▸ · Browser nodes · Worktree isolation — the last
+/// group in the ☰ menu.
+///
+/// The count is pinned rather than derived because it is what makes the *index* arithmetic
+/// below trustworthy: several tests reach a specific row by position, and a row silently
+/// appearing above one of them would move every click after it without failing anything.
+const PREFERENCES_ROWS: usize = 12;
 
 const MENU_TOP: f32 = STRIP;
 
@@ -2229,4 +2234,225 @@ fn the_more_button_opens_the_folded_tools_and_picking_one_arms_it() {
     // First row is Table, per `Tool::OCCASIONAL`.
     let output = frame(&ctx, &mut chrome, &state, click_at(rows[0].center()));
     assert_eq!(output.events, vec![UiEvent::ToolChanged(Tool::Table)]);
+}
+
+// ============================================================================
+// The Agent Canvas layer
+// ============================================================================
+
+/// An agent node as the app describes one to the chrome: a worker, idle, inheriting
+/// everything.
+fn agent_node(running: bool) -> vellum_ui::SelectionItem {
+    use vellum_ui::{
+        AgentRules, AgentSummary, DisplayMode, ItemFacet, Placement, Provider, ProviderChoice,
+        RoleKind, RuleFile, SelectionItem, WorktreeState,
+    };
+    let own = AgentRules::default();
+    SelectionItem {
+        agent: Some(AgentSummary {
+            role: "Reviewer".to_owned(),
+            role_kind: RoleKind::Worker,
+            provider: None,
+            inherited_provider: ProviderChoice::new(Provider::Claude),
+            display: None,
+            inherited_display: DisplayMode::Clean,
+            working_dir: None,
+            project_dir: Some("/tmp/project".to_owned()),
+            worktree: WorktreeState::Off,
+            schedule: None,
+            territory: None,
+            spawn_cap: 0,
+            context: Vec::new(),
+            running,
+            rules: vellum_ui::vellum_agent::rules::resolve(
+                &RuleFile::default(),
+                &RuleFile::default(),
+                &own,
+                "Reviewer",
+            ),
+            own_rules: own,
+            connected: Vec::new(),
+            accepts_messages: true,
+            voice: false,
+        }),
+        opacity: Some(1.0),
+        ..SelectionItem::new(
+            "1@1".parse().expect("well-formed item id"),
+            ItemFacet::Agent,
+            Placement::new(0.0, 0.0, 420.0, 300.0),
+        )
+    }
+}
+
+/// An agent's bar is three buttons that do three different things, driven by real clicks.
+///
+/// The same shape as the link card's two address buttons, and for the same reason: *Run* and
+/// *Raw* sit side by side and are told apart by an icon and a word, so aiming at "the first
+/// control" would pass on a bar where the wrong button emitted the right event. Every control
+/// is clicked in turn, each on its own chrome, and what it answers is collected.
+///
+/// **Counting rects is wrong here**, as feedback 32 records: egui registers the icon and the
+/// frame around it, so two rectangles can share one button. The assertions are about which
+/// answers appear at all, never about how many controls there are.
+#[test]
+fn an_agents_bar_runs_it_switches_its_output_and_names_its_provider() {
+    use vellum_ui::AgentEdit;
+
+    let ctx = Context::default();
+    let mut chrome = Chrome::new();
+    let selection = [agent_node(false)];
+    let state = selected_state(&selection, Some(SELECTED));
+    settle(&ctx, &mut chrome, &state);
+    let bar = bar_rect(&ctx).expect("a selected agent gets a bar");
+    let controls = widgets(&ctx, |rect| bar.contains(rect.center()));
+    assert!(controls.len() >= 4, "the agent's bar drew {} controls", controls.len());
+
+    // (runs, switches output) per control.
+    let answers: Vec<(bool, bool)> = controls
+        .iter()
+        .map(|control| {
+            let ctx = Context::default();
+            let mut chrome = Chrome::new();
+            settle(&ctx, &mut chrome, &state);
+            let events = frame(&ctx, &mut chrome, &state, click_at(control.center())).events;
+            (
+                events.contains(&UiEvent::Command(Command::RunAgent)),
+                events.contains(&UiEvent::Command(Command::ToggleAgentRaw)),
+            )
+        })
+        .collect();
+
+    assert!(answers.contains(&(true, false)), "no control ran the agent: {answers:?}");
+    assert!(answers.contains(&(false, true)), "no control switched its output: {answers:?}");
+    assert!(
+        !answers.contains(&(true, true)),
+        "one control did both, so they are not two buttons: {answers:?}"
+    );
+
+    // Nothing on this bar may stop the agent while it is idle — the row names the verb that
+    // applies, and offering both would mean one of them is always wrong.
+    for control in &controls {
+        let ctx = Context::default();
+        let mut chrome = Chrome::new();
+        settle(&ctx, &mut chrome, &state);
+        let events = frame(&ctx, &mut chrome, &state, click_at(control.center())).events;
+        assert!(
+            !events.contains(&UiEvent::Command(Command::StopAgent)),
+            "an idle agent's bar offered Stop: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(event, UiEvent::Agent(AgentEdit::Provider(_)))),
+            "a plain click chose a provider: {events:?}"
+        );
+    }
+
+    // …and a running one offers the other verb, from the same position.
+    let running = [agent_node(true)];
+    let state = selected_state(&running, Some(SELECTED));
+    let ctx = Context::default();
+    let mut chrome = Chrome::new();
+    settle(&ctx, &mut chrome, &state);
+    let bar = bar_rect(&ctx).expect("a running agent gets a bar too");
+    let stopped = widgets(&ctx, |rect| bar.contains(rect.center())).into_iter().any(|control| {
+        let ctx = Context::default();
+        let mut chrome = Chrome::new();
+        settle(&ctx, &mut chrome, &state);
+        frame(&ctx, &mut chrome, &state, click_at(control.center()))
+            .events
+            .contains(&UiEvent::Command(Command::StopAgent))
+    });
+    assert!(stopped, "a running agent's bar had no way to stop it");
+}
+
+/// An agent's right-click menu carries the agent verbs, driven through the real menu.
+#[test]
+fn an_agents_context_menu_offers_its_rules_and_its_schedule() {
+    let ctx = Context::default();
+    let mut chrome = Chrome::new();
+    let selection = [agent_node(false)];
+    let state = selected_state(&selection, Some(SELECTED));
+    settle(&ctx, &mut chrome, &state);
+
+    chrome.open_context_menu(Pos2::new(700.0, 300.0), vellum_ui::ContextTarget::Selection);
+    let _ = frame(&ctx, &mut chrome, &state, input());
+    let _ = frame(&ctx, &mut chrome, &state, input());
+
+    let rows = menu_rows(&ctx);
+    assert!(rows.len() >= 8, "an agent's menu drew {} rows", rows.len());
+
+    // Every row is clicked on its own chrome, and the four agent verbs must all be
+    // reachable. Aiming at an index would pin the *order*, which is not what matters and
+    // is the half of the list most likely to move.
+    let mut seen: Vec<Command> = Vec::new();
+    for row in rows {
+        let ctx = Context::default();
+        let mut chrome = Chrome::new();
+        settle(&ctx, &mut chrome, &state);
+        chrome.open_context_menu(Pos2::new(700.0, 300.0), vellum_ui::ContextTarget::Selection);
+        let _ = frame(&ctx, &mut chrome, &state, input());
+        let _ = frame(&ctx, &mut chrome, &state, input());
+        for event in frame(&ctx, &mut chrome, &state, click_at(row.center())).events {
+            if let UiEvent::Command(command) = event {
+                seen.push(command);
+            }
+        }
+    }
+
+    for wanted in [
+        Command::RunAgent,
+        Command::ToggleAgentRaw,
+        Command::EditAgentRules,
+        Command::EditAgentSchedule,
+    ] {
+        assert!(seen.contains(&wanted), "{wanted:?} was not reachable: {seen:?}");
+    }
+    assert!(
+        !seen.contains(&Command::StopAgent),
+        "an idle agent's menu offered Stop: {seen:?}"
+    );
+}
+
+/// The inspector's agent section draws, and shows the rule cascade's provenance.
+///
+/// A drawing test rather than an event one: what matters here is that the panel comes up at
+/// all for a node kind it has never seen, and that the words *Inherited from this project*
+/// reach the screen — which is feature 11's whole visible promise, and the one thing a pure
+/// test of `ResolvedRules` cannot check.
+#[test]
+fn the_inspector_shows_where_an_agents_rules_came_from() {
+    use vellum_ui::{AgentRules, RuleFile};
+
+    let ctx = Context::default();
+    let mut chrome = Chrome::new();
+    chrome.set_properties_open(true);
+
+    let own = AgentRules::default();
+    let mut node = agent_node(false);
+    node.agent.as_mut().expect("an agent").rules = vellum_ui::vellum_agent::rules::resolve(
+        &RuleFile::parse("---\ntone: warm\n---\nHouse style."),
+        &RuleFile::parse("---\nlanguage: German\n---\nProject style."),
+        &own,
+        "Reviewer",
+    );
+    let selection = [node];
+    let state = selected_state(&selection, Some(SELECTED));
+    settle(&ctx, &mut chrome, &state);
+
+    let full = frame_painted(&ctx, &mut chrome, &state, input());
+    let painted: Vec<String> =
+        painted_text(&full).into_iter().map(|(_, text, _)| text).collect();
+    assert!(painted.iter().any(|t| t.contains("Reviewer")), "the role label: {painted:?}");
+    assert!(
+        painted.iter().any(|t| t.contains("Inherited from this project")),
+        "the provenance of the project's language never reached the screen: {painted:?}"
+    );
+    assert!(
+        painted.iter().any(|t| t.contains("German")),
+        "the value itself never reached the screen: {painted:?}"
+    );
+    // The provider row states who pays, which is the point of putting it on the node.
+    assert!(
+        painted.iter().any(|t| t.contains("subscription")),
+        "the billing was never stated: {painted:?}"
+    );
 }

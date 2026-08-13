@@ -4,17 +4,31 @@
 //! agent on Claude, one on a model running on the user's own GPU and one on Kimi, at the
 //! same time. So a provider is a value stored on the node, not a mode the application is in.
 //!
-//! # The three transports, and why there are three
+//! # The four transports, and why there are four
 //!
-//! - [`Transport::Acp`] delegates to an agent process the user already has — `claude`,
-//!   `codex`, `gemini`. It is the default for those, and it is the entire answer to
-//!   feature 17: that process already holds a Claude Max or Codex Pro subscription, so
-//!   Velm never sees a key and the user never pays per token.
+//! - [`Transport::ClaudeCli`] delegates to the `claude` binary the user already has, over
+//!   **its own** line-delimited JSON protocol. It is the default for [`Provider::Claude`] and
+//!   it is the answer to feature 17: that process already holds the user's Claude
+//!   subscription, so Velm never sees a key and the user never pays per token.
+//! - [`Transport::Acp`] delegates over the Agent Client Protocol, for agents that speak it.
 //! - [`Transport::Pty`] runs a CLI in a real pseudo-terminal. For agents with no protocol
 //!   mode, and for when the user wants the terminal itself on the board.
 //! - [`Transport::Http`] talks to an API directly. This is how Kimi, a bare OpenAI key and
-//!   **any OpenAI-compatible local server** are supported without a fourth code path —
+//!   **any OpenAI-compatible local server** are supported without a fifth code path —
 //!   llama.cpp, LM Studio, Ollama and vLLM all speak it.
+//!
+//! ## ⚠ What was assumed here, and what is now measured
+//!
+//! This file used to say that `claude`, `codex` and `gemini` all speak ACP, and that ACP is
+//! *"the entire answer to feature 17"*. That was written from recall, before anything could be
+//! run. **Measured on this machine on 2026-08-13: `claude` does not speak ACP at all** — see
+//! [`crate::transport::claude_cli`], whose tests quote the captured session. So Claude has its
+//! own transport, and the two claims that stand up are the narrow ones: a delegated CLI is
+//! unmetered, and the binary must be probed rather than believed in.
+//!
+//! `codex` and `gemini` are left on [`Transport::Acp`] and that is **unverified** — neither has
+//! been run from here. It is a default, and a wrong default costs one config field
+//! ([`ProviderChoice::transport`]), which is the whole reason that field exists.
 
 use serde::{Deserialize, Serialize};
 
@@ -82,10 +96,17 @@ impl Provider {
 
     /// The transport to use when the user has not chosen one.
     ///
-    /// ACP wherever a subscription-holding CLI exists, because the alternative bills the
-    /// user for something they have already paid for.
+    /// A delegated CLI wherever one exists, because the alternative bills the user for
+    /// something they have already paid for. **Which** protocol that CLI speaks is not a
+    /// guess for Claude and is one for the other two: `claude` was measured
+    /// ([`Transport::ClaudeCli`]), `codex` and `gemini` are assumed to speak ACP and have
+    /// never been run from here.
     pub const fn default_transport(self) -> Transport {
-        if self.supports_subscription() { Transport::Acp } else { Transport::Http }
+        match self {
+            Self::Claude => Transport::ClaudeCli,
+            Self::OpenAi | Self::Gemini => Transport::Acp,
+            Self::Kimi | Self::Local | Self::Custom => Transport::Http,
+        }
     }
 
     /// The default API base, for the providers that have a fixed one.
@@ -103,13 +124,15 @@ impl Provider {
         }
     }
 
-    /// The command an ACP or PTY session launches, when the provider has a known one.
+    /// The command a delegated session launches, when the provider has a known one —
+    /// everything [`Transport::needs_a_command`] answers `true` for.
     ///
-    /// **A default, not a fact.** The exact binary name and flags belong to tools that ship
-    /// on their own schedule, so [`ProviderConfig::command`] overrides this and the session
-    /// probes for the binary before trusting either. A wrong guess must cost a config field,
-    /// never a broken feature — so a missing binary degrades to [`Transport::Http`] with a
-    /// toast naming what was not found.
+    /// **A default, not a fact.** The exact binary name and flags belong to tools that ship on
+    /// their own schedule, so [`crate::transport::LaunchSpec::command`] overrides this and the
+    /// session probes for the binary before trusting either. A wrong guess must cost a config
+    /// field, never a broken feature — so a missing binary answers
+    /// [`crate::AgentError::MissingCommand`], which names what was looked for and is the one
+    /// error in this crate whose remedy is in its own text.
     pub const fn default_command(self) -> Option<&'static str> {
         match self {
             Self::Claude => Some("claude"),
@@ -131,9 +154,13 @@ impl Provider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
-    /// Agent Client Protocol: JSON-RPC 2.0 over a child process's stdio. The default where
-    /// a subscription-holding CLI exists.
+    /// The `claude` CLI's own line-delimited JSON protocol over stdio. The default for
+    /// [`Provider::Claude`], and the one transport here whose wire format was **captured from
+    /// a real session** rather than recalled — see [`crate::transport::claude_cli`].
     #[default]
+    ClaudeCli,
+    /// Agent Client Protocol: JSON-RPC 2.0 over a child process's stdio. For agents that
+    /// genuinely speak it — which, measured, does not include `claude`.
     Acp,
     /// A real pseudo-terminal running a CLI.
     Pty,
@@ -142,10 +169,12 @@ pub enum Transport {
 }
 
 impl Transport {
-    pub const ALL: [Self; 3] = [Self::Acp, Self::Pty, Self::Http];
+    pub const ALL: [Self; 4] = [Self::ClaudeCli, Self::Acp, Self::Pty, Self::Http];
 
+    /// The on-disk tag. Stable: it is written into board files.
     pub const fn tag(self) -> &'static str {
         match self {
+            Self::ClaudeCli => "claude_cli",
             Self::Acp => "acp",
             Self::Pty => "pty",
             Self::Http => "http",
@@ -154,6 +183,9 @@ impl Transport {
 
     pub const fn label(self) -> &'static str {
         match self {
+            // Named for the product the user installed, not for the protocol: "Claude Code"
+            // is what they signed into, and the wire format is our problem rather than theirs.
+            Self::ClaudeCli => "Claude Code",
             Self::Acp => "Agent protocol",
             Self::Pty => "Terminal",
             Self::Http => "API",
@@ -164,8 +196,23 @@ impl Transport {
     ///
     /// What the interface uses to say *"this one runs on your subscription"* beside a node's
     /// provider row, which is the single most useful thing to know before starting a long run.
+    ///
+    /// [`Self::ClaudeCli`] is **not** metered, and that is the measured half rather than the
+    /// hopeful one: the CLI authenticates with the user's own subscription credentials and
+    /// Velm never sets `ANTHROPIC_API_KEY`. A `total_cost_usd` does appear on every `result`
+    /// line — it is what the same tokens *would* cost on the API, and surfacing it as a bill
+    /// would contradict the one claim this predicate exists to make.
     pub const fn is_metered(self) -> bool {
         matches!(self, Self::Http)
+    }
+
+    /// Whether this transport runs a child process Velm has to find first.
+    ///
+    /// The three that do all fail the same way — *"`claude` is not installed"* — and it is
+    /// [`crate::transport::probe_command`] that turns that into a named message rather than a
+    /// spawn error or a hang.
+    pub const fn needs_a_command(self) -> bool {
+        !matches!(self, Self::Http)
     }
 }
 
@@ -225,16 +272,59 @@ impl ProviderChoice {
 mod tests {
     use super::*;
 
-    /// The bring-your-own-subscription path: a provider with a CLI defaults to ACP, and ACP
-    /// is not metered. If this ever inverts, every user of a Max plan starts paying twice.
+    /// The bring-your-own-subscription path: a provider with a CLI defaults to *delegating to
+    /// it*, and no delegated transport is metered. If this ever inverts, every user of a Max
+    /// plan starts paying twice.
     #[test]
     fn a_subscription_provider_defaults_to_an_unmetered_transport() {
         for provider in [Provider::Claude, Provider::OpenAi, Provider::Gemini] {
             assert!(provider.supports_subscription(), "{provider:?}");
             let choice = ProviderChoice::new(provider);
-            assert_eq!(choice.effective_transport(), Transport::Acp, "{provider:?}");
+            assert!(
+                !choice.effective_transport().is_metered(),
+                "{provider:?} was billed per token by default"
+            );
             assert!(!choice.is_metered(), "{provider:?} was billed per token by default");
         }
+    }
+
+    /// ⚠ **Claude's default is the transport that was measured, not the one that was
+    /// remembered.** `claude` does not speak ACP — that was established by running it, and
+    /// this assertion is what stops the old assumption being reinstated by someone tidying the
+    /// enum. The other two keep ACP, which is a *guess* and is labelled one.
+    #[test]
+    fn claude_delegates_over_the_protocol_its_cli_actually_speaks() {
+        let claude = ProviderChoice::new(Provider::Claude);
+        assert_eq!(claude.effective_transport(), Transport::ClaudeCli);
+        assert!(!claude.is_metered(), "the subscription path must never be billed");
+        assert_eq!(claude.summary(), "Claude · default model · subscription");
+
+        for guessed in [Provider::OpenAi, Provider::Gemini] {
+            assert_eq!(guessed.default_transport(), Transport::Acp, "{guessed:?}");
+        }
+
+        // A node may still be pointed at ACP by hand — nothing about the measurement removes
+        // a transport, and an agent that does speak ACP is still reachable.
+        let by_hand = claude.clone().with_transport(Transport::Acp);
+        assert_eq!(by_hand.effective_transport(), Transport::Acp);
+        assert!(!by_hand.is_metered());
+    }
+
+    /// The tag is written into board files, so it must be exactly what serde writes — two
+    /// spellings of one value is a board that reads back as a different transport than it was
+    /// saved as. **A board saved before `ClaudeCli` existed carries `"acp"` and must keep
+    /// parsing**, which is the only thing here that RULE ZERO cares about.
+    #[test]
+    fn every_transport_tag_is_the_one_serde_writes_and_the_old_ones_still_parse() {
+        for transport in Transport::ALL {
+            let json = serde_json::to_string(&transport).unwrap();
+            assert_eq!(json, format!("\"{}\"", transport.tag()), "{transport:?}");
+        }
+        assert_eq!(Transport::ClaudeCli.tag(), "claude_cli");
+
+        let older = r#"{"provider":"claude","transport":"acp"}"#;
+        let choice: ProviderChoice = serde_json::from_str(older).unwrap();
+        assert_eq!(choice.effective_transport(), Transport::Acp);
     }
 
     /// Kimi has no CLI to delegate to, so it is an API call and it says so.

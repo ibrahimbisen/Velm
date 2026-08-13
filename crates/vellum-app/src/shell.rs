@@ -115,6 +115,14 @@ pub enum Ask {
     /// with a ⓘ saying why it matters. Answering *Continue* runs what `ImportFromMiro`
     /// used to run straight away.
     ImportSteps,
+    /// The rules editor was opened on one agent node.
+    AgentRules(vellum_doc::ItemId),
+    /// The schedule editor was opened on one agent node.
+    AgentSchedule(vellum_doc::ItemId),
+    /// A provider's API key was asked for. Carries which provider, because the dialog does
+    /// not: `Dialog::SignIn` is told only *whether* a key already exists, never which
+    /// provider's key it is being handed back — that correlation is this enum's whole job.
+    SignIn(vellum_agent::Provider),
 }
 
 /// The chrome and everything it needs between frames.
@@ -133,6 +141,15 @@ pub struct Shell {
     /// the renderer does.
     selection: Vec<SelectionItem>,
     selection_key: (u64, usize, u64),
+    /// What each AI provider looks like from this machine: installed, credentialled, and
+    /// one line saying what was found.
+    ///
+    /// **Cached, because answering it walks `PATH` for three binaries and reads the
+    /// credentials file.** Doing that once per frame would be a filesystem round trip
+    /// behind every frame of an idle board, which is precisely the idle cost this
+    /// application exists not to have. Refreshed by [`Shell::refresh_providers`] when a
+    /// sign-in changes something, which is the only time the answer can move.
+    providers: Vec<vellum_ui::ProviderStatus>,
     cards: Vec<BoardCard>,
     fonts: Vec<String>,
     find_matches: Option<(usize, usize)>,
@@ -192,7 +209,9 @@ impl Shell {
             ..ViewState::default()
         };
 
+        let providers = library.provider_status();
         let mut shell = Self {
+            providers,
             // Filled in by the first `run`. Default until then, which greys every row —
             // correct, since there is nothing to act on before the first frame.
             command_context: vellum_ui::CommandContext::default(),
@@ -552,6 +571,15 @@ impl Shell {
         self.chrome.ask(dialog(id));
     }
 
+    /// Re-probes which providers are reachable and which have a key.
+    ///
+    /// Called after a sign-in rather than per frame: answering walks `PATH` for three
+    /// binaries and reads the credentials file, and this is the only moment the answer can
+    /// have changed.
+    pub fn refresh_providers(&mut self) {
+        self.providers = self.library.provider_status();
+    }
+
     /// What a dialog was about, consumed so an answer cannot be acted on twice.
     pub fn take_ask(&mut self, id: DialogId) -> Option<Ask> {
         let index = self.pending.iter().position(|(pending, _)| *pending == id)?;
@@ -785,6 +813,7 @@ impl Shell {
                 chrome,
                 cards,
                 selection,
+                providers,
                 screen,
                 tool,
                 view,
@@ -795,6 +824,14 @@ impl Shell {
 
             let view_state = ViewState { zoom: facts.zoom, ..*view };
             let state = ChromeState {
+                // The Agent Canvas settings, all four application-wide rather than per board.
+                // A grid is a drawing aid you want everywhere (feedback 31's reasoning); so
+                // is the mode agent output is shown in, whether a browser engine may run at
+                // all, and whether coding agents get their own checkout.
+                default_display: self.library.default_display_mode(),
+                browser_nodes: self.library.browser_nodes(),
+                worktrees: self.library.worktrees(),
+                providers: providers.as_slice(),
                 link_previews: self.library.link_previews(),
                 align_objects: self.library.align_objects(),
                 snap_to_grid: self.library.snap_to_grid(),
