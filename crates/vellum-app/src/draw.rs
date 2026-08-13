@@ -1565,10 +1565,16 @@ impl Painter {
                 // of truth that can disagree with the endpoints it describes, which this
                 // repository has already paid for twice.
                 //
-                // Gated on `AgentViews::is_empty`, which is the promise that a board with no
-                // agents on it costs exactly what it did before this layer existed: one
+                // Gated on `AgentViews::has_agents`, which is the promise that a board with
+                // no agents on it costs exactly what it did before this layer existed: one
                 // boolean per connector rather than two projection lookups.
-                let link = if ctx.agents.is_empty() {
+                //
+                // **`has_agents`, not `is_empty`.** The views map holds only the nodes that
+                // are *visible*, so a connector on screen whose two agent endpoints are both
+                // off screen would fall to `Plain` and the line would change style as the
+                // user panned — which is worse than either style, because it reads as the
+                // link being lost.
+                let link = if !ctx.agents.has_agents() {
                     crate::agent::LinkKind::Plain
                 } else {
                     let kind_of = |end: &vellum_doc::ConnectorEnd| {
@@ -5637,8 +5643,8 @@ fn push_node_card(
 /// arrive the way an agent's transcript does — read once per frame by the runtime and handed to
 /// the painter as a snapshot. Until `crate::agent_view` grows that map this answers `None`, and
 /// `note_paint` draws a line saying so rather than an empty box.
-fn note_body<'a>(_ctx: &DrawContext<'a>, _id: SceneId) -> Option<&'a str> {
-    None
+fn note_body<'a>(ctx: &DrawContext<'a>, id: SceneId) -> Option<&'a str> {
+    ctx.agents.note(id)
 }
 
 /// The rows a file tree draws.
@@ -5646,8 +5652,8 @@ fn note_body<'a>(_ctx: &DrawContext<'a>, _id: SceneId) -> Option<&'a str> {
 /// The same join as [`note_body`], and the same reason: `vellum_agent::filetree::visible` reads
 /// directories, which is not something a frame may do. Until the runtime supplies it this
 /// answers `None` and the node says it has not been read.
-fn tree_view<'a>(_ctx: &DrawContext<'a>, _id: SceneId) -> Option<&'a TreeView> {
-    None
+fn tree_view<'a>(ctx: &DrawContext<'a>, id: SceneId) -> Option<&'a TreeView> {
+    ctx.agents.tree(id)
 }
 
 /// Whether browser nodes are permitted at all.
@@ -5656,8 +5662,8 @@ fn tree_view<'a>(_ctx: &DrawContext<'a>, _id: SceneId) -> Option<&'a TreeView> {
 /// default, so until Preferences is plumbed through to the painter every node draws
 /// `placeholder_reason`'s *"Browser nodes are off — turn them on in Preferences"*, which is
 /// exactly what a default installation should say.
-const fn browser_nodes_enabled(_ctx: &DrawContext<'_>) -> bool {
-    false
+const fn browser_nodes_enabled(ctx: &DrawContext<'_>) -> bool {
+    ctx.agents.browser_nodes()
 }
 
 /// What an Agent Canvas node's pieces were built against, so a frame can tell whether it still

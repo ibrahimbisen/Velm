@@ -127,6 +127,12 @@ impl RulesForm {
     }
 
     /// Whether this node sets a field itself.
+    ///
+    /// Unused today: the editor draws provenance from [`ResolvedRules`]'s own record, which
+    /// is the arrangement `docs/07-agent-canvas.md` §7 requires — the display must not
+    /// re-derive what the agent actually got. Kept because it is the right predicate for the
+    /// editor's own "cleared here" affordance, which is the next thing anyone will want.
+    #[expect(dead_code, reason = "the editor reads provenance from ResolvedRules; see above")]
     fn sets(&self, field: RuleField) -> bool {
         match field {
             RuleField::Tone => !self.tone.trim().is_empty(),

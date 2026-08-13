@@ -1206,6 +1206,15 @@ impl AgentRuntime {
     /// One function, so the two cannot come to disagree — a node that drew an event the file
     /// never got would look right and replay wrong.
     pub fn record(&mut self, key: &NodeKey, at: Timestamp, event: &TranscriptEvent) {
+        // **Seed from disk first, then append.** Without this the ring holds only what this
+        // process recorded, and the *next* `ensure_loaded` reads the file — which by then
+        // contains those same events — and pushes them in again. The transcript silently
+        // doubles the first time a node is drawn after it has spoken.
+        //
+        // Measured, not reasoned: `--demo agent-transcript` reported "clean showed 6
+        // (expected 3), raw showed 12 (expected 6)". Exactly twice, which is the signature.
+        self.ensure_loaded(key);
+
         let Self { sidecar, nodes, .. } = self;
         let state = nodes.entry(key.clone()).or_default();
 
@@ -1500,13 +1509,8 @@ impl AgentRuntime {
 
         // Answer what is already in flight, both queues, before the join. A refusal is a
         // sentence an agent can act on; a dropped connection is not.
-        loop {
-            match self.inbox.try_recv() {
-                Ok(job) => {
-                    let _ = job.reply.send(Err(AgentError::Refused("Velm is closing".into())));
-                }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok(job) = self.inbox.try_recv() {
+            let _ = job.reply.send(Err(AgentError::Refused("Velm is closing".into())));
         }
         for pending in self.deferred.drain(..) {
             pending.reply.refuse("Velm is closing");

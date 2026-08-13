@@ -87,6 +87,27 @@ pub struct AgentViews {
     /// A `Vec` rather than a map because it is nearly always empty and, when it is not, it
     /// holds one or two entries — a linear scan beats a hash on both.
     pulses: Vec<(SceneId, LinkPulse)>,
+    /// Each visible note node's file contents, read once per frame by the runtime.
+    ///
+    /// **A note's text is not in the document** — that is the whole of §8 — so the painter
+    /// has to be handed it, and this is the hand. A frame may not read a file.
+    notes: HashMap<SceneId, String>,
+    /// Each visible file-tree node's rows, likewise. Reading a directory is not something a
+    /// frame may do either.
+    trees: HashMap<SceneId, vellum_agent::filetree::View>,
+    /// Whether browser nodes are permitted at all, from Preferences.
+    ///
+    /// Carried here rather than read from the library by the painter because the painter has
+    /// no library — and because it is one bool that decides what every browser node on the
+    /// board says about itself, so it belongs with the other per-frame agent facts.
+    browser_nodes: bool,
+    /// Whether the board holds **any** agent node, on screen or not.
+    ///
+    /// Distinct from `views` being non-empty, and the distinction is a real bug: `views`
+    /// holds only what is *visible*, so a connector on screen whose two agent endpoints are
+    /// both off screen would otherwise be drawn as an ordinary line. The link would flicker
+    /// between styles as the user panned, which is worse than either answer alone.
+    has_agents: bool,
 }
 
 impl AgentViews {
@@ -145,6 +166,59 @@ impl AgentViews {
     /// How many agent nodes have a view this frame. For the HUD.
     pub fn len(&self) -> usize {
         self.views.len()
+    }
+
+    /// Whether the board holds any agent node at all, visible or not.
+    ///
+    /// What the connector styling gates on. Gating on `is_empty()` instead makes a link
+    /// between two off-screen agents draw as an ordinary connector, so the line changes
+    /// style as the user pans — see the field's own comment.
+    pub const fn has_agents(&self) -> bool {
+        self.has_agents
+    }
+
+    pub const fn set_has_agents(&mut self, any: bool) {
+        self.has_agents = any;
+    }
+
+    /// One visible note's file contents.
+    pub fn note(&self, id: SceneId) -> Option<&str> {
+        self.notes.get(&id).map(String::as_str)
+    }
+
+    pub fn set_note(&mut self, id: SceneId, body: String) {
+        self.notes.insert(id, body);
+    }
+
+    /// One visible file tree's rows.
+    pub fn tree(&self, id: SceneId) -> Option<&vellum_agent::filetree::View> {
+        self.trees.get(&id)
+    }
+
+    pub fn set_tree(&mut self, id: SceneId, view: vellum_agent::filetree::View) {
+        self.trees.insert(id, view);
+    }
+
+    /// Whether a browser node may run an engine at all.
+    pub const fn browser_nodes(&self) -> bool {
+        self.browser_nodes
+    }
+
+    pub const fn set_browser_nodes(&mut self, allowed: bool) {
+        self.browser_nodes = allowed;
+    }
+
+    /// Empties the frame's answers while keeping the allocations.
+    ///
+    /// Called at the head of every rebuild. `clear` rather than a fresh `AgentViews` so a
+    /// steady-state frame with agents on it allocates nothing, which is the same reason
+    /// `DrawList` is owned and reused.
+    pub fn clear(&mut self) {
+        self.views.clear();
+        self.pulses.clear();
+        self.notes.clear();
+        self.trees.clear();
+        self.has_agents = false;
     }
 }
 

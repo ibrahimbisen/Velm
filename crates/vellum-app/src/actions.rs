@@ -1977,6 +1977,65 @@ impl ActiveState {
     ///
     /// **The early-out is the whole cost on an ordinary board**: a board with no agent nodes
     /// and no views already built returns before it touches the camera or the R-tree.
+    /// Hands the painter the two things it may not fetch for itself: a note's file contents
+    /// and a file tree's rows.
+    ///
+    /// **On-screen nodes only**, and that is the rule rather than an optimisation. A board
+    /// with forty note nodes must not read forty files to draw the two you are looking at,
+    /// and a file tree rooted at a `target/` directory is forty thousand entries — the whole
+    /// canvas rests on frame cost following what is visible rather than what exists.
+    ///
+    /// A tree is read here rather than cached because a directory changes underneath us and
+    /// a cached listing is one that is wrong the moment anything moves. It is bounded twice:
+    /// by the viewport, and by `filetree::MAX_ROWS` inside the walk.
+    fn fill_node_content(
+        &mut self,
+        board: &vellum_agent::BoardKey,
+        visible: vellum_scene::WorldRect,
+    ) {
+        let project = self.editor.path().and_then(|path| path.parent()).map(Path::to_path_buf);
+        let nodes: Vec<_> = self
+            .editor
+            .projection()
+            .iter()
+            .filter(|(_, projected)| projected.bounds.intersects(&visible))
+            .map(|(id, projected)| (*id, projected.doc_id, projected.item.kind.clone()))
+            .collect();
+
+        for (scene, doc, kind) in nodes {
+            match kind {
+                ItemKind::AgentNote { .. } => {
+                    let key = crate::agent_runtime::NodeKey::new(board, doc.to_string());
+                    if let Some(body) = self.agent_runtime.note_text(&key) {
+                        let body = body.to_owned();
+                        self.agents.set_note(scene, body);
+                    }
+                }
+                ItemKind::FileTree { model } => {
+                    let tree = crate::filetree::decode(&model);
+                    // An empty root means the board's project directory. A board that is not
+                    // a project has no tree to show, and says so rather than showing the
+                    // application's working directory, which is not the user's project.
+                    let root = if tree.root.trim().is_empty() {
+                        project.clone()
+                    } else if Path::new(&tree.root).is_absolute() {
+                        Some(PathBuf::from(&tree.root))
+                    } else {
+                        project.as_ref().map(|base| base.join(&tree.root))
+                    };
+                    let Some(root) = root else { continue };
+                    match vellum_agent::filetree::visible(&root, &tree, tree.show_ignored) {
+                        Ok(view) => self.agents.set_tree(scene, view),
+                        Err(error) => {
+                            log::debug!("agents: reading {} failed ({error})", root.display());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub(crate) fn rebuild_agent_views(&mut self) {
         let has_nodes = self.agent_board.as_ref().is_some_and(|stamp| stamp.has_nodes);
         if !has_nodes {
@@ -1990,9 +2049,9 @@ impl ActiveState {
         let board = self.agent_board_key();
         let visible = self.camera.visible_world_rect();
         let now_ms = crate::agent_runtime::unix_now().saturating_mul(1_000);
-        // The app-wide default a node with no choice of its own follows. A constant until
-        // Preferences carries the setting — see this module's note in the handover.
-        let fallback = vellum_agent::DisplayMode::default();
+        // The app-wide default a node with no choice of its own follows — feature 2's
+        // second half, so changing it in Preferences moves every node that never chose.
+        let fallback = self.shell.library.default_display_mode();
         self.agents = self.agent_runtime.rebuild_views(
             &board,
             self.editor.projection(),
@@ -2000,6 +2059,11 @@ impl ActiveState {
             fallback,
             now_ms,
         );
+        // Three answers the painter cannot work out for itself: a frame may not read a file
+        // or a directory, and it has no library to ask about a preference.
+        self.agents.set_browser_nodes(self.shell.library.browser_nodes());
+        self.agents.set_has_agents(true);
+        self.fill_node_content(&board, visible);
     }
 
     /// The window gained or lost focus. Feature 15's app-side half.
@@ -2055,6 +2119,43 @@ impl ActiveState {
     /// The press path's single question, answered from **the same rectangles the painter
     /// drew** — `crate::agent::layout`, which its own header says is called by both readers
     /// precisely so a control cannot be drawn where it cannot be pressed.
+    /// A press inside an agent node's transcript: an option card, or a permission's answer.
+    ///
+    /// Returns whether it was consumed. Everything is measured from `draw::agent_paint`'s own
+    /// output — the painter's rectangles, not a second copy of the arithmetic — which is the
+    /// rule `kanban_runs` exists to enforce and the reason `NodePaint` is `pub(crate)`.
+    fn press_in_transcript(&mut self, scene: SceneId, world: WorldPoint, doc: DocId) -> bool {
+        let Some(projected) = self.editor.projection().get(scene) else { return false };
+        let (width, height) = projected.item.placement.scaled_size();
+        let laid = crate::agent::layout(width, height);
+        let Some(view) = self.agents.get(scene) else { return false };
+        let paint = crate::draw::agent_paint(view, &laid, crate::draw::node_font_size(width));
+
+        let (x, y) = (
+            world.x - projected.item.placement.x + width / 2.0,
+            world.y - projected.item.placement.y + height / 2.0,
+        );
+
+        for chips in paint.permissions() {
+            if chips.allow.contains(x, y) || chips.deny.contains(x, y) {
+                let allowed = chips.allow.contains(x, y);
+                let request = vellum_agent::RequestId(chips.request.clone());
+                self.answer_agent_permission(doc, &request, allowed);
+                return true;
+            }
+        }
+        if let Some(card) = paint.option_at(x, y) {
+            let choice = card.choice.clone();
+            // Sent back as the next turn's input, which is what makes an option set an
+            // answer rather than a picture: "here are three UI directions I built" is only
+            // useful if clicking one tells the agent which.
+            self.set_agent_draft(doc, choice);
+            self.run_agent(doc);
+            return true;
+        }
+        false
+    }
+
     fn agent_part_under(
         &self,
         scene: SceneId,
@@ -4866,6 +4967,20 @@ impl ActiveState {
                         self.begin_prompting(doc);
                         return;
                     }
+                    // A press in the transcript can land on an option card or on a
+                    // permission's Allow/Deny. Both are answered from the painter's own
+                    // laid-out rectangles — `NodePaint`, the `kanban_runs` rule — rather
+                    // than from arithmetic repeated here.
+                    //
+                    // A permission that could be *drawn* and not *answered* would leave the
+                    // agent blocked for ever behind a button, which is why the painter
+                    // reserved the row and deliberately did not paint it until this existed.
+                    crate::agent::AgentPart::Transcript
+                        if self.press_in_transcript(id, world, doc) =>
+                    {
+                        self.input.resolve_press(true);
+                        return;
+                    }
                     // Everything else on the node falls through: the role takes the caret
                     // through the ordinary double-click path, and a press on the transcript,
                     // the status dot or bare header is a press on the item — which has to
@@ -6724,7 +6839,7 @@ impl ActiveState {
                 let item = self.editor.board().item(id).ok()?;
                 let ItemKind::Browser { model } = &item.kind else { return None };
                 let page = crate::browser::decode(model);
-                page.live.then(|| (id, page))
+                page.live.then_some((id, page))
             })
             .collect();
         if live.is_empty() {
