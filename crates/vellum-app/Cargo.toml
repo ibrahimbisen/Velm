@@ -58,6 +58,11 @@ vellum-ui.workspace = true
 
 # The board itself, and everything that draws it. The dependency arrows all point
 # down from here: nothing in the workspace depends on this crate.
+# The Agent Canvas layer: providers, transports, rules, notes, the inter-agent bus.
+# `crate::agent`, `crate::note`, `crate::filetree` and `crate::browser` supply the
+# token encoding and the measurement it deliberately does not do — the same split
+# `vellum-flow` and `vellum-mindmap` already have.
+vellum-agent.workspace = true
 # Chart geometry: scales, nice-number ticks, marks, legends. `crate::chart`
 # supplies the shaping and the tessellation it does not do.
 vellum-chart.workspace = true

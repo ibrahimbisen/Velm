@@ -35,12 +35,15 @@
 //! `docs/01-architecture.md` §3 rests the whole performance argument on.
 
 pub mod actions;
+pub mod agent;
 pub mod app;
 pub mod appearance;
 pub mod assets;
 pub mod bench;
+pub mod browser;
 pub mod capture;
 pub mod chart;
+pub mod filetree;
 pub mod chrome_pass;
 pub mod compose;
 pub mod connector;
@@ -60,6 +63,7 @@ pub mod links;
 pub mod menubar;
 pub mod mesh;
 pub mod mindmap;
+pub mod note;
 pub mod options;
 pub mod project;
 pub mod session;
