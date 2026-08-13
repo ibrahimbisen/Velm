@@ -57,7 +57,9 @@ pub mod pty;
 /// here — `system_context` is the finished string (role label + the rule cascade + context
 /// sources), because `vellum-agent` does not read the board and `crate::rules` is where that
 /// resolution lives.
-#[derive(Debug, Clone, Default)]
+/// **Never logged.** The `Debug` impl below says *whether* there is a key and never what it
+/// is; see it for why a derive on this particular struct is the worst of the four.
+#[derive(Clone, Default)]
 pub struct LaunchSpec {
     /// Which provider, which model, which transport. See [`ProviderChoice`].
     pub provider: ProviderChoice,
@@ -101,6 +103,35 @@ pub struct LaunchSpec {
     /// The pseudo-terminal's size in (columns, rows). `None` takes [`pty::DEFAULT_SIZE`].
     /// Ignored by the other two transports.
     pub terminal: Option<(u16, u16)>,
+}
+
+/// ⚠ **Hand-written, and this is the most exposed of the crate's four secrets.**
+///
+/// A `LaunchSpec` is what every transport's `start` is handed, so it is the argument in every
+/// stack frame where starting an agent goes wrong — and *"the agent would not start"* is the
+/// commonest failure this crate has, which makes it the struct somebody is most likely to
+/// `dbg!`. `#[derive(Debug)]` would put the user's API key in that output, and it would put it
+/// there on the one path where the output is copied into a bug report.
+///
+/// `env` is redacted for the same reason and it is not belt and braces: it is how `VELM_IPC`
+/// and `VELM_AGENT_ID` reach the child, and `VELM_IPC_TOKEN` is a documented way to pass the
+/// IPC credential — so the map holds a second secret whenever that form is used. The *names*
+/// are printed, which is what a "was the environment wired up" question needs.
+impl std::fmt::Debug for LaunchSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LaunchSpec")
+            .field("provider", &self.provider)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("env", &self.env.iter().map(|(name, _)| name).collect::<Vec<_>>())
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<set>"))
+            .field("data_dir", &self.data_dir)
+            .field("terminal", &self.terminal)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LaunchSpec {
@@ -185,46 +216,29 @@ pub(crate) fn park_blob(blobs: &Blobs, mime: &str, bytes: Vec<u8>) -> String {
     id
 }
 
-/// Base64, for the image bytes an agent sends inline.
+/// Base64, for the image bytes an agent sends inline — **[`crate::ipc`]'s strict decoder**,
+/// re-exported so the three call sites on the image path share one definition.
 ///
-/// Hand-rolled to keep this crate's dependency list at the `docs/07` §1 names, and short
-/// enough to read: four characters in, three bytes out, whitespace and padding skipped.
-/// Answers `None` on anything that is not base64 rather than producing bytes that are not the
-/// picture — a half-decoded image is a texture upload of garbage, not a smaller picture.
+/// # There used to be three of these, and two of them were lenient
 ///
-/// It lives here rather than in one transport because **two protocols carry pictures in
-/// different envelopes and the same encoding**: ACP's flat `data`/`mimeType` and Anthropic's
-/// `source.data`/`source.media_type`. [`acp`] still has its own private copy from before this
-/// one existed; collapsing it onto this is a one-line edit for whoever owns that file next.
-pub(crate) fn decode_base64(text: &str) -> Option<Vec<u8>> {
-    fn sextet(byte: u8) -> Option<u32> {
-        match byte {
-            b'A'..=b'Z' => Some(u32::from(byte - b'A')),
-            b'a'..=b'z' => Some(u32::from(byte - b'a') + 26),
-            b'0'..=b'9' => Some(u32::from(byte - b'0') + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    let mut accumulator: u32 = 0;
-    let mut bits = 0;
-    for byte in text.bytes() {
-        if byte == b'=' || byte.is_ascii_whitespace() {
-            continue;
-        }
-        let value = sextet(byte)?;
-        accumulator = (accumulator << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((accumulator >> bits) & 0xff) as u8);
-        }
-    }
-    Some(out)
-}
+/// This module had its own and [`acp`] had another, both skipping `=` and whitespace anywhere,
+/// both accepting a length that is not a multiple of four, and both ignoring non-canonical
+/// trailing bits — while each claimed in its own doc comment to answer `None` on anything that
+/// is not base64. `decode_base64("a")` answered `Some(vec![])`: a **zero-byte blob**, parked
+/// by [`park_blob`] and written to the content-addressed store as though it were a picture.
+///
+/// `ipc::decode_base64` was already the strict one, and already carried the argument for why
+/// (trap 2 in `CLAUDE.md`, at a different layer: something that always decodes is a decoder
+/// that never reports a bug). Two spellings of one rule is how they came to disagree, so there
+/// is one now.
+///
+/// ⚠ **Behaviour change, deliberately.** Line-wrapped base64 (`"aGVs\nbG8="`), an unpadded
+/// length (`"aGVsbG8"`) and a `=` in the middle are all refused now where they used to decode.
+/// Neither protocol on this path emits any of those — ACP's flat `data`/`mimeType` and
+/// Anthropic's `source.data`/`source.media_type` are both single unwrapped tokens — and each
+/// of those shapes is what a *truncated or spliced* payload looks like, which is exactly the
+/// thing worth refusing on the way into a blob store.
+pub(crate) use crate::ipc::decode_base64;
 
 /// One running agent, whatever kind of process is behind it.
 ///
@@ -421,14 +435,60 @@ mod tests {
 
     /// A picture that half decodes is a texture upload of garbage rather than a smaller
     /// picture, so anything that is not base64 must answer `None` rather than bytes.
+    ///
+    /// ⚠ **This test used to assert the bug.** Its middle line was
+    /// `decode_base64("aGVs\nbG8=") == Some(b"hello")` under a comment reading *"padding and
+    /// line breaks are both legal in a wire payload"* — a decoder that skips whitespace
+    /// anywhere is one that cannot tell a wrapped payload from a spliced one, and the same
+    /// leniency answered `Some(vec![])` for the single character `"a"`. A zero-byte blob went
+    /// into the content-addressed store as a picture. The three copies of this function are
+    /// one now, and it is the strict one.
     #[test]
     fn base64_decodes_a_picture_and_refuses_what_is_not_one() {
         assert_eq!(decode_base64("aGk=").as_deref(), Some(&b"hi"[..]));
-        // Padding and line breaks are both legal in a wire payload.
         assert_eq!(decode_base64("aGVsbG8gd29ybGQ=").as_deref(), Some(&b"hello world"[..]));
-        assert_eq!(decode_base64("aGVs\nbG8=").as_deref(), Some(&b"hello"[..]));
         assert_eq!(decode_base64(""), Some(Vec::new()));
         assert_eq!(decode_base64("not base64!"), None);
+
+        // The near misses — the shape a *mistake* takes, rather than the shape rubbish takes.
+        assert_eq!(decode_base64("a"), None, "one character decoded to a zero-byte blob");
+        assert_eq!(decode_base64("aGVsbG8"), None, "an unpadded length is a truncated payload");
+        assert_eq!(decode_base64("aGVs\nbG8="), None, "whitespace inside the payload");
+        assert_eq!(decode_base64("aGk=aGk="), None, "two payloads spliced together");
+        assert_eq!(decode_base64("Zh=="), None, "a non-canonical tail is a second spelling");
+    }
+
+    /// A `LaunchSpec` is the argument in every frame where starting an agent went wrong,
+    /// which makes it the struct somebody reaches for `dbg!` on — and it carries the user's
+    /// API key. The derive that used to be here would have put that key in the output of the
+    /// one debugging session most likely to end up pasted into a bug report.
+    ///
+    /// `env` is checked as well and it is not belt and braces: `VELM_IPC_TOKEN` is a
+    /// documented way to pass the IPC credential to a child, so the map holds a second secret.
+    #[test]
+    fn a_launch_spec_debug_says_a_key_is_set_and_never_what_it_is() {
+        let mut spec = LaunchSpec::new(ProviderChoice::new(Provider::Claude));
+        spec.api_key = Some("sk-ant-notarealkey-0123456789".into());
+        spec.env = vec![
+            ("VELM_AGENT_ID".into(), "node-4".into()),
+            ("VELM_IPC_TOKEN".into(), "a-token-nobody-should-print".into()),
+        ];
+
+        let printed = format!("{spec:?}");
+        assert!(!printed.contains("sk-ant"), "the api key was printed: {printed}");
+        assert!(!printed.contains("notarealkey"), "the api key was printed: {printed}");
+        assert!(
+            !printed.contains("a-token-nobody-should-print"),
+            "an environment secret was printed: {printed}"
+        );
+
+        // Redacted, not omitted: "is a key set at all" is the actual question being debugged.
+        assert!(printed.contains("api_key"), "{printed}");
+        assert!(printed.contains("<set>"), "{printed}");
+        assert!(printed.contains("VELM_IPC_TOKEN"), "the variable's name is not the secret");
+
+        let bare = format!("{:?}", LaunchSpec::new(ProviderChoice::new(Provider::Claude)));
+        assert!(bare.contains("None"), "an unset key must be visibly unset: {bare}");
     }
 
     /// A launch spec must not have to be told what a Claude node already implies, and must

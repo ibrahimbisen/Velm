@@ -1367,7 +1367,7 @@ impl Transcribe for HostedTranscriber {
         if !(200..300).contains(&status) {
             return Err(hosted_error(self.provider, status, &text));
         }
-        Ok(read_transcription(&text))
+        read_transcription(&text)
     }
 
     fn backend(&self) -> Backend {
@@ -1399,9 +1399,10 @@ pub fn multipart_body(boundary: &str, model: &str, wav: &[u8]) -> Vec<u8> {
         body.extend_from_slice(b"\r\n");
     };
     field("model", model);
-    // JSON rather than `text`: a server that does not honour `response_format` answers JSON
-    // anyway, and `read_transcription` falls back to the raw body — so asking for JSON works
-    // with both and asking for text works with one.
+    // JSON rather than `text`, and this field is now load-bearing rather than a preference:
+    // `read_transcription` requires the `{"text": …}` shape, because its old fallback to the
+    // raw body turned a captive portal's login page into the agent's next prompt. Every
+    // OpenAI-compatible server answers this format with that shape, whisper.cpp's included.
     field("response_format", "json");
 
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -1423,11 +1424,20 @@ pub fn multipart_body(boundary: &str, model: &str, wav: &[u8]) -> Vec<u8> {
 /// diagnose. One scan and a suffix is the whole cost.
 fn unique_boundary(payload: &[u8]) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let mut boundary = format!(
-        "velmvoice{}{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    );
+    let base = format!("velmvoice{}{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+    dodge_boundary(base, payload)
+}
+
+/// The retry loop of [`unique_boundary`], with the starting name supplied.
+///
+/// Split out **so the loop can actually be tested**. The assertion that used to guard it fed
+/// `unique_boundary` a payload holding the boundary's *prefix* — but the generated name is
+/// longer than that prefix, so `contains` returned `false` on its length check before it
+/// compared a byte, and the loop below never ran once in the test suite's life. The counter
+/// makes the name unpredictable from outside, so there is no payload a caller of
+/// `unique_boundary` can build that is guaranteed to collide: the seam has to be here.
+fn dodge_boundary(base: String, payload: &[u8]) -> String {
+    let mut boundary = base;
     for attempt in 0..16 {
         if !contains(payload, boundary.as_bytes()) {
             break;
@@ -1443,18 +1453,52 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack.windows(needle.len()).any(|window| window == needle)
 }
 
-/// The text out of a transcription response.
+/// The text out of a transcription response: `{"text": "…"}`, and **nothing else**.
 ///
-/// `{"text": "…"}` on every OpenAI-compatible server; a plain body on one that honoured a
-/// `text` response format or has its own idea. Falling back to the body rather than failing is
-/// what makes this work against whisper.cpp's server without a second code path.
-fn read_transcription(body: &str) -> String {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body)
-        && let Some(text) = value["text"].as_str()
-    {
-        return text.trim().to_owned();
+/// ⚠ **This used to fall back to the whole body, and what that produced was the agent's next
+/// prompt.** A 200 is not a transcription — a captive portal answers 200 with a login page, a
+/// proxy answers 200 with an error document, a misconfigured server answers 200 with its own
+/// index — and every one of those became, verbatim and uncapped, *what the user said*. There
+/// is nothing on screen to disbelieve at that point: the words are in the prompt box, so they
+/// look like a bad transcription rather than like no transcription at all.
+///
+/// The fallback existed for a server that honoured a `text` response format. It cannot arise:
+/// [`multipart_body`] asks for `response_format=json`, and every OpenAI-compatible server —
+/// whisper.cpp's included — answers that with the documented shape.
+///
+/// A failure names the provider's own words when it gave any, and otherwise the *shape* of
+/// what came back, capped by **characters** because a body can be a megabyte of HTML and
+/// `&body[..200]` aborts the process on any multi-byte character straddling the boundary
+/// (`CLAUDE.md` feedback 30, twice, with `panic = "abort"` in the release profile).
+fn read_transcription(body: &str) -> Result<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(text) = value["text"].as_str() {
+            return Ok(text.trim().to_owned());
+        }
+        // A JSON error body: the provider named the problem, so quote it rather than the
+        // shape. Both spellings, because the bare-string form is what local servers send.
+        let named = value["error"]["message"]
+            .as_str()
+            .or_else(|| value["error"].as_str())
+            .or_else(|| value["message"].as_str());
+        if let Some(message) = named {
+            return Err(AgentError::Transport {
+                transport: "http",
+                message: format!(
+                    "the transcription endpoint answered 200 and then reported: {}",
+                    message.trim().chars().take(200).collect::<String>()
+                ),
+            });
+        }
     }
-    body.trim().to_owned()
+    let excerpt: String = body.trim().chars().take(200).collect();
+    Err(AgentError::Transport {
+        transport: "http",
+        message: format!(
+            "the transcription endpoint answered 200 with something that is not a \
+             transcription — no `text` field. It sent: {excerpt}"
+        ),
+    })
 }
 
 /// A non-2xx, named.
@@ -2084,23 +2128,77 @@ mod tests {
         // transcript is of the first half of the sentence.
         let boundary = unique_boundary(&wav);
         assert!(!contains(&wav, boundary.as_bytes()));
-
-        // A payload that already carries the boundary's prefix — the case the scan exists
-        // for. Whatever comes back must not occur in it.
-        let hostile = format!("velmvoice{}", std::process::id()).into_bytes();
-        let dodged = unique_boundary(&hostile);
-        assert!(!contains(&hostile, dodged.as_bytes()), "the boundary occurs in the payload");
     }
 
-    /// Both response shapes: JSON from an OpenAI-compatible server, and a bare body from one
-    /// that honoured `response_format` or has its own idea.
+    /// ⚠ **The version of this that lived inside the multipart test was vacuous**, and it is
+    /// worth saying how: it built a hostile payload out of the boundary's *prefix*
+    /// (`velmvoice{pid}`) and asserted the answer did not occur in it. The generated name is
+    /// longer than that prefix, so `contains` returned `false` on its length check before
+    /// comparing a single byte — the retry loop it was written to exercise never ran once.
+    ///
+    /// The loop is the thing that matters: PCM is arbitrary bytes, so a boundary that *does*
+    /// occur in the audio truncates the upload at that point and produces a transcript of the
+    /// first half of the sentence — a bug nobody would ever diagnose from the symptom.
+    ///
+    /// A/B: with the loop's body removed, the first assertion fails.
     #[test]
-    fn a_transcription_response_is_read_in_either_shape() {
-        assert_eq!(read_transcription(r#"{"text":"  Open the door. "}"#), "Open the door.");
-        assert_eq!(read_transcription("Open the door.\n"), "Open the door.");
-        // A JSON error body has no `text`, so it falls through as itself rather than as an
-        // empty transcript — an empty one would report as "nothing was said".
-        assert!(read_transcription(r#"{"error":{"message":"no such model"}}"#).contains("no such"));
+    fn a_boundary_that_occurs_in_the_payload_is_moved_until_it_does_not() {
+        // A payload that contains the whole starting name, which is what the loop is for.
+        let hostile = b"....velmvoice1....".to_vec();
+        let dodged = dodge_boundary("velmvoice1".to_owned(), &hostile);
+        assert_ne!(dodged, "velmvoice1", "the collision was not dodged at all");
+        assert!(!contains(&hostile, dodged.as_bytes()), "the boundary occurs in the payload");
+
+        // And when each successive attempt is also present, so the loop has to go round more
+        // than once — one retry is not evidence that a second one works.
+        let mut stubborn = b"velmvoice1".to_vec();
+        stubborn.extend_from_slice(b" velmvoice1x0 velmvoice1x0x1 velmvoice1x0x1x2");
+        let dodged = dodge_boundary("velmvoice1".to_owned(), &stubborn);
+        assert!(!contains(&stubborn, dodged.as_bytes()), "{dodged}");
+        assert!(dodged.len() > "velmvoice1x0x1x2".len(), "the loop stopped early: {dodged}");
+
+        // A payload with no collision leaves the name exactly as it was.
+        assert_eq!(dodge_boundary("velmvoice1".to_owned(), b"nothing here"), "velmvoice1");
+    }
+
+    /// ⚠ **This test asserted the bug, in both of its last two lines.** It required the raw
+    /// body to become the transcript (*"Open the door.\n"*) and required a JSON error body to
+    /// come back as a *successful* transcript containing the words *"no such"*.
+    ///
+    /// What that produced in the running app: a 200 that is not a transcription — a captive
+    /// portal's login page, a proxy's error document, a server's own index — became, verbatim
+    /// and uncapped, **what the user said**, and went straight into the agent as its next
+    /// prompt. There is nothing to disbelieve at that point; the words are in the box.
+    #[test]
+    fn a_transcription_that_is_not_a_transcription_is_a_named_failure() {
+        assert_eq!(read_transcription(r#"{"text":"  Open the door. "}"#).unwrap(), "Open the door.");
+        // An empty transcription is a legitimate answer — the user said nothing — and must
+        // not be confused with a body that had no `text` field at all.
+        assert_eq!(read_transcription(r#"{"text":""}"#).unwrap(), "");
+
+        // The captive portal, which is the case this exists for. It must be an **error** —
+        // the excerpt is deliberately quoted, because naming what came back instead is the
+        // whole value of the message; what must never happen is the page arriving as a
+        // successful transcript and going into the agent as the user's words.
+        let portal = "<!doctype html><title>Sign in to WiFi</title><h1>Sign in</h1>";
+        let error = read_transcription(portal).unwrap_err();
+        assert!(error.to_string().contains("not a transcription"), "{error}");
+
+        let plain = read_transcription("Open the door.\n").unwrap_err();
+        assert!(plain.to_string().contains("not a transcription"), "{plain}");
+
+        // A provider that named the problem has its words quoted, because that is the one
+        // thing worth putting in front of the user.
+        let named = read_transcription(r#"{"error":{"message":"no such model"}}"#).unwrap_err();
+        assert!(named.to_string().contains("no such model"), "{named}");
+        let bare = read_transcription(r#"{"error":"no such model"}"#).unwrap_err();
+        assert!(bare.to_string().contains("no such model"), "{bare}");
+
+        // Capped by **characters**. A megabyte of HTML must not reach a toast, and a byte
+        // slice through a multi-byte character aborts the process outright.
+        let huge = format!("<html>{}</html>", "\u{4e2d}".repeat(5_000));
+        let capped = read_transcription(&huge).unwrap_err().to_string();
+        assert!(capped.chars().count() < 400, "{} characters", capped.chars().count());
     }
 
     /// The temp WAV is private and **removes itself**, including on the paths that return

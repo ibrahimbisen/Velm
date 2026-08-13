@@ -28,6 +28,14 @@
 //! wrong and unactionable. The loop ends when stdin ends, which is how a client says it is
 //! finished.
 //!
+//! ⚠ **That includes a line that is not UTF-8**, and it did not used to. `read_line` refuses
+//! the whole read on one invalid byte — it answers `InvalidData` rather than the bytes — and
+//! this loop treated an `Err` as end of stdin, so **a single stray byte from a client ended
+//! the server**, contradicting the paragraph above. `read_until` takes the bytes as bytes and
+//! `from_utf8_lossy` turns them into a line that `handle_line` can then refuse *as a protocol
+//! error*, with the answer the client is waiting for. The rule generalises: at this layer an
+//! `Err` should mean the pipe is gone, and nothing else.
+//!
 //! # A missing Velm is not a reason to refuse to start
 //!
 //! `VELM_IPC` is unset whenever this is run outside an agent node — from a terminal, from a
@@ -49,10 +57,12 @@ fn main() {
     let stdout = std::io::stdout();
     let mut writer = stdout.lock();
 
-    let mut line = String::new();
+    let mut raw: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
+        raw.clear();
+        // Bytes, not a `String`. See the note above: `read_line` refuses the entire read on
+        // one invalid UTF-8 byte, and this loop reads an `Err` as the end of the pipe.
+        match reader.read_until(b'\n', &mut raw) {
             // End of stdin: the client is finished. Not an error.
             Ok(0) => break,
             Ok(_) => {}
@@ -61,6 +71,7 @@ fn main() {
                 break;
             }
         }
+        let line = String::from_utf8_lossy(&raw);
 
         let Some(answer) = server.handle_line(&line) else {
             // A notification, or a blank line. Silence is the correct answer to both.

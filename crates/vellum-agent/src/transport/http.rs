@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -66,12 +66,52 @@ const MAX_TOKENS: u32 = 8192;
 /// string, it only appends and flushes whole.
 const FLUSH_BYTES: usize = 240;
 
-/// The most answer text one turn will accumulate.
+/// The most a turn will produce, **text and thinking together**.
 ///
 /// A provider that loops — or a local server misconfigured into repeating itself — would
 /// otherwise grow one `String` until the machine gave out. The turn ends `Exhausted`, which
 /// is what that state is for.
+///
+/// ⚠ It used to count `Piece::Text` alone, which left a provider emitting nothing but
+/// `thinking_delta` unbounded — the cap was on whichever half was in mind when it was written,
+/// and both halves cross the same channel into the same transcript.
 const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
+
+/// The longest single line the body reader will hold.
+///
+/// One SSE frame is a sentence. A body with no newline in it at all — a server answering a
+/// stream request with a megabyte of HTML, a proxy's error page — would otherwise be one
+/// `String` grown by `read_line` **before** [`MAX_ANSWER_BYTES`] is ever consulted, which is
+/// the wrong order: that constant bounds what the *answer* accumulates and cannot bound what
+/// reading one line costs. A line past this is cut and the remainder arrives as the next
+/// line, where it fails to parse as `data:` and is skipped.
+const MAX_LINE_BYTES: u64 = 1024 * 1024;
+
+/// The most raw body bytes one exchange will read, across every line.
+///
+/// The aggregate half of [`MAX_LINE_BYTES`]: a stream of well-formed short frames that never
+/// ends is bounded by [`MAX_ANSWER_BYTES`] only in what it *keeps*, and a provider emitting
+/// nothing but ignorable events would be read forever.
+const MAX_STREAM_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How long the body may go without producing a **single byte** before the turn is failed.
+///
+/// ⚠ **A stall timeout, not a deadline, and the difference is the whole point.** A total
+/// budget — `ureq`'s own `timeout_recv_body`, or `voice.rs`'s `timeout_global` — cuts off a
+/// long answer that is arriving perfectly well, which looks exactly like the model giving up
+/// mid-sentence; that is why [`agent`] deliberately sets no global timeout. What has to be
+/// caught is the *other* shape: a socket that sends its headers and then goes quiet forever.
+/// Measured from the last byte, so an answer that keeps producing is never interrupted however
+/// long it runs, and one that produces nothing ends the turn instead of wedging the node —
+/// `busy()` is `!handle.is_finished()`, so a worker blocked on a dead socket refuses every
+/// later prompt for the life of the session.
+const STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often the consumer wakes while waiting for a line.
+///
+/// Also what makes **cancel work while stalled**: the old blocking `read_line` checked the
+/// flag only between lines, so a stalled stream ignored the user's stop as well.
+const STALL_TICK: Duration = Duration::from_millis(200);
 
 /// A browser-shaped, honest user agent. Named as ourselves, exactly as `vellum-link`'s is.
 const USER_AGENT: &str = concat!("Velm/", env!("CARGO_PKG_VERSION"), " (agent canvas)");
@@ -432,6 +472,15 @@ enum Piece {
     Thought(String),
     /// The provider said why it stopped.
     Stop(TurnOutcome),
+    /// Content **and** a stop reason in the same frame.
+    ///
+    /// Not a tidiness variant — it is a shape the OpenAI wire genuinely sends, and reading it
+    /// as either half alone loses the other. Returning `Text` early meant the stop was
+    /// dropped, so a stream that *had* said it finished reached EOF with no terminator and was
+    /// reported as cut short: the fix for "a truncated stream is reported as complete" turned
+    /// into "a complete stream is reported as truncated", which is the same defect facing the
+    /// other way and every bit as much of a lie.
+    TextThenStop(String, TurnOutcome),
     /// The provider reported an error mid-stream.
     Failed(String),
     /// End of stream.
@@ -475,30 +524,105 @@ fn parse_event(wire: Wire, data: &str) -> Piece {
             },
             "message_stop" => Piece::Done,
             "error" => Piece::Failed(
-                value["error"]["message"].as_str().unwrap_or("the provider reported an error").to_owned(),
+                error_message(&value)
+                    .unwrap_or_else(|| "the provider reported an error".to_owned()),
             ),
             _ => Piece::Ignore,
         },
         Wire::OpenAi => {
-            if let Some(message) = value["error"]["message"].as_str() {
-                return Piece::Failed(message.to_owned());
+            // ⚠ **Both error shapes, and the second one is the one that bites.** Ollama sends
+            // `{"error":"model 'x' not found"}` — a bare string where the wire documents an
+            // object — and reading only `error.message` made that frame a `Piece::Ignore`.
+            // Ignored, the stream then reaches EOF with no terminator, which used to be
+            // reported as a *completed* turn: the node went idle, in green, having said
+            // nothing, over a failure the provider had named in the first frame.
+            if let Some(message) = error_message(&value) {
+                return Piece::Failed(message);
             }
             let choice = &value["choices"][0];
+            let stop = choice["finish_reason"].as_str().map(openai_outcome);
             if let Some(text) = choice["delta"]["content"].as_str()
                 && !text.is_empty()
             {
-                return Piece::Text(text.to_owned());
+                return match stop {
+                    Some(outcome) => Piece::TextThenStop(text.to_owned(), outcome),
+                    None => Piece::Text(text.to_owned()),
+                };
             }
             if let Some(text) = choice["delta"]["reasoning_content"].as_str()
                 && !text.is_empty()
             {
                 return Piece::Thought(text.to_owned());
             }
-            match choice["finish_reason"].as_str() {
-                Some(reason) => Piece::Stop(openai_outcome(reason)),
+            match stop {
+                Some(outcome) => Piece::Stop(outcome),
                 None => Piece::Ignore,
             }
         }
+    }
+}
+
+/// The provider's own error message, in **either** shape it arrives in.
+///
+/// `{"error": {"message": "…"}}` is what both wires document and what the hosted providers
+/// send. `{"error": "…"}` — a bare string — is what Ollama sends, and it is not a rare corner:
+/// *"model 'x' not found"* is the first thing a user meets when a local model name is wrong.
+/// Reading only the object form turned that into no message at all, which then degraded into
+/// an empty answer and a completed turn.
+fn error_message(value: &Value) -> Option<String> {
+    match &value["error"] {
+        Value::String(message) if !message.trim().is_empty() => Some(message.clone()),
+        Value::Object(_) => Some(
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or("the provider reported an error it did not describe")
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
+/// What a body *was*, for a failure that has to name a shape it did not recognise.
+///
+/// **The field names, never the values.** A 200 that is not an answer can be a captive
+/// portal's login page, a proxy's error document, or the user's own prompt handed back; none
+/// of that belongs in a message on the canvas, and the useful half — *"it sent `model`,
+/// `done`, `response`"* — is what tells whoever reads it which server they are actually
+/// talking to.
+fn describe_shape(value: &Value) -> String {
+    match value {
+        Value::Object(map) if map.is_empty() => "an empty JSON object".to_owned(),
+        Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            let listed = keys.len();
+            keys.truncate(8);
+            let named = keys.join(", ");
+            if listed > 8 {
+                format!("a JSON object whose fields begin {named} (and {} more)", listed - 8)
+            } else {
+                format!("a JSON object with the field(s) {named}")
+            }
+        }
+        Value::Array(items) => format!("a JSON array of {} item(s)", items.len()),
+        Value::Null => "a JSON null".to_owned(),
+        _ => "a JSON scalar".to_owned(),
+    }
+}
+
+/// The failure a 200 with nothing in it deserves.
+///
+/// ⚠ **Silence reported as success is the worst answer this transport can give.** An agent
+/// that stopped for a reason nobody was told is one the user will believe: the node goes
+/// `Idle`, in the colour that means it worked, with no error and no detail. A named failure
+/// costs the user one glance and is always recoverable; a false success is not.
+fn empty_answer(value: &Value) -> TurnOutcome {
+    TurnOutcome::Failed {
+        message: format!(
+            "the provider answered 200 with no content and no stop reason, so nothing was \
+             said and nothing explained why. It sent {}.",
+            describe_shape(value)
+        ),
     }
 }
 
@@ -509,8 +633,8 @@ fn parse_event(wire: Wire, data: &str) -> Piece {
 fn parse_complete(wire: Wire, value: &Value) -> (String, Option<String>, TurnOutcome) {
     match wire {
         Wire::Anthropic => {
-            if let Some(message) = value["error"]["message"].as_str() {
-                return (String::new(), None, TurnOutcome::Failed { message: message.to_owned() });
+            if let Some(message) = error_message(value) {
+                return (String::new(), None, TurnOutcome::Failed { message });
             }
             let mut text = String::new();
             let mut thinking = String::new();
@@ -525,14 +649,21 @@ fn parse_complete(wire: Wire, value: &Value) -> (String, Option<String>, TurnOut
                     }
                 }
             }
-            let outcome = value["stop_reason"]
-                .as_str()
-                .map_or(TurnOutcome::Completed, anthropic_outcome);
-            (text, (!thinking.is_empty()).then_some(thinking), outcome)
+            // A body with nothing in it and no reason for having nothing in it is **not** a
+            // completed turn. `{"choices":[]}`, `{"error":"…"}` in a shape we did not read, an
+            // OpenAI-ish server answering an Anthropic-ish request — all three used to arrive
+            // here as an empty string and `Completed`.
+            let Some(reason) = value["stop_reason"].as_str() else {
+                if text.is_empty() && thinking.is_empty() {
+                    return (String::new(), None, empty_answer(value));
+                }
+                return (text, (!thinking.is_empty()).then_some(thinking), TurnOutcome::Completed);
+            };
+            (text, (!thinking.is_empty()).then_some(thinking), anthropic_outcome(reason))
         }
         Wire::OpenAi => {
-            if let Some(message) = value["error"]["message"].as_str() {
-                return (String::new(), None, TurnOutcome::Failed { message: message.to_owned() });
+            if let Some(message) = error_message(value) {
+                return (String::new(), None, TurnOutcome::Failed { message });
             }
             let choice = &value["choices"][0];
             let text = choice["message"]["content"].as_str().unwrap_or_default().to_owned();
@@ -540,9 +671,13 @@ fn parse_complete(wire: Wire, value: &Value) -> (String, Option<String>, TurnOut
                 .as_str()
                 .filter(|text| !text.is_empty())
                 .map(str::to_owned);
-            let outcome =
-                choice["finish_reason"].as_str().map_or(TurnOutcome::Completed, openai_outcome);
-            (text, thinking, outcome)
+            let Some(reason) = choice["finish_reason"].as_str() else {
+                if text.is_empty() && thinking.is_none() {
+                    return (String::new(), None, empty_answer(value));
+                }
+                return (text, thinking, TurnOutcome::Completed);
+            };
+            (text, thinking, openai_outcome(reason))
         }
     }
 }
@@ -748,11 +883,14 @@ fn exchange(
     if !streaming {
         // A server that ignored `stream` answered the whole thing at once. Not an error and
         // not worth a second request — several local servers do exactly this.
-        let mut response = response;
-        let text = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|error| transport_error(&error.to_string()))?;
+        //
+        // Read through the same pump as the stream, so the stall timeout covers it too: a
+        // socket that sends headers and goes quiet wedges a whole-body read exactly as it
+        // wedges a streamed one, and `read_to_string` has no clock of its own.
+        let lines = spawn_line_reader(response);
+        let Some(text) = read_body(&lines, cancel, STALL_TIMEOUT)? else {
+            return Ok(Answer { text: String::new(), outcome: TurnOutcome::Cancelled });
+        };
         let value: Value = serde_json::from_str(&text).map_err(|_| {
             transport_error("the provider's answer was neither a stream nor JSON")
         })?;
@@ -776,25 +914,201 @@ fn read_stream(
     cancel: &AtomicBool,
     events: &Sender<TranscriptEvent>,
 ) -> Result<Answer> {
-    let mut reader = BufReader::new(response.into_body().into_reader());
-    let mut line = String::new();
+    let lines = spawn_line_reader(response);
+    consume_stream(wire, &lines, cancel, events, STALL_TIMEOUT)
+}
+
+/// Hands the body's lines back one at a time, from a thread that owns the socket.
+///
+/// # Why the read is on its own thread
+///
+/// A blocking `read_line` cannot be given a stall timeout: the only clocks `ureq` offers are
+/// *total* budgets, and a total budget on a streamed answer cuts off a model that is still
+/// talking (see [`STALL_TIMEOUT`]). Moving the read one thread away means the consumer waits
+/// on a channel instead of a socket, and a channel can be waited on with a deadline.
+///
+/// ⚠ **A stalled reader is leaked, deliberately, and the leak is bounded.** The thread stays
+/// blocked on a socket nobody can interrupt from here; it ends when the peer or the OS finally
+/// closes the connection, and at worst when the process does. One thread and one socket per
+/// stalled turn is the price of a node that stays usable, against a node that is wedged for
+/// the life of the session — and the wedge is not hypothetical, `busy()` is
+/// `!handle.is_finished()`, so the *next* prompt and every prompt after it is refused.
+///
+/// The reader is capped twice: [`MAX_LINE_BYTES`] per line, so no single unterminated line can
+/// be allocated whole, and [`MAX_STREAM_BYTES`] across the body.
+fn spawn_line_reader(
+    response: ureq::http::Response<ureq::Body>,
+) -> std::sync::mpsc::Receiver<std::io::Result<String>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    // Cloned into the worker so the original survives a failed `spawn` — `Builder::spawn`
+    // drops the closure it could not run, and with it the only sender, which would reach the
+    // consumer as a clean end of body. Dropped below, or the channel never disconnects and
+    // end of body is indistinguishable from a stall.
+    let worker = sender.clone();
+    let spawned = std::thread::Builder::new()
+        .name("velm-agent-http-body".into())
+        .spawn(move || {
+            let source: Box<dyn std::io::Read + Send> =
+                Box::new(response.into_body().into_reader());
+            pump_lines(BufReader::new(source.take(MAX_STREAM_BYTES)), &worker);
+        });
+    if let Err(error) = spawned {
+        // No thread, so nothing will ever send: hand the failure over the channel rather than
+        // returning an empty one, or the consumer reads it as a clean end of body — which is
+        // the "silence reported as success" this whole path exists to refuse.
+        let _ = sender.send(Err(error));
+    }
+    drop(sender);
+    receiver
+}
+
+/// Splits a body into lines and posts each one, bounded **per line**.
+///
+/// ⚠ **The cap is applied before the allocation, not after it.** `read_line` grows its target
+/// until it meets a newline and only then can anything be checked — so a body with no newline
+/// in it is allocated whole first and refused second, which is not a bound. `read_until` on a
+/// `Take` stops at [`MAX_LINE_BYTES`] instead; the remainder of an over-long line arrives as
+/// the next line, where it fails to parse as `data:` and is skipped.
+///
+/// Takes any [`BufRead`] rather than the response, so this is an offline test over a byte
+/// slice — the socket half of [`spawn_line_reader`] has no test seam at all.
+fn pump_lines(mut reader: impl BufRead, sender: &Sender<std::io::Result<String>>) {
+    loop {
+        let mut raw: Vec<u8> = Vec::new();
+        match (&mut reader).take(MAX_LINE_BYTES).read_until(b'\n', &mut raw) {
+            Ok(0) => break,
+            Ok(_) => {
+                if sender.send(Ok(String::from_utf8_lossy(&raw).into_owned())).is_err() {
+                    // The consumer gave up — a cancel, or a stall it has already reported.
+                    // There is nothing left to hand anywhere.
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(Err(error));
+                break;
+            }
+        }
+    }
+}
+
+/// What the line pump produced, or why it produced nothing.
+enum Next {
+    Line(String),
+    /// The body ended.
+    Ended,
+    /// Nothing at all arrived inside the stall window.
+    Stalled,
+    /// The user pressed stop.
+    Cancelled,
+}
+
+/// One line, waiting no longer than the stall window for it.
+///
+/// `idle` is time since the **last byte**, carried by the caller and reset on every line, so a
+/// long answer that keeps arriving is never interrupted. The wait is broken into
+/// [`STALL_TICK`]s rather than taken in one `recv_timeout`, which is also what lets a cancel
+/// land while the stream is quiet — the old blocking read only tested the flag between lines.
+fn next_line(
+    lines: &std::sync::mpsc::Receiver<std::io::Result<String>>,
+    cancel: &AtomicBool,
+    stall: Duration,
+    idle: &mut Duration,
+) -> Result<Next> {
+    let tick = STALL_TICK.min(stall);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(Next::Cancelled);
+        }
+        match lines.recv_timeout(tick) {
+            Ok(Ok(line)) => {
+                *idle = Duration::ZERO;
+                return Ok(Next::Line(line));
+            }
+            Ok(Err(error)) => return Err(transport_error(&error.to_string())),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                *idle = idle.saturating_add(tick);
+                if *idle >= stall {
+                    return Ok(Next::Stalled);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(Next::Ended),
+        }
+    }
+}
+
+/// Reads a whole body through the pump, so it is stall-bounded like the streamed one.
+///
+/// `None` means the user cancelled. It is **not** the empty string: a partial body parsed as
+/// though it were the whole answer is a truncated answer reported as a finished one, which is
+/// the same defect this module has in the streaming path and deserves the same refusal.
+fn read_body(
+    lines: &std::sync::mpsc::Receiver<std::io::Result<String>>,
+    cancel: &AtomicBool,
+    stall: Duration,
+) -> Result<Option<String>> {
+    let mut body = String::new();
+    let mut idle = Duration::ZERO;
+    loop {
+        match next_line(lines, cancel, stall, &mut idle)? {
+            Next::Line(line) => body.push_str(&line),
+            Next::Ended => return Ok(Some(body)),
+            Next::Stalled => return Err(stalled_error(stall)),
+            Next::Cancelled => return Ok(None),
+        }
+    }
+}
+
+/// Consumes the SSE frames, emitting coalesced events as it goes.
+///
+/// Separated from [`spawn_line_reader`] so every rule below is an ordinary offline test: the
+/// tests push lines down the channel by hand, close it without a terminator, and hold one back
+/// to make the stall fire.
+///
+/// # ⚠ A stream that stops is not a stream that finished
+///
+/// `outcome` starts as `Completed` because that is what a well-formed stream ends up as, and
+/// for a long time nothing but `Piece::Stop` ever reassigned it. So a body reaching **clean
+/// EOF** with no `[DONE]`, no `message_stop` and no `finish_reason` — a dropped connection, a
+/// proxy that closed early, a local server killed mid-answer — was indistinguishable from one
+/// that finished: the node went `Idle` with no error and no detail, mid-sentence. `terminator`
+/// is what tells the two apart, and an agent that stopped silently is one the user will
+/// believe, which is why it is a failure rather than a warning.
+fn consume_stream(
+    wire: Wire,
+    lines: &std::sync::mpsc::Receiver<std::io::Result<String>>,
+    cancel: &AtomicBool,
+    events: &Sender<TranscriptEvent>,
+    stall: Duration,
+) -> Result<Answer> {
     let mut answer = String::new();
     let mut pending = String::new();
     let mut outcome = TurnOutcome::Completed;
     let mut exhausted = false;
+    let mut terminator = false;
+    // Text **and** thinking, against one budget. Counting only the answer left a provider
+    // that emits nothing but `thinking_delta` unbounded — the cap was on the half that
+    // happened to be in mind when it was written.
+    let mut produced = 0usize;
+    let mut idle = Duration::ZERO;
 
     loop {
-        if cancel.load(Ordering::Relaxed) {
-            flush(events, &mut pending);
-            return Ok(Answer { text: answer, outcome: TurnOutcome::Cancelled });
-        }
-        line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .map_err(|error| transport_error(&error.to_string()))?;
-        if read == 0 {
-            break;
-        }
+        let line = match next_line(lines, cancel, stall, &mut idle)? {
+            Next::Line(line) => line,
+            Next::Ended => break,
+            Next::Cancelled => {
+                flush(events, &mut pending);
+                return Ok(Answer { text: answer, outcome: TurnOutcome::Cancelled });
+            }
+            Next::Stalled => {
+                flush(events, &mut pending);
+                return Ok(Answer {
+                    text: answer,
+                    outcome: TurnOutcome::Failed { message: stalled_message(stall) },
+                });
+            }
+        };
+
         let Some(data) = line.trim_end().strip_prefix("data:") else {
             // `event:`, `id:`, a comment (`:` keepalive), or the blank line between events.
             continue;
@@ -802,39 +1116,90 @@ fn read_stream(
 
         match parse_event(wire, data) {
             Piece::Text(text) => {
+                produced += text.len();
                 answer.push_str(&text);
                 pending.push_str(&text);
                 if pending.len() >= FLUSH_BYTES || pending.ends_with('\n') {
                     flush(events, &mut pending);
                 }
-                if answer.len() > MAX_ANSWER_BYTES {
+                if produced > MAX_ANSWER_BYTES {
                     exhausted = true;
                     break;
                 }
             }
             Piece::Thought(text) => {
+                produced += text.len();
                 flush(events, &mut pending);
                 if events.send(TranscriptEvent::Thought { text }).is_err() {
                     break;
                 }
+                if produced > MAX_ANSWER_BYTES {
+                    exhausted = true;
+                    break;
+                }
             }
-            Piece::Stop(reported) => outcome = reported,
+            Piece::Stop(reported) => {
+                terminator = true;
+                outcome = reported;
+            }
+            // The text is delivered *before* the stop is recorded, so the last words of an
+            // answer reach the node even though the same frame ended the turn.
+            Piece::TextThenStop(text, reported) => {
+                answer.push_str(&text);
+                produced += text.len();
+                pending.push_str(&text);
+                flush(events, &mut pending);
+                terminator = true;
+                outcome = reported;
+            }
             Piece::Failed(message) => {
                 flush(events, &mut pending);
                 return Ok(Answer { text: answer, outcome: TurnOutcome::Failed { message } });
             }
-            Piece::Done => break,
+            Piece::Done => {
+                terminator = true;
+                break;
+            }
             Piece::Ignore => {}
         }
     }
 
     flush(events, &mut pending);
     if exhausted {
-        outcome = TurnOutcome::Exhausted {
-            message: "the answer grew past what one turn will hold".into(),
-        };
+        // Our own stop, and a legitimate end: the turn says how far it got.
+        return Ok(Answer {
+            text: answer,
+            outcome: TurnOutcome::Exhausted {
+                message: "the answer grew past what one turn will hold".into(),
+            },
+        });
+    }
+    if !terminator {
+        return Ok(Answer {
+            outcome: TurnOutcome::Failed {
+                message: format!(
+                    "the provider's stream ended after {} character(s) without saying the \
+                     answer was finished — no stop reason and no end-of-stream marker. \
+                     Whatever is on the node is very likely cut short.",
+                    answer.chars().count()
+                ),
+            },
+            text: answer,
+        });
     }
     Ok(Answer { text: answer, outcome })
+}
+
+fn stalled_message(stall: Duration) -> String {
+    format!(
+        "the provider stopped sending: nothing arrived for {}s while the connection stayed \
+         open. The answer, if there was one, is unfinished.",
+        stall.as_secs().max(1)
+    )
+}
+
+fn stalled_error(stall: Duration) -> AgentError {
+    transport_error(&stalled_message(stall))
 }
 
 fn flush(events: &Sender<TranscriptEvent>, pending: &mut String) {
@@ -1087,6 +1452,252 @@ mod tests {
         let (text, _, outcome) = parse_complete(Wire::OpenAi, &refused);
         assert!(text.is_empty());
         assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+    }
+
+    /// **A 200 whose shape we do not recognise is a failure, not an empty answer.**
+    ///
+    /// Three bodies, all of which used to reach the node as a *completed* turn that said
+    /// nothing: Ollama's string-shaped error, an empty `choices` list, and a JSON document
+    /// from something that is not this API at all. The node went `Idle`, in the colour that
+    /// means it worked, with no error and no detail — and an agent that stopped silently is
+    /// one the user will believe.
+    ///
+    /// The failure must **name the shape** so whoever reads it can tell which server they
+    /// are talking to, and must not quote the body, which can be a login page.
+    #[test]
+    fn a_two_hundred_that_is_not_an_answer_is_reported_as_a_failure() {
+        // Ollama, verbatim: an error as a bare string where the wire documents an object.
+        let ollama: Value =
+            serde_json::from_str(r#"{"error":"model 'llama9' not found, try pulling it"}"#)
+                .unwrap();
+        let (text, _, outcome) = parse_complete(Wire::OpenAi, &ollama);
+        assert!(text.is_empty());
+        let TurnOutcome::Failed { message } = outcome else {
+            panic!("a string-shaped error was not a failure");
+        };
+        assert!(message.contains("llama9"), "the provider's own words were dropped: {message}");
+
+        // The same string shape on the Anthropic wire, and mid-stream.
+        let (_, _, outcome) = parse_complete(Wire::Anthropic, &ollama);
+        assert!(matches!(outcome, TurnOutcome::Failed { .. }));
+        assert_eq!(
+            parse_event(Wire::OpenAi, r#"{"error":"no such model"}"#),
+            Piece::Failed("no such model".into()),
+            "a string-shaped error frame was ignored, so the stream ended with no terminator"
+        );
+
+        // No content and no finish reason. Nothing said, nothing explaining why.
+        let empty: Value = serde_json::from_str(r#"{"choices":[]}"#).unwrap();
+        let (text, _, outcome) = parse_complete(Wire::OpenAi, &empty);
+        assert!(text.is_empty());
+        let TurnOutcome::Failed { message } = outcome else {
+            panic!("an empty choices list was reported as a completed turn");
+        };
+        assert!(message.contains("choices"), "the failure did not name the shape: {message}");
+
+        let foreign: Value =
+            serde_json::from_str(r#"{"model":"x","done":true,"response":""}"#).unwrap();
+        let (_, _, outcome) = parse_complete(Wire::Anthropic, &foreign);
+        let TurnOutcome::Failed { message } = outcome else {
+            panic!("a body from another API was reported as a completed turn");
+        };
+        assert!(message.contains("done") && message.contains("model"), "{message}");
+        assert!(!message.contains("\"x\""), "the body's values reached the message: {message}");
+
+        // ⚠ The other half: a legitimately empty answer that *says* why is still not a
+        // failure. A tool-call-only turn carries no text and a real stop reason.
+        let tools: Value = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":null},"finish_reason":"tool_calls"}]}"#,
+        )
+        .unwrap();
+        let (_, _, outcome) = parse_complete(Wire::OpenAi, &tools);
+        assert_eq!(outcome, TurnOutcome::Completed, "a stop reason was ignored");
+    }
+
+    /// Feeds the consumer lines as though the reader thread had produced them.
+    ///
+    /// Everything below the socket is exercised: the channel is the seam, so a stall is a
+    /// sender held open and an end of body is a sender dropped.
+    fn consume(
+        wire: Wire,
+        lines: &[&str],
+        stall: Duration,
+    ) -> (Result<Answer>, Vec<TranscriptEvent>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for line in lines {
+            sender.send(Ok((*line).to_owned())).unwrap();
+        }
+        drop(sender);
+        let (events, drained) = std::sync::mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let answer = consume_stream(wire, &receiver, &cancel, &events, stall);
+        drop(events);
+        (answer, drained.try_iter().collect())
+    }
+
+    /// ⚠ **A stream that stops is not a stream that finished.**
+    ///
+    /// `outcome` starts as `Completed` and only `Piece::Stop` ever moved it, so a body
+    /// reaching clean EOF with no `[DONE]`, no `message_stop` and no `finish_reason` — a
+    /// dropped connection, a proxy that closed early, a local server killed mid-answer — was
+    /// indistinguishable from one that finished. The node went `Idle` with no error and no
+    /// detail, mid-sentence. **Reporting a failed turn as a completed one is the worst thing
+    /// this transport can do**, because there is nothing on screen to disbelieve.
+    ///
+    /// A/B: with `terminator` forced to `true` the first case reports `Completed` and every
+    /// other assertion here still passes — which is why the *absence* is what is asserted.
+    #[test]
+    fn a_stream_that_ends_without_saying_so_is_a_failure_and_not_a_completed_turn() {
+        let cut_short = [
+            r#"data: {"choices":[{"delta":{"content":"the first half of a "}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"sentence that never"}}]}"#,
+        ];
+        let (answer, _) = consume(Wire::OpenAi, &cut_short, Duration::from_millis(50));
+        let answer = answer.expect("a truncated body is an answer with a bad outcome, not an Err");
+        assert_eq!(answer.text, "the first half of a sentence that never");
+        let TurnOutcome::Failed { message } = answer.outcome else {
+            panic!("a truncated stream was reported as a completed turn");
+        };
+        assert!(message.contains("cut short"), "{message}");
+
+        // The three ways a stream *does* say it finished, none of which may fail.
+        let (done, _) = consume(
+            Wire::OpenAi,
+            &[r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#, "data: [DONE]"],
+            Duration::from_millis(50),
+        );
+        assert_eq!(done.unwrap().outcome, TurnOutcome::Completed);
+
+        let (stopped, _) = consume(
+            Wire::OpenAi,
+            &[r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#],
+            Duration::from_millis(50),
+        );
+        // Both halves of that frame, because it carries both. Asserting only the outcome
+        // would pass on a build that reported `Completed` and threw the last words away —
+        // which is what the first version of `Piece::TextThenStop` would have done if it had
+        // recorded the stop and dropped the text.
+        let stopped = stopped.unwrap();
+        assert_eq!(stopped.outcome, TurnOutcome::Completed);
+        assert_eq!(stopped.text, "hi", "a frame carrying content and a stop lost its content");
+
+        let (anthropic, _) = consume(
+            Wire::Anthropic,
+            &[
+                r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}"#,
+                r#"data: {"type":"message_stop"}"#,
+            ],
+            Duration::from_millis(50),
+        );
+        assert_eq!(anthropic.unwrap().outcome, TurnOutcome::Completed);
+
+        // A provider that named its own failure is already a failure and must keep *its*
+        // words rather than being overwritten by the missing-terminator message.
+        let (failed, _) = consume(
+            Wire::OpenAi,
+            &[r#"data: {"error":"no such model"}"#],
+            Duration::from_millis(50),
+        );
+        let TurnOutcome::Failed { message } = failed.unwrap().outcome else {
+            panic!("a named provider error was not a failure");
+        };
+        assert_eq!(message, "no such model");
+    }
+
+    /// **A stall, not a deadline.** A socket that sends its headers and then goes quiet used
+    /// to block the worker thread forever — and `busy()` is `!handle.is_finished()`, so the
+    /// node refused every later prompt for the life of the session with *"this agent is still
+    /// answering"*.
+    ///
+    /// The distinction is asserted in both directions: a quiet connection ends the turn, and
+    /// a slow one that keeps producing does **not** — which is the reason a total budget
+    /// (`ureq`'s own `timeout_recv_body`) is the wrong tool and is deliberately not set.
+    #[test]
+    fn a_body_that_goes_quiet_ends_the_turn_and_a_slow_one_does_not() {
+        // ⚠ The margin between the feeder's gaps and the stall window is **10×**, not 3×, and
+        // that is deliberate. `cargo test` runs ~65 binaries in parallel on this machine and
+        // `glass_budget.rs` is on record overrunning a wall-clock budget by 2× under exactly
+        // that load — a `sleep(45ms)` that oversleeps past the window would report the slow
+        // half as a stall, which is a red run that means nothing. The stall-*fires* half needs
+        // no margin: it can only run long, never wrong.
+        let stall = Duration::from_millis(450);
+
+        // The sender is held open with nothing on it: the connection is alive and silent.
+        let (_held, receiver) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        let (events, _drained) = std::sync::mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let answer = consume_stream(Wire::OpenAi, &receiver, &cancel, &events, stall)
+            .expect("a stall is an outcome, not a transport Err");
+        assert!(started.elapsed() < Duration::from_secs(5), "the stall never fired");
+        let TurnOutcome::Failed { message } = answer.outcome else {
+            panic!("a silent connection was not reported");
+        };
+        assert!(message.contains("stopped sending"), "{message}");
+
+        // A body arriving in pieces, each one inside the window but the whole run well past
+        // it. A deadline would cut this off; a stall must not.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let feeder = std::thread::spawn(move || {
+            for index in 0..6 {
+                std::thread::sleep(Duration::from_millis(45));
+                let line = format!(
+                    r#"data: {{"choices":[{{"delta":{{"content":"{index}"}}}}]}}"#
+                );
+                if sender.send(Ok(line)).is_err() {
+                    return;
+                }
+            }
+            let _ = sender.send(Ok("data: [DONE]".to_owned()));
+        });
+        let (events, _drained) = std::sync::mpsc::channel();
+        let answer = consume_stream(Wire::OpenAi, &receiver, &cancel, &events, stall).unwrap();
+        let _ = feeder.join();
+        assert_eq!(answer.text, "012345", "a slow but progressing answer was cut off");
+        assert_eq!(answer.outcome, TurnOutcome::Completed);
+    }
+
+    /// The two allocation bounds on a body, both of which used to be checked after the
+    /// allocation they were meant to prevent.
+    ///
+    /// `MAX_ANSWER_BYTES` counted only `Piece::Text`, so a provider emitting nothing but
+    /// `thinking_delta` was unbounded — the cap was on whichever half was in mind when it
+    /// was written. And `read_line` grows its target until it finds a newline, so a body with
+    /// no newline in it at all was allocated whole before anything could refuse it.
+    #[test]
+    fn a_body_is_bounded_per_line_and_thinking_counts_against_the_answer_cap() {
+        // A megabyte of "thinking" per frame, four frames: no answer text at all, and the
+        // turn must still stop.
+        let chunk = "t".repeat(1_100_000);
+        let frame = format!(
+            r#"data: {{"type":"content_block_delta","delta":{{"type":"thinking_delta","thinking":"{chunk}"}}}}"#
+        );
+        let lines = [frame.as_str(); 5];
+        let (answer, _) = consume(Wire::Anthropic, &lines, Duration::from_millis(50));
+        let answer = answer.unwrap();
+        assert!(answer.text.is_empty(), "thinking is not answer text");
+        assert!(
+            matches!(answer.outcome, TurnOutcome::Exhausted { .. }),
+            "a stream of pure thinking was unbounded: {:?}",
+            answer.outcome
+        );
+
+        // One line with no newline anywhere in it. The pump must cut it rather than grow it.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let runaway = vec![b'x'; (MAX_LINE_BYTES as usize) + 4_096];
+        pump_lines(&runaway[..], &sender);
+        drop(sender);
+        let pieces: Vec<String> = receiver.iter().map(|line| line.unwrap()).collect();
+        assert_eq!(pieces.len(), 2, "an unterminated line was not cut: {} piece(s)", pieces.len());
+        assert_eq!(pieces[0].len(), MAX_LINE_BYTES as usize);
+        assert_eq!(pieces[1].len(), 4_096);
+
+        // Ordinary lines are still whole, newline and all — the framing must survive.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        pump_lines(&b"data: one\ndata: two\n"[..], &sender);
+        drop(sender);
+        let pieces: Vec<String> = receiver.iter().map(|line| line.unwrap()).collect();
+        assert_eq!(pieces, vec!["data: one\n".to_owned(), "data: two\n".to_owned()]);
     }
 
     /// Both providers' "I stopped early" reasons must reach the **same** outcome, or the

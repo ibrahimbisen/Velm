@@ -111,7 +111,9 @@ pub const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Deliberately not in the board file, not in the library sidecar and not in any settings:
 /// it is true only while this process is running, and a stale copy in a durable file would be
 /// a port number pointing at nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// **Never logged.** The `Debug` impl prints the port and the pid and not one byte of the
+/// token — see the impl below for why a derive here is a hole rather than a nicety.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeFile {
     pub port: u16,
     /// The per-launch token. **Never logged, never printed, never put in a toast.**
@@ -121,6 +123,28 @@ pub struct RuntimeFile {
     /// than a check. It is here so a human debugging a stale file can tell whether the
     /// process that wrote it is still alive.
     pub pid: u32,
+}
+
+/// ⚠ **Hand-written, and the field it hides is the one the whole IPC surface is protected by.**
+///
+/// The token authorises every verb a shim can ask for — send a message as another agent, write
+/// a note, spawn a sub-agent — and this file is written mode `0600` precisely because it is a
+/// credential. `#[derive(Debug)]` undoes that at the first `dbg!` anybody writes, in any panic
+/// message that formats a struct holding one, and in every `assert_eq!` failure in this
+/// module's own tests — which is where it would first be read out loud.
+///
+/// Latent today: nothing formats one. That is exactly the argument the derive would win on,
+/// and it is wrong — this crate hand-writes redacting impls for `Credentials`, `ClaudeCli` and
+/// `AcpTransport` for the same reason, and a secret's safety should not depend on nobody
+/// having reached for the obvious debugging tool yet.
+impl std::fmt::Debug for RuntimeFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeFile")
+            .field("port", &self.port)
+            .field("pid", &self.pid)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RuntimeFile {
@@ -192,13 +216,27 @@ pub fn call(address: SocketAddr, envelope: &Envelope) -> crate::Result<Response>
 /// `agent`. Flattening would read slightly better and would mean a verb could one day carry a
 /// field called `token` and shadow the one that authenticates it — a wire format where the
 /// credential and the payload share a namespace is one substitution away from being wrong.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     /// The per-launch token from the runtime file.
     pub token: String,
     /// The calling agent's node id, from `VELM_AGENT_ID`.
     pub agent: String,
     pub request: Request,
+}
+
+/// ⚠ **Hand-written, for the same reason [`RuntimeFile`]'s is** — and this one is the more
+/// exposed of the two, because an `Envelope` is a *message*: it is what a failed request holds
+/// when something goes wrong and somebody reaches for `dbg!` to find out what was on the wire.
+/// The verb is printed, which is the useful half; the credential is not.
+impl std::fmt::Debug for Envelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Envelope")
+            .field("agent", &self.agent)
+            .field("request", &self.request)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What an agent may ask Velm to do.
@@ -1492,6 +1530,40 @@ mod tests {
         assert_eq!(decode_base64("Zh=="), None, "a non-canonical tail decoded as if it were f");
         assert_eq!(decode_base64("Zm9vYmE="), Some(b"fooba".to_vec()));
         assert_eq!(decode_base64("Zm9vYmF="), None, "a non-canonical tail decoded as fooba");
+    }
+
+    /// The two structs that carry the IPC token must not print it, and both used to.
+    ///
+    /// Latent when it was found — nothing formats either one — which is exactly the argument
+    /// a derive wins on and exactly why it is wrong: the moment somebody debugs a refused
+    /// verb, the credential that authorises *every* verb goes into the output. This crate
+    /// hand-writes redacting impls for `Credentials`, `ClaudeCli` and `AcpTransport` already,
+    /// so these two were the odd ones out rather than the precedent.
+    #[test]
+    fn neither_the_runtime_file_nor_an_envelope_prints_its_token() {
+        let secret = "tok-3f9a-never-print-me";
+
+        let file = RuntimeFile { port: 51234, token: secret.to_owned(), pid: 4242 };
+        let printed = format!("{file:?}");
+        assert!(!printed.contains(secret), "the runtime file printed its token: {printed}");
+        assert!(!printed.contains("token"), "even the field name invites a second look");
+        // The diagnostic half is kept: a stale file is diagnosed by its port and its pid.
+        assert!(printed.contains("51234") && printed.contains("4242"), "{printed}");
+
+        let envelope = Envelope {
+            token: secret.to_owned(),
+            agent: "node-7".to_owned(),
+            request: Request::Send { to: "node-8".to_owned(), text: "hello".to_owned() },
+        };
+        let printed = format!("{envelope:?}");
+        assert!(!printed.contains(secret), "the envelope printed its token: {printed}");
+        // The verb and the caller are the useful half of a wire dump and neither is a secret.
+        assert!(printed.contains("node-7") && printed.contains("node-8"), "{printed}");
+
+        // ⚠ And through a container, which is how it would actually happen: a derived `Debug`
+        // on any struct holding one of these prints it with *this* impl.
+        let nested = format!("{:?}", vec![file]);
+        assert!(!nested.contains(secret), "the token escaped inside a container: {nested}");
     }
 
     /// A token is compared without an early exit, and — much more importantly — a wrong

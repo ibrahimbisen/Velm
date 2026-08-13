@@ -36,8 +36,17 @@
 //! # Compressed input is bounded
 //!
 //! Everything decompressed here comes from a file the user was given, so every inflate is
-//! capped ([`MAX_INFLATED_BYTES`], [`MAX_PART_BYTES`]). A zip bomb is a hundred kilobytes on
-//! disk and a terabyte in memory, and this crate runs inside the application's own process.
+//! capped. A zip bomb is a hundred kilobytes on disk and a terabyte in memory, and this crate
+//! runs inside the application's own process.
+//!
+//! ⚠ **Two caps, per item and in aggregate, and this paragraph used to name only the first
+//! pair.** [`MAX_INFLATED_BYTES`] bounds one PDF stream and [`MAX_PART_BYTES`] bounds one ZIP
+//! entry — and neither bounds a *file*, because a PDF has as many streams as it likes and an
+//! Office document is *made* of parts, all of which were accumulated with nothing counting the
+//! total. Measured against the code as it stood: ~128 PDF objects × 64MB ≈ 7.9GB, and 100
+//! spreadsheet sheets × 32MB ≈ 3.2GB, both from an input of a few hundred kilobytes.
+//! [`MAX_PDF_TEXT_BYTES`] and [`MAX_PARTS_BYTES`] are the totals, and they are what makes the
+//! sentence above true.
 //!
 //! # What is tested and what is not
 //!
@@ -89,7 +98,35 @@ pub const MAX_INFLATED_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// `word/document.xml` for a long report is a few megabytes; a `.xlsx` sheet with a hundred
 /// thousand rows is larger, which is why this is not smaller.
+///
+/// ⚠ **On its own this is not a bound on the file** — see [`MAX_PARTS_BYTES`].
 pub const MAX_PART_BYTES: usize = 32 * 1024 * 1024;
+
+/// The most **every** part of one Office file may come to, added together.
+///
+/// ⚠ A per-part cap is not a cap on a document, and a `.pptx` or a `.xlsx` is *made* of parts:
+/// [`office_parts`] collects every matching entry into one `Vec` before a caller sees any of
+/// them, so a workbook of a hundred sheets was a hundred × [`MAX_PART_BYTES`] — 3.2GB — held
+/// at once, from an archive that is a few hundred kilobytes on disk. That is the classic ZIP
+/// bomb with the per-entry check passing on every entry.
+///
+/// A whole Office document worth reading is a few megabytes of XML; 64MB is a document nobody
+/// is going to read to the end of. Parts past the cap are **dropped rather than truncated**,
+/// because a half-read XML part parses as a shorter document rather than as a broken one, and
+/// a silently shorter spreadsheet is worse than an absent sheet.
+pub const MAX_PARTS_BYTES: usize = 64 * 1024 * 1024;
+
+/// The most text one PDF will yield, across **every** content stream in it.
+///
+/// ⚠ The same shape as [`MAX_PARTS_BYTES`], and the same reason. [`MAX_INFLATED_BYTES`] bounds
+/// one stream; a PDF has as many streams as it likes, and `pdf_text` concatenated all of them
+/// into one `String` with nothing counting the total. A document with 128 objects — an
+/// unremarkable number — was 128 × 64MB, near 8GB, in a process that also holds a GPU surface
+/// on an 8GB machine.
+///
+/// 8MB of extracted text is roughly four thousand pages. A cap on someone else's file, not a
+/// tuning knob.
+pub const MAX_PDF_TEXT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Named as ourselves. The same reasoning `vellum-link` records: plenty of sites serve less
 /// to an unrecognised agent, and impersonating a browser is a lie that also goes stale.
@@ -637,6 +674,12 @@ pub enum PdfText {
 /// So `pdftotext` remains the better reader where it exists, and [`pdf`] prefers it. This is
 /// the honest in-process answer, not a PDF library.
 pub fn pdf_text(bytes: &[u8]) -> PdfText {
+    pdf_text_within(bytes, MAX_PDF_TEXT_BYTES)
+}
+
+/// [`pdf_text`] with the aggregate budget supplied, so the bound is an offline test over a
+/// handful of bytes rather than one that needs a multi-gigabyte fixture.
+fn pdf_text_within(bytes: &[u8], budget: usize) -> PdfText {
     // Some producers put junk before the header, so the marker is looked for rather than
     // required at byte zero.
     let head = &bytes[..bytes.len().min(1024)];
@@ -649,6 +692,12 @@ pub fn pdf_text(bytes: &[u8]) -> PdfText {
     let mut index = 0usize;
 
     while let Some(at) = find_bytes(bytes, b"stream", index) {
+        // ⚠ The aggregate bound, checked at the top so a document with more streams than any
+        // reader will get through stops rather than being counted after the fact.
+        // `MAX_INFLATED_BYTES` bounds *one* stream and a PDF holds as many as it likes.
+        if collected.len() >= budget {
+            break;
+        }
         // `endstream` contains `stream`. Stepping over it here is cheaper and clearer than
         // a search that has to know about word boundaries.
         if at >= 3 && bytes.get(at - 3..at) == Some(b"end".as_slice()) {
@@ -668,13 +717,11 @@ pub fn pdf_text(bytes: &[u8]) -> PdfText {
         let body_end = find_bytes(bytes, b"endstream", body_start).unwrap_or(bytes.len());
         let body = bytes.get(body_start..body_end).unwrap_or(&[]);
 
-        let mut take = |data: &[u8]| {
-            let text = pdf_content_text(data);
-            if !text.trim().is_empty() {
-                collected.push_str(&text);
-                collected.push('\n');
-            }
-        };
+        // Which bytes, if any, this stream contributes. Resolved into a value rather than
+        // taken by a closure so the budget below can be applied in one place — a closure
+        // that captured `collected` could not stop the loop it was called from.
+        let mut inline: Option<&[u8]> = None;
+        let mut inflated: Option<Vec<u8>> = None;
 
         if is_not_content(dictionary) {
             // A font, an image, a thumbnail, an object stream or the cross-reference table.
@@ -682,7 +729,7 @@ pub fn pdf_text(bytes: &[u8]) -> PdfText {
             // on a text-showing *operator*, which none of these contain, so the result would
             // be empty anyway. Cheap to skip a megabyte of JPEG.
         } else if find_bytes(dictionary, b"/Filter", 0).is_none() {
-            take(body);
+            inline = Some(body);
         } else if find_bytes(dictionary, b"FlateDecode", 0).is_some() {
             // ⚠ A `/Predictor` in `/DecodeParms` means the inflated bytes are PNG- or
             // TIFF-predicted and have to be un-predicted before they mean anything. That is
@@ -692,7 +739,7 @@ pub fn pdf_text(bytes: &[u8]) -> PdfText {
                 compressed += 1;
             } else {
                 match inflate(body) {
-                    Some(data) => take(&data),
+                    Some(data) => inflated = Some(data),
                     None => compressed += 1,
                 }
             }
@@ -700,6 +747,19 @@ pub fn pdf_text(bytes: &[u8]) -> PdfText {
             // The one compression PDF still allows that `flate2` cannot do. Rare enough
             // since Acrobat 4 that implementing it would be work with no reader.
             compressed += 1;
+        }
+
+        if let Some(data) = inflated.as_deref().or(inline) {
+            let text = pdf_content_text(data);
+            if !text.trim().is_empty() {
+                // One byte kept back for the separator, so the total cannot step past the
+                // budget by the newline. Cut on a character boundary — this string is built
+                // from arbitrary bytes in someone else's file and `panic = "abort"` has
+                // ended this application twice on a byte index that was computed.
+                let room = budget.saturating_sub(collected.len() + 1);
+                collected.push_str(prefix_within(&text, room));
+                collected.push('\n');
+            }
         }
         index = body_end + 9;
     }
@@ -756,6 +816,23 @@ fn is_not_content(dictionary: &[u8]) -> bool {
     const NOT_CONTENT: [&[u8]; 6] =
         [b"/ObjStm", b"/XRef", b"/Metadata", b"/Image", b"/FontFile", b"/Thumb"];
     NOT_CONTENT.iter().any(|marker| find_bytes(dictionary, marker, 0).is_some())
+}
+
+/// The longest prefix of `text` that fits in `budget` **bytes**, cut on a character boundary.
+///
+/// `&text[..budget]` panics on any multi-byte character straddling the index, and with
+/// `panic = "abort"` in the release profile that is the whole application. `CLAUDE.md`'s
+/// feedback 30 records this exact shape aborting Velm twice, in a function whose own tests
+/// used only ASCII.
+fn prefix_within(text: &str, budget: usize) -> &str {
+    if text.len() <= budget {
+        return text;
+    }
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).unwrap_or("")
 }
 
 /// Inflates a `FlateDecode`d stream, bounded by [`MAX_INFLATED_BYTES`].
@@ -1362,18 +1439,46 @@ fn xml_attr(tag: &str, name: &str) -> Option<String> {
 /// reading takes it mutably; there is no way to do both at once, and the alternative is
 /// opening the file once per part.
 fn office_parts(path: &Path, wanted: &dyn Fn(&str) -> bool) -> Option<Vec<(String, String)>> {
+    office_parts_within(path, wanted, MAX_PART_BYTES, MAX_PARTS_BYTES)
+}
+
+/// [`office_parts`] with both budgets supplied, so the aggregate bound is an offline test over
+/// an archive built in memory rather than one that needs a gigabyte of fixture.
+fn office_parts_within(
+    path: &Path,
+    wanted: &dyn Fn(&str) -> bool,
+    per_part: usize,
+    total: usize,
+) -> Option<Vec<(String, String)>> {
     let file = std::fs::File::open(path).ok()?;
     let mut archive = zip::ZipArchive::new(file).ok()?;
     let names: Vec<String> =
         archive.file_names().filter(|name| wanted(name)).map(str::to_owned).collect();
 
     let mut parts = Vec::new();
+    let mut collected = 0usize;
     for name in names {
+        // ⚠ **The aggregate bound, and it is the one that was missing.** The per-part cap
+        // below passes on every entry of a ZIP bomb — that is what makes it a bomb — while
+        // this function holds *all* of them at once for the caller: a hundred sheets at
+        // `MAX_PART_BYTES` each is 3.2GB out of an archive of a few hundred kilobytes.
+        //
+        // Remaining parts are **dropped, not truncated**: half an XML part parses as a
+        // shorter document rather than as a broken one, and a spreadsheet silently missing
+        // its last thousand rows is worse than one visibly missing a sheet.
+        if collected >= total {
+            break;
+        }
         let Ok(entry) = archive.by_name(&name) else { continue };
         let mut bytes = Vec::new();
         // Bounded: the compressed size on disk says nothing about the uncompressed size, and
-        // a ZIP bomb is a hundred kilobytes that inflates without end.
-        if entry.take(MAX_PART_BYTES as u64).read_to_end(&mut bytes).is_ok() {
+        // a ZIP bomb is a hundred kilobytes that inflates without end. `take` before
+        // `read_to_end`, so the cap is applied instead of the allocation rather than after it.
+        if entry.take(per_part as u64).read_to_end(&mut bytes).is_ok() {
+            if collected + bytes.len() > total {
+                break;
+            }
+            collected += bytes.len();
             parts.push((name, String::from_utf8_lossy(&bytes).into_owned()));
         }
     }
@@ -2599,6 +2704,96 @@ mod tests {
             timedtext_to_text(xml),
             "Never gonna give you up\nNever gonna let you &down",
             "an empty cue must not become a blank line"
+        );
+    }
+
+    /// ⚠ **A per-stream cap is not a cap on a document.** `MAX_INFLATED_BYTES` bounds one
+    /// stream and `pdf_text` concatenated every stream in the file into one `String` with
+    /// nothing counting the total — so ~128 objects, an unremarkable number, was 128 × 64MB
+    /// ≈ 7.9GB in a process that also holds a GPU surface on an 8GB machine.
+    ///
+    /// Driven through the budget rather than the constant, so this is 200 bytes of fixture
+    /// instead of a gigabyte of one. The assertion is the **total**, which is the thing that
+    /// was unbounded: each individual stream here is well inside any per-item cap, which is
+    /// exactly what makes it a bomb.
+    #[test]
+    fn a_pdf_with_many_streams_is_bounded_in_total_and_not_only_per_stream() {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        for index in 0..40 {
+            pdf.extend_from_slice(b"<< >>\nstream\nBT (");
+            pdf.extend_from_slice(format!("{index:04}").repeat(25).as_bytes());
+            pdf.extend_from_slice(b") Tj ET\nendstream\n");
+        }
+
+        let unbounded = pdf_text_within(&pdf, usize::MAX);
+        let PdfText::Text(whole) = unbounded else { panic!("the fixture produced no text") };
+        assert!(whole.len() > 3_000, "the fixture is too small to test a budget: {}", whole.len());
+
+        let bounded = pdf_text_within(&pdf, 512);
+        let PdfText::Text(clipped) = bounded else { panic!("the budget produced no text") };
+        assert!(
+            clipped.len() <= 512,
+            "the aggregate budget was not honoured: {} bytes",
+            clipped.len()
+        );
+        // Bounded, not emptied: what did fit is still there and still readable.
+        assert!(clipped.starts_with("0000"), "{}", &clipped[..20.min(clipped.len())]);
+
+        // A budget cut on a byte index would abort the process on a multi-byte character —
+        // this is `strip_site_affix`'s shape, which ended the application twice. A UTF-16BE
+        // hex string, because that is how a PDF actually spells a non-Latin character: the
+        // literal `(…)` form is decoded byte-wise as WinAnsi and never produces one.
+        let cjk = format!(
+            "%PDF-1.4\n<< >>\nstream\nBT <FEFF{}> Tj ET\nendstream\n",
+            "4E2D".repeat(50)
+        );
+        // 100 is not a multiple of three, so the cut lands inside a character.
+        let PdfText::Text(text) = pdf_text_within(cjk.as_bytes(), 100) else { panic!("no text") };
+        assert!(text.len() <= 100, "{} bytes", text.len());
+        assert!(text.chars().all(|ch| ch == '\u{4e2d}'), "{text:?}");
+        assert!(!text.is_empty(), "the boundary walk emptied the string instead of cutting it");
+    }
+
+    /// The same shape one layer down: `MAX_PART_BYTES` bounds one ZIP entry, and a `.pptx` or
+    /// a `.xlsx` is *made* of entries — `office_parts` collects every matching one into a
+    /// `Vec` before a caller sees any of them, so 100 sheets × 32MB ≈ 3.2GB out of an archive
+    /// of a few hundred kilobytes. The per-entry cap passes on every entry, which is what
+    /// makes it a bomb rather than a big file.
+    #[test]
+    fn every_part_of_an_office_file_is_bounded_in_total_and_not_only_per_part() {
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("book.xlsx");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        let payload = vec![b'a'; 1_000];
+        for sheet in 1..=20 {
+            writer.start_file(format!("xl/worksheets/sheet{sheet}.xml"), options).unwrap();
+            writer.write_all(&payload).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let wanted = |name: &str| name.starts_with("xl/worksheets/sheet");
+
+        // Unbounded in aggregate: every entry passes a generous per-part cap, and 20 of them
+        // arrive at once. This is the arithmetic the bomb relies on.
+        let whole = office_parts_within(&path, &wanted, 1_000_000, usize::MAX).unwrap();
+        assert_eq!(whole.len(), 20);
+        let total: usize = whole.iter().map(|(_, text)| text.len()).sum();
+        assert_eq!(total, 20_000);
+
+        // With a total budget, the per-part cap is untouched and the *sum* is what stops.
+        // The part that would cross the line is dropped whole rather than truncated: half an
+        // XML part parses as a shorter document rather than as a broken one.
+        let capped = office_parts_within(&path, &wanted, 1_000_000, 4_500).unwrap();
+        let total: usize = capped.iter().map(|(_, text)| text.len()).sum();
+        assert!(total <= 4_500, "the aggregate budget was not honoured: {total} bytes");
+        assert!(!capped.is_empty(), "the budget refused everything rather than bounding it");
+        assert!(capped.len() < 20, "nothing was left out, so nothing was bounded");
+        assert!(
+            capped.iter().all(|(_, text)| text.len() == 1_000),
+            "a part was truncated where it should have been dropped"
         );
     }
 

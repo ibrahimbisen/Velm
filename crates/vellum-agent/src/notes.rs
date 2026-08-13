@@ -475,6 +475,29 @@ impl NoteStore {
     /// See [`NoteStore::dir_for`]: the layout is the encoding, and these two must agree. A
     /// file deeper than one directory below the root is not a shape this store creates, so
     /// it is treated as private to nobody — the user may read it, an agent may not.
+    ///
+    /// # ⚠ There are two notions of "in bounds" in this file, and they are not the same one
+    ///
+    /// This function bounds to [`NoteStore::root`] — the *notes directory* — while
+    /// [`NoteStore::resolve_stored`] bounds to [`NoteStore::boundary`], which is the **project
+    /// root** when there is one. That is deliberate on both sides and is stated here because
+    /// the app calls both and nothing else says so:
+    ///
+    /// - `resolve_stored` is the wider one on purpose. Its own doc gives the reason: a note
+    ///   node pointed at a `docs/plan.md` the project already has is a reasonable thing to
+    ///   want and is not an escape. It answers *"is this path a legal target"*.
+    /// - This one is the narrower, and it answers a different question — *"may **this
+    ///   requester** read it"* — from the file's **position**, because position is how scope
+    ///   is encoded (`root/x.md` is shared, `root/<agent>/x.md` is private to that agent).
+    ///
+    /// So a project file outside the notes directory resolves and is then readable by the
+    /// **user** and not by an **agent**, which is the safe direction and the intended one.
+    /// The hazard is the reverse reading: **neither is a substitute for the other**, and a
+    /// change that made one call the other — or that "unified" them onto `boundary()` — would
+    /// silently make every file in the project readable by every agent on the board, because
+    /// a path anywhere under the project root has no parent equal to `root` and would fall
+    /// through this function's `Requester::Agent` arm. Two questions, two answers, both
+    /// asked.
     pub fn may_read_path(&self, path: &Path, by: Requester<'_>) -> bool {
         let Some(dir) = path.parent() else { return false };
         if dir == self.root.as_path() {

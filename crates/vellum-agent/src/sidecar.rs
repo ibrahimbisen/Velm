@@ -67,11 +67,28 @@ pub const AGENTS_DIR: &str = "agents";
 /// what was asked for, it just costs a second read.
 const TAIL_WINDOW: u64 = 64 * 1024;
 
+/// The furthest back from the end of a transcript a read will ever look.
+///
+/// ⚠ **The doubling had no ceiling, and [`MAX_SINCE_RECORDS`] is not one** — that caps the
+/// records *kept*, and says nothing about the bytes read to find them. `since`'s stopping
+/// condition is *"one record older than the cutoff"*, which a cutoff older than the whole file
+/// can never satisfy: the window doubled past the file's length and `read_to_end` brought an
+/// overnight transcript into memory whole, inside the app's own process. "Since last week" on
+/// a Monday is exactly that question, and it is the ordinary way the away-mode digest is
+/// asked.
+///
+/// 8MB is roughly the last thirty thousand ordinary records. A read that stops here answers
+/// with `complete: false`, which is what that field already means and what every caller
+/// already reads.
+const MAX_TAIL_WINDOW: u64 = 8 * 1024 * 1024;
+
 /// The most records a time-based read will answer with.
 ///
 /// [`Sidecar::since`] deliberately returns the state *before* its cutoff as well as the news
 /// after it, so without a cap "everything since last week" is the whole file — and the
 /// caller is a once-a-session digest, not a paging reader.
+///
+/// ⚠ A cap on records is not a cap on bytes read. See [`MAX_TAIL_WINDOW`] for the other half.
 pub const MAX_SINCE_RECORDS: usize = 2_000;
 
 /// One line of a transcript: an event and when it was appended.
@@ -311,6 +328,19 @@ impl Sidecar {
         cap: usize,
         enough: impl Fn(&[Record]) -> bool,
     ) -> Result<Tail> {
+        self.read_back_within(board, item, cap, MAX_TAIL_WINDOW, enough)
+    }
+
+    /// [`Self::read_back`] with the window ceiling supplied, so the bound is an offline test
+    /// over a few kilobytes rather than one that needs a transcript nobody has.
+    fn read_back_within(
+        &self,
+        board: &BoardKey,
+        item: &str,
+        cap: usize,
+        ceiling: u64,
+        enough: impl Fn(&[Record]) -> bool,
+    ) -> Result<Tail> {
         let path = self.path_for(board, item);
         let mut file = match File::open(&path) {
             Ok(file) => file,
@@ -339,14 +369,25 @@ impl Sidecar {
 
             let mut tail = parse_lines(&bytes, start > 0);
             tail.complete = start == 0;
-            if enough(&tail.records) || start == 0 {
+            // ⚠ **The ceiling is what stops "since last week" from being the whole file.**
+            // The doubling is bounded by *what was asked for* only when the question can be
+            // satisfied: [`Sidecar::since`]'s `enough` is "one record older than the cutoff",
+            // and a cutoff older than the oldest record in the file is never satisfied — so
+            // the window doubled past the file's length and `read_to_end` brought an
+            // overnight transcript into memory whole. `cap` bounds the *records* kept and
+            // does nothing about the bytes read to find them.
+            //
+            // Answering short is correct here rather than a compromise: `complete` is already
+            // `false` whenever the window did not reach the start, which is exactly what it
+            // means, and every caller reads it.
+            if enough(&tail.records) || start == 0 || window >= ceiling {
                 if tail.records.len() > cap {
                     tail.records.drain(..tail.records.len() - cap);
                     tail.complete = false;
                 }
                 return Ok(tail);
             }
-            window = window.saturating_mul(2);
+            window = window.saturating_mul(2).min(ceiling);
         }
     }
 }
@@ -683,6 +724,59 @@ mod tests {
 
         let whole = parse_lines(file.as_bytes(), false);
         assert_eq!(whole.records.len(), 2);
+    }
+
+    /// ⚠ **A cutoff older than the file read the whole file into memory.**
+    ///
+    /// `since`'s stopping condition is *"one record older than the cutoff"*, and a cutoff
+    /// older than the oldest record can never satisfy it — so the window doubled past the
+    /// file's length and `read_to_end` brought an overnight transcript in whole, inside the
+    /// application's own process. `MAX_SINCE_RECORDS` looks like the bound and is not: it caps
+    /// the records *kept* and says nothing about the bytes read to find them.
+    ///
+    /// Driven through the ceiling rather than the constant, so this is a few kilobytes of
+    /// fixture instead of a transcript nobody has. The assertion is that the read **stops**
+    /// and says it was short — answering `complete: false` is what that field already means.
+    #[test]
+    fn a_cutoff_older_than_the_file_stops_at_the_window_ceiling() {
+        let (_scratch, sidecar) = sidecar();
+        let board = BoardKey::from_raw("b");
+
+        let mut appender = sidecar.appender(&board, "1@2").unwrap();
+        let padding = "x".repeat(1_000);
+        for index in 0..400u64 {
+            // Long records, so a few hundred of them comfortably outrun the ceiling below —
+            // which must sit *above* `TAIL_WINDOW`, or the loop never doubles and the clamp
+            // on the doubling is not what is being tested.
+            appender.write(1_000 + index, &text(&padding)).unwrap();
+        }
+        drop(appender);
+        let length = std::fs::metadata(sidecar.path_for(&board, "1@2")).unwrap().len();
+        assert!(length > 256 * 1024, "the fixture is too small to outrun a ceiling: {length}");
+
+        // A cutoff before the file begins: nothing can ever be "older than the cutoff", so
+        // this is the question that used to walk the doubling all the way to the file.
+        let never_satisfied = |records: &[Record]| records.first().is_some_and(|r| r.at < 1);
+        let stopped = sidecar
+            .read_back_within(&board, "1@2", MAX_SINCE_RECORDS, 128 * 1024, never_satisfied)
+            .unwrap();
+        assert!(!stopped.complete, "a read that stopped short claimed to be complete");
+        assert!(!stopped.records.is_empty(), "the ceiling refused everything rather than bounding");
+        assert!(
+            stopped.records.len() < 400,
+            "the ceiling read the whole file anyway: {} records",
+            stopped.records.len()
+        );
+        // The **end** is what is kept, which is what a tail read is for.
+        assert_eq!(stopped.records.last().unwrap().at, 1_399);
+
+        // The other half: a ceiling above the file still answers completely, so this is a
+        // bound rather than a behaviour change.
+        let whole = sidecar
+            .read_back_within(&board, "1@2", MAX_SINCE_RECORDS, 64 * 1024 * 1024, never_satisfied)
+            .unwrap();
+        assert!(whole.complete, "a file that fits inside the ceiling must read whole");
+        assert_eq!(whole.records.len(), 400);
     }
 
     /// Two boards must never share a transcript, and one board must keep its own across a

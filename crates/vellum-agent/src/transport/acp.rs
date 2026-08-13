@@ -47,7 +47,9 @@ use crate::provider::Transport as TransportKind;
 use crate::transcript::{
     RequestId, ToolCallId, TranscriptEvent, TurnId, TurnOutcome,
 };
-use crate::transport::{AgentTransport, Blobs, LaunchSpec, PendingBlob, park_blob, probe_command};
+use crate::transport::{
+    AgentTransport, Blobs, LaunchSpec, PendingBlob, decode_base64, park_blob, probe_command,
+};
 use crate::{AgentError, Result};
 
 /// The methods Velm calls on the agent, and the ones the agent calls on Velm.
@@ -324,42 +326,6 @@ fn pick_option(options: &Value, allowed: bool) -> Option<String> {
         .or_else(|| if allowed { list.first() } else { list.last() })?;
 
     matching["optionId"].as_str().map(str::to_owned)
-}
-
-/// Base64, for the image bytes an agent sends inline.
-///
-/// Hand-rolled to keep this crate's dependency list at the four `docs/07` §1 names, and
-/// short enough to read: four characters in, three bytes out, whitespace and padding
-/// skipped. Answers `None` on anything that is not base64 rather than producing bytes that
-/// are not the picture.
-fn decode_base64(text: &str) -> Option<Vec<u8>> {
-    fn sextet(byte: u8) -> Option<u32> {
-        match byte {
-            b'A'..=b'Z' => Some(u32::from(byte - b'A')),
-            b'a'..=b'z' => Some(u32::from(byte - b'a') + 26),
-            b'0'..=b'9' => Some(u32::from(byte - b'0') + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    let mut accumulator: u32 = 0;
-    let mut bits = 0;
-    for byte in text.bytes() {
-        if byte == b'=' || byte.is_ascii_whitespace() {
-            continue;
-        }
-        let value = sextet(byte)?;
-        accumulator = (accumulator << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((accumulator >> bits) & 0xff) as u8);
-        }
-    }
-    Some(out)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1046,14 +1012,26 @@ mod tests {
         }
     }
 
+    /// ⚠ **This test asserted the bug**, and it is the reason the bug survived: its second and
+    /// fourth lines *required* the unpadded and line-wrapped forms to decode, under a comment
+    /// reading *"wrapped base64 is still base64"*. This file had its own lenient copy of a
+    /// decoder whose doc comment claimed to be strict, and the same leniency turned the single
+    /// character `"a"` into `Some(vec![])` — a zero-byte blob, parked and written to the
+    /// content-addressed store as an agent's picture.
+    ///
+    /// There is one decoder now (`crate::ipc::decode_base64`), and it refuses every shape a
+    /// truncated or spliced payload takes. ACP sends `data` as a single unwrapped token, so
+    /// nothing legitimate on this path is lost.
     #[test]
-    fn base64_decodes_padded_and_unpadded_and_refuses_what_is_not_base64() {
+    fn base64_refuses_the_shapes_a_truncated_or_spliced_payload_takes() {
         assert_eq!(decode_base64("aGVsbG8=").unwrap(), b"hello");
-        assert_eq!(decode_base64("aGVsbG8").unwrap(), b"hello");
         assert_eq!(decode_base64("YW55IGNhcm5hbCBwbGVhc3VyZQ==").unwrap(), b"any carnal pleasure");
-        assert_eq!(decode_base64("aGVs\nbG8=").unwrap(), b"hello", "wrapped base64 is still base64");
         assert_eq!(decode_base64("").unwrap(), b"");
+
         assert!(decode_base64("not base64!").is_none());
+        assert!(decode_base64("a").is_none(), "one character decoded to a zero-byte blob");
+        assert!(decode_base64("aGVsbG8").is_none(), "an unpadded length is a truncated payload");
+        assert!(decode_base64("aGVs\nbG8=").is_none(), "whitespace inside the payload");
     }
 
     /// Every transport reports the same four outcomes, so the node says the same thing

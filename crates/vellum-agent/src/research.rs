@@ -44,6 +44,58 @@
 //!   An agent told *"amazon.com answered 403"* can go and find another source; an agent handed
 //!   an empty page cannot.
 //!
+//! # ⚠ The host policy: this tool reaches the public internet and nothing else
+//!
+//! The URL `research_fetch` is given is **chosen by a model**, from a page it read, from a
+//! search result, or from a board file that arrived from somewhere. `crate::mcp` passes it
+//! straight through. So the interesting question is not what a site allows us to read, it is
+//! what a *machine* allows us to read — and a bare `GET` from inside Velm's process is a `GET`
+//! from inside the user's network, with whatever that network trusts about its own address
+//! space. That is server-side request forgery, and the scheme check that used to be the only
+//! gate here does not touch it: `http://` is exactly the scheme `http://169.254.169.254/…`
+//! has.
+//!
+//! `Research::check_host` therefore refuses, **by literal address and by every address the
+//! name resolves to**:
+//!
+//! - **Loopback** — `127.0.0.0/8`, `::1`, and `localhost` by name. This is where a user's own
+//!   Ollama, their SearXNG, Velm's own IPC server and every unauthenticated development tool
+//!   on the machine listen.
+//! - **Link-local** — `169.254.0.0/16` and `fe80::/10`. `169.254.169.254` is cloud instance
+//!   metadata: credentials, in plain text, to anything that can make an HTTP request.
+//! - **Private and carrier-grade NAT** — `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, and
+//!   IPv6 unique-local `fc00::/7`. The router, the NAS, the printer, the other machines.
+//! - **Names that can only mean the local network** — `.local`, `.internal`, `.home.arpa`.
+//!
+//! Three things about it are deliberate and worth not undoing:
+//!
+//! - **It is checked before `robots.txt`, not after.** `Research::fetch_robots` makes a real
+//!   request to the host, so a policy consulted after it has already let a request out to the
+//!   address it was supposed to refuse. And [`Robots::permissive`] is the degraded answer for
+//!   an unreachable `robots.txt`, so a local address was not merely unchecked — it was
+//!   *explicitly allowed*.
+//! - **It is checked on every redirect hop**, for the same reason the robots check is: a
+//!   remote page answering `302 Location: http://127.0.0.1:11434/…` is a request to the local
+//!   network wearing a public host's clothes.
+//! - **A refusal is a [`ResearchError::BlockedHost`], not a network error.** An agent told
+//!   *"could not reach it"* retries; an agent told *"Velm does not fetch private addresses"*
+//!   goes and finds a public source. This is the same rule the rest of this module already
+//!   follows for a 403.
+//!
+//! **The opt-in, and why it is a config field rather than a special case.** A user pointing
+//! this at their own local model or their own SearXNG is a legitimate thing to want, so
+//! [`ResearchConfig::allow_local_hosts`] exists — **default off**, set by the user and never
+//! by a model. The distinction that matters throughout is *who chose the URL*: a **search
+//! endpoint is user configuration** and is exempt already ([`Research::search_at`]), because
+//! SearXNG on `localhost` is the ordinary way to run it and the user typed that address
+//! themselves. A URL a model produced is not.
+//!
+//! **The residual, stated rather than over-claimed: DNS rebinding is not closed.** The
+//! addresses are checked here and `ureq` resolves the name again when it connects, so a
+//! resolver that answers differently between the two calls defeats this. Closing it needs a
+//! connector that dials the address that was checked, which is a `ureq` `Connector`
+//! implementation and a larger change than the hole justifies today.
+//!
 //! # What this module does not read
 //!
 //! **The clock, except in one place.** Every pure part here — the limiter, the robots cache's
@@ -58,6 +110,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -207,6 +260,19 @@ pub enum ResearchError {
     #[error("{url} is disallowed by {host}/robots.txt (the rule was `{rule}`)")]
     RobotsDisallowed { url: String, host: String, rule: String },
 
+    /// The host is on this machine or on the local network. See the module's host policy.
+    ///
+    /// **Its own variant, and not a [`ResearchError::Network`]**, because the two say opposite
+    /// things to the thing that reads them. A network failure is worth retrying and a policy
+    /// refusal never is — an agent handed *"could not reach it"* tries again, and again, at
+    /// whatever address it was told not to reach.
+    #[error(
+        "{url} was not fetched: {host} is {reason}, and Velm's research tool reaches the \
+         public internet only. Use a public address, or ask the user to turn on \
+         `allow_local_hosts` if this really is their own server."
+    )]
+    BlockedHost { url: String, host: String, reason: String },
+
     /// The exchange failed below HTTP: DNS, TLS, a dropped connection, a timeout.
     #[error("could not reach {url}: {message}")]
     Network { url: String, message: String },
@@ -315,6 +381,21 @@ pub struct ResearchConfig {
     /// constructor here and nothing in the shipping path sets it false** — a switch that
     /// turned the policy off would be the evasion this module refuses to be.
     pub respect_robots: bool,
+
+    /// Whether the host policy is lifted. See the module header.
+    ///
+    /// **Off in every constructor, and it is the user's switch rather than the model's.** A
+    /// user pointing an agent at their own local model, their own wiki or their own SearXNG is
+    /// a real thing to want, and refusing it outright would be a policy the user cannot
+    /// override on their own machine. What it must never be is the *default*, because the URL
+    /// this guards is chosen by a model and the addresses behind it — cloud metadata, the
+    /// router's admin page, Velm's own IPC server — are reachable with no credential at all.
+    ///
+    /// It is one flag rather than an allow-list of hosts on purpose: an allow-list is a thing
+    /// a model can talk a user into extending one entry at a time, and a single switch is a
+    /// decision somebody makes once, knowingly.
+    pub allow_local_hosts: bool,
+
     pub search: SearchEngine,
 }
 
@@ -327,6 +408,7 @@ impl Default for ResearchConfig {
             max_text_chars: DEFAULT_MAX_TEXT_CHARS,
             min_interval: DEFAULT_MIN_INTERVAL,
             respect_robots: true,
+            allow_local_hosts: false,
             search: SearchEngine::default(),
         }
     }
@@ -890,6 +972,142 @@ pub fn split_url(url: &str) -> Option<UrlParts> {
     }
     let path = if path.starts_with('/') { path.to_owned() } else { format!("/{path}") };
     Some(UrlParts { scheme, host, path })
+}
+
+// ---------------------------------------------------------------------------------------
+// The host policy
+// ---------------------------------------------------------------------------------------
+
+/// The bare host out of an authority: no port, no IPv6 brackets.
+///
+/// [`UrlParts::host`] is host **and** port, because that is what `robots.txt` and the cookie
+/// jar key off. The policy needs the other thing.
+///
+/// The bracket case is not a nicety: an IPv6 literal is full of colons, which is the reason
+/// the brackets exist, and splitting on the last colon without handling them turns `[::1]`
+/// into `[:` — a name that is refused for the wrong reason today and might not be tomorrow.
+pub fn hostname_of(authority: &str) -> &str {
+    let authority = authority.trim();
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    // A bare, unbracketed IPv6 literal is not legal in a URL, but it is what a hand-written
+    // string contains often enough to matter, and the port split would mangle it.
+    if authority.matches(':').count() > 1 {
+        return authority;
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) => {
+            host
+        }
+        _ => authority,
+    }
+}
+
+/// Whether this path **is** `/robots.txt`, the one path exempt from `robots.txt`.
+///
+/// ⚠ **Equality, not a prefix.** The exemption exists because fetching the rules cannot be
+/// subject to them, and `starts_with("/robots.txt")` said the same thing about
+/// `/robots.txt.bak`, `/robots.txt/../private/secret` and `/robots.txtsecret` — three paths
+/// that are not the rules file, each of which then skipped the robots check for the whole
+/// request. A prefix test on a path is an access-control hole in any module that has one.
+///
+/// The query and fragment come off first. [`UrlParts::path`] carries the query, so
+/// `/robots.txt?v=2` is the rules file and must stay exempt; the fragment is already dropped
+/// by [`split_url`] and is handled here anyway, so this does not depend on that staying true.
+pub fn is_robots_path(path: &str) -> bool {
+    path.split(['?', '#']).next().unwrap_or_default() == "/robots.txt"
+}
+
+/// Why this IPv4 address is not on the public internet, if it is not.
+fn blocked_v4(ip: Ipv4Addr) -> Option<&'static str> {
+    let [first, second, ..] = ip.octets();
+    if ip.is_loopback() {
+        return Some("a loopback address (127.0.0.0/8) — this machine");
+    }
+    if ip.is_private() {
+        return Some("a private address (10/8, 172.16/12 or 192.168/16) — the local network");
+    }
+    if ip.is_link_local() {
+        return Some(
+            "a link-local address (169.254.0.0/16) — where cloud instance metadata, and the \
+             credentials it hands out, live",
+        );
+    }
+    if ip.is_broadcast() {
+        return Some("the broadcast address");
+    }
+    // `is_shared` is still unstable, so carrier-grade NAT is spelled out. `0.0.0.0/8` covers
+    // `is_unspecified` and the rest of "this network", which resolves to the local host on
+    // most stacks.
+    if first == 100 && (64..=127).contains(&second) {
+        return Some("a carrier-grade NAT address (100.64.0.0/10)");
+    }
+    if first == 0 {
+        return Some("a `this network` address (0.0.0.0/8) — this machine");
+    }
+    None
+}
+
+/// Why this address is not on the public internet, if it is not.
+///
+/// **The IPv4-mapped case is checked first and it is the one a policy usually forgets**:
+/// `::ffff:127.0.0.1` is a perfectly ordinary way to spell the loopback address, and a v6
+/// branch that only looks at `is_loopback` says yes to it.
+pub fn blocked_ip(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => blocked_v4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return blocked_v4(v4);
+            }
+            if v6.is_loopback() {
+                return Some("the IPv6 loopback address (::1) — this machine");
+            }
+            if v6.is_unspecified() {
+                return Some("the unspecified address (::)");
+            }
+            let segments = v6.segments();
+            // `is_unicast_link_local` and `is_unique_local` are both still unstable.
+            if segments[0] & 0xffc0 == 0xfe80 {
+                return Some("an IPv6 link-local address (fe80::/10)");
+            }
+            if segments[0] & 0xfe00 == 0xfc00 {
+                return Some("an IPv6 unique-local address (fc00::/7) — the local network");
+            }
+            None
+        }
+    }
+}
+
+/// Why this **name** is not on the public internet, if it can be told without resolving it.
+///
+/// The cheap half of the policy, and the half that still works when there is no DNS: a literal
+/// address needs no lookup, and the four name suffixes below cannot mean anything but a local
+/// machine however they resolve. `.internal` matters more than it looks —
+/// `metadata.google.internal` is the same instance-metadata endpoint `169.254.169.254` is,
+/// reached by name.
+pub fn blocked_by_name(hostname: &str) -> Option<&'static str> {
+    let name = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() {
+        return Some("an empty host");
+    }
+    if let Ok(ip) = name.parse::<IpAddr>() {
+        return blocked_ip(ip);
+    }
+    if name == "localhost" || name.ends_with(".localhost") {
+        return Some("`localhost` — this machine");
+    }
+    if name == "local" || name.ends_with(".local") {
+        return Some("a `.local` (mDNS) name, which only ever resolves on the local network");
+    }
+    if name.ends_with(".internal") || name == "internal" {
+        return Some("an `.internal` name, which is a private-network or cloud-metadata name");
+    }
+    if name.ends_with(".home.arpa") || name == "home.arpa" {
+        return Some("a `home.arpa` name, which is reserved for home networks");
+    }
+    None
 }
 
 /// Resolves `href` against the page it was found on.
@@ -1704,6 +1922,11 @@ impl Research {
 
         for _ in 0..MAX_REDIRECTS {
             let parts = split_url(&target).ok_or_else(|| ResearchError::NotHttp(target.clone()))?;
+            // ⚠ **Before the robots check, not after it.** `fetch_robots` makes a real request
+            // to this host, so a host policy consulted afterwards has already let a request
+            // out to the address it exists to refuse — and worse, an unreachable `robots.txt`
+            // degrades to `Robots::permissive`, so a local address was *explicitly allowed*.
+            self.check_host(&target, &parts)?;
             self.check_robots(&parts, &mut now)?;
             now = self.pace(&parts.host, now)?;
 
@@ -1749,6 +1972,14 @@ impl Research {
     /// **The search request goes through the same robots check and the same pacing table as
     /// any other fetch.** It costs nothing and it means the policy has no exception carved
     /// into it — which is the difference between a policy and a preference.
+    ///
+    /// ⚠ **The one thing it does not go through is `Research::check_host`, and that is the
+    /// distinction the host policy is actually drawn along: who chose the URL.** The search
+    /// endpoint is *user configuration* — [`SEARCH_ENDPOINT_ENV`], set by hand — and a SearXNG
+    /// on `localhost` is the ordinary way to run one. A URL a model produced is a different
+    /// thing entirely and is checked. Note that the results a search returns are only ever
+    /// followed through [`Research::fetch_at`], which does check, so an endpoint that answered
+    /// with a list of local addresses still cannot get one fetched.
     pub fn search_at(
         &self,
         query: &str,
@@ -1878,12 +2109,49 @@ impl Research {
         Ok((status, location, body, truncated))
     }
 
+    /// Applies the host policy to one URL. See the module header for what it refuses and why.
+    ///
+    /// Two checks, and both are needed. The **name** answers without a lookup and catches
+    /// every literal address and the four suffixes that can only mean a local machine. The
+    /// **resolved addresses** catch the case the name cannot: a perfectly ordinary public
+    /// hostname whose A record is `127.0.0.1`, which is how this is done deliberately.
+    ///
+    /// Every address is checked, not the first: a name that resolves to a public address and a
+    /// private one is a name that reaches the private one whenever the resolver feels like it.
+    fn check_host(&self, url: &str, parts: &UrlParts) -> Result<(), ResearchError> {
+        if self.config.allow_local_hosts {
+            return Ok(());
+        }
+        let hostname = hostname_of(&parts.host);
+        let refuse = |reason: &str| ResearchError::BlockedHost {
+            url: url.to_owned(),
+            host: hostname.to_owned(),
+            reason: reason.to_owned(),
+        };
+        if let Some(reason) = blocked_by_name(hostname) {
+            return Err(refuse(reason));
+        }
+
+        // The port is irrelevant to what a name resolves to, so a fixed one keeps this to one
+        // lookup shape. A resolution failure is a *network* error and not a policy refusal —
+        // it is the one thing here that is genuinely worth retrying.
+        let resolved = (hostname, 80u16).to_socket_addrs().map_err(|error| {
+            ResearchError::Network { url: url.to_owned(), message: error.to_string() }
+        })?;
+        for address in resolved {
+            if let Some(reason) = blocked_ip(address.ip()) {
+                return Err(refuse(reason));
+            }
+        }
+        Ok(())
+    }
+
     /// Consults, and if necessary fetches, this host's `robots.txt`.
     fn check_robots(&self, parts: &UrlParts, now: &mut Instant) -> Result<(), ResearchError> {
         if !self.config.respect_robots {
             return Ok(());
         }
-        if parts.path.starts_with("/robots.txt") {
+        if is_robots_path(&parts.path) {
             return Ok(()); // Fetching the rules is never itself subject to them.
         }
 
@@ -2638,6 +2906,165 @@ mod policy_tests {
     #[test]
     fn robots_is_honoured_by_default() {
         assert!(ResearchConfig::default().respect_robots);
+        // The same claim for the host policy, and it is the more important of the two: the
+        // URL it guards is chosen by a model, and the switch that lifts it is the user's.
+        assert!(
+            !ResearchConfig::default().allow_local_hosts,
+            "the host policy is off by default, so a model can reach this machine"
+        );
+    }
+
+    /// **The SSRF gate.** The only check that used to stand between a model-chosen URL and
+    /// this machine was the *scheme*, which `http://127.0.0.1:11434/api/…` passes as happily
+    /// as any other page. Every address here reaches something that answers with no
+    /// credential: the user's local model, Velm's own IPC server, the router, and — the worst
+    /// of them — cloud instance metadata at `169.254.169.254`, which hands out keys.
+    ///
+    /// Asserted on the pure halves, because the resolving half needs a resolver: the literal
+    /// forms and the names are exactly what `check_host` consults first, and they are where
+    /// every entry in the module's policy list is pinned.
+    #[test]
+    fn the_host_policy_refuses_this_machine_and_the_local_network() {
+        let blocked = [
+            "127.0.0.1",
+            "127.13.9.4",
+            "0.0.0.0",
+            "10.0.0.7",
+            "172.16.4.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd00::abcd",
+            "fc00::1",
+            // The spelling a policy usually forgets: the loopback address as IPv6.
+            "::ffff:127.0.0.1",
+            "localhost",
+            "LOCALHOST",
+            "db.localhost",
+            "printer.local",
+            "metadata.google.internal",
+            "nas.home.arpa",
+            // A trailing dot is a fully-qualified name and the same host.
+            "localhost.",
+        ];
+        for host in blocked {
+            assert!(
+                blocked_by_name(host).is_some(),
+                "{host} was allowed, and it reaches this machine or this network"
+            );
+        }
+
+        // The other half, which matters just as much: ordinary public hosts are not refused.
+        for host in ["example.com", "8.8.8.8", "172.32.0.1", "11.0.0.1", "100.128.0.1", "2606:4700::1111"] {
+            assert!(blocked_by_name(host).is_none(), "{host} is public and was refused");
+        }
+
+        // The reason is a sentence an agent can act on, not a code.
+        let reason = blocked_by_name("169.254.169.254").unwrap();
+        assert!(reason.contains("metadata"), "the reason did not say what is there: {reason}");
+    }
+
+    /// The port and the brackets come off before the address is read.
+    ///
+    /// [`UrlParts::host`] is host **and** port, so a policy that read it raw would test
+    /// `"127.0.0.1:11434"`, fail to parse it as an address, and let it through — which is the
+    /// single most likely local address a model would name.
+    #[test]
+    fn a_host_is_read_without_its_port_or_its_brackets() {
+        assert_eq!(hostname_of("example.com"), "example.com");
+        assert_eq!(hostname_of("example.com:8080"), "example.com");
+        assert_eq!(hostname_of("127.0.0.1:11434"), "127.0.0.1");
+        assert_eq!(hostname_of("[::1]"), "::1");
+        assert_eq!(hostname_of("[::1]:8080"), "::1");
+        assert_eq!(hostname_of("[fe80::1]:443"), "fe80::1");
+        // A bare v6 literal is not legal in a URL and does turn up in hand-written strings;
+        // splitting it on the last colon would produce a name that is refused by accident.
+        assert_eq!(hostname_of("::1"), "::1");
+        // A colon that is not a port must not be mistaken for one.
+        assert_eq!(hostname_of("example.com:notaport"), "example.com:notaport");
+
+        // The join that matters: through `split_url`, as `check_host` actually reads it.
+        let parts = split_url("http://127.0.0.1:11434/api/generate").unwrap();
+        assert_eq!(parts.host, "127.0.0.1:11434");
+        assert!(blocked_by_name(hostname_of(&parts.host)).is_some());
+    }
+
+    /// ⚠ **A redirect is a request to another host, so the policy is re-applied per hop.**
+    /// The redirect loop already re-checked the *scheme* every hop and never the host, so a
+    /// public page answering `302 Location: http://127.0.0.1:…` walked straight in.
+    ///
+    /// Driven through `resolve_url`, which is what the loop uses to build the next target —
+    /// asserting on the hop's resolved URL is what makes this about the loop rather than
+    /// about `blocked_by_name` a second time.
+    #[test]
+    fn a_redirect_into_the_local_network_is_refused_at_the_hop_that_reaches_it() {
+        // Each `Location` as a redirecting server would send it: absolute, protocol-relative
+        // and root-relative, which are the three forms `resolve_url` has to handle.
+        let hops = [
+            ("https://example.org/second", false),
+            ("http://127.0.0.1:11434/api/tags", true),
+            ("//169.254.169.254/latest/meta-data/", true),
+            ("/harmless", true),
+        ];
+        let mut target = "https://example.com/start".to_owned();
+        let mut verdicts = Vec::new();
+        for (location, _) in hops {
+            let next = resolve_url(&target, location).expect("the hop did not resolve");
+            let parts = split_url(&next).expect("the hop was not an http(s) URL");
+            verdicts.push(blocked_by_name(hostname_of(&parts.host)).is_some());
+            target = next;
+        }
+        let expected: Vec<bool> = hops.iter().map(|(_, blocked)| *blocked).collect();
+        assert_eq!(verdicts, expected, "a hop into the local network was not caught");
+        // The last hop is the one worth naming: a *root-relative* redirect inherits the
+        // previous hop's host, so once a chain is inside the network every later hop is too.
+        assert_eq!(target, "http://169.254.169.254/harmless");
+
+        // A refusal must not read as a network failure, or the agent retries it forever.
+        let refused = ResearchError::BlockedHost {
+            url: "http://127.0.0.1:11434/api/tags".into(),
+            host: "127.0.0.1".into(),
+            reason: "a loopback address (127.0.0.0/8) — this machine".into(),
+        };
+        let text = refused.to_string();
+        assert!(text.contains("127.0.0.1"), "{text}");
+        assert!(text.contains("public internet"), "{text}");
+        let crate_wide: crate::AgentError = refused.into();
+        assert!(
+            matches!(crate_wide, crate::AgentError::Refused(_)),
+            "a policy refusal arrived as something retryable: {crate_wide:?}"
+        );
+    }
+
+    /// **The robots exemption is an equality test, not a prefix.** `/robots.txt` is exempt
+    /// because fetching the rules cannot be subject to them — and `starts_with` said the same
+    /// about three paths that are not the rules file, each of which then skipped the robots
+    /// check for the whole request.
+    #[test]
+    fn only_the_rules_file_itself_is_exempt_from_the_rules() {
+        assert!(is_robots_path("/robots.txt"));
+        // A query on the rules file is still the rules file.
+        assert!(is_robots_path("/robots.txt?v=2"));
+        assert!(is_robots_path("/robots.txt#top"));
+
+        // None of these is the rules file, and each used to be exempt.
+        assert!(!is_robots_path("/robots.txt.bak"), "a backup of the rules is not the rules");
+        assert!(!is_robots_path("/robots.txt/../private/secret"));
+        assert!(!is_robots_path("/robots.txtsecret"));
+        assert!(!is_robots_path("/robots.txt/admin"));
+
+        // The join, against the parser that produces the path: `split_url` keeps the query on
+        // `path`, which is why the split is needed at all.
+        assert_eq!(split_url("https://a.example/robots.txt?v=2").unwrap().path, "/robots.txt?v=2");
+        assert_eq!(
+            split_url("https://a.example/robots.txt.bak").unwrap().path,
+            "/robots.txt.bak"
+        );
     }
 
     /// A refusal carries the status code. An agent told "amazon.com answered 403" can find

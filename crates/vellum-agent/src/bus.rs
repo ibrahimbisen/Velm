@@ -353,6 +353,23 @@ impl Bus {
     /// happening and then stops, rather than running a timer while the board sits still.
     pub const PULSE_MS: u64 = 600;
 
+    /// The most deliveries that may wait to be drained.
+    ///
+    /// ⚠ **The queue had no bound at all**, and the two things that fill it do not need the
+    /// app's cooperation to keep going: every `send` pushes **two** entries, and the IPC
+    /// server's thread calls `send` — so an agent in a loop, or a headless run where nothing
+    /// calls [`Bus::drain`], grew this `VecDeque` until the machine gave out. The hop limit
+    /// bounds one *chain* and says nothing about how many chains there are; the refusal it
+    /// produces is itself a queued entry.
+    ///
+    /// **The oldest is dropped, not the newest**, which is the opposite of what a queue
+    /// usually wants and is right here. This is drained once per frame, so reaching four
+    /// thousand entries does not mean the app is behind — it means something is generating
+    /// messages faster than a board can be read, and the recent end is the part that says
+    /// what. Losing the start of a runaway conversation costs nothing; losing the end costs
+    /// the only evidence of what it turned into.
+    pub const MAX_QUEUED: usize = 4_096;
+
     pub fn new() -> Self {
         Self::with_max_hops(Self::DEFAULT_MAX_HOPS)
     }
@@ -444,26 +461,33 @@ impl Bus {
                  is {}. Two agents may be answering each other in a loop.",
                 self.max_hops
             );
-            inner.queue.push_back(Delivery {
-                node: to,
-                event: TranscriptEvent::Error { message: reason.clone() },
-                hops,
-            });
+            // The line stays — §6 puts it on the receiver on purpose, because the node being
+            // hammered is the one a user clicks on — but a *run* of identical refusals is one
+            // line's worth of information, and a loop generates them as fast as it turns.
+            if !inner.already_said(&to, &reason) {
+                inner.enqueue(Delivery {
+                    node: to,
+                    event: TranscriptEvent::Error { message: reason.clone() },
+                    hops,
+                });
+            }
             return Err(AgentError::Refused(reason));
         }
 
         if inner.topology.accepts(&to) != Some(true) {
             let reason = format!("{to_name} is not accepting messages");
-            inner.queue.push_back(Delivery {
-                node: from,
-                event: TranscriptEvent::Error { message: reason.clone() },
-                hops,
-            });
+            if !inner.already_said(&from, &reason) {
+                inner.enqueue(Delivery {
+                    node: from,
+                    event: TranscriptEvent::Error { message: reason.clone() },
+                    hops,
+                });
+            }
             return Err(AgentError::Refused(reason));
         }
 
         // Both transcripts, so a conversation reads correctly from either end.
-        inner.queue.push_back(Delivery {
+        inner.enqueue(Delivery {
             node: from.clone(),
             event: TranscriptEvent::MessageSent {
                 to: AgentRef::new(to.clone(), to_name),
@@ -471,7 +495,7 @@ impl Bus {
             },
             hops,
         });
-        inner.queue.push_back(Delivery {
+        inner.enqueue(Delivery {
             node: to.clone(),
             event: TranscriptEvent::Message {
                 from: AgentRef::new(from.clone(), from_name),
@@ -550,6 +574,33 @@ impl Default for Bus {
 impl Inner {
     fn expire(&mut self, now_ms: u64) {
         self.flights.retain(|flight| flight.until_ms > now_ms);
+    }
+
+    /// Queues a delivery, bounded by [`Bus::MAX_QUEUED`].
+    ///
+    /// **The one way anything reaches the queue**, so the bound cannot be forgotten at one of
+    /// the four call sites — which is exactly how the queue came to be unbounded at all of
+    /// them. See the constant for why the *oldest* is what goes.
+    fn enqueue(&mut self, delivery: Delivery) {
+        while self.queue.len() >= Bus::MAX_QUEUED {
+            self.queue.pop_front();
+        }
+        self.queue.push_back(delivery);
+    }
+
+    /// Whether the tail of the queue is already this exact refusal for this exact node.
+    ///
+    /// A hop-limit refusal is generated at the speed of the loop that provokes it, so two
+    /// agents answering each other produce a run of identical lines. The bound above is what
+    /// actually protects the memory; this stops the *transcript* from being a thousand copies
+    /// of one sentence, which is the difference between a message a user reads and one they
+    /// scroll past. Only the tail is checked, which is O(1) and is where a run repeats.
+    fn already_said(&self, node: &str, message: &str) -> bool {
+        matches!(
+            self.queue.back(),
+            Some(Delivery { node: at, event: TranscriptEvent::Error { message: said }, .. })
+                if at.as_str() == node && said.as_str() == message
+        )
     }
 
     /// Light a link, or extend the pulse already on it — a second message down the same wire
@@ -703,6 +754,81 @@ mod tests {
         // the refusal is recorded, because the node being hammered is the one a user clicks.
         assert_eq!(reported[0].node, "b", "the hop-limit refusal landed on the wrong node");
         assert!(matches!(reported[0].event, TranscriptEvent::Error { .. }));
+    }
+
+    /// ⚠ **Nothing bounded the queue.** Every `send` pushes *two* entries, the IPC server's
+    /// thread calls `send`, and the only thing that empties it is the app's frame loop — so an
+    /// agent in a loop, or any run where nothing drains, grew this `VecDeque` without limit
+    /// inside the application's own process. The hop limit bounds one *chain* and says nothing
+    /// about how many chains there are, and its refusal is itself a queued entry.
+    ///
+    /// Both halves are asserted, because a cap that kept the wrong end would be worse than
+    /// none: this is drained every frame, so a full queue means something is generating faster
+    /// than a board can be read, and the recent end is the part that says what.
+    #[test]
+    fn the_delivery_queue_is_bounded_and_keeps_the_newest() {
+        let bus = bus_with(pair());
+        // The cap in messages, so **twice** the cap in deliveries — every `send` pushes two —
+        // with nothing draining in between.
+        for index in 0..Bus::MAX_QUEUED {
+            bus.send(Message::new("a", "b", format!("message {index}")), 0).unwrap();
+        }
+        assert_eq!(bus.pending(), Bus::MAX_QUEUED, "the queue grew past its bound");
+
+        let drained = bus.drain();
+        assert_eq!(drained.len(), Bus::MAX_QUEUED);
+        // The *last* message sent must still be in there. Dropping the newest would mean a
+        // runaway conversation is recorded only as the part before it went wrong.
+        let last = format!("message {}", Bus::MAX_QUEUED - 1);
+        assert!(
+            drained.iter().any(|delivery| matches!(
+                &delivery.event,
+                TranscriptEvent::Message { text, .. } if *text == last
+            )),
+            "the newest delivery was dropped"
+        );
+        assert!(bus.pending() == 0, "drain left something behind");
+    }
+
+    /// A hop-limit refusal is generated at the speed of the loop that provokes it, so a pair
+    /// of agents talking past each other writes the same sentence into one transcript over and
+    /// over. The bound above is what protects the memory; this is what stops the transcript
+    /// from being a thousand copies of one line, which is the difference between a message a
+    /// user reads and one they scroll past.
+    #[test]
+    fn a_run_of_identical_refusals_is_recorded_once() {
+        let bus = Bus::with_max_hops(0);
+        bus.set_topology(pair());
+
+        for _ in 0..50 {
+            assert!(bus.send(Message::new("a", "b", "hello"), 0).is_err());
+        }
+        let queued = bus.drain();
+        assert_eq!(queued.len(), 1, "one refusal repeated 50 times wrote 50 lines: {queued:?}");
+        assert_eq!(queued[0].node, "b");
+
+        // Not a *global* suppression, which would be the wrong fix: only a refusal that is
+        // already the last thing in the queue is skipped, so the same refusal after other
+        // traffic still gets its line.
+        let mut muted = Topology::new();
+        muted.node("a", "Planner", true).node("b", "Builder", false);
+        muted.link("a", "b", LinkDirection::Both);
+        let bus = bus_with(muted);
+
+        assert!(bus.send(Message::new("a", "b", "one"), 0).is_err());
+        assert!(bus.send(Message::new("a", "b", "two"), 0).is_err());
+        assert_eq!(bus.pending(), 1, "the same refusal twice in a row is still one line");
+
+        bus.set_topology(pair()); // "b" accepts again
+        bus.send(Message::new("a", "b", "three"), 0).unwrap();
+        assert_eq!(bus.pending(), 3);
+
+        let mut muted = Topology::new();
+        muted.node("a", "Planner", true).node("b", "Builder", false);
+        muted.link("a", "b", LinkDirection::Both);
+        bus.set_topology(muted);
+        assert!(bus.send(Message::new("a", "b", "four"), 0).is_err());
+        assert_eq!(bus.pending(), 4, "a refusal after other traffic was swallowed");
     }
 
     /// The bound is configurable, and zero means "these agents may not talk at all" rather

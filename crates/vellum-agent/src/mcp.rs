@@ -75,10 +75,15 @@ pub mod protocol {
     pub const TOOLS_LIST: &str = "tools/list";
     pub const TOOLS_CALL: &str = "tools/call";
 
-    /// Every notification's method name starts with this. Used as the *second* test for
-    /// "is this a notification", after the absence of an `id`, because a client that sends
-    /// `"id": null` on a notification is wrong in a way that is cheaper to tolerate than to
-    /// argue with.
+    /// Every notification's method name starts with this.
+    ///
+    /// ⚠ **Naming only. It is not, and must not become, a test for "is this a
+    /// notification".** JSON-RPC 2.0 defines a notification as a request with no `id`, and
+    /// the method name has no say in it — so a prefix test used as an *independent*
+    /// condition drops `{"id": 7, "method": "notifications/message"}`, which is a real
+    /// request, and leaves the client blocked on id 7 for as long as it is willing to wait.
+    /// That is exactly what [`super::Server::handle_line`] used to do. The absence of the id
+    /// decides; this constant describes a namespace.
     pub const NOTIFICATION_PREFIX: &str = "notifications/";
 }
 
@@ -133,11 +138,32 @@ pub struct Endpoint {
     reach: Result<Reach, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Reach {
     address: SocketAddr,
     token: String,
     agent: String,
+}
+
+/// ⚠ **Hand-written, because this token is the one that authorises `spawn` and `configure`.**
+///
+/// [`Endpoint`]'s own derive is fine and stays — a derived `Debug` prints its fields with
+/// *their* impls, so redacting here redacts there. What must not happen is a derive on this
+/// struct: an `Endpoint` is held for the life of the MCP server and is the natural thing to
+/// print when a `velm_*` tool answers a refusal nobody expected, which is precisely the moment
+/// the token would be read out into a log the user then pastes somewhere.
+///
+/// The address and the agent id are printed. Neither is a secret — the port is in a file on
+/// disk and the agent id is in the environment — and both are what a *"which Velm is this
+/// talking to"* question actually needs.
+impl std::fmt::Debug for Reach {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Reach")
+            .field("address", &self.address)
+            .field("agent", &self.agent)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Endpoint {
@@ -683,11 +709,25 @@ impl Server {
         let params = object.get("params").cloned().unwrap_or(Value::Null);
         let id = object.get("id").cloned();
 
-        // A notification: no `id`, or a method in the notifications namespace. Both forms are
-        // accepted because a client that sends `"id": null` alongside `notifications/…` is
-        // cheaper to tolerate than to argue with, and **an unrecognised notification is
-        // ignored rather than answered** — it means a newer client, not a broken session.
-        if id.is_none() || method.starts_with(protocol::NOTIFICATION_PREFIX) {
+        // ⚠ **The absence of an `id` is the deciding test; the prefix is only a secondary
+        // condition on it.** JSON-RPC 2.0 defines a notification as a request *without an
+        // `id`*, and nothing else — the method name has no say in it. Reading the two as
+        // independent alternatives meant `{"id": 7, "method": "notifications/message"}` was
+        // dropped on the floor: no result, no error, and a client blocked on id 7 for as long
+        // as it was willing to wait, which for most of them is forever.
+        //
+        // A null `id` counts as absent, which is what tolerates the client that sends
+        // `{"id": null}` alongside a `notifications/…` method: the spec says an id must not
+        // be null in a request, so there is nothing there to answer *to*.
+        //
+        // **An unrecognised notification is ignored rather than answered** — it means a newer
+        // client, not a broken session.
+        //
+        // ⚠ Behaviour change worth knowing about: `{"id": null, "method": "tools/list"}` is
+        // now silence where it used to be answered with a result carrying a null id. A null id
+        // is not a request id under the spec, so there was never anything for that client to
+        // match the answer against.
+        if matches!(id, None | Some(Value::Null)) {
             return None;
         }
         let id = id.unwrap_or(Value::Null);
@@ -1269,10 +1309,39 @@ mod tests {
         assert_eq!(server.handle_line(""), None);
         assert_eq!(server.handle_line("   \n"), None);
 
+        // ⚠ **An `id` means an answer is owed, whatever the method is called.** The prefix
+        // used to be an *independent* test, so this message got no result and no error and
+        // the client blocked on id 7 — which is the one failure a stdio server must never
+        // have, since there is nothing else on the pipe to notice it. A method in that
+        // namespace that carries an id is not a notification; it is a request for something
+        // this server does not implement, and that has a defined answer.
+        let with_id = answer(
+            &server,
+            r#"{"jsonrpc":"2.0","id":7,"method":"notifications/message","params":{"level":"info"}}"#,
+        );
+        assert_eq!(with_id["id"], 7, "a request under `notifications/` went unanswered");
+        assert_eq!(with_id["error"]["code"], code::METHOD_NOT_FOUND);
+
+        // The same rule for a namespace nobody has invented yet.
+        let future = answer(&server, r#"{"jsonrpc":"2.0","id":8,"method":"notifications/x/y"}"#);
+        assert_eq!(future["id"], 8);
+
         // Garbage gets a parse error with a null id, and the server is still usable after it.
         let garbage = answer(&server, "this is not json {");
         assert_eq!(garbage["error"]["code"], code::PARSE_ERROR);
         assert_eq!(garbage["id"], Value::Null);
+
+        // Bytes that are not UTF-8 at all, as `velm-mcp`'s loop now hands them over: read as
+        // bytes and decoded lossily, so one stray byte from a client is a **protocol** error
+        // with an answer rather than the end of the server. `read_line` refuses the whole read
+        // on that byte, and the binary's loop treats an `Err` as the end of stdin — so the
+        // session died over one byte, which is precisely what that file's own header says it
+        // never does.
+        let invalid = String::from_utf8_lossy(b"{\"jsonrpc\":\"2.0\",\"id\":9,\xff\xfe}");
+        let lossy = answer(&server, &invalid);
+        assert_eq!(lossy["error"]["code"], code::PARSE_ERROR);
+        let after = answer(&server, r#"{"jsonrpc":"2.0","id":10,"method":"ping"}"#);
+        assert_eq!(after["id"], 10, "the server did not survive a line that was not UTF-8");
 
         let batch = answer(&server, r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#);
         assert_eq!(batch["error"]["code"], code::INVALID_REQUEST);
@@ -1280,6 +1349,36 @@ mod tests {
         let ping = answer(&server, r#"{"jsonrpc":"2.0","id":8,"method":"ping"}"#);
         assert!(ping["result"].is_object(), "ping must answer with an empty result object");
         assert!(ping.get("error").is_none());
+    }
+
+    /// The token in an [`Endpoint`] authorises `velm_spawn` and `velm_configure` — the two
+    /// verbs that make new processes and change a node's model — so it is the last thing that
+    /// should reach a log. An `Endpoint` is held for the life of the server and is the natural
+    /// thing to print when a `velm_*` tool refuses something unexpectedly, which is precisely
+    /// the session whose output gets pasted into a bug report.
+    ///
+    /// Asserted through `Endpoint`, not `Reach`, because that is the shape it would be printed
+    /// in: a derived `Debug` prints its fields with *their* impls, so this is the join.
+    #[test]
+    fn an_endpoint_debug_never_prints_the_token_that_authorises_spawn() {
+        let secret = "tok-9c1e-never-print-me";
+        let endpoint = Endpoint {
+            reach: Ok(Reach {
+                address: SocketAddr::from(([127, 0, 0, 1], 51234)),
+                token: secret.to_owned(),
+                agent: "node-3".to_owned(),
+            }),
+        };
+
+        let printed = format!("{endpoint:?}");
+        assert!(!printed.contains(secret), "the endpoint printed its token: {printed}");
+        assert!(!printed.contains("token"), "even the field name invites a second look");
+        // Which Velm, and as whom — the question a debug print is actually asked.
+        assert!(printed.contains("51234") && printed.contains("node-3"), "{printed}");
+
+        // The unavailable form has no secret in it and must still say why.
+        let missing = Endpoint::unavailable("VELM_IPC is not set");
+        assert!(format!("{missing:?}").contains("VELM_IPC"));
     }
 
     /// Every frame is exactly one line. A response carrying a newline splits into two frames on
