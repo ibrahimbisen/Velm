@@ -121,8 +121,16 @@ pub struct AgentFacts<'a> {
     ///
     /// Without this a row prints `42@7` at somebody, which tells them nothing.
     pub label_of: &'a dyn Fn(&str) -> Option<String>,
-    /// Whether a note's file exists, and whether it is in conflict. Both are filesystem
-    /// facts and neither is in the token.
+    /// Whether a note's file exists, and whether it is in conflict.
+    ///
+    /// Both are questions about the filesystem rather than about the token, which is why they
+    /// are asked through a closure at all. ⚠ **The second is answered `false` unconditionally
+    /// today**, and the caller in `app.rs` says why: a conflict file is written by
+    /// `NoteStore::save`, nothing in this application calls `save` yet, so no note on any
+    /// board can be in conflict. That makes the constant *correct* rather than a stand-in —
+    /// but it is correct for a reason outside this type, which is the shape of the
+    /// `locked: false` trap. It has to be answered for real the day a note's body becomes
+    /// editable on the canvas.
     pub note_state: &'a dyn Fn(&str) -> (bool, bool),
 }
 

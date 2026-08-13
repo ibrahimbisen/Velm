@@ -5,14 +5,22 @@
 //! measurement that crate deliberately does not do, exactly as `vellum-flow` never measures
 //! a kanban card.
 //!
-//! # Rows are addressed by index, and that is a trap worth naming
+//! # A row index is not what the press path resolves against, and that is deliberate
 //!
-//! The painter draws row *n* at a rectangle derived from *n*, and the press path resolves a
-//! point back to *n*. Both use [`row_at`] and [`row_rect`], which are inverses of each
-//! other and tested as such. Expanding a directory renumbers every row below it — the same
-//! shape as the kanban caret's stale slot (feedback: "a stale slot draws the caret on one
-//! card while typing into another") — so a caller holding a row index across an expand must
-//! re-derive it rather than keep it.
+//! [`row_rect`] is where a row is drawn. The press path does **not** invert it: it reads
+//! `crate::draw::NodePaint::tree_rows`, the rectangles the painter actually painted, because
+//! three separate things decide which row ends up where — `TreeLayout::visible_rows`, the row
+//! the painter holds back for its *"n more"* line, and the scroll offset. An inverse that knew
+//! only the arithmetic would resolve a point to a row that is not on the screen.
+//!
+//! There *was* an inverse here, `row_at`, written and tested and called by nothing — which is
+//! how a tree came to be drawn with disclosure triangles that could not be pressed at all. It
+//! is gone rather than left as a second answer to a question `NodePaint` already answers.
+//!
+//! Expanding a directory renumbers every row below it — the same shape as the kanban caret's
+//! stale slot (feedback: "a stale slot draws the caret on one card while typing into
+//! another") — which is why the press path carries a row's **relative path** away with it and
+//! never an index.
 
 use vellum_agent::FileTreeModel;
 
@@ -94,22 +102,6 @@ pub fn row_rect(list: Rect, index: usize, scroll: usize) -> Rect {
     Rect::new(list.x, list.y + offset, list.width, ROW_HEIGHT)
 }
 
-/// Which visible row a point in item space is over, if any.
-///
-/// The exact inverse of [`row_rect`], and tested as such — a press path that reproduced the
-/// arithmetic instead of sharing it is a click that lands on the row above the one under
-/// the pointer.
-pub fn row_at(list: Rect, y: f64, scroll: usize) -> Option<usize> {
-    if list.height <= 0.0 || y < list.y || y >= list.y + list.height {
-        return None;
-    }
-    let row = ((y - list.y) / ROW_HEIGHT).floor();
-    if row < 0.0 {
-        return None;
-    }
-    Some(scroll + row as usize)
-}
-
 /// Where a row's disclosure triangle sits, given the row's rectangle and its depth.
 pub fn twisty_rect(row: Rect, depth: usize) -> Rect {
     let x = row.x + depth as f64 * INDENT;
@@ -132,33 +124,24 @@ mod tests {
         assert_eq!(decode(&encode(&tree)), tree);
     }
 
-    /// The two must be inverses. A press path that reproduced the arithmetic rather than
-    /// sharing it is a click landing on the row above the one under the pointer — and it
-    /// would be invisible in any test that only checked one direction.
+    /// Rows stack without a gap and without an overlap. A press lands on exactly one of them
+    /// because the painter records what it drew — so what this has to guarantee is that the
+    /// rectangles themselves tile, not that some inverse agrees with them.
     #[test]
-    fn row_geometry_and_row_hit_testing_are_inverses() {
+    fn rows_tile_the_list_without_gaps_or_overlaps() {
         let l = layout(DEFAULT_SIZE.0, DEFAULT_SIZE.1);
-        for scroll in [0, 3, 40] {
-            for index in scroll..scroll + l.visible_rows() {
-                let rect = row_rect(l.list, index, scroll);
-                let middle = rect.y + rect.height / 2.0;
-                assert_eq!(
-                    row_at(l.list, middle, scroll),
-                    Some(index),
-                    "row {index} at scroll {scroll} did not round-trip"
-                );
-                // And the very top of the row belongs to that row, not the one above.
-                assert_eq!(row_at(l.list, rect.y + 0.01, scroll), Some(index));
-            }
+        let fits = l.visible_rows();
+        assert!(fits > 1);
+        for index in 0..fits - 1 {
+            let (row, next) = (row_rect(l.list, index, 0), row_rect(l.list, index + 1, 0));
+            assert!((next.y - (row.y + row.height)).abs() < 1e-9, "row {index} left a seam");
+            assert_eq!(row.x, l.list.x);
+            assert_eq!(row.width, l.list.width);
         }
-    }
-
-    #[test]
-    fn a_point_outside_the_list_is_not_a_row() {
-        let l = layout(DEFAULT_SIZE.0, DEFAULT_SIZE.1);
-        assert_eq!(row_at(l.list, l.list.y - 1.0, 0), None, "the header answered as a row");
-        assert_eq!(row_at(l.list, l.list.y + l.list.height + 1.0, 0), None);
-        assert_eq!(row_at(Rect::default(), 0.0, 0), None);
+        assert_eq!(row_rect(l.list, 0, 0).y, l.list.y, "the first row missed the top");
+        // A scrolled list draws the same rectangles for the rows it is showing, which is what
+        // lets the offset be a display concern rather than a geometry one.
+        assert_eq!(row_rect(l.list, 3, 3), row_rect(l.list, 0, 0));
     }
 
     /// Only what is on screen may be shaped. The whole canvas rests on this rule, and a

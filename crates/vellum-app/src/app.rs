@@ -133,6 +133,14 @@ pub(crate) struct ActiveState {
     /// **not board content**: it must not be a CRDT write, must not join an undo group, and
     /// must not reach the file RULE ZERO protects. See `ActiveState::begin_prompting`.
     pub(crate) prompting: Option<crate::actions::Prompting>,
+    /// When the prompt row's caret last moved or its text last changed, for the blink.
+    ///
+    /// Its own instant rather than `editing_touched`: the two carets are mutually exclusive
+    /// but the field names what it is about, and a shared one would make a prompt's blink
+    /// restart because something typed on the *canvas* an hour ago. The painter is handed the
+    /// elapsed seconds rather than the instant, for `TextCursor::idle_for`'s reason — a frame
+    /// that reads a clock is a frame `--screenshot` cannot reproduce.
+    pub(crate) prompting_touched: Instant,
     /// What the painter is told about the agents on this board, rebuilt once per frame by
     /// `crate::agent_runtime`.
     ///
@@ -148,6 +156,12 @@ pub(crate) struct ActiveState {
     /// Empty until the user starts one — a board full of agent nodes nobody has run owns no
     /// thread, no process and no socket.
     pub(crate) agent_runtime: crate::agent_runtime::AgentRuntime,
+    /// Every live web engine, and the one place a native child view is allowed to exist.
+    ///
+    /// Empty costs nothing — `BrowserEngines::unavailable()` in a build without the `browser`
+    /// feature, which is the shipping default, and an empty map with it. See
+    /// [`crate::browser_engine`] for why a webview is not a texture and what that forces.
+    pub(crate) browsers: crate::browser_engine::BrowserEngines,
     /// What the hot board's agent identity was when its wiring was last derived.
     ///
     /// This is the gate that keeps the layer free on an ordinary board — see
@@ -545,10 +559,22 @@ impl Vellum {
         }
         crate::flight::prune(&data_directory);
 
+        // The engine host. Without the feature this is `NoEngine`, which refuses with a
+        // sentence rather than being absent — so the pool, the reconcile and every rule in
+        // `crate::browser_engine` run identically in the build that ships.
+        #[cfg(feature = "browser")]
+        let browsers = crate::browser_engine::BrowserEngines::new(Box::new(
+            crate::browser_engine::wry_host::WryHost::new(window.clone()),
+        ));
+        #[cfg(not(feature = "browser"))]
+        let browsers = crate::browser_engine::BrowserEngines::unavailable();
+
         let mut state = ActiveState {
             prompting: None,
+            prompting_touched: Instant::now(),
             agents: crate::agent_view::AgentViews::new(),
             agent_runtime,
+            browsers,
             agent_board: None,
             occluded: false,
             recorder,
@@ -1073,6 +1099,10 @@ impl ActiveState {
                 log::error!("saving {} on quit: {error:#}", parked.path().display());
             }
         }
+        // Every native page, torn down — the third of the three ways a page must stop without
+        // the node changing (`crate::browser_engine`'s "hide, or destroy"). Before the agents,
+        // because these are views on this window and the window is about to go.
+        self.browsers.destroy_all();
         // Every agent process, released — and the loopback server stopped in the order that
         // cannot deadlock (`crate::agent_runtime`'s header). Before the recorder's own last
         // line, so a hang here would be visible as a session with no `EXIT`.
@@ -1229,8 +1259,20 @@ impl ActiveState {
             // Before the paint, because the painter reads `self.agents` and a view rebuilt
             // afterwards would draw one frame behind every event.
             self.rebuild_agent_views();
+            // And the native views, which are not painted by us at all — they are composited
+            // by the window server over everything wgpu draws. Driven from the document once a
+            // frame rather than from events, so a node that is deleted or undone out of
+            // existence simply stops being asked for; see `BrowserEngines::reconcile`.
+            self.reconcile_browsers();
             self.paint_board();
         } else {
+            // **No board on screen is no page on screen.** The library covers the window and a
+            // native view would be composited on top of it, which is the one thing this layer
+            // cannot be occluded out of. Destroyed rather than hidden because going to the
+            // library is the user leaving the board.
+            if !self.browsers.dormant() {
+                self.browsers.destroy_all();
+            }
             // The library covers the window, so painting the board behind it would be
             // a full frame of culling, text shaping and texture residency for pixels
             // nobody sees.
@@ -1494,32 +1536,16 @@ impl ActiveState {
         let running = |id: vellum_doc::ItemId| {
             key_of(id).is_some_and(|key| agent_runtime.is_running(&key))
         };
-        // Reachability along a connector, derived from the board exactly as the painter
-        // derives the line's own style — `crate::agent::link_kind`, never a second rule.
+        // Reachability along a connector, through **the one derivation** — the same call the
+        // schedule dialog makes.
+        //
+        // ⚠ It used to be a second copy of that walk with a different fallback for an unnamed
+        // node: this one answered `42@7`, the raw item id, while `connected_agents` answered
+        // `Orchestrator`, the role's label. So the schedule dialog and the inspector named the
+        // same agent two different things, and `connected_agents`' own doc comment claimed
+        // there was one rule.
         let connected = |from: vellum_doc::ItemId| -> Vec<vellum_ui::AgentLink> {
-            let mut out = Vec::new();
-            for id in editor.board().item_ids() {
-                let Ok(item) = editor.board().item(id) else { continue };
-                let vellum_doc::ItemKind::Connector { start, end, .. } = &item.kind else {
-                    continue;
-                };
-                let (Some(a), Some(b)) = (start.target, end.target) else { continue };
-                let other = if a == from {
-                    b
-                } else if b == from {
-                    a
-                } else {
-                    continue;
-                };
-                let Ok(target) = editor.board().item(other) else { continue };
-                if !crate::agent::is_agent(&target.kind) {
-                    continue;
-                }
-                let id = other.to_string();
-                let label = label_of(&id).unwrap_or_else(|| id.clone());
-                out.push(vellum_ui::AgentLink { id, label });
-            }
-            out
+            crate::actions::connected_agents_of(editor.board(), from)
         };
         let rules = |_: vellum_doc::ItemId, model: &vellum_agent::AgentModel| {
             let global = vellum_agent::RuleFile::read(&vellum_agent::rules::global_rules_path(
@@ -1534,6 +1560,18 @@ impl ActiveState {
                 });
             vellum_agent::rules::resolve(&global, &project, &model.rules, "")
         };
+        // `(on disk, conflicted)`.
+        //
+        // ⚠ **The second half is a literal `false`, and this comment is here because the
+        // field's own doc used to claim both were filesystem facts.** A conflict is written by
+        // `NoteStore::save` as `<slug>.velm-conflict.md`, and nothing in the application calls
+        // `save` yet: there is no caret path into a note's *body* (`ItemKind::AgentNote`
+        // answers `text()` with its **title**), so the canvas never writes a note and a
+        // conflict cannot arise. Answering `false` is therefore correct today rather than a
+        // stand-in — but it is correct for a reason outside this function, which is exactly
+        // the `locked: false` trap. **When a note's body becomes editable, this has to be
+        // answered for real**, and by asking `vellum-agent` for the conflict path rather than
+        // by spelling that suffix a second time here.
         let note_state = |path: &str| -> (bool, bool) {
             let Some(board) = board.as_ref() else { return (false, false) };
             // Resolved against the store's own base — a note path is stored relative to

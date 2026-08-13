@@ -43,6 +43,7 @@ pub mod appearance;
 pub mod assets;
 pub mod bench;
 pub mod browser;
+pub mod browser_engine;
 pub mod capture;
 pub mod chart;
 pub mod filetree;

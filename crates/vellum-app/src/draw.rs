@@ -1800,7 +1800,21 @@ impl Painter {
         // they occupy rather than scaled by the camera; greeked bars stay in the board
         // view, where they coalesce with the geometry above instead of paying for the
         // view flip.
+        // The prompt row's caret, resolved **once** rather than per slot. Gated on the view
+        // carrying one, which is true for at most one node on the board — so no ordinary item
+        // is asked to build a `NodePaint` it does not have.
+        let mut prompt_slot = None;
+        if ctx.agents.get(id).is_some_and(|view| view.caret.is_some()) {
+            prompt_slot = self.node_paint(id, projected, ctx).prompt_slot();
+        }
         for slot in 0..self.slots_of(id, projected, projected.generation, ctx) {
+            // Either caret, as one `TextCursor`. An agent's prompt row is a text surface like
+            // any other and gets the same caret, the same selection wash and the same blink —
+            // a second implementation drawn only for prompts is two things to keep in step.
+            let caret = ctx
+                .editing
+                .filter(|c| c.scene == id && c.slot == slot)
+                .or_else(|| prompt_cursor(id, slot, prompt_slot, ctx));
             match self.block(id, projected, slot, ctx) {
                 Some(Painted::Glyphs(block)) => {
                     list.use_view(screen);
@@ -1812,7 +1826,7 @@ impl Painter {
                     // The selection goes *under* the glyphs, so the text stays legible
                     // through it, and the caret goes over — which is only visible where
                     // the two coincide, at a caret sitting on a glyph's stem.
-                    if let Some(cursor) = ctx.editing.filter(|c| c.scene == id && c.slot == slot) {
+                    if let Some(cursor) = caret {
                         push_selection_boxes(list, ctx, &block, layout, cursor);
                     }
                     stats.glyphs_missing += list.push_layout(
@@ -1822,7 +1836,7 @@ impl Painter {
                         camera.zoom() as f32,
                         block.color.with_alpha(block.color.a * opacity),
                     );
-                    if let Some(cursor) = ctx.editing.filter(|c| c.scene == id && c.slot == slot) {
+                    if let Some(cursor) = caret {
                         push_caret(list, ctx, &block, layout, cursor);
                         // Kept for the *next* click to resolve against. See the field.
                         self.edited_origin = Some((BlockKey::new(id, slot), block.origin));
@@ -2626,8 +2640,16 @@ impl Painter {
 
         // Copied out before the engine is borrowed to shape, as every other indexed path
         // here does: the run list lives in `self.nodes` and the shaping needs `self.text`.
-        let run = self.node_paint(id, projected, ctx).run(index)?.clone();
-        if run.text.trim().is_empty() {
+        let (run, has_caret) = {
+            let paint = self.node_paint(id, projected, ctx);
+            (paint.run(index)?.clone(), paint.prompt_slot() == Some(slot))
+        };
+        // **An empty run still gets a block when the caret is in it**, which is feedback 25's
+        // rule — `Painter::block` skipping a wordless slot is right for a board of blank notes
+        // and catastrophic while a caret is in one, because no block means no origin and
+        // `push_caret` has nothing to measure from. That fix was applied to a table cell and a
+        // kanban card and to nothing else; this is the fourth field it turns out to need.
+        if run.text.trim().is_empty() && !has_caret {
             return None;
         }
 
@@ -4219,10 +4241,26 @@ fn says_the_same_as(title: Option<&str>, description: &str) -> bool {
 // # Every rectangle comes from the node's own `layout()`
 //
 // `crate::agent::layout`, `crate::note::layout`, `crate::filetree::layout` and
-// `crate::browser::layout` are each called by the press path as well as by this file.
-// Nothing here computes a position of its own for anything that can be pressed — the
-// `draw::kanban_runs` / `CardLayout::badge` rule, which this repository has paid for twice:
-// a second copy of a layout is a click that lands where the paint is not.
+// `crate::browser::layout` are each called by the press path as well as by this file —
+// `ActiveState::node_part_under` is the one place that asks. Nothing here computes a position
+// of its own for anything that can be pressed: the `draw::kanban_runs` / `CardLayout::badge`
+// rule, which this repository has paid for twice, a second copy of a layout being a click that
+// lands where the paint is not.
+//
+// ⚠ **This paragraph was written before it was true.** For three waves only the *agent* layout
+// had a caller: `NoteLayout::hit`, `BrowserLayout::hit` and `filetree::row_at` were each
+// written, tested and reached from nothing, so a note's footer, a browser's Reload, its
+// address, its *Open externally* button — which `crate::browser` calls "the whole answer when
+// no engine is running" — and **every disclosure triangle on every file tree** were drawn and
+// could not be pressed. A tree could not be expanded at all. A comment asserting a call that
+// does not happen is the `locked: false` trap in prose; if a fifth kind is added here, check
+// it against the press path rather than against this paragraph.
+//
+// A file tree needs one thing more than a layout, which is why [`NodePaint::tree_rows`]
+// exists: the rows that were *drawn* are not the rows the tree holds — `visible_rows()` bounds
+// them and one is held back for the "n more" line — so the press path asks `tree_paint` for
+// the rectangles it actually painted rather than asking `row_at` for a row that is not on
+// screen.
 //
 // The one place that rule is *widened* rather than obeyed is [`NodePaint`], which flattens a
 // transcript into positioned runs, pictures and option cards. It is `pub(crate)` and pure for
@@ -4410,17 +4448,17 @@ struct NodeImage {
 /// the `kanban_runs` failure in a new place: a card that lights up under the pointer while the
 /// click selects its neighbour.
 ///
-/// `dead_code` is allowed because the press path is a later wave and nothing in *this* file
-/// reads a card back — `pub(crate)` alone does not keep the lint quiet for an item with no
-/// caller yet, and silencing it here is better than the alternative that made
-/// `opens_context_menu` a defect: writing the geometry only when the click arrives, by then in
-/// a second copy.
-#[allow(dead_code)]
+/// The press path reads `rect`, `choice` and `chosen`. **`event` is recorded and not read**,
+/// and the lint is allowed for that one field: it names which `TranscriptEvent::Options` a
+/// card belongs to, which is what a future *"which question was this"* needs and is free to
+/// record while the list is being built. Writing the geometry only when the click arrives is
+/// the alternative, and it is the mistake that made `opens_context_menu` a defect.
 #[derive(Debug, Clone)]
 pub(crate) struct OptionCard {
     /// The card's box in the item's own space, already scaled.
     pub(crate) rect: NodeRect,
     /// Which `TranscriptEvent::Options` it belongs to — its index in `AgentView::events`.
+    #[allow(dead_code)]
     pub(crate) event: usize,
     /// `Choice::id`, sent back verbatim when the user picks this one.
     pub(crate) choice: String,
@@ -4430,12 +4468,10 @@ pub(crate) struct OptionCard {
 
 /// Where the two answers to a permission request will go.
 ///
-/// **Reserved and deliberately not painted.** A drawn button the press path cannot answer is
-/// the inert control this codebase refuses to ship — every gap answers with a toast naming
-/// what is missing, and none of them is a dead button. So the row is measured now, so that
-/// wiring the answers later cannot reflow a transcript out from under a reader, and the chips
-/// themselves arrive with the handler that can honour them.
-#[allow(dead_code)]
+/// The row is measured here and answered by `ActiveState::press_in_transcript`, which reads
+/// these three rectangles rather than repeating the arithmetic. A permission that could be
+/// *drawn* and not *answered* would leave the agent blocked for ever behind a button, which is
+/// the inert control this codebase refuses to ship.
 #[derive(Debug, Clone)]
 pub(crate) struct PermissionChips {
     /// `RequestId`'s string, which is what an answer is sent back with.
@@ -4458,24 +4494,52 @@ pub(crate) struct NodePaint {
     permissions: Vec<PermissionChips>,
     /// A file tree's disclosure triangles: the box, and whether the directory is open.
     twisties: Vec<(NodeRect, bool)>,
+    /// A file tree's rows, so the press path can resolve a click against the rows that were
+    /// actually **drawn**.
+    ///
+    /// The `kanban_runs` rule, and it is sharper here than anywhere else in this file: the
+    /// painter draws `visible_rows()` of them, holds one back for the *"n more"* line, and
+    /// numbers them from a scroll offset. A press path that re-derived any of those three
+    /// would expand the wrong directory — or, as it was, expand none at all.
+    tree_rows: Vec<TreeRowHit>,
+    /// Which run is the prompt row, when that row has the keyboard.
+    ///
+    /// `None` for every node that is not being typed into, which is all of them but one. The
+    /// index is into [`NodePaint::runs`] and is turned into a text *slot* by
+    /// [`NodePaint::prompt_slot`], so the painter's caret lands on the run whose string the
+    /// caret's offsets actually index.
+    prompt_run: Option<usize>,
+}
+
+/// One drawn file-tree row, as the press path needs it.
+#[derive(Debug, Clone)]
+pub(crate) struct TreeRowHit {
+    /// The whole row, in the item's own space.
+    pub(crate) rect: NodeRect,
+    /// The disclosure triangle, for a directory. `None` for a file.
+    pub(crate) twisty: Option<NodeRect>,
+    /// The entry's path relative to the tree's root — the form `FileTreeModel::expanded`
+    /// stores, so expanding is a call rather than a conversion.
+    pub(crate) relative: String,
+    /// The absolute path, for revealing or opening the file.
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) is_dir: bool,
 }
 
 impl NodePaint {
     /// Which option card a point in the item's own space is over, if any.
     ///
-    /// The press path's question, answered from the rectangles the painter drew. See
-    /// [`OptionCard`] — including why the lint is allowed on these three.
-    #[allow(dead_code)]
+    /// The press path's question, answered from the rectangles the painter drew.
     pub(crate) fn option_at(&self, x: f64, y: f64) -> Option<&OptionCard> {
         self.options.iter().find(|card| card.rect.contains(x, y))
     }
 
-    #[allow(dead_code)]
+    /// Every card, for the tests that check they tile without overlapping.
+    #[cfg(test)]
     pub(crate) fn options(&self) -> &[OptionCard] {
         &self.options
     }
 
-    #[allow(dead_code)]
     pub(crate) fn permissions(&self) -> &[PermissionChips] {
         &self.permissions
     }
@@ -4483,6 +4547,36 @@ impl NodePaint {
     /// How many text slots this node claims.
     pub(crate) fn runs(&self) -> usize {
         self.runs.len()
+    }
+
+    /// The text slot the prompt row's caret belongs in, if this node's row has the keyboard.
+    ///
+    /// A *slot*, not a run index, because that is what `Painter::block` and
+    /// [`crate::draw::TextCursor`] speak — and deriving it here rather than at the two call
+    /// sites is what keeps the `CELL_SLOT_BASE` offset in one place.
+    pub(crate) fn prompt_slot(&self) -> Option<u16> {
+        let index = u16::try_from(self.prompt_run?).ok()?;
+        index.checked_add(CELL_SLOT_BASE)
+    }
+
+    /// Every tree row that was **drawn**, in order.
+    ///
+    /// `pub(crate)` for the same reason `kanban_runs` is: a caller that wants to aim at a row
+    /// — the press path, or a `--demo` fixture driving a real press at one — must ask the
+    /// list the painter produced rather than rebuild it from `row_rect` and a bound.
+    pub(crate) fn tree_rows(&self) -> &[TreeRowHit] {
+        &self.tree_rows
+    }
+
+    /// Which drawn tree row a point in the item's own space is over, and whether it landed on
+    /// the disclosure triangle.
+    ///
+    /// The press path's question, answered from the rectangles the painter drew — see
+    /// [`TreeRowHit`].
+    pub(crate) fn tree_row_at(&self, x: f64, y: f64) -> Option<(&TreeRowHit, bool)> {
+        let row = self.tree_rows.iter().find(|row| row.rect.contains(x, y))?;
+        let on_twisty = row.twisty.is_some_and(|box_| box_.contains(x, y));
+        Some((row, on_twisty))
     }
 
     fn run(&self, index: usize) -> Option<&NodeRun> {
@@ -4509,15 +4603,32 @@ impl NodePaint {
         for (rect, _) in &mut self.twisties {
             rect.y += dy;
         }
+        for row in &mut self.tree_rows {
+            row.rect.y += dy;
+            if let Some(twisty) = row.twisty.as_mut() {
+                twisty.y += dy;
+            }
+        }
     }
 
     fn absorb(&mut self, other: Self) {
+        // **`runs` first, and the offset taken before it.** An absorbed paint's run indices
+        // move by however many runs are already here, so anything that *names* an index —
+        // `prompt_run`, and `OptionCard::event`'s neighbour `prompt_slot` — has to be
+        // rebased. Today only `agent_paint` sets `prompt_run`, and it sets it on the paint
+        // doing the absorbing rather than on one being absorbed; this keeps that true if a
+        // later caller does the opposite.
+        let offset = self.runs.len();
+        if self.prompt_run.is_none() {
+            self.prompt_run = other.prompt_run.map(|index| index + offset);
+        }
         self.runs.extend(other.runs);
         self.plates.extend(other.plates);
         self.images.extend(other.images);
         self.options.extend(other.options);
         self.permissions.extend(other.permissions);
         self.twisties.extend(other.twisties);
+        self.tree_rows.extend(other.tree_rows);
     }
 
     /// Adds a run, clipped to what its own box was measured for.
@@ -4542,6 +4653,31 @@ impl NodePaint {
         }
         let stamp = fnv1a(clipped.as_bytes(), rect.width.to_bits() ^ font_size.to_bits());
         self.runs.push(NodeRun { rect, text: clipped, font_size, tone, align, stamp });
+    }
+
+    /// Adds a run holding a **field's exact string**, unclipped, and answers where it went.
+    ///
+    /// [`NodePaint::text`] ellipsises to what the box was measured for, which is right for a
+    /// transcript — an agent's answer is as long as it likes — and wrong for a field with a
+    /// caret in it: the caret's offsets index the buffer, so a shaped string that has been cut
+    /// short puts the caret at the wrong character, or past the end of the string entirely.
+    /// `crate::draw`'s kanban path already keeps the raw value beside the drawn one for
+    /// exactly this, and this is the same split by a shorter route.
+    ///
+    /// It also pushes an **empty** run, which `text` refuses to do. That is feedback 25 — the
+    /// caret that would not appear in an empty sticky — arriving in a fourth place: no run
+    /// means no block, no block means no origin, and `push_caret` has nothing to measure from.
+    fn field(&mut self, rect: NodeRect, text: &str, font_size: f64, tone: Tone, align: Align) -> usize {
+        let stamp = fnv1a(text.as_bytes(), rect.width.to_bits() ^ font_size.to_bits());
+        self.runs.push(NodeRun {
+            rect,
+            text: text.to_owned(),
+            font_size,
+            tone,
+            align,
+            stamp,
+        });
+        self.runs.len() - 1
     }
 
     fn plate(&mut self, rect: NodeRect, tone: PlateTone, radius: f32) {
@@ -4924,7 +5060,8 @@ pub(crate) fn agent_paint(view: &AgentView, laid: &AgentLayout, font: f64) -> No
         );
     }
 
-    // The prompt row: a well, and either what the user has half-typed or an invitation.
+    // The prompt row: a well, and either what is being typed, what was half-typed earlier, or
+    // an invitation.
     //
     // The draft is held by the runtime rather than by the caret precisely so it survives
     // clicking away from the node — `AgentView::draft` says why — so drawing it is what makes
@@ -4939,12 +5076,27 @@ pub(crate) fn agent_paint(view: &AgentView, laid: &AgentLayout, font: f64) -> No
             (laid.prompt.width - pad * 2.0).max(1.0),
             line.min(laid.prompt.height),
         );
-        let (text, tone) = if view.draft.trim().is_empty() {
-            ("Ask this agent to do something", Tone::Muted)
-        } else {
-            (view.draft.as_str(), Tone::Primary)
-        };
-        paint.text(inner, text, font, tone, Align::Left);
+        match view.caret {
+            // **The keyboard is in this row.** Three things change together and all three are
+            // load-bearing: the string is the buffer's own and is *unclipped* (the caret's
+            // offsets index it, so an ellipsised copy puts the caret at the wrong character);
+            // the run is pushed even when it is empty (feedback 25 — no run, no block, and
+            // `push_caret` has nothing to measure from); and the placeholder is suppressed,
+            // because "Ask this agent to do something" is not what the buffer holds and
+            // drawing it would put the caret inside a sentence the user is not typing.
+            Some(_) => {
+                paint.prompt_run =
+                    Some(paint.field(inner, &view.draft, font, Tone::Primary, Align::Left));
+            }
+            None => {
+                let (text, tone) = if view.draft.trim().is_empty() {
+                    ("Ask this agent to do something", Tone::Muted)
+                } else {
+                    (view.draft.as_str(), Tone::Primary)
+                };
+                paint.text(inner, text, font, tone, Align::Left);
+            }
+        }
     }
 
     let box_ = laid.transcript;
@@ -4968,7 +5120,8 @@ pub(crate) fn agent_paint(view: &AgentView, laid: &AgentLayout, font: f64) -> No
     let mut used = 0.0;
     let mut elided = view.truncated || view.events.len() > MAX_ENTRIES;
     for (index, event) in view.events.iter().enumerate().rev().take(MAX_ENTRIES) {
-        let entry = transcript_entry(index, event, box_.x, box_.width, font, available - used);
+        let entry =
+            transcript_entry(index, event.as_ref(), box_.x, box_.width, font, available - used);
         if entry.height <= 0.0 {
             continue;
         }
@@ -5154,9 +5307,24 @@ pub(crate) fn tree_paint(
     let shown = if more { fits.saturating_sub(1) } else { fits };
     for (index, row) in view.rows.iter().take(shown).enumerate() {
         let rect = crate::filetree::row_rect(laid.list, index, 0);
-        if row.entry.is_dir {
-            paint.twisties.push((crate::filetree::twisty_rect(rect, row.depth), row.expanded));
+        let twisty = row
+            .entry
+            .is_dir
+            .then(|| crate::filetree::twisty_rect(rect, row.depth));
+        if let Some(twisty) = twisty {
+            paint.twisties.push((twisty, row.expanded));
         }
+        // Recorded for the press path, from the rectangle that was just drawn. Three things
+        // decide which row is where — `visible_rows()`, the row held back for the *"n more"*
+        // line, and the scroll offset — and a press path that re-derived any of them would
+        // expand the wrong directory. See `NodePaint::tree_rows`.
+        paint.tree_rows.push(TreeRowHit {
+            rect,
+            twisty,
+            relative: row.entry.relative.clone(),
+            path: row.entry.path.clone(),
+            is_dir: row.entry.is_dir,
+        });
         let left = crate::filetree::label_x(rect, row.depth);
         paint.text(
             NodeRect::new(left, rect.y, (rect.x + rect.width - left).max(1.0), rect.height),
@@ -5183,13 +5351,14 @@ pub(crate) fn tree_paint(
 
 /// A browser node's address and, in place of a page, the reason there is not one.
 ///
-/// `crate::browser::placeholder_reason` decides the wording from the two switches
-/// `should_run_engine` reads, so the node, the runtime and the inspector cannot come to
-/// disagree about whether a page is live — which would otherwise show up as an engine running
-/// behind a node that says it is not.
+/// `crate::browser::viewport_message` decides the wording — from the two switches
+/// `should_run_engine` reads **and** from what the engine pool says about this particular page
+/// — so the node, the runtime and the inspector cannot come to disagree about whether a page
+/// is live. The failure that join prevents is an engine running behind a card that says there
+/// is not one.
 pub(crate) fn browser_paint(
     model: &vellum_agent::BrowserModel,
-    reason: Option<&'static str>,
+    reason: Option<String>,
     laid: &crate::browser::BrowserLayout,
     font: f64,
 ) -> NodePaint {
@@ -5232,7 +5401,7 @@ pub(crate) fn browser_paint(
     let name =
         if model.title.trim().is_empty() { model.url.as_str() } else { model.title.as_str() };
     column.paragraph(name, 1.0, Tone::Primary, 2);
-    if let Some(reason) = reason {
+    if let Some(reason) = reason.as_deref() {
         column.gap(font * 0.3);
         column.paragraph(reason, SUBTITLE_SCALE, Tone::Muted, 2);
     }
@@ -5658,10 +5827,12 @@ fn tree_view<'a>(ctx: &DrawContext<'a>, id: SceneId) -> Option<&'a TreeView> {
 
 /// Whether browser nodes are permitted at all.
 ///
-/// **`false` is the correct answer, not a stub.** `docs/07` §0 rule 3 has browser nodes off by
-/// default, so until Preferences is plumbed through to the painter every node draws
-/// `placeholder_reason`'s *"Browser nodes are off — turn them on in Preferences"*, which is
-/// exactly what a default installation should say.
+/// The app's own preference, carried on `AgentViews` because the painter has no library to
+/// ask. `docs/07` §0 rule 3 has browser nodes off by default, so on a default installation
+/// every node draws `placeholder_reason`'s *"Browser nodes are off — turn them on in
+/// Preferences"*, which is exactly what it should say. (This used to add that the preference
+/// was "not plumbed through to the painter yet". It is — `ActiveState::rebuild_agent_views`
+/// sets it every frame.)
 const fn browser_nodes_enabled(ctx: &DrawContext<'_>) -> bool {
     ctx.agents.browser_nodes()
 }
@@ -5711,6 +5882,11 @@ fn node_signature(kind: &ItemKind, view: Option<&AgentView>) -> u64 {
             ],
             hash,
         );
+        // **Whether the prompt row has the keyboard, not just what is in it.** The draft above
+        // covers the characters; this covers the *state change* — arriving in the row with an
+        // empty buffer, or leaving it — which alters the run without altering a byte of text,
+        // and would otherwise draw a placeholder where the caret is.
+        hash = fnv1a(&[u8::from(view.caret.is_some())], hash);
         hash = fnv1a(&view.events.len().to_le_bytes(), hash);
         // The newest entry is the one that streams, and it is the one whose *identity* the rest
         // of this signature cannot see: a tail that gained an event and lost one off the front
@@ -5768,7 +5944,11 @@ fn build_node_paint(
             let enabled = browser_nodes_enabled(ctx);
             browser_paint(
                 &browser,
-                crate::browser::placeholder_reason(&browser, enabled),
+                // The configuration **and** the pool's own word for this page. Asking only
+                // `placeholder_reason` — which is what this did — leaves a node whose page
+                // would not load, or which has been panned half off the canvas, drawing
+                // nothing under its own address to say so.
+                crate::browser::viewport_message(&browser, enabled, ctx.agents.browser_note(id)),
                 &crate::browser::layout(width, height),
                 font,
             )
@@ -6077,6 +6257,40 @@ fn caret_is_visible(idle_for: f32) -> bool {
         return true;
     }
     (idle_for - CARET_SOLID_FOR) % CARET_BLINK_PERIOD < CARET_BLINK_PERIOD / 2.0
+}
+
+/// The prompt row's caret, as the same [`TextCursor`] the on-canvas caret uses.
+///
+/// Free rather than a method because it borrows nothing but the frame's context: the string is
+/// `AgentView::draft`, which is the buffer's own — `ActiveState::show_live_prompt` puts it
+/// there every frame precisely so the offsets and the characters they index arrive together.
+///
+/// `None` unless `slot` is the run the prompt was drawn into, which
+/// [`NodePaint::prompt_slot`] answered from the paint the painter just built. Deriving the
+/// slot here instead would be a second opinion about which run holds the prompt, which is the
+/// `kanban_runs` failure — a caret drawn on one row while the typing goes into another.
+fn prompt_cursor<'a>(
+    id: SceneId,
+    slot: u16,
+    prompt_slot: Option<u16>,
+    ctx: &DrawContext<'a>,
+) -> Option<TextCursor<'a>> {
+    if prompt_slot != Some(slot) {
+        return None;
+    }
+    // Bound out of the context first, so the borrow is the views' own `'a` and not a reborrow
+    // limited to this `&DrawContext` — the string has to outlive the call.
+    let views: &'a crate::agent_view::AgentViews = ctx.agents;
+    let view = views.get(id)?;
+    let caret = view.caret?;
+    Some(TextCursor {
+        scene: id,
+        slot,
+        idle_for: caret.idle_for,
+        cursor: caret.cursor,
+        anchor: caret.anchor,
+        text: view.draft.as_str(),
+    })
 }
 
 fn push_caret(
@@ -8850,9 +9064,12 @@ mod card_overflow_tests {
             detail: "ran 3 tools".into(),
             subtitle: "Claude · subscription".into(),
             mode: DisplayMode::Clean,
-            events,
+            // Shared in the view, owned by the caller here — the tests are about what is
+            // drawn, not about who holds the events.
+            events: events.into_iter().map(std::sync::Arc::new).collect(),
             truncated: false,
             draft: String::new(),
+            caret: None,
         }
     }
 
@@ -8887,6 +9104,155 @@ mod card_overflow_tests {
                 "the `{name}` dot disagrees with the chrome's own token"
             );
         }
+    }
+
+    /// ⚠ **Typing into a prompt row drew nothing at all**, and every unit test passed
+    /// throughout: `type_prompt_key` wrote into its own buffer, the runtime's stored draft was
+    /// written only when the session *ended*, and `AgentView::draft` came from the stored one
+    /// — so the row said *"Ask this agent to do something"* for the whole of the typing. This
+    /// is the painter's half of the seam that closes it.
+    ///
+    /// Three things are asserted together because each is wrong on its own:
+    ///
+    /// - The run holds the buffer's string **exactly**. `NodePaint::text` ellipsises to what
+    ///   the box was measured for, which is right for a transcript and puts the caret at the
+    ///   wrong character in a field — `layout.caret` indexes the string it was given.
+    /// - It is pushed **even when empty**, so an empty prompt with a caret in it still has a
+    ///   block to be measured from. That is feedback 25, the caret that would not appear in an
+    ///   empty sticky, arriving in a fourth place.
+    /// - The **placeholder is suppressed**, or the caret sits inside a sentence the user is
+    ///   not typing.
+    #[test]
+    fn a_prompt_row_with_the_keyboard_draws_the_buffer_and_not_the_invitation() {
+        let laid = node_layout();
+        let font = node_font();
+        let caret = crate::agent_view::PromptCaret { cursor: 3, anchor: 3, idle_for: 0.0 };
+
+        // No caret: the stored draft, or the invitation when there is none.
+        let resting = agent_view(Vec::new());
+        let paint = agent_paint(&resting, &laid, font);
+        assert!(
+            paint.runs.iter().any(|run| run.text.contains("Ask this agent")),
+            "an untouched prompt row lost its invitation"
+        );
+        assert!(paint.prompt_slot().is_none(), "a row nobody is typing into claimed the caret");
+
+        // With the keyboard in it, and a string long enough that clipping would show.
+        let typed = "check the torque figures against the workshop manual and report back";
+        let live = AgentView {
+            draft: typed.to_owned(),
+            caret: Some(caret),
+            ..agent_view(Vec::new())
+        };
+        let paint = agent_paint(&live, &laid, font);
+        let slot = paint.prompt_slot().expect("the prompt row claimed no slot");
+        let index = usize::from(slot - CELL_SLOT_BASE);
+        let run = paint.run(index).expect("the prompt slot names no run");
+        assert_eq!(run.text, typed, "the shaped string is not the buffer's own");
+        assert!(
+            !paint.runs.iter().any(|run| run.text.contains("Ask this agent")),
+            "the invitation was drawn under the caret"
+        );
+
+        // Empty, with the caret in it. `NodePaint::text` refuses an empty string; the field
+        // path must not, or there is no block and nothing for the caret to measure against.
+        let blank = AgentView { draft: String::new(), caret: Some(caret), ..agent_view(Vec::new()) };
+        let paint = agent_paint(&blank, &laid, font);
+        let slot = paint.prompt_slot().expect("an empty prompt row with a caret claimed no slot");
+        let run = paint
+            .run(usize::from(slot - CELL_SLOT_BASE))
+            .expect("the caret has nothing to be drawn against");
+        assert!(run.text.is_empty());
+        assert!(
+            !paint.runs.iter().any(|run| run.text.contains("Ask this agent")),
+            "an empty row with the keyboard in it still offered the invitation"
+        );
+    }
+
+    /// Arriving in the prompt row changes what is drawn without changing a byte of text, so
+    /// the cache has to see it. Without this the row keeps the placeholder it was built with
+    /// and the caret is drawn over the word "Ask".
+    #[test]
+    fn the_node_cache_notices_the_keyboard_arriving_in_a_prompt_row() {
+        let kind = ItemKind::Agent { model: String::new(), label: StyledText::plain("Planner") };
+        let resting = agent_view(Vec::new());
+        let live = AgentView {
+            caret: Some(crate::agent_view::PromptCaret { cursor: 0, anchor: 0, idle_for: 0.0 }),
+            ..agent_view(Vec::new())
+        };
+        assert_ne!(
+            node_signature(&kind, Some(&resting)),
+            node_signature(&kind, Some(&live)),
+            "a node whose prompt row took the keyboard signed the same as one that had not"
+        );
+    }
+
+    /// The rows the press path resolves against are the rows that were **drawn**, which is not
+    /// the same list as the rows the tree holds: `visible_rows()` bounds them and one is held
+    /// back for the "n more" line. A press path that re-derived any of that would expand the
+    /// wrong directory — which is academic next to what it actually did, which was nothing at
+    /// all, because `filetree::row_at` had no caller.
+    #[test]
+    fn a_file_trees_drawn_rows_are_the_ones_a_press_resolves_against() {
+        use vellum_agent::filetree::{Entry, Row, View as TreeRows};
+
+        let entry = |name: &str, is_dir: bool| Entry {
+            name: name.to_owned(),
+            relative: name.to_owned(),
+            path: std::path::PathBuf::from("/tmp").join(name),
+            is_dir,
+            len: 0,
+            ignored: false,
+            is_symlink: false,
+        };
+        // Far more rows than fit, so the bound is exercised rather than assumed.
+        let rows: Vec<Row> = (0..200)
+            .map(|n| Row { entry: entry(&format!("item-{n}"), n % 2 == 0), depth: 0, expanded: false })
+            .collect();
+        let view = TreeRows { rows, truncated: false };
+
+        let laid = crate::filetree::layout(
+            crate::filetree::DEFAULT_SIZE.0,
+            crate::filetree::DEFAULT_SIZE.1,
+        );
+        let model = vellum_agent::FileTreeModel::default();
+        let paint = tree_paint(&model, Some(&view), &laid, node_font_size(crate::filetree::DEFAULT_SIZE.0));
+
+        assert!(!paint.tree_rows.is_empty(), "a drawn tree recorded no pressable rows");
+        assert!(
+            paint.tree_rows.len() < laid.visible_rows(),
+            "every visible row was drawn, leaving none for the \"n more\" line"
+        );
+        // Every recorded row answers at its own centre, and answers with itself.
+        for row in &paint.tree_rows {
+            let (cx, cy) = (row.rect.x + row.rect.width / 2.0, row.rect.y + row.rect.height / 2.0);
+            let (found, _) = paint.tree_row_at(cx, cy).expect("a drawn row was not pressable");
+            assert_eq!(found.relative, row.relative, "a press landed on the wrong row");
+        }
+        // A directory's triangle is inside its own row and is reported as the triangle; a file
+        // has none, and a press on a file's row must not claim to be on one.
+        let directory = paint.tree_rows.iter().find(|row| row.is_dir).expect("no directory drawn");
+        let twisty = directory.twisty.expect("a directory drew no disclosure triangle");
+        let (found, on_twisty) = paint
+            .tree_row_at(twisty.x + twisty.width / 2.0, twisty.y + twisty.height / 2.0)
+            .expect("a disclosure triangle was not pressable");
+        assert_eq!(found.relative, directory.relative);
+        assert!(on_twisty, "a press on the triangle did not report as one");
+
+        let file = paint.tree_rows.iter().find(|row| !row.is_dir).expect("no file drawn");
+        assert!(file.twisty.is_none(), "a file drew a disclosure triangle");
+        let (_, on_twisty) = paint
+            .tree_row_at(file.rect.x + 2.0, file.rect.y + file.rect.height / 2.0)
+            .expect("a file row was not pressable");
+        assert!(!on_twisty);
+
+        // Outside the list entirely — the header, and past the last drawn row.
+        assert!(paint.tree_row_at(laid.list.x + 1.0, laid.header.y + 1.0).is_none());
+        assert!(
+            paint
+                .tree_row_at(laid.list.x + 1.0, laid.list.y + laid.list.height + 10.0)
+                .is_none()
+        );
     }
 
     /// The four states have to be tellable apart under **every** accent Preferences offers,
@@ -9282,7 +9648,7 @@ mod card_overflow_tests {
             title: "The spec".into(),
             live: false,
         };
-        let reason = crate::browser::placeholder_reason(&model, false);
+        let reason = crate::browser::placeholder_reason(&model, false).map(str::to_owned);
         let paint = browser_paint(&model, reason, &laid, font);
         assert!(paint.runs.iter().any(|run| run.text.contains("The spec")), "no page name");
         assert!(

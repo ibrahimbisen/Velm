@@ -96,5 +96,29 @@ unicode-segmentation.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 
+# A real web engine — `WKWebView` on macOS, WebView2 on Windows — for browser nodes.
+# **Optional, and the feature is off by default**, which is the design rather than caution:
+# `docs/01-architecture.md` §1 rejects a webview *in the canvas*, and this is a deliberate,
+# bounded exception to it — one native child view over a node's own rectangle, never the
+# surface the board is drawn into.
+wry = { version = "0.56", optional = true }
+
+[features]
+# Live pages inside browser nodes. **Off by default**, the `voice` pattern in `vellum-agent`
+# applied for the same three reasons:
+#
+# - An engine is 60–150MB idle and 250–400MB playing. `docs/07-agent-canvas.md` §0 rule 2
+#   requires a board with no agent nodes to cost nothing, and rule 3 requires everything
+#   expensive to be opt-in.
+# - It is the only thing in the workspace that runs third-party code in-process.
+# - A build that has it *still* needs the preference and the node's own `live` before a page
+#   loads — `crate::browser::should_run_engine`. This is the third of three switches, not a
+#   replacement for them.
+#
+# With it off, `browser_engine::NoEngine` answers with a named, actionable message and the
+# node still places, persists, draws its address and opens the page in the user's own
+# browser. Nothing is inert.
+browser = ["dep:wry"]
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -32,6 +32,7 @@
 
 use vellum_scene::ItemId as SceneId;
 use std::collections::HashMap;
+use std::sync::Arc;
 use vellum_agent::{DisplayMode, LinkPulse, Status, TranscriptEvent};
 
 /// One agent node, as the painter sees it.
@@ -52,16 +53,54 @@ pub struct AgentView {
     pub mode: DisplayMode,
     /// The events to draw, **already filtered for `mode` and already bounded**, oldest
     /// first. The painter draws what it is given and makes no decision about what belongs.
-    pub events: Vec<TranscriptEvent>,
+    ///
+    /// **Shared rather than copied.** This is rebuilt once a frame for every visible node and
+    /// a `Text` event carries the agent's whole answer, so owning them meant deep-copying most
+    /// of a conversation sixty times a second on a board that is not doing anything. The
+    /// painter only ever reads them, so an `Arc` costs one atomic increment each and says in
+    /// the type that a view is a snapshot.
+    pub events: Vec<Arc<TranscriptEvent>>,
     /// True when there is more history than `events` carries, so the node can say so
     /// rather than silently appearing to be the whole story.
     pub truncated: bool,
-    /// What the user has typed into this node's prompt row but not yet sent.
+    /// What is in this node's prompt row.
     ///
-    /// Held by the runtime rather than by the caret, because a prompt survives clicking
-    /// away from the node — losing a half-written instruction to a stray click is the kind
-    /// of small betrayal that stops people trusting a tool.
+    /// **Two sources, and which one is used matters.** Normally it is the *stored* draft, held
+    /// by the runtime rather than by the caret so that a prompt survives clicking away from
+    /// the node — losing a half-written instruction to a stray click is the kind of small
+    /// betrayal that stops people trusting a tool. While the keyboard is *in* this row it is
+    /// instead the live buffer, overwritten by `ActiveState::rebuild_agent_views`.
+    ///
+    /// ⚠ That overwrite is not a nicety, it is the feature. The stored draft is only written
+    /// when the session **ends**, so a view built from it alone showed *"Ask this agent to do
+    /// something"* for the whole of the typing — the layer's primary interaction looked dead.
+    /// This is `crate::draw::LiveStroke` and `crate::draw::Placing` a third time: state
+    /// accumulated where the painter cannot see it is state that does not exist.
     pub draft: String,
+    /// The caret in `draft`, for the one node whose prompt row has the keyboard.
+    ///
+    /// `None` for every other node, which is all of them but one. The painter turns this into
+    /// the same `TextCursor` the on-canvas caret uses, so the caret, the selection highlight
+    /// and the blink are one implementation rather than a second one for prompts.
+    pub caret: Option<PromptCaret>,
+}
+
+/// Where the caret is in a prompt row.
+///
+/// Byte offsets into [`AgentView::draft`], which is what `vellum_text::Layout::caret` indexes
+/// by — so the draft the painter is handed has to be the buffer's own string rather than a
+/// clipped copy of it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PromptCaret {
+    pub cursor: usize,
+    /// The other end of the selection; equal to `cursor` when nothing is selected.
+    pub anchor: usize,
+    /// Seconds since the caret last moved or the text last changed, for the blink.
+    ///
+    /// Supplied by the app because neither this module nor the painter has a clock, and must
+    /// not grow one: a frame whose output depends on when it ran is a frame `--screenshot`
+    /// cannot reproduce. The same reason `crate::draw::TextCursor` carries it.
+    pub idle_for: f32,
 }
 
 impl AgentView {
@@ -101,6 +140,15 @@ pub struct AgentViews {
     /// no library — and because it is one bool that decides what every browser node on the
     /// board says about itself, so it belongs with the other per-frame agent facts.
     browser_nodes: bool,
+    /// What the engine pool says each visible browser node is doing, when that is not
+    /// "showing a page".
+    ///
+    /// `crate::browser::placeholder_reason` answers from configuration alone and cannot see a
+    /// page that would not load or a node that has been panned off the canvas. This is the
+    /// pool's own word for it, carried the same way a note's text is — the painter may not ask
+    /// a pool any more than it may read a file. The join is the point: an engine running
+    /// behind a card that says there is not one is the failure both halves exist to prevent.
+    browser_notes: HashMap<SceneId, String>,
     /// Whether the board holds **any** agent node, on screen or not.
     ///
     /// Distinct from `views` being non-empty, and the distinction is a real bug: `views`
@@ -129,10 +177,12 @@ impl AgentViews {
         EMPTY.get_or_init(Self::default)
     }
 
-    /// True when there is nothing agent-shaped to draw at all.
+    /// True when no **agent** node has a view and nothing is travelling.
     ///
-    /// The painter's early-out, and the property that makes this layer free on an ordinary
-    /// board: a board with no agent nodes costs one `is_empty` per frame.
+    /// ⚠ It says nothing about notes, file trees or browser nodes — a board of those is
+    /// `is_empty()` and still has plenty to draw. Read as "there is nothing to clear" by its
+    /// one caller, `ActiveState::rebuild_agent_views`, which is the reading it can bear; a
+    /// painter using it as *"nothing to draw"* would skip a board of file trees.
     pub fn is_empty(&self) -> bool {
         self.views.is_empty() && self.pulses.is_empty()
     }
@@ -143,6 +193,17 @@ impl AgentViews {
 
     pub fn get(&self, id: SceneId) -> Option<&AgentView> {
         self.views.get(&id)
+    }
+
+    /// One node's view, to amend after the rebuild.
+    ///
+    /// Exactly one caller — `ActiveState::show_live_prompt`, which puts the live prompt buffer
+    /// and its caret over the top of the stored draft. That is an amendment rather than part
+    /// of the rebuild because the runtime does not own the keyboard: the buffer lives beside
+    /// the caret in `crate::actions`, and handing the runtime a reference to it would tie the
+    /// session pool to a transient input mode.
+    pub fn get_mut(&mut self, id: SceneId) -> Option<&mut AgentView> {
+        self.views.get_mut(&id)
     }
 
     /// Records a message travelling along `connector`.
@@ -157,8 +218,11 @@ impl AgentViews {
 
     /// Whether any message is in flight anywhere on the board.
     ///
-    /// What decides whether the frame needs to be repainted again immediately. On an idle
-    /// board this is a length check, which is the point.
+    /// ⚠ **This does not drive a repaint, and it used to claim it did.** `app.rs` sets
+    /// `ControlFlow::Poll` and requests a redraw every pass while the window is visible, so a
+    /// pulse animates because the loop is already running — nothing has to ask. What this is
+    /// for is asking the question in one place: the pulse tests here and in `crate::draw` use
+    /// it to say "no message is travelling" without reaching into the vector.
     pub fn any_in_flight(&self) -> bool {
         !self.pulses.is_empty()
     }
@@ -204,21 +268,37 @@ impl AgentViews {
         self.browser_nodes
     }
 
+    /// What the engine pool says this browser node is doing, if it is not showing a page.
+    pub fn browser_note(&self, id: SceneId) -> Option<String> {
+        self.browser_notes.get(&id).cloned()
+    }
+
+    pub fn set_browser_note(&mut self, id: SceneId, message: String) {
+        self.browser_notes.insert(id, message);
+    }
+
     pub const fn set_browser_nodes(&mut self, allowed: bool) {
         self.browser_nodes = allowed;
     }
 
     /// Empties the frame's answers while keeping the allocations.
     ///
-    /// Called at the head of every rebuild. `clear` rather than a fresh `AgentViews` so a
-    /// steady-state frame with agents on it allocates nothing, which is the same reason
-    /// `DrawList` is owned and reused.
+    /// Called at the head of every rebuild — by `AgentRuntime::rebuild_views`, which takes
+    /// this set by `&mut` for exactly that reason. `clear` rather than a fresh `AgentViews` so
+    /// a steady-state frame with agents on it allocates nothing, which is the same reason
+    /// `DrawList` is owned and reused. (It was written this way and *not called*: the rebuild
+    /// returned a new set, so three `HashMap`s were allocated and dropped per frame and this
+    /// comment described something nothing did.)
     pub fn clear(&mut self) {
         self.views.clear();
         self.pulses.clear();
         self.notes.clear();
         self.trees.clear();
+        self.browser_notes.clear();
         self.has_agents = false;
+        // Deliberately **not** `browser_nodes`: it is a preference rather than a per-frame
+        // answer, and the caller sets it right after this. Clearing it would make the value
+        // depend on the order of two calls that have no reason to be ordered.
     }
 }
 

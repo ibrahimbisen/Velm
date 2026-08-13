@@ -134,12 +134,43 @@ pub const fn should_run_engine(model: &BrowserModel, browser_nodes_enabled: bool
 }
 
 /// What the placeholder says when no engine is running, so the node is never inert.
+///
+/// **Three answers, not two.** Both switches can be on and the binary still have no engine
+/// in it — `crate::browser_engine::ENGINE_BUILT` is `false` unless the `browser` cargo
+/// feature was asked for, which is the shipping default. That is a different sentence again
+/// because it is a different remedy: the other two are settings the user can change and this
+/// one is a build they would have to install.
 pub fn placeholder_reason(model: &BrowserModel, browser_nodes_enabled: bool) -> Option<&'static str> {
     match (browser_nodes_enabled, model.live) {
-        (true, true) => None,
         (false, _) => Some("Browser nodes are off — turn them on in Preferences"),
         (true, false) => Some("Press Load to open this page on the canvas"),
+        (true, true) if !crate::browser_engine::ENGINE_BUILT => {
+            Some(crate::browser_engine::NOT_BUILT)
+        }
+        (true, true) => None,
     }
+}
+
+/// The whole sentence under a node: the switches, the build, and whatever the engine is
+/// doing about *this* page.
+///
+/// [`placeholder_reason`] answers from configuration alone and cannot see a page that would
+/// not load or a node that has been panned off the canvas. This takes the pool's word for
+/// that — `BrowserEngines::message`, which is `None` while a page is up — so there is one
+/// derivation of "what is on this node" rather than a painter's guess beside a runtime's
+/// truth. **That join is the whole reason this function exists**: the failure it prevents is
+/// an engine running behind a card that says there is not one.
+///
+/// `None` means a page is showing and the card underneath it should stay quiet.
+pub fn viewport_message(
+    model: &BrowserModel,
+    browser_nodes_enabled: bool,
+    engine: Option<String>,
+) -> Option<String> {
+    if let Some(reason) = placeholder_reason(model, browser_nodes_enabled) {
+        return Some(reason.to_owned());
+    }
+    engine
 }
 
 #[cfg(test)]
@@ -166,8 +197,13 @@ mod tests {
         assert!(should_run_engine(&asked, true));
     }
 
-    /// Nothing in this app is inert: every state that does not draw a page says why, and
-    /// the two reasons are different because the remedies are different.
+    /// Nothing in this app is inert: every state that does not draw a page says why, and no
+    /// two reasons share a sentence because no two share a remedy.
+    ///
+    /// The third state is the one a build has rather than a board: both switches on and no
+    /// engine compiled in. Written so that **both arms compile in both builds** and the one
+    /// that runs is the one that is true — a `#[cfg]`'d assertion would only ever be checked
+    /// in the build nobody ships.
     #[test]
     fn a_node_with_no_engine_always_says_why() {
         let dormant = BrowserModel::default();
@@ -176,7 +212,48 @@ mod tests {
         assert!(placeholder_reason(&dormant, false).unwrap().contains("Preferences"));
         assert!(placeholder_reason(&dormant, true).unwrap().contains("Load"));
         assert_ne!(placeholder_reason(&dormant, false), placeholder_reason(&dormant, true));
-        assert_eq!(placeholder_reason(&asked, true), None, "a live page still showed a placeholder");
+
+        if crate::browser_engine::ENGINE_BUILT {
+            assert_eq!(
+                placeholder_reason(&asked, true),
+                None,
+                "a live page still showed a placeholder"
+            );
+        } else {
+            assert_eq!(
+                placeholder_reason(&asked, true),
+                Some(crate::browser_engine::NOT_BUILT),
+                "a build with no engine in it said nothing about that"
+            );
+        }
+    }
+
+    /// The join that stops an engine running behind a card claiming there is not one — and
+    /// the other way round, a sentence printed under a page that is perfectly fine.
+    #[test]
+    fn the_card_takes_the_engines_word_for_what_is_actually_happening() {
+        let asked = BrowserModel { live: true, ..BrowserModel::default() };
+
+        // Configuration wins first: with the preference off it does not matter what the
+        // pool would have said, because there is no pool entry for a node that cannot run.
+        assert!(
+            viewport_message(&asked, false, Some("this page could not be loaded".into()))
+                .unwrap()
+                .contains("Preferences")
+        );
+
+        // With the switches on, the engine's own word is what shows.
+        let failed = viewport_message(&asked, true, Some("the page timed out".into())).unwrap();
+        if crate::browser_engine::ENGINE_BUILT {
+            assert_eq!(failed, "the page timed out");
+            assert_eq!(
+                viewport_message(&asked, true, None),
+                None,
+                "a page that is up was written over"
+            );
+        } else {
+            assert_eq!(failed, crate::browser_engine::NOT_BUILT);
+        }
     }
 
     /// The escape hatch must exist in *both* states — it is the whole answer with no engine,

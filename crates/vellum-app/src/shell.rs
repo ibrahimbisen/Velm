@@ -925,6 +925,20 @@ impl Shell {
     }
 
     /// Puts the renderer's material in step with the palette and the OS.
+    /// The floating chrome's rectangles, in **logical** points.
+    ///
+    /// Exposed for `crate::browser_engine`, which needs to know what a native child view
+    /// would end up on top of. `glass_surfaces` is the right list because it is *exactly* the
+    /// chrome that floats over the board rather than beside it — the same list the blur pass
+    /// uses, so the two cannot come to disagree about what is floating.
+    pub fn floating_chrome(&self) -> impl Iterator<Item = egui::Rect> + '_ {
+        self.chrome
+            .glass_surfaces()
+            .iter()
+            .map(|surface| surface.rect)
+            .filter(|rect| rect.is_positive())
+    }
+
     pub fn configure_glass(&self, glass: &mut GlassRenderer) {
         glass.set_scale_factor(self.pixels_per_point);
         glass.set_mode(if self.chrome.translucency() {

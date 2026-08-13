@@ -34,6 +34,16 @@
 //!   frame that draws them; a message pulse asks for repaints for the fraction of a second
 //!   it is travelling and then stops, which is `landed_background`'s rule from feedback 21.
 //!
+//! # A transcript is never deleted, and nothing in the application deletes one
+//!
+//! `docs/07` §4 calls a transcript disposable, and it is — but *disposing* of one is the
+//! user's act and there is no verb for it yet. [`AgentRuntime::release`] stops a session and
+//! keeps the file; deleting the node keeps it; closing the board keeps it. There used to be a
+//! `forget` here that removed the sidecar, written and tested and **called by nothing**, which
+//! is worse than the gap: it read like the deletion path while the deletion path did not
+//! exist. It is gone. When a *Clear transcript* row is added, this is the paragraph to correct
+//! rather than the place to quietly re-add a method.
+//!
 //! # Undo groups: this module opens none, ever
 //!
 //! Read `CLAUDE.md` trap 11 and feedback 27/30 before touching anything here. A transcript
@@ -72,8 +82,23 @@
 //! another board (the bug feedback 17 fixed for cross-board paste), and a parked board's
 //! agents keep running while another tab is in front. The wire form the shim sees in
 //! `VELM_AGENT_ID` is that pair, so a request names exactly one node on exactly one board.
+//!
+//! **Every map here that is keyed by board is keyed by board for that reason, and each one
+//! has to be checked.** Two were not, and both were real: [`AgentRuntime::set_schedules`]
+//! replaced the single scheduler queue with the front board's walk, so switching tabs
+//! disarmed everything on the board you left; and `crate::actions`' `agent_doc` parsed the
+//! item half of a key and never compared the board half, so a request could be served
+//! against an unrelated item that happened to share a `TreeID` on the board in front.
+//!
+//! What a parked board's agents can and cannot do, stated exactly because "keep running" is
+//! easy to over-read: their **processes** run, their transcripts append, their schedules stay
+//! armed and fire. What waits is anything that needs the *document* — a schedule that fires
+//! on a parked board is held by [`AgentRuntime::defer_due`] and runs when that board is next
+//! in front, because `crate::actions` only ever holds one board. Closing the tab rather than
+//! parking it is different again: [`AgentRuntime::forget_board`] stops that board's agents,
+//! since nothing is left that could stop them by hand.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
@@ -242,6 +267,15 @@ pub struct BoardStamp {
     /// perfectly ordinary thing to want — and that board still has to poll its files while
     /// costing nothing to the boards that have neither.
     pub has_notes: bool,
+    /// Whether it had **any** of the four Agent Canvas kinds on it.
+    ///
+    /// ⚠ A third flag rather than a re-reading of the other two, because both of those are
+    /// about one kind and this is about the family. `rebuild_agent_views` gated on `has_nodes`
+    /// — agents alone — so a board holding only a file tree and a browser node was never given
+    /// a view at all: its tree drew *"This tree has not been read yet"* for ever, and its
+    /// browser drew *"Browser nodes are off"* whatever the preference said, because the flag
+    /// that carries the preference is set in the same pass.
+    pub has_content: bool,
 }
 
 impl BoardStamp {
@@ -249,7 +283,7 @@ impl BoardStamp {
     pub fn needs_resync(&self, path: Option<&Path>, epoch: u64, items: usize) -> bool {
         self.path.as_deref() != path
             || self.items != items
-            || ((self.has_nodes || self.has_notes) && self.epoch != epoch)
+            || (self.has_content && self.epoch != epoch)
     }
 }
 
@@ -366,7 +400,13 @@ struct NodeState {
     /// The tail, oldest first. Seeded from disk the first time the node is looked at and
     /// extended by [`AgentRuntime::drain`] — never re-read per frame, which would be a file
     /// read per agent per frame on a board of twenty.
-    events: VecDeque<TranscriptEvent>,
+    ///
+    /// **`Arc`, because [`AgentRuntime::rebuild_views`] runs once a frame per visible node.**
+    /// A `TranscriptEvent::Text` carries the agent's whole answer and an `Image` its caption,
+    /// so handing the painter forty of them used to be forty deep string clones per node per
+    /// frame — the cost this layer's own header forbids. Sharing the events costs one atomic
+    /// increment each and the painter never mutates one.
+    events: VecDeque<Arc<TranscriptEvent>>,
     /// True when there is more history on disk than this ring carries.
     truncated: bool,
     /// Whether the ring has been seeded from the sidecar yet.
@@ -429,10 +469,11 @@ pub struct AgentRuntime {
     nodes: HashMap<NodeKey, NodeState>,
 
     /// Per board, so a tab switch does not lose the wiring of the board it left.
+    ///
+    /// *When* this is re-derived is the caller's question, not this type's:
+    /// [`BoardStamp::needs_resync`] is the whole of that gate and there is deliberately no
+    /// second copy of the epoch here to disagree with it.
     wiring: HashMap<BoardKey, BoardWiring>,
-    /// The projection epoch each board's wiring was derived from, so it is rebuilt when the
-    /// document changes and not once a frame. `painter.sync` is the precedent.
-    epochs: HashMap<BoardKey, u64>,
     /// Where each board's notes live. Set when a board is registered.
     stores: HashMap<BoardKey, NoteStore>,
 
@@ -453,8 +494,33 @@ pub struct AgentRuntime {
     deferred: VecDeque<Pending>,
 
     scheduler: Option<Scheduler>,
+    /// Every board's armed schedules, by board.
+    ///
+    /// **Per board for `set_wiring`'s reason, and it was a real bug that it was not.** The
+    /// scheduler holds one queue, and replacing the whole of it with the *front* board's walk
+    /// disarmed every schedule on every parked board the moment a tab was switched — so an
+    /// agent set to run at six in the evening simply did not, and nothing said so.
+    /// `BTreeMap`, so the union below is assembled in a stable order and a re-arm that changes
+    /// nothing produces a byte-identical queue.
+    schedules: BTreeMap<BoardKey, Vec<(Timestamp, NodeKey)>>,
     /// Schedules that fired and have not been run yet.
     due: Vec<NodeKey>,
+    /// When each schedule last fired, and whether that run failed.
+    ///
+    /// ⚠ Here rather than in the document, for [`AgentRuntime::note_models`]' reason. These
+    /// two fields used to be written back into the node's token after every fire, through
+    /// `Editor::edit` — which **records an undo step**, so `⌘Z` after a scheduled run undid a
+    /// timestamp rather than whatever the user had just done. Worse, undoing it restored an
+    /// *older* `last_run`, which made the schedule past due again, which re-armed it and ran
+    /// the agent a second time.
+    ///
+    /// The cost, stated rather than hidden: **a run is remembered for the session and not
+    /// across a restart.** Nothing fires early because of it — `Schedule::next_fire` with no
+    /// `last_run` computes the next occurrence after *now* — and a `FilesChanged` trigger
+    /// falls back to "anything newer than the epoch", which is the direction
+    /// `agent_trigger_holds` already chooses deliberately: a wasted turn beats a schedule
+    /// that silently never fires.
+    schedule_runs: HashMap<NodeKey, (Option<Timestamp>, bool)>,
     /// What to do when the turn a schedule started ends. See [`AgentRuntime::complete`].
     completions: HashMap<NodeKey, vellum_agent::Completion>,
     /// What a completed scheduled run asked to be put in front of the user.
@@ -466,6 +532,14 @@ pub struct AgentRuntime {
     /// process-wide precisely so a map like this one cannot resolve this turn's picture to
     /// the last one's.
     blob_names: HashMap<String, String>,
+    /// Placeholders whose bytes were offered and would not store.
+    ///
+    /// Kept apart from [`AgentRuntime::blob_names`] so that "this picture failed" is a
+    /// different statement from "this picture has not arrived". An event naming one of these
+    /// is written into the transcript as an **error** rather than as a picture — see
+    /// [`resolve_blob`]. Without it the placeholder itself was written to the JSONL, where it
+    /// stayed across restarts as a picture that resolves to nothing.
+    failed_blobs: HashSet<String>,
 
     /// Each note node's file contents, as last read from disk.
     ///
@@ -473,6 +547,19 @@ pub struct AgentRuntime {
     /// live somewhere the painter can be handed it from, and this is that place. Keyed like
     /// everything else here so a note on a parked board keeps what was read.
     note_text: HashMap<NodeKey, String>,
+    /// Each note node's model **as the poll last left it** — its stamp and its derived links.
+    ///
+    /// ⚠ Here rather than in the document, and that is a fix rather than a convenience. The
+    /// poll used to write the stamp back into the node's token every time a file changed,
+    /// through `Editor::edit` — which **records an undo step**. A note an agent writes every
+    /// two seconds therefore put an mtime stamp on the undo stack twice a second, so `⌘Z`
+    /// undid a timestamp instead of the user's last action, over and over.
+    ///
+    /// A stamp is a cache of "what this process last read", not board content: it is worth
+    /// exactly one re-read to reconstruct, which is what a reopened board now does. Keeping it
+    /// out of the document is also the RULE ZERO posture — a background poll that writes to a
+    /// `.vellum` on a timer is a risk taken for a value nobody would miss.
+    note_models: HashMap<NodeKey, vellum_agent::NoteModel>,
     /// When each note was last stat'd, so the freshness check is a low-frequency poll rather
     /// than a syscall per note per frame.
     note_checked: HashMap<NodeKey, Timestamp>,
@@ -496,7 +583,6 @@ impl AgentRuntime {
             sessions: HashMap::new(),
             nodes: HashMap::new(),
             wiring: HashMap::new(),
-            epochs: HashMap::new(),
             stores: HashMap::new(),
             bus: Bus::new(),
             roles: Arc::new(RwLock::new(HashMap::new())),
@@ -506,11 +592,15 @@ impl AgentRuntime {
             stopping: Arc::new(AtomicBool::new(false)),
             deferred: VecDeque::new(),
             scheduler: None,
+            schedules: BTreeMap::new(),
+            schedule_runs: HashMap::new(),
             due: Vec::new(),
             completions: HashMap::new(),
             reports: Vec::new(),
             blob_names: HashMap::new(),
+            failed_blobs: HashSet::new(),
             note_text: HashMap::new(),
+            note_models: HashMap::new(),
             note_checked: HashMap::new(),
             away_since: None,
         }
@@ -529,17 +619,6 @@ impl AgentRuntime {
             && self.reports.is_empty()
             && self.ipc.is_none()
             && self.bus.pending() == 0
-    }
-
-    /// How many sessions are live. For the HUD.
-    pub fn live(&self) -> usize {
-        self.sessions.len()
-    }
-
-    /// Whether this board has any agent-family node on it at all, from the wiring cached at
-    /// the last epoch — so the answer costs a map lookup rather than a walk of the document.
-    pub fn board_has_nodes(&self, board: &BoardKey) -> bool {
-        self.wiring.get(board).is_some_and(|wiring| !wiring.nodes.is_empty())
     }
 
     /// Whether this node has a session in flight.
@@ -587,12 +666,10 @@ impl AgentRuntime {
     pub fn set_wiring(
         &mut self,
         board: &BoardKey,
-        epoch: u64,
         nodes: Vec<(String, String, bool)>,
         links: Vec<(String, String, LinkDirection)>,
         roles: Vec<(String, RoleKind)>,
     ) {
-        self.epochs.insert(board.clone(), epoch);
         self.wiring.insert(board.clone(), BoardWiring { nodes, links });
         self.rebuild_topology();
 
@@ -614,11 +691,11 @@ impl AgentRuntime {
         // comes down, and the Stop button went with the node, so there is no way left to stop
         // it at all.
         //
-        // **`release`, never `forget`.** Releasing keeps the transcript; forgetting deletes
-        // it. A node can be absent because the user pressed ⌘Z on the paste that made it, and
-        // an undo that silently destroyed the history is exactly the kind of thing RULE
-        // ZERO's posture is against. The transcript is disposable, but it is the *user's*
-        // Delete that disposes of it.
+        // **Released, never deleted.** Releasing stops the process and keeps the transcript.
+        // A node can be absent because the user pressed ⌘Z on the paste that made it, and an
+        // undo that silently destroyed the history is exactly the kind of thing RULE ZERO's
+        // posture is against — so nothing here removes a sidecar, and see the module header
+        // on why no verb in the application does either.
         //
         // Scoped to this board's ids, so an agent running on a board behind another tab is
         // untouched — which is the whole reason a session is keyed by board and item.
@@ -640,11 +717,6 @@ impl AgentRuntime {
             log::info!("agents: releasing {} — its node is no longer on the board", key.item);
             self.release(&key);
         }
-    }
-
-    /// The epoch this board's wiring was derived from, so the caller can skip the walk.
-    pub fn wiring_epoch(&self, board: &BoardKey) -> Option<u64> {
-        self.epochs.get(board).copied()
     }
 
     /// Compose every board's wiring into the one topology the bus routes against.
@@ -729,6 +801,11 @@ impl AgentRuntime {
     }
 
     /// Answer a permission request.
+    ///
+    /// Which requests are outstanding is **not** exposed here and deliberately is not: the
+    /// painter learns about one from the `PermissionAsked` event in the node's own ring, and
+    /// a second answer to "what is this node blocked on" is a second thing that can disagree
+    /// with the transcript the user is reading.
     pub fn answer_permission(
         &mut self,
         key: &NodeKey,
@@ -739,13 +816,6 @@ impl AgentRuntime {
             Some(live) => live.session.answer_permission(id, allowed),
             None => Ok(()),
         }
-    }
-
-    /// The permission requests this node is blocked on, oldest first.
-    pub fn pending_permissions(&self, key: &NodeKey) -> Vec<RequestId> {
-        self.sessions
-            .get(key)
-            .map_or_else(Vec::new, |live| live.session.pending_permissions().to_vec())
     }
 
     /// End a session and release its process. The transcript and the ring both survive: a
@@ -759,17 +829,6 @@ impl AgentRuntime {
             state.appender = None;
         }
         self.settle_ipc();
-    }
-
-    /// Forget a node the user deleted: its session, its ring **and its transcript**.
-    ///
-    /// The transcript is the one file this layer removes, and it is explicitly disposable
-    /// (`docs/07` §4). RULE ZERO's trash rule is about `.vellum` files; deleting a node's
-    /// history when the node is gone loses no board content.
-    pub fn forget(&mut self, key: &NodeKey) {
-        self.release(key);
-        self.nodes.remove(key);
-        let _ = self.sidecar.delete(&key.board, &key.item);
     }
 
     /// Start the loopback server if it is not already up.
@@ -846,21 +905,33 @@ impl AgentRuntime {
         self.bus.expire(now_ms);
     }
 
-    /// Poll every live session: blobs first, then events.
+    /// Poll every live session: **events into a snapshot, then blobs, then substitution.**
     ///
-    /// **Blobs before events, and substitution before the append**, which is the order
-    /// `PendingBlob`'s own documentation demands: the worker parks the bytes and *then* sends
-    /// the event, so a caller that read events first could see a placeholder it has no bytes
-    /// for — and a transcript written with the placeholder still in it reads back, after a
-    /// restart, as a picture that resolves to nothing.
+    /// ⚠ This order is the whole of a defect and the previous comment here argued for the
+    /// wrong one. The transport **parks the bytes and then sends the event**, so:
+    ///
+    /// - Taking the blobs *first* leaves a window between the two calls exactly one park
+    ///   wide. Bytes parked in it are not in `blob_names` when the event that names them is
+    ///   substituted, so `"blob":"pending:3"` is written into the JSONL — where it stays,
+    ///   across restarts, as a picture that resolves to nothing. Nothing ever repairs it:
+    ///   `record` appends and the ring is seeded from the file.
+    /// - Taking the events first closes it, because park-happens-before-send makes
+    ///   "the event is visible" imply "its bytes are already parked". So a blob taken *after*
+    ///   an event was seen is guaranteed to include that event's bytes.
+    ///
+    /// Substitution therefore has to happen after both — see [`resolve_blob`], which is where
+    /// a picture that would not store becomes an error rather than a broken placeholder.
     fn drain_sessions(&mut self, now: Timestamp, now_ms: u64) {
         let mut arrivals: Vec<(NodeKey, TranscriptEvent)> = Vec::new();
         let mut finished: Vec<NodeKey> = Vec::new();
         let mut turns_ended: Vec<NodeKey> = Vec::new();
 
         {
-            let Self { sessions, blobs, blob_names, .. } = self;
+            let Self { sessions, blobs, blob_names, failed_blobs, .. } = self;
             for (key, live) in sessions.iter_mut() {
+                // The snapshot, taken **before** the blobs. Held rather than recorded here
+                // because the bytes their placeholders name have not been stored yet.
+                let polled: Vec<TranscriptEvent> = live.session.poll();
                 for blob in live.session.take_pending_blobs() {
                     match blobs.put(&blob.bytes) {
                         Ok(hash) => {
@@ -868,19 +939,12 @@ impl AgentRuntime {
                         }
                         Err(error) => {
                             log::warn!("agents: storing a picture failed ({error})");
+                            failed_blobs.insert(blob.id);
                         }
                     }
                 }
-                for mut event in live.session.poll() {
-                    if let TranscriptEvent::Image { blob, .. } = &mut event {
-                        // Resolved to an owned value first: the placeholder is read out of
-                        // the same string that is about to be written over, and taking a
-                        // copy is what keeps that a plain assignment.
-                        let resolved = blob_names.get(blob.as_str()).cloned();
-                        if let Some(hash) = resolved {
-                            *blob = hash;
-                        }
-                    }
+                for mut event in polled {
+                    resolve_blob(&mut event, blob_names, failed_blobs);
                     // A turn ending is where a borrowed hop count stops applying: anything
                     // this agent sends after it is something it decided to do, which is hop
                     // zero by `bus.rs`'s definition.
@@ -1092,7 +1156,7 @@ impl AgentRuntime {
             .nodes
             .get(key)
             .and_then(|state| {
-                state.events.iter().rev().find_map(|event| match event {
+                state.events.iter().rev().find_map(|event| match event.as_ref() {
                     TranscriptEvent::Text { text } => Some(text.clone()),
                     _ => None,
                 })
@@ -1235,7 +1299,7 @@ impl AgentRuntime {
         if let TranscriptEvent::Error { message } = event {
             state.resting = message.clone();
         }
-        state.events.push_back(event.clone());
+        state.events.push_back(Arc::new(event.clone()));
         while state.events.len() > TAIL_EVENTS {
             state.events.pop_front();
             state.truncated = true;
@@ -1261,7 +1325,7 @@ impl AgentRuntime {
                     if let TranscriptEvent::Error { message } = &record.event {
                         state.resting = message.clone();
                     }
-                    state.events.push_back(record.event);
+                    state.events.push_back(Arc::new(record.event));
                 }
             }
             Err(error) => log::warn!("agents: reading a transcript failed ({error})"),
@@ -1288,16 +1352,62 @@ impl AgentRuntime {
 
     /// A note node's file, as last read.
     ///
-    /// ⚠ **Nothing draws this yet.** `crate::agent_view` carries agent nodes only, so the
-    /// text a note node should show has no seam to reach the painter through — see the
-    /// handover. It is read and kept here so that adding one is a field rather than a
-    /// feature.
+    /// The painter is handed this through `AgentViews::set_note`, once per frame per
+    /// **visible** note — a frame may not read a file, and a board of forty notes must not
+    /// read forty of them to draw the two on screen.
     pub fn note_text(&self, key: &NodeKey) -> Option<&str> {
         self.note_text.get(key).map(String::as_str)
     }
 
     pub fn set_note_text(&mut self, key: &NodeKey, text: String) {
         self.note_text.insert(key.clone(), text);
+    }
+
+    /// The note model the last poll left, or `None` for one this process has not read.
+    ///
+    /// The caller seeds a fresh model from the document token — which holds the *path* and
+    /// the *scope*, the two things that are genuinely board content — and then overlays this,
+    /// which holds the stamp and the links. See the field for why the halves live apart.
+    pub fn note_model(&self, key: &NodeKey) -> Option<&vellum_agent::NoteModel> {
+        self.note_models.get(key)
+    }
+
+    pub fn set_note_model(&mut self, key: &NodeKey, model: vellum_agent::NoteModel) {
+        self.note_models.insert(key.clone(), model);
+    }
+
+    /// Record the user's answer to an agent's question, in the ring the painter reads.
+    ///
+    /// Returns whether an unanswered question was found — `false` for a card that has already
+    /// been picked, which is what stops one gesture sending two answers.
+    ///
+    /// ⚠ **In memory only, and the transcript on disk is not rewritten.** A sidecar is
+    /// append-only JSONL (`vellum_agent::sidecar`), so recording the choice durably would mean
+    /// either rewriting a file this layer only ever appends to or writing a second event that
+    /// the ring would then draw as a *second* question. The consequence is stated rather than
+    /// hidden: reopening a board shows the question unanswered again. That is honest — the
+    /// session it was an answer to is gone, so asking again is the correct offer.
+    pub fn choose_option(&mut self, key: &NodeKey, choice: &str) -> bool {
+        let Some(state) = self.nodes.get_mut(key) else { return false };
+        // Newest first: a long-running agent can ask more than one question, and the one on
+        // screen being answered is the last one it asked.
+        for event in state.events.iter_mut().rev() {
+            let TranscriptEvent::Options { prompt, choices, chosen } = event.as_ref() else {
+                continue;
+            };
+            if chosen.is_some() || !choices.iter().any(|option| option.id == choice) {
+                continue;
+            }
+            // A fresh `Arc`, never `Arc::get_mut`: the painter is holding clones of these and
+            // mutating one in place would change what a frame already decided to draw.
+            *event = Arc::new(TranscriptEvent::Options {
+                prompt: prompt.clone(),
+                choices: choices.clone(),
+                chosen: Some(choice.to_owned()),
+            });
+            return true;
+        }
+        false
     }
 
     /// Whether this note is due a freshness check, marking it checked if so.
@@ -1326,15 +1436,24 @@ impl AgentRuntime {
     /// because `agent_view.rs` says the expensive decision belongs in one place — and
     /// `TranscriptEvent::visible_in_clean_mode` is deliberately the only definition of what
     /// Clean mode shows, so it is *called* rather than re-derived.
+    ///
+    /// # It fills the caller's set rather than returning a new one
+    ///
+    /// `AgentViews::clear` empties the frame's answers **and keeps the allocations**, which is
+    /// what its own doc comment has always promised and what returning a fresh
+    /// `AgentViews::new()` here quietly made false: three `HashMap`s were allocated and
+    /// dropped on every frame a board had an agent on it. Taking `&mut` is what makes the
+    /// promise true, and it is the same reason `DrawList` is owned and reused.
     pub fn rebuild_views(
         &mut self,
+        views: &mut crate::agent_view::AgentViews,
         board: &BoardKey,
         projection: &crate::project::Projection,
         visible: vellum_scene::WorldRect,
         fallback: DisplayMode,
         now_ms: u64,
-    ) -> crate::agent_view::AgentViews {
-        let mut views = crate::agent_view::AgentViews::new();
+    ) {
+        views.clear();
 
         // What is on screen, through the same R-tree the painter culls with.
         let visible_ids: Vec<vellum_scene::ItemId> =
@@ -1365,7 +1484,12 @@ impl AgentRuntime {
             let state = self.nodes.entry(key.clone()).or_default();
             // Filtered for the mode, then bounded to the tail — in that order, or a node in
             // Clean mode whose last forty events were all tool calls would draw nothing.
-            let kept: Vec<&TranscriptEvent> = state
+            //
+            // **The events are shared, not copied.** This runs once a frame for every visible
+            // node, and a `Text` event carries the agent's whole answer — so cloning forty of
+            // them per node per frame was a deep string copy of most of a conversation, sixty
+            // times a second, on a board that is not doing anything. See `NodeState::events`.
+            let kept: Vec<&Arc<TranscriptEvent>> = state
                 .events
                 .iter()
                 .filter(|event| mode == DisplayMode::Raw || event.visible_in_clean_mode())
@@ -1374,8 +1498,8 @@ impl AgentRuntime {
             // The **last** `VIEW_EVENTS`, because what is on screen is the end of a
             // conversation rather than its beginning.
             let from = kept.len().saturating_sub(VIEW_EVENTS);
-            let events: Vec<TranscriptEvent> =
-                kept[from..].iter().map(|event| (*event).clone()).collect();
+            let events: Vec<Arc<TranscriptEvent>> =
+                kept[from..].iter().map(|event| Arc::clone(event)).collect();
 
             views.insert(
                 *scene,
@@ -1387,6 +1511,10 @@ impl AgentRuntime {
                     events,
                     truncated,
                     draft: state.draft.clone(),
+                    // The *stored* draft, always. The live buffer belongs to the keyboard,
+                    // which this module deliberately knows nothing about — the app puts it
+                    // over the top afterwards. See `AgentView::draft`.
+                    caret: None,
                 },
             );
         }
@@ -1409,23 +1537,51 @@ impl AgentRuntime {
                 }
             }
         }
-
-        views
     }
 
     // ----- scheduling ---------------------------------------------------------------
 
-    /// Arm the scheduler with everything this board has.
+    /// Arm the scheduler with everything **one board** has, leaving every other board's
+    /// schedules exactly as they were.
+    ///
+    /// ⚠ **Per board, and it was a defect that it was not.** The scheduler holds one queue,
+    /// and this used to replace the whole of it with the walk of whichever board was in
+    /// front — so switching tabs disarmed every schedule on the board you left. An agent set
+    /// to run at six in the evening simply did not, and nothing on screen said so.
+    /// [`AgentRuntime::set_wiring`] was already careful about exactly this and its neighbour
+    /// was not.
     ///
     /// One thread with a sorted queue that **wakes for the next fire time**, not a poll — and
-    /// it does not exist at all while nothing is scheduled: an empty list stops it outright.
-    /// Re-armed from the document, so a run that writes `last_run` re-enters here on the next
-    /// epoch and the loop closes itself.
-    pub fn set_schedules(&mut self, entries: Vec<(NodeKey, Schedule)>, now: Timestamp) {
-        let mut queue: Vec<(Timestamp, NodeKey)> = entries
+    /// it does not exist at all while nothing is scheduled *anywhere*: the union going empty
+    /// stops it outright. Re-armed from the document, so a run that writes `last_run`
+    /// re-enters here on the next epoch and the loop closes itself.
+    pub fn set_schedules(
+        &mut self,
+        board: &BoardKey,
+        entries: Vec<(NodeKey, Schedule)>,
+        now: Timestamp,
+    ) {
+        let armed: Vec<(Timestamp, NodeKey)> = entries
             .into_iter()
             .filter_map(|(key, schedule)| schedule.next_fire(now).map(|at| (at, key)))
             .collect();
+        if armed.is_empty() {
+            self.schedules.remove(board);
+        } else {
+            self.schedules.insert(board.clone(), armed);
+        }
+        self.rearm();
+    }
+
+    /// Rebuild the one queue the scheduler thread holds from every board's entries.
+    ///
+    /// The union rather than one thread per board: a thread that sleeps until the next fire
+    /// time costs nothing while it sleeps, and one of them can carry every board's times just
+    /// as well as five can — while five is five sets of OS handles for a feature whose whole
+    /// argument is that it costs nothing when unused.
+    fn rearm(&mut self) {
+        let mut queue: Vec<(Timestamp, NodeKey)> =
+            self.schedules.values().flatten().cloned().collect();
         queue.sort_by_key(|(at, _)| *at);
 
         if queue.is_empty() {
@@ -1440,6 +1596,82 @@ impl AgentRuntime {
             return;
         }
         self.scheduler = Some(Scheduler::start(queue));
+    }
+
+    /// Overlay what this process remembers about a schedule's history onto a model decoded
+    /// from the document.
+    ///
+    /// Called everywhere a schedule is *used* — arming it and checking its trigger — so there
+    /// is one answer to "when did this last run" rather than a document that has one and a
+    /// runtime that has another. See [`AgentRuntime::schedule_runs`] for why the answer is not
+    /// in the document at all.
+    pub fn apply_schedule_history(&self, key: &NodeKey, schedule: &mut Schedule) {
+        let Some((last_run, last_failed)) = self.schedule_runs.get(key) else { return };
+        schedule.last_run = *last_run;
+        schedule.last_failed = *last_failed;
+    }
+
+    /// Record that a schedule fired, whether or not its trigger held.
+    ///
+    /// **Whether or not**, deliberately, and that is what the document write got right and is
+    /// kept: a declined fire that did not move `last_run` stayed past due, so every later edit
+    /// to the board re-armed it, fired it again and logged another skipped line.
+    pub fn note_schedule_run(&mut self, key: &NodeKey, at: Timestamp, failed: bool) {
+        self.schedule_runs.insert(key.clone(), (Some(at), failed));
+    }
+
+    /// Put a fired schedule back, because the board it belongs to is not the one in front.
+    ///
+    /// A run needs the *document* — the trigger, the model, the `last_run` write and the
+    /// completion action all read or write the board — and `crate::actions` only ever holds
+    /// the board on screen. So a key whose board is parked waits here rather than being
+    /// dropped, which is what it used to be: `take_due` handed it over, `agent_doc` could not
+    /// resolve it, and the arm that could not resolve it simply moved on.
+    ///
+    /// A board that is *closed* rather than parked never comes front again, so its waiting
+    /// keys are dropped by [`AgentRuntime::forget_board`] rather than left here for the life
+    /// of the process — `due` is one of the six things [`AgentRuntime::dormant`] tests, so a
+    /// key nothing will ever collect keeps the whole layer awake.
+    ///
+    /// De-duplicated, because a board can stay parked across many frames and each one would
+    /// otherwise put the same key back again.
+    pub fn defer_due(&mut self, key: NodeKey) {
+        if self.due.contains(&key) {
+            return;
+        }
+        self.due.push(key);
+    }
+
+    /// A board's tab was closed: stop its agents and forget everything derived from it.
+    ///
+    /// Closing is not parking. A parked board keeps its sessions and its schedules — that is
+    /// what the tab strip is for — but a closed one has no way left to be looked at, so a
+    /// process still running under it could never be stopped and a schedule still armed under
+    /// it would fire into a board nobody can see. Its **transcripts survive**: they are the
+    /// record of what happened and reopening the board shows them again.
+    pub fn forget_board(&mut self, board: &BoardKey) {
+        let running: Vec<NodeKey> = self
+            .sessions
+            .keys()
+            .filter(|key| &key.board == board)
+            .cloned()
+            .collect();
+        for key in running {
+            self.release(&key);
+        }
+        self.due.retain(|key| &key.board != board);
+        self.schedule_runs.retain(|key, _| &key.board != board);
+        self.completions.retain(|key, _| &key.board != board);
+        self.reports.retain(|(key, _)| &key.board != board);
+        self.schedules.remove(board);
+        self.wiring.remove(board);
+        self.stores.remove(board);
+        if let Ok(mut table) = self.roles.write() {
+            let prefix = format!("{board}:");
+            table.retain(|id, _| !id.starts_with(&prefix));
+        }
+        self.rebuild_topology();
+        self.rearm();
     }
 
     /// Move anything the scheduler has fired into [`AgentRuntime::due`].
@@ -1535,6 +1767,46 @@ impl Drop for AgentRuntime {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Turn a picture's placeholder into the hash its bytes were stored under — or, when they
+/// would not store, into an error.
+///
+/// Free and pure so the rule can be tested without a `Session`, which owns a process and a
+/// thread and cannot be built in a unit test. The ordering that makes it correct is
+/// [`AgentRuntime::drain_sessions`]'s; this is only what to do once both halves are in hand.
+///
+/// Three cases, and the third is the one that used to be silently wrong:
+///
+/// - **Stored.** The placeholder becomes the hash and the transcript holds a picture.
+/// - **Would not store.** The event becomes an [`TranscriptEvent::Error`] naming what
+///   happened. Recording the `Image` anyway wrote a placeholder into the JSONL that no later
+///   frame could ever resolve, so the node showed a broken picture for the life of the board
+///   rather than a sentence saying the picture was lost.
+/// - **Neither.** Left exactly as it is — a hash from `serve_image` is already final, and a
+///   placeholder that has been neither stored nor refused is not this function's to judge.
+fn resolve_blob(
+    event: &mut TranscriptEvent,
+    names: &HashMap<String, String>,
+    failed: &HashSet<String>,
+) {
+    let TranscriptEvent::Image { blob, caption } = event else { return };
+    // Resolved to an owned value first: the placeholder is read out of the same string that
+    // is about to be written over, and taking a copy is what keeps that a plain assignment.
+    if let Some(hash) = names.get(blob.as_str()).cloned() {
+        *blob = hash;
+        return;
+    }
+    if !failed.contains(blob.as_str()) {
+        return;
+    }
+    let what = match caption.as_deref() {
+        Some(caption) if !caption.trim().is_empty() => format!(" ({caption})"),
+        _ => String::new(),
+    };
+    *event = TranscriptEvent::Error {
+        message: format!("a picture this agent posted{what} could not be stored"),
+    };
 }
 
 /// Every `.md` in one directory, as note entries. Not recursive: a private note is one
@@ -1986,10 +2258,8 @@ mod tests {
         let dir = scratch();
         let mut runtime = open(&dir);
         assert!(runtime.dormant());
-        assert_eq!(runtime.live(), 0);
         runtime.drain(1_000);
         assert!(runtime.dormant(), "draining an idle runtime woke something up");
-        assert!(!runtime.board_has_nodes(&board()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2086,20 +2356,167 @@ mod tests {
         let mut runtime = open(&dir);
         assert!(runtime.scheduler.is_none());
 
-        runtime.set_schedules(Vec::new(), 1_000);
+        runtime.set_schedules(&board(), Vec::new(), 1_000);
         assert!(runtime.scheduler.is_none(), "an empty list started a thread");
 
         let key = NodeKey::new(&board(), "3@1");
-        let schedule = Schedule {
+        runtime.set_schedules(&board(), vec![(key, hourly())], 1_000);
+        assert!(runtime.scheduler.is_some(), "an armed schedule started nothing");
+
+        runtime.set_schedules(&board(), Vec::new(), 1_000);
+        assert!(runtime.scheduler.is_none(), "disarming left the thread running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn hourly() -> Schedule {
+        Schedule {
             enabled: true,
             recurrence: vellum_agent::Recurrence::Interval { minutes: 60 },
             ..Schedule::default()
-        };
-        runtime.set_schedules(vec![(key, schedule)], 1_000);
-        assert!(runtime.scheduler.is_some(), "an armed schedule started nothing");
+        }
+    }
 
-        runtime.set_schedules(Vec::new(), 1_000);
-        assert!(runtime.scheduler.is_none(), "disarming left the thread running");
+    /// ⚠ **Switching tabs used to disarm every schedule on the board you left.** The
+    /// scheduler holds one queue and `set_schedules` replaced the whole of it with the front
+    /// board's walk, so an agent set to run at six in the evening on a parked board simply
+    /// did not — and nothing said so.
+    ///
+    /// A/B: with the per-board map removed, the second call below leaves one entry in the
+    /// queue instead of two and the first board's key is gone.
+    #[test]
+    fn arming_one_board_leaves_another_boards_schedules_armed() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let (first, second) = (board(), BoardKey::from_raw("00000000feedface"));
+        let a = NodeKey::new(&first, "3@1");
+        let b = NodeKey::new(&second, "4@1");
+
+        runtime.set_schedules(&first, vec![(a.clone(), hourly())], 1_000);
+        // The other tab comes front and derives *its* wiring, which is the whole gesture.
+        runtime.set_schedules(&second, vec![(b.clone(), hourly())], 1_000);
+
+        let armed: Vec<NodeKey> = runtime
+            .schedules
+            .values()
+            .flatten()
+            .map(|(_, key)| key.clone())
+            .collect();
+        assert!(armed.contains(&a), "the parked board's schedule was disarmed by a tab switch");
+        assert!(armed.contains(&b));
+
+        // And withdrawing one board's schedules leaves the other's alone.
+        runtime.set_schedules(&second, Vec::new(), 1_000);
+        assert!(runtime.schedules.contains_key(&first));
+        assert!(runtime.scheduler.is_some(), "the surviving schedule lost its thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Closing a tab is not parking it: nothing is left that could stop an agent by hand, so
+    /// its process, its schedule and anything it had waiting go with the board. Its
+    /// transcript does **not** — that is the record of what happened.
+    #[test]
+    fn closing_a_board_takes_its_schedules_and_its_waiting_work_with_it() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let (first, second) = (board(), BoardKey::from_raw("00000000feedface"));
+        let a = NodeKey::new(&first, "3@1");
+        let b = NodeKey::new(&second, "4@1");
+
+        runtime.set_schedules(&first, vec![(a.clone(), hourly())], 1_000);
+        runtime.set_schedules(&second, vec![(b.clone(), hourly())], 1_000);
+        runtime.record(&a, 1, &TranscriptEvent::Text { text: "ran".into() });
+        runtime.defer_due(a.clone());
+        runtime.defer_due(a.clone());
+        assert_eq!(runtime.due.len(), 1, "the same key was deferred twice");
+        assert!(!runtime.dormant(), "a waiting schedule left the runtime dormant");
+
+        runtime.forget_board(&first);
+        assert!(runtime.due.is_empty(), "a closed board left work nothing will ever collect");
+        assert!(!runtime.schedules.contains_key(&first));
+        assert!(runtime.schedules.contains_key(&second), "closing one board disarmed another");
+        assert!(
+            runtime.sidecar().read_all(&first, &a.item).is_ok_and(|tail| !tail.records.is_empty()),
+            "closing a board destroyed its transcript"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⚠ **A picture that would not store used to be written into the transcript as
+    /// `pending:N`, permanently.** The JSONL is append-only and the ring is seeded from it, so
+    /// nothing could ever repair it: the node drew a broken picture for the life of the board.
+    ///
+    /// The three cases are asserted together because the third is only wrong *relative* to
+    /// the other two — a rule that turned every unresolved placeholder into an error would
+    /// also destroy a hash `serve_image` had already resolved.
+    #[test]
+    fn a_picture_that_would_not_store_becomes_an_error_rather_than_a_placeholder() {
+        let mut names = HashMap::new();
+        names.insert("pending:1".to_owned(), "abc123".to_owned());
+        let mut failed = HashSet::new();
+        failed.insert("pending:2".to_owned());
+
+        let mut stored =
+            TranscriptEvent::Image { blob: "pending:1".into(), caption: Some("a chart".into()) };
+        resolve_blob(&mut stored, &names, &failed);
+        assert_eq!(
+            stored,
+            TranscriptEvent::Image { blob: "abc123".into(), caption: Some("a chart".into()) },
+            "a stored picture did not take its hash"
+        );
+
+        let mut refused =
+            TranscriptEvent::Image { blob: "pending:2".into(), caption: Some("a chart".into()) };
+        resolve_blob(&mut refused, &names, &failed);
+        match &refused {
+            TranscriptEvent::Error { message } => {
+                assert!(message.contains("a chart"), "the error did not name the picture");
+            }
+            other => panic!("a picture that would not store was recorded as {other:?}"),
+        }
+
+        // Neither stored nor refused: a hash `serve_image` already resolved, and a placeholder
+        // whose bytes have simply not been offered yet. Both are left exactly as they are.
+        let mut settled = TranscriptEvent::Image { blob: "deadbeef".into(), caption: None };
+        let before = settled.clone();
+        resolve_blob(&mut settled, &names, &failed);
+        assert_eq!(settled, before, "a resolved hash was rewritten");
+
+        let mut waiting = TranscriptEvent::Image { blob: "pending:9".into(), caption: None };
+        let before = waiting.clone();
+        resolve_blob(&mut waiting, &names, &failed);
+        assert_eq!(waiting, before, "a picture still in flight was declared lost");
+    }
+
+    /// Clicking an option card twice used to send twice: nothing ever set `chosen`, so
+    /// `PlateTone::Chosen` was unreachable and every press looked like the first one.
+    #[test]
+    fn answering_a_question_is_recorded_once_and_refused_the_second_time() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let key = NodeKey::new(&board(), "5@1");
+        let choices = vec![Choice::new("a", "Blue"), Choice::new("b", "Green")];
+        runtime.record(
+            &key,
+            1,
+            &TranscriptEvent::Options {
+                prompt: "which?".into(),
+                choices: choices.clone(),
+                chosen: None,
+            },
+        );
+
+        assert!(runtime.choose_option(&key, "a"), "the first press found nothing to answer");
+        assert!(!runtime.choose_option(&key, "a"), "a second press answered the same question");
+        assert!(!runtime.choose_option(&key, "b"), "a second card answered a settled question");
+        assert!(!runtime.choose_option(&key, "nonsense"), "an unknown choice was accepted");
+
+        let state = runtime.nodes.get(&key).expect("the node exists");
+        match state.events.back().map(std::convert::AsRef::as_ref) {
+            Some(TranscriptEvent::Options { chosen, .. }) => {
+                assert_eq!(chosen.as_deref(), Some("a"));
+            }
+            other => panic!("the ring holds {other:?} rather than an answered question"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2157,7 +2574,6 @@ mod tests {
         // A resync that still names the node leaves it alone.
         runtime.set_wiring(
             &board,
-            1,
             vec![(key.wire(), "Planner".into(), true)],
             Vec::new(),
             vec![(key.wire(), RoleKind::Worker)],
@@ -2165,7 +2581,7 @@ mod tests {
         assert!(runtime.is_running(&key), "a node that is still on the board lost its session");
 
         // A resync with the node gone releases it.
-        runtime.set_wiring(&board, 2, Vec::new(), Vec::new(), Vec::new());
+        runtime.set_wiring(&board, Vec::new(), Vec::new(), Vec::new());
         assert!(!runtime.is_running(&key), "a deleted node left its process running");
         assert!(runtime.dormant(), "the runtime never went quiet again");
 
@@ -2192,6 +2608,7 @@ mod tests {
             items: 40,
             has_nodes: false,
             has_notes: false,
+            has_content: false,
         };
         let here = Some(Path::new("/tmp/x.vellum"));
 
@@ -2206,14 +2623,24 @@ mod tests {
 
         // A board that *has* agents follows the generation, because a role, a schedule or an
         // arrowhead can change without the count moving.
-        let live = BoardStamp { has_nodes: true, ..plain.clone() };
+        let live = BoardStamp { has_nodes: true, has_content: true, ..plain.clone() };
         assert!(live.needs_resync(here, 11, 40));
         assert!(!live.needs_resync(here, 10, 40));
 
         // And so does one with only notes — a set of file-backed documents on a canvas is an
         // ordinary thing to want, and that board still has files to watch.
-        let noted = BoardStamp { has_notes: true, ..plain };
+        let noted = BoardStamp { has_notes: true, has_content: true, ..plain.clone() };
         assert!(noted.needs_resync(here, 11, 40));
+
+        // And one holding only a file tree or a browser node, which have neither flag above
+        // and are still Agent Canvas content that has to be given a view. A board of those
+        // used to be treated exactly like a board of stickies: never resynced, never handed a
+        // view, so its tree said "not been read yet" for ever.
+        let others = BoardStamp { has_content: true, ..plain };
+        assert!(
+            others.needs_resync(here, 11, 40),
+            "a board of file trees and browser nodes never noticed its own edits"
+        );
     }
 
     /// A note listing reads as a set of documents rather than a set of filenames, and a

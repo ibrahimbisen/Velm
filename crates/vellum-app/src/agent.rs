@@ -345,6 +345,14 @@ pub enum LinkKind {
 }
 
 /// Which way messages flow along a message link.
+///
+/// ⚠ **This is a description of the drawn line, not the gate on delivery.** Routing is
+/// `vellum_agent::Topology`'s, through the `LinkDirection` `sync_agent_wiring` derives from
+/// the same arrowheads — so a message that may not travel is refused by the bus, in one place,
+/// against the topology the bus itself holds. There used to be `allows_forward` /
+/// `allows_backward` here as well: a second, *unused* copy of the same rule with its own tests
+/// passing beside a painter that matches `Message(_)` with a wildcard. A tested rule nothing
+/// calls is worse than no rule, because it reads as the answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Start to end.
@@ -354,18 +362,6 @@ pub enum Direction {
     /// Both ways. What an undecorated line means: a connector with no arrowhead says the
     /// two are related without saying who leads, so both may speak.
     Both,
-}
-
-impl Direction {
-    /// Whether a message may travel from the connector's `start` to its `end`.
-    pub const fn allows_forward(self) -> bool {
-        matches!(self, Self::Forward | Self::Both)
-    }
-
-    /// Whether a message may travel from the connector's `end` to its `start`.
-    pub const fn allows_backward(self) -> bool {
-        matches!(self, Self::Backward | Self::Both)
-    }
 }
 
 /// Whether a kind is one an agent can be wired to as a *peer* — i.e. an agent.
@@ -464,13 +460,6 @@ mod tests {
         // it mean "nobody may speak" would leave the feature switched off by default.
         assert_eq!(link_kind(Some(&a), Some(&b), NONE, NONE), LinkKind::Message(Direction::Both));
         assert_eq!(link_kind(Some(&a), Some(&b), HEAD, HEAD), LinkKind::Message(Direction::Both));
-    }
-
-    #[test]
-    fn direction_gates_travel_in_the_way_it_names() {
-        assert!(Direction::Forward.allows_forward() && !Direction::Forward.allows_backward());
-        assert!(Direction::Backward.allows_backward() && !Direction::Backward.allows_forward());
-        assert!(Direction::Both.allows_forward() && Direction::Both.allows_backward());
     }
 
     /// An agent joined to a note reads it, whichever way round the line was drawn —
