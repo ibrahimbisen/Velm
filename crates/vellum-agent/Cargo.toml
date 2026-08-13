@@ -1,0 +1,53 @@
+[package]
+name = "vellum-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Velm's Agent Canvas layer: providers, transports, rules, notes and the inter-agent bus."
+
+# A library plus two small binaries. The library is where all the logic lives and it
+# depends on nothing in the workspace and nothing graphical, exactly as `vellum-doc`
+# and `vellum-flow` do — so every rule, every cascade and every protocol frame is an
+# ordinary unit test on a machine with no GPU and no display.
+[lib]
+name = "vellum_agent"
+path = "src/lib.rs"
+
+# The shim an agent process invokes to talk back to Velm: send a message along a
+# connector, read or write a note, spawn a sub-agent, post an image. It is a separate
+# binary because it runs inside *the agent's* process tree, not ours, and it must stay
+# tiny — it is executed once per call.
+[[bin]]
+name = "velm-agent-cli"
+path = "src/bin/velm_agent_cli.rs"
+
+# Velm's own MCP server, so an agent that speaks MCP gets the same surface the shim
+# offers without Velm having to be on its PATH.
+[[bin]]
+name = "velm-mcp"
+path = "src/bin/velm_mcp.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+
+# The one network dependency, and the same one the rest of the workspace uses:
+# blocking, rustls-backed, driven from a worker thread that posts answers back through
+# a channel. `reqwest` would bring `tokio` and a second execution model in exchange for
+# concurrency a handful of agent turns does not need — the reasoning `vellum-link`
+# already recorded, applied again rather than re-litigated.
+ureq.workspace = true
+
+# A real pseudo-terminal, for CLI agents that have no protocol mode. This is Maestri's
+# mechanic: the agent believes it is talking to a terminal, so it emits the interactive
+# output it would for a human, and one agent can type into another's session.
+#
+# `portable-pty` rather than raw `forkpty`: it is the same abstraction on macOS and
+# Windows, which is the platform pair Velm ships on, and it does not drag in an async
+# runtime.
+portable-pty = "0.9"
+
+[dev-dependencies]
+tempfile.workspace = true

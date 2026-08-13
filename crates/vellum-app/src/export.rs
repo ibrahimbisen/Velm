@@ -245,6 +245,22 @@ fn convert(
             Geometry::rect(rect),
             Some(style.fill.map_or(Color::WHITE, colour)),
         ),
+        // The Agent Canvas kinds export as their card — the box, its fill and whatever text
+        // this adapter was handed. A transcript is deliberately *not* exported: it is not
+        // board content, it lives outside the document, and an SVG of an agent's scrollback
+        // is not a picture of the board anybody wants.
+        ItemKind::Agent { .. } | ItemKind::AgentNote { .. } | ItemKind::FileTree { .. } => (
+            Kind::Card,
+            Geometry::rect(rect),
+            Some(style.fill.map_or(Color::WHITE, colour)),
+        ),
+        // A browser node exports as its poster, not its page: the page is live and this is
+        // paper. With no engine running there is nothing to capture in any case.
+        ItemKind::Browser { .. } => (
+            Kind::Card,
+            Geometry::rect(rect),
+            Some(style.fill.map_or(Color::WHITE, colour)),
+        ),
         ItemKind::Image { .. } => (Kind::Image, Geometry::rect(rect), None),
         ItemKind::LinkPreview { .. } => (Kind::LinkPreview, Geometry::rect(rect), None),
         ItemKind::Embed { .. } => (Kind::Embed, Geometry::rect(rect), None),

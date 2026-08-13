@@ -95,6 +95,17 @@ pub enum ItemFacet {
     Frame,
     Connector,
     Group,
+    /// A live agent node — a worker, an orchestrator or the meta agent. One facet for all
+    /// three: they carry the same controls (provider, display mode, role, rules) and differ
+    /// in which of them are *offered*, which is a question the controls answer for
+    /// themselves rather than one the facet should fork over.
+    Agent,
+    /// A project's file structure, scoped to one agent.
+    FileTree,
+    /// A markdown note that is a real `.md` file on disk.
+    Note,
+    /// A live web page on the canvas.
+    Browser,
 }
 
 impl ItemFacet {
@@ -114,6 +125,10 @@ impl ItemFacet {
             Self::Frame => "Frame",
             Self::Connector => "Connector",
             Self::Group => "Group",
+            Self::Agent => "Agent",
+            Self::FileTree => "File tree",
+            Self::Note => "Note",
+            Self::Browser => "Browser",
         }
     }
 }

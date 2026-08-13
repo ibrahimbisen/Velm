@@ -322,6 +322,80 @@ pub enum ItemKind {
     /// it is not a slide. What it does is make a selection transform as one thing,
     /// which the movable tree already provides.
     Group,
+    /// A live AI agent, running on the board. The Agent Canvas layer's core node —
+    /// see `docs/07-agent-canvas.md`.
+    ///
+    /// **`model` is an opaque token**, for the reason [`ItemKind::Shape`] gives: this
+    /// crate depends on `loro` and `thiserror` and nothing else, and holding a
+    /// `vellum_agent::AgentModel` here would invert the dependency arrows and drag an
+    /// HTTP client and a PTY host into the document layer. `vellum-app` owns the
+    /// encoding; everything here does is store the string and give it back unchanged.
+    ///
+    /// **The token is configuration, never output.** What the agent has said lives in a
+    /// sidecar transcript outside the document — see `docs/07-agent-canvas.md` §4.
+    /// Streaming an agent's words into a CRDT would make every token an undo step and
+    /// grow the board file without bound, and the board file is the thing RULE ZERO
+    /// protects.
+    ///
+    /// A worker, an orchestrator and the meta agent are all this variant, told apart by
+    /// a field inside the token. They differ in what they are allowed to do, not in what
+    /// they are on the canvas.
+    Agent {
+        /// The serialised `vellum_agent::AgentModel`: provider, transport, working
+        /// directory, display mode, rules, schedule, territory and spawn cap.
+        model: String,
+        /// The agent's role, as free text the user writes — "Frontend Developer",
+        /// "Code Reviewer". Styled rather than a `String`, and stored *beside* the token
+        /// rather than inside it, exactly as [`ItemKind::Shape`] keeps its label beside
+        /// its form: that is what makes a role searchable through [`ItemKind::text`] and
+        /// editable through [`Board::set_text`](crate::Board::set_text) with no new path.
+        ///
+        /// It is not decoration. `vellum-app` folds it into the agent's system context,
+        /// so editing it here changes how the agent answers.
+        label: StyledText,
+    },
+    /// A project's folder and file structure, browsable on the canvas.
+    ///
+    /// Opaque `model`, same reasoning as [`ItemKind::Agent`]. Scoped **per agent**: the
+    /// token carries a root and an optional owning agent, so two file trees on one board
+    /// can show two different subtrees rather than two copies of the same project.
+    ///
+    /// The tree itself is **not** stored — it is read from the filesystem when the node
+    /// is on screen. A directory listing cached in a board file is a listing that is
+    /// wrong the moment anything changes on disk.
+    FileTree { model: String },
+    /// A markdown note that is a **real `.md` file on disk**, readable and writable by
+    /// agents and by any text editor.
+    ///
+    /// Opaque `model`, same reasoning as [`ItemKind::Agent`]. The token carries the path,
+    /// the scope (shared with every agent on the board, or private to one) and the note's
+    /// outbound links; **the content is not in the document at all.** That is the whole
+    /// point of the variant — a note locked inside an app database is one no agent and no
+    /// editor can reach, and this crate holding a copy would be a second version of the
+    /// truth that silently disagrees with the file.
+    ///
+    /// The difference from [`ItemKind::Sticky`], which also holds markdown-ish text: a
+    /// sticky's words *are* document content and merge as a CRDT; a note's words are a
+    /// file this board points at.
+    AgentNote {
+        /// The serialised `vellum_agent::NoteModel`: path, scope, links, last-seen mtime.
+        model: String,
+        /// The note's title, kept beside the token for the reason [`ItemKind::Agent`]'s
+        /// label is — searchable and editable through the paths that already exist.
+        title: StyledText,
+    },
+    /// A live web page on the canvas — Maestri's "Portal", for previewing the thing being
+    /// built without leaving the board.
+    ///
+    /// Opaque `model`, same reasoning as [`ItemKind::Agent`].
+    ///
+    /// **Holding this variant is not a promise that a browser engine exists.** An engine
+    /// is RAM-heavy and `docs/01-architecture.md` §1 rules a webview out of the canvas, so
+    /// it is opt-in, feature-gated and instantiated only when a node is created or becomes
+    /// visible. With it off the node draws as a card naming the page and offering to open
+    /// it in the real browser, which is a legible answer rather than a dead rectangle —
+    /// and the board round-trips either way.
+    Browser { model: String },
     /// An embedded PDF. Miro's `document`.
     Document {
         /// Content hash of the PDF in the shared blob store.
@@ -406,6 +480,10 @@ impl ItemKind {
             Self::Kanban { .. } => "kanban",
             Self::Group => "group",
             Self::Document { .. } => "document",
+            Self::Agent { .. } => "agent",
+            Self::FileTree { .. } => "file_tree",
+            Self::AgentNote { .. } => "agent_note",
+            Self::Browser { .. } => "browser",
         }
     }
 
@@ -422,6 +500,13 @@ impl ItemKind {
                 Some(text)
             }
             Self::Frame { title, .. } => Some(title),
+            // An agent's role and a note's title are text the *user* wrote, so both are
+            // searchable and editable like any other. What deliberately does not appear
+            // here is an agent's transcript: it is not the user's words, which is the
+            // same rule that keeps a link card's scraped title out of a search.
+            Self::Agent { label, .. } => Some(label),
+            Self::AgentNote { title, .. } => Some(title),
+            Self::FileTree { .. } | Self::Browser { .. } => None,
             Self::Ink { .. }
             | Self::Image { .. }
             | Self::LinkPreview { .. }

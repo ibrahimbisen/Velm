@@ -136,6 +136,13 @@ pub const fn facet_of(kind: &ItemKind) -> ItemFacet {
         ItemKind::MindMap { .. } => ItemFacet::MindMap,
         ItemKind::Kanban { .. } => ItemFacet::Kanban,
         ItemKind::Group => ItemFacet::Group,
+        // The Agent Canvas kinds. A worker, an orchestrator and the meta agent share one
+        // facet: they carry the same controls and differ only in which are offered, which
+        // the controls decide for themselves — see `ItemFacet::Agent`.
+        ItemKind::Agent { .. } => ItemFacet::Agent,
+        ItemKind::FileTree { .. } => ItemFacet::FileTree,
+        ItemKind::AgentNote { .. } => ItemFacet::Note,
+        ItemKind::Browser { .. } => ItemFacet::Browser,
     }
 }
 

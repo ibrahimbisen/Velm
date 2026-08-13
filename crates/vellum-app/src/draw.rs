@@ -1276,6 +1276,24 @@ impl Painter {
 
             // A group is a container, not a drawing. `vellum_doc::ItemKind::Group`
             // is explicit that it has no visual payload of its own.
+            // The four Agent Canvas kinds. WAVE2-PENDING: each draws its own chrome —
+            // status ring, transcript, tree rows, page poster. Until then every one draws
+            // the card its content will sit on, so a placed node is a real, selectable,
+            // movable box from the moment it exists rather than an invisible item.
+            ItemKind::Agent { .. }
+            | ItemKind::FileTree { .. }
+            | ItemKind::AgentNote { .. }
+            | ItemKind::Browser { .. } => {
+                let fill = projected.item.style.fill.map_or(theme.surface, theme::convert);
+                list.push_quad(
+                    QuadInstance::solid(position, size, fill)
+                        .with_corner_radius(CARD_RADIUS)
+                        .with_rotation(rotation)
+                        .with_opacity(opacity)
+                        .with_border(theme.border, 1.0),
+                );
+            }
+
             ItemKind::Group => {}
 
             ItemKind::Image { asset_id, crop } => {

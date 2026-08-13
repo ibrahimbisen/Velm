@@ -230,9 +230,35 @@ mod key {
     pub const PAGE_COUNT: &str = "page_count";
     pub const CURRENT_PAGE: &str = "current_page";
 
+    /// An agent node's serialised configuration. Opaque here — see [`ItemKind::Agent`].
+    ///
+    /// Its own key rather than sharing [`MODEL`] with a table, for the reason [`TREE`]
+    /// gives: [`super::kind_keys_for_tag`] only clears the keys the *new* kind does not
+    /// use, so a shared key survives a change of kind and a table turned into an agent
+    /// would find a table where its configuration should be.
+    pub const AGENT: &str = "agent";
+
+    /// A file-tree node's serialised root and scope. Opaque here — see
+    /// [`ItemKind::FileTree`]. Its own key, for the reason [`AGENT`] gives.
+    pub const FILE_TREE: &str = "file_tree";
+
+    /// A note node's serialised path, scope and links. Opaque here — see
+    /// [`ItemKind::AgentNote`]. Its own key, for the reason [`AGENT`] gives.
+    ///
+    /// The note's *content* is not here and never will be: it is a `.md` file on disk.
+    pub const NOTE: &str = "note";
+
+    /// A browser node's serialised address and settings. Opaque here — see
+    /// [`ItemKind::Browser`]. Its own key, for the reason [`AGENT`] gives.
+    pub const BROWSER: &str = "browser";
+
     /// Every kind-specific key, so switching an item's kind can clear the ones the
     /// new kind does not use. Kept in step with [`super::kind_keys`] by a test.
-    pub const KIND_SPECIFIC: [&str; 30] = [
+    pub const KIND_SPECIFIC: [&str; 34] = [
+        AGENT,
+        FILE_TREE,
+        NOTE,
+        BROWSER,
         TEXT,
         BACKGROUND,
         POINTS,
@@ -1119,6 +1145,22 @@ fn write_kind(meta: &LoroMap, kind: &ItemKind) -> LoroResult<()> {
         ItemKind::Chart { spec } => meta.insert(key::SPEC, spec.as_str()).map(|_| ()),
         ItemKind::MindMap { model } => meta.insert(key::TREE, model.as_str()).map(|_| ()),
         ItemKind::Kanban { board } => meta.insert(key::COLUMNS, board.as_str()).map(|_| ()),
+        // The four Agent Canvas kinds. Each stores one opaque token, and the two that
+        // carry text the user wrote store it in the shared `TEXT` container exactly as a
+        // shape's label does — which is what puts a role and a note title inside search,
+        // the caret and `set_text` with no new path.
+        ItemKind::Agent { model, label } => {
+            meta.insert(key::AGENT, model.as_str())?;
+            let target = meta.ensure_mergeable_text(key::TEXT)?;
+            text::write(&target, label)
+        }
+        ItemKind::FileTree { model } => meta.insert(key::FILE_TREE, model.as_str()).map(|_| ()),
+        ItemKind::AgentNote { model, title } => {
+            meta.insert(key::NOTE, model.as_str())?;
+            let target = meta.ensure_mergeable_text(key::TEXT)?;
+            text::write(&target, title)
+        }
+        ItemKind::Browser { model } => meta.insert(key::BROWSER, model.as_str()).map(|_| ()),
         ItemKind::Group => Ok(()),
         ItemKind::Document { asset_id, page_count, current_page } => {
             meta.insert(key::ASSET, asset_id.as_str())?;
@@ -1203,6 +1245,10 @@ fn kind_keys_for_tag(tag: &str) -> Option<&'static [&'static str]> {
         "kanban" => &[key::COLUMNS],
         "group" => &[],
         "document" => &[key::ASSET, key::PAGE_COUNT, key::CURRENT_PAGE],
+        "agent" => &[key::AGENT, key::TEXT],
+        "file_tree" => &[key::FILE_TREE],
+        "agent_note" => &[key::NOTE, key::TEXT],
+        "browser" => &[key::BROWSER],
         _ => return None,
     })
 }
@@ -1385,6 +1431,20 @@ fn read_kind(meta: &LoroMap) -> Result<ItemKind> {
         },
         "kanban" => ItemKind::Kanban {
             board: string_at(meta, key::COLUMNS).unwrap_or_default(),
+        },
+        "agent" => ItemKind::Agent {
+            model: string_at(meta, key::AGENT).unwrap_or_default(),
+            label: read_text(meta),
+        },
+        "file_tree" => ItemKind::FileTree {
+            model: string_at(meta, key::FILE_TREE).unwrap_or_default(),
+        },
+        "agent_note" => ItemKind::AgentNote {
+            model: string_at(meta, key::NOTE).unwrap_or_default(),
+            title: read_text(meta),
+        },
+        "browser" => ItemKind::Browser {
+            model: string_at(meta, key::BROWSER).unwrap_or_default(),
         },
         "group" => ItemKind::Group,
         "document" => ItemKind::Document {
@@ -2805,7 +2865,92 @@ mod tests {
             frame(),
             ItemKind::Group,
             document(),
+            // The four Agent Canvas kinds. Listed here rather than tested separately so
+            // they are covered by the three exhaustive tests below — that every key they
+            // write is registered for clearing, that converting between *any* two kinds
+            // leaves nothing stale, and that undo walks an edit to each of them. Two of
+            // them share the `TEXT` container with a sticky, which is exactly the overlap
+            // the stale-clearing test exists to catch.
+            ItemKind::Agent {
+                model: r#"{"role_kind":"orchestrator"}"#.into(),
+                label: StyledText::plain("Code Reviewer"),
+            },
+            ItemKind::FileTree { model: r#"{"root":"src"}"#.into() },
+            ItemKind::AgentNote {
+                model: r#"{"path":".velm/notes/plan.md"}"#.into(),
+                title: StyledText::plain("Plan"),
+            },
+            ItemKind::Browser { model: r#"{"url":"https://example.com"}"#.into() },
         ]
+    }
+
+    /// RULE ZERO, at the only level this crate can check it: **a board that uses none of
+    /// the Agent Canvas kinds is byte for byte the board it was before they existed.**
+    ///
+    /// The encoded snapshot is the on-disk format, so this compares the actual bytes rather
+    /// than the items read back — a re-encode that produced equal items from different bytes
+    /// would still be a file-format change, and this is the assertion that would catch it.
+    #[test]
+    fn a_board_with_no_agent_items_is_unchanged_by_this_layer() {
+        let mut board = Board::new();
+        let anchor = board.add(sticky("anchor", 0.0, 0.0)).unwrap();
+        board.add(NewItem::new(frame(), Placement::new(10.0, 20.0, 300.0, 200.0))).unwrap();
+        board.add(NewItem::new(document(), Placement::new(0.0, 0.0, 100.0, 100.0))).unwrap();
+        board
+            .add(NewItem::new(
+                connector(
+                    ConnectorEnd::bound(anchor, ConnectorEnd::RIGHT),
+                    ConnectorEnd::free(ConnectorEnd::LEFT),
+                ),
+                Placement::default(),
+            ))
+            .unwrap();
+
+        // Not one of the four keys this layer added may appear anywhere in the snapshot of
+        // a board that never used one.
+        let bytes = board.to_bytes().unwrap();
+        let haystack = String::from_utf8_lossy(&bytes).into_owned();
+        for added in [key::AGENT, key::FILE_TREE, key::NOTE, key::BROWSER] {
+            assert!(
+                !haystack.contains(&format!("\"{added}\"")),
+                "`{added}` reached the snapshot of a board that has no agent nodes"
+            );
+        }
+
+        // And it still reads back as exactly what was put in.
+        let reopened = Board::from_bytes(&bytes).expect("a plain board stopped loading");
+        assert_eq!(reopened.items().unwrap().len(), 4);
+    }
+
+    /// The other direction: the four kinds survive a full snapshot round trip, tokens and
+    /// labels intact. A token is opaque here, so "intact" means byte-identical — this crate
+    /// must never normalise, reformat or validate what `vellum-app` handed it.
+    #[test]
+    fn agent_kinds_round_trip_through_a_snapshot_with_their_tokens_verbatim() {
+        let mut board = Board::new();
+        let token = r#"{"role_kind":"meta","spawn_cap":3,"unknown_future_field":[1,2]}"#;
+        board
+            .add(NewItem::new(
+                ItemKind::Agent {
+                    model: token.into(),
+                    label: StyledText::plain("Research Assistant"),
+                },
+                Placement::new(0.0, 0.0, 400.0, 300.0),
+            ))
+            .unwrap();
+
+        let reopened = Board::from_bytes(&board.to_bytes().unwrap()).unwrap();
+        let items = reopened.items().unwrap();
+        assert_eq!(items.len(), 1);
+        let ItemKind::Agent { model, label } = &items[0].kind else {
+            panic!("an agent node came back as {}", items[0].kind.tag());
+        };
+        assert_eq!(model, token, "the token was not stored verbatim");
+        assert_eq!(label.to_plain(), "Research Assistant");
+
+        // The role is the item's text, so search, the caret and `set_text` all reach it
+        // with no new path — the whole reason it is stored beside the token.
+        assert_eq!(items[0].kind.text().map(StyledText::to_plain).as_deref(), Some("Research Assistant"));
     }
 
     /// [`key::KIND_SPECIFIC`] is the fallback sweep for a kind tag this build does
