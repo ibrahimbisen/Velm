@@ -471,6 +471,11 @@ impl ActiveState {
             // time, exactly as the shape and the pen preset are. Nothing to do here beyond
             // arming the tool, which the flyout has already asked for.
             UiEvent::StickyColorChosen(_) => self.choose_tool(Tool::Sticky),
+            // The chrome already stored the choice; `Shell::agent_role` reads it back when
+            // an agent is placed, exactly as `sticky_color` is read. The picker also emits
+            // `ToolChanged`, so arming is not this arm's job — doing it here as well would
+            // be two paths deciding one thing.
+            UiEvent::AgentRoleChosen(_) => {}
             UiEvent::CustomShapeChosen(_) | UiEvent::UploadShape => self.gap(
                 "Custom SVG shapes need an SVG parser the app does not carry yet",
             ),
@@ -1423,6 +1428,7 @@ impl ActiveState {
             "edit-then-delete" => self.demo_edit_then_delete(),
             "frame-marquee" => self.demo_frame_marquee(),
             "grid-snap" => self.demo_grid_snap(),
+            "agent" => self.demo_agent(),
             // Not a fixture, but the same "do it on the first frame so an unattended
             // run can check it" need — an export is a menu row and nothing else can
             // reach one.
@@ -1434,8 +1440,118 @@ impl ActiveState {
                 "--demo: no fixture called `{other}` \
                  (shapes, empty, table, chart, mindmap, kanban, card-drag, typing, caret, connector, placing, snapping, \
                   object-eraser, group-handles, locked-arrange, widget-edit, links, copy-paste, context-menu, \
-                  edit-then-delete, frame-marquee, grid-snap, export-svg, export-pdf, export-png, present)"
+                  edit-then-delete, frame-marquee, grid-snap, agent, export-svg, export-pdf, export-png, present)"
             ),
+        }
+    }
+
+    /// Two agent nodes and a note, placed with the **real tools**, then wired with the
+    /// **real connector tool** — and the resulting links read back out of the document.
+    ///
+    /// # Why a fixture and not a unit test
+    ///
+    /// `crate::agent::link_kind` is pure and has its own tests, and none of them prove the
+    /// feature is *reachable*. Three separate things here are wiring rather than arithmetic,
+    /// and every one of them has an established way of being silently wrong in this repo:
+    ///
+    /// - **That the agent tool places an agent at all.** `Tool::Agent` has to reach
+    ///   `default_size`, `kind_for_tool` and `Input::Tool::Place`; miss any one and the drag
+    ///   sweeps a marquee and nothing is created. A test calling `board.add` directly enters
+    ///   below all three and passes with the tool unwired — which is exactly how
+    ///   `opens_context_menu` and `import_to_new_board` each sat written, tested and
+    ///   callerless.
+    /// - **That a connector drawn between two agents binds to them.** The derivation is on
+    ///   the *endpoints*, so a connector that failed to bind reads as `Plain` — the feature
+    ///   would look switched off while every unit test stayed green.
+    /// - **That an agent and a note derive a different link from two agents.** Both halves
+    ///   are asserted, because a build that answered `Message` for everything satisfies
+    ///   "there is an agent link here" and is wrong.
+    fn demo_agent(&mut self) {
+        // Placed through the tools, not through `board.add` — see the doc comment.
+        let mut place = |actions: &mut Self, tool: Tool, x: f64, size: (f64, f64)| {
+            actions.choose_tool(tool);
+            let from = actions.camera.world_to_screen(WorldPoint::new(x, 0.0));
+            let to = actions
+                .camera
+                .world_to_screen(WorldPoint::new(x + size.0, size.1));
+            actions.act_on(Intent::Place { at: from, to });
+        };
+        place(self, Tool::Agent, -900.0, crate::agent::DEFAULT_SIZE);
+        place(self, Tool::Agent, -100.0, crate::agent::DEFAULT_SIZE);
+        place(self, Tool::Note, 600.0, crate::note::DEFAULT_SIZE);
+
+        // The caret lands on a freshly placed agent's role, so the placement gesture leaves
+        // an editing session open. Close it before dispatching anything else — feedback 27's
+        // rule, and the reason this fixture would otherwise raise the undo-group toast.
+        self.settle();
+
+        let ids = self.editor.board().item_ids();
+        let kind_of = |actions: &Self, id| actions.editor.board().item(id).ok().map(|i| i.kind);
+        let agents: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| matches!(kind_of(self, *id), Some(ItemKind::Agent { .. })))
+            .collect();
+        let notes: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| matches!(kind_of(self, *id), Some(ItemKind::AgentNote { .. })))
+            .collect();
+
+        let ([first, second], [note]) = (agents.as_slice(), notes.as_slice()) else {
+            self.gap(&format!(
+                "the agent tools placed {} agent(s) and {} note(s), not 2 and 1",
+                agents.len(),
+                notes.len()
+            ));
+            return;
+        };
+        let (first, second, note) = (*first, *second, *note);
+
+        self.fit_board();
+        let mut wire = |actions: &mut Self, a: f64, b: f64| {
+            actions.choose_tool(Tool::Connector);
+            let from = actions.camera.world_to_screen(WorldPoint::new(a, 200.0));
+            let to = actions.camera.world_to_screen(WorldPoint::new(b, 200.0));
+            actions.act_on(Intent::Place { at: from, to });
+        };
+        // Agent to agent, then agent to note: the two derivations that must differ.
+        wire(self, -640.0, 160.0);
+        wire(self, 160.0, 860.0);
+
+        // Read every link back out of the document, resolving each end's *kind* exactly as
+        // the painter will.
+        let mut message = 0_u32;
+        let mut context = 0_u32;
+        let mut plain = 0_u32;
+        for id in self.editor.board().item_ids() {
+            let Ok(item) = self.editor.board().item(id) else { continue };
+            let ItemKind::Connector { start, end, .. } = &item.kind else { continue };
+            let start_kind = start.target.and_then(|t| kind_of(self, t));
+            let end_kind = end.target.and_then(|t| kind_of(self, t));
+            match crate::agent::link_kind(
+                start_kind.as_ref(),
+                end_kind.as_ref(),
+                start.arrowhead,
+                end.arrowhead,
+            ) {
+                crate::agent::LinkKind::Message(_) => message += 1,
+                crate::agent::LinkKind::Context => context += 1,
+                crate::agent::LinkKind::Plain => plain += 1,
+            }
+        }
+
+        let _ = (first, second, note);
+        if message == 1 && context == 1 && plain == 0 {
+            self.ok(
+                "placed 2 agents and a note with their own tools, and wired them into \
+                 1 message link and 1 context link",
+            );
+        } else {
+            self.gap(&format!(
+                "the wiring produced {message} message link(s), {context} context link(s) \
+                 and {plain} plain connector(s); expected 1, 1 and 0"
+            ));
         }
     }
 
@@ -3141,7 +3257,14 @@ impl ActiveState {
             | Tool::Chart
             | Tool::MindMap
             | Tool::Kanban
-            | Tool::Image => crate::input::Tool::Place,
+            | Tool::Image
+            // All four Agent Canvas nodes are placed by a sweep, exactly like a frame:
+            // they are boxes whose useful size is the one the user drew, and a click gives
+            // the module's own default.
+            | Tool::Agent
+            | Tool::Note
+            | Tool::FileTree
+            | Tool::Browser => crate::input::Tool::Place,
         });
     }
 
@@ -4456,7 +4579,16 @@ impl ActiveState {
         self.editor
             .projection()
             .get(session.scene)
-            .is_some_and(|projected| matches!(projected.item.kind, ItemKind::Frame { .. }))
+            .is_some_and(|projected| {
+                matches!(
+                    projected.item.kind,
+                    // A frame's title, an agent's role and a note's title are all one line
+                    // by definition — a role with a paragraph break in it is not a role, and
+                    // all three are drawn in a single-line header where a second line has
+                    // nowhere to go. So Enter commits rather than inserting a break.
+                    ItemKind::Frame { .. } | ItemKind::Agent { .. } | ItemKind::AgentNote { .. }
+                )
+            })
     }
 
     /// Runs `edit` against the live buffer, reporting whether the text changed.
@@ -5349,6 +5481,14 @@ impl ActiveState {
             // nothing here scrolls, so a default that overflowed would draw outside the
             // item the moment it was placed.
             Tool::Kanban => Some(crate::kanban::DEFAULT_SIZE),
+            // The four Agent Canvas nodes, each sized by its own module so the default and
+            // the layout that has to fit inside it are one decision. `crate::agent`'s tests
+            // hold the box against the rows laid out in it, which is what stops a placed
+            // agent from being born too small for its own header.
+            Tool::Agent => Some(crate::agent::DEFAULT_SIZE),
+            Tool::Note => Some(crate::note::DEFAULT_SIZE),
+            Tool::FileTree => Some(crate::filetree::DEFAULT_SIZE),
+            Tool::Browser => Some(crate::browser::DEFAULT_SIZE),
             // Miro's default shape box, and a square so the first click gives a circle
             // rather than an ellipse.
             Tool::Shape => Some((200.0, 200.0)),
@@ -5448,6 +5588,9 @@ impl ActiveState {
                 Tool::Frame => crate::draw::PlacingLook::Frame,
                 Tool::Sticky => crate::draw::PlacingLook::Sticky,
                 Tool::Shape => crate::draw::PlacingLook::Shape(self.shell.shape()),
+                Tool::Agent | Tool::Note | Tool::FileTree | Tool::Browser => {
+                    crate::draw::PlacingLook::Card
+                }
                 _ => crate::draw::PlacingLook::Ghost,
             },
         })
@@ -5505,6 +5648,32 @@ impl ActiveState {
                 order: None,
                 speaker_notes: None,
             }),
+            // The role the palette's flyout last chose — worker, orchestrator or meta.
+            // All three are one `ItemKind`; they differ in configuration, not in what they
+            // are on the canvas. The label is a placeholder the caret lands on, exactly as
+            // a frame's "Frame" is, because a role is text the user writes and an unnamed
+            // agent is one nobody can tell from its neighbour.
+            Tool::Agent => {
+                let mut model = vellum_agent::AgentModel::worker();
+                model.role_kind = self.shell.agent_role();
+                Some(ItemKind::Agent {
+                    model: crate::agent::encode(&model),
+                    label: StyledText::plain(model.role_kind.label()),
+                })
+            }
+            // A note with no file yet. The file is created when the note is first named or
+            // written to — placing one must not litter the project with `untitled.md`
+            // before the user has said anything about it.
+            Tool::Note => Some(ItemKind::AgentNote {
+                model: crate::note::encode(&vellum_agent::NoteModel::default()),
+                title: StyledText::plain("Note"),
+            }),
+            Tool::FileTree => Some(ItemKind::FileTree {
+                model: crate::filetree::encode(&vellum_agent::FileTreeModel::default()),
+            }),
+            Tool::Browser => Some(ItemKind::Browser {
+                model: crate::browser::encode(&vellum_agent::BrowserModel::default()),
+            }),
             _ => None,
         };
 
@@ -5534,12 +5703,33 @@ impl ActiveState {
                 | Tool::Table
                 | Tool::Chart
                 | Tool::MindMap
-                | Tool::Kanban => {}
+                | Tool::Kanban
+                | Tool::Agent
+                | Tool::Note
+                | Tool::FileTree
+                | Tool::Browser => {}
             }
             if !tool.is_continuous() {
                 self.choose_tool(Tool::Select);
             }
             return;
+        };
+
+        // An orchestrator or a meta agent is born owning a region, derived from the box it
+        // was just drawn at. `vellum_agent::orchestrator` refuses every spawn from a node
+        // with no territory — correctly, since a territory arrived at by omission is an
+        // unbounded one — so a node created without one could never spawn, and the feature
+        // would be written, tested and unreachable. The user redraws it afterwards; this is
+        // a starting point, not a guess at what they meant.
+        let kind = match kind {
+            ItemKind::Agent { model, label } => {
+                let mut config = crate::agent::decode(&model);
+                if config.role_kind.may_spawn() && config.territory.is_none() {
+                    config.territory = Some(crate::agent::default_territory(&placement));
+                }
+                ItemKind::Agent { model: crate::agent::encode(&config), label }
+            }
+            other => other,
         };
 
         let result = self
@@ -5557,7 +5747,15 @@ impl ActiveState {
                 // A frame is included where the panel version left it out: its title says
                 // "Frame", which is a placeholder nobody wants to keep, and the caret now
                 // has somewhere to be — over the frame, on its title.
-                if matches!(tool, Tool::Sticky | Tool::Text | Tool::Shape | Tool::Frame) {
+                // An agent and a note join the four that take the caret on placement, for
+                // exactly the frame's reason: both are born carrying a placeholder — "Agent",
+                // "Note" — that nobody wants to keep, and the role a user types is not a
+                // label but the thing that shapes how the agent answers. A file tree and a
+                // browser are left out: neither has text of its own to write.
+                if matches!(
+                    tool,
+                    Tool::Sticky | Tool::Text | Tool::Shape | Tool::Frame | Tool::Agent | Tool::Note
+                ) {
                     let scene = self.editor.projection().scene_id(id);
                     match scene {
                         Some(scene) if self.begin_editing(scene, true) => {}

@@ -50,6 +50,12 @@ pub enum UiEvent {
     /// changes nothing already on the board — which is why it is its own event and not a
     /// `StyleEdit::Fill` with no selection.
     StickyColorChosen(vellum_doc::Color),
+    /// Which of the three roles the agent tool will place next.
+    ///
+    /// A *tool* setting, exactly as [`UiEvent::StickyColorChosen`] is: it names what the next
+    /// agent node will be and changes nothing already on the board. Converting an existing
+    /// node's role is a different verb and arrives as a style-style edit from the inspector.
+    AgentRoleChosen(vellum_agent::RoleKind),
     /// One of the user's own SVG shapes was chosen. Carries the id the app gave it in
     /// [`Chrome::set_custom_shapes`](crate::Chrome::set_custom_shapes), because the
     /// chrome never parses an SVG and has nothing else to identify it by.

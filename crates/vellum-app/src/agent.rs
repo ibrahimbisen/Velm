@@ -28,6 +28,7 @@
 //! rectangle from here.
 
 use vellum_agent::{AgentModel, DisplayMode, RoleKind};
+use vellum_doc::{ArrowKind, ItemKind};
 
 /// An axis-aligned box in the item's own space: origin at the item's top-left, units are
 /// world units before the placement's scale.
@@ -282,6 +283,29 @@ pub fn subtitle(model: &AgentModel) -> String {
     }
 }
 
+/// The region a newly placed orchestrator or meta agent owns.
+///
+/// # Why a default territory exists at all
+///
+/// `vellum_agent::orchestrator` refuses every spawn from a node with no territory, and it is
+/// right to: a territory arrived at by omission is an unbounded one, which is exactly what
+/// the cap exists to prevent. But an orchestrator created with `None` cannot spawn until the
+/// user has discovered that it needs a rectangle drawn, which makes the feature dead on
+/// arrival — the same shape as `opens_context_menu` being written, tested and callerless.
+///
+/// So a new one is born owning a bounded region **derived from its own box**, which the user
+/// can then redraw. Five node-widths by three node-heights, centred on the node: enough for
+/// [`AgentModel::DEFAULT_SPAWN_CAP`] children laid out around their parent with room to
+/// spare, and — the property that matters — **independent of the zoom**. Taking the viewport
+/// instead was the obvious alternative and is worse: the same gesture would produce a
+/// territory of wildly different size depending on how far out the board happened to be
+/// scrolled, which is not something the user could predict or later reason about.
+pub fn default_territory(placement: &vellum_doc::Placement) -> vellum_agent::Territory {
+    let width = (placement.width * placement.scale).abs().max(DEFAULT_SIZE.0);
+    let height = (placement.height * placement.scale).abs().max(DEFAULT_SIZE.1);
+    vellum_agent::Territory::new(placement.x, placement.y, width * 5.0, height * 3.0)
+}
+
 /// The display mode this node actually draws in, resolving `None` against the app-wide
 /// default the user set in Preferences.
 ///
@@ -294,10 +318,210 @@ pub const fn display_mode(model: &AgentModel, fallback: DisplayMode) -> DisplayM
     }
 }
 
+/// What a connector between two nodes *means*, when at least one end is an agent.
+///
+/// # Why this is derived and not stored
+///
+/// Nothing is added to [`ItemKind::Connector`]. A stored "this is an agent link" flag would
+/// be a second source of truth that can disagree with the endpoints it describes, and this
+/// repo has already paid for that twice — the grid's two controls, one of which was
+/// permanently inert, and `inspect.rs`'s hardcoded `locked: false`. Derivation cannot drift,
+/// needs no migration, and makes an agent link out of every connector the user has already
+/// drawn between two agents.
+///
+/// **Direction is the arrowhead**, which is a control the user already has on the context
+/// bar, rather than a new one that would have to be found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    /// An ordinary connector. Neither end is an agent, or one end is unbound.
+    Plain,
+    /// Agent to agent: messages may pass. This is the wire feature 3 asks for.
+    Message(Direction),
+    /// An agent and something it can read — a note, or a file tree. The agent takes it as
+    /// context. Drawn differently from a message link, because "reads this" and "talks to
+    /// this" are not the same relationship and a board where they look alike is one you
+    /// cannot follow.
+    Context,
+}
+
+/// Which way messages flow along a message link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Start to end.
+    Forward,
+    /// End to start.
+    Backward,
+    /// Both ways. What an undecorated line means: a connector with no arrowhead says the
+    /// two are related without saying who leads, so both may speak.
+    Both,
+}
+
+impl Direction {
+    /// Whether a message may travel from the connector's `start` to its `end`.
+    pub const fn allows_forward(self) -> bool {
+        matches!(self, Self::Forward | Self::Both)
+    }
+
+    /// Whether a message may travel from the connector's `end` to its `start`.
+    pub const fn allows_backward(self) -> bool {
+        matches!(self, Self::Backward | Self::Both)
+    }
+}
+
+/// Whether a kind is one an agent can be wired to as a *peer* — i.e. an agent.
+pub const fn is_agent(kind: &ItemKind) -> bool {
+    matches!(kind, ItemKind::Agent { .. })
+}
+
+/// Whether a kind is something an agent can be wired to as *context* to read.
+///
+/// A note and a file tree, and deliberately not a sticky: a sticky's words are document
+/// content that only Velm can write, while a note is a file on disk an agent can edit. The
+/// distinction is the entire reason notes are their own kind, and blurring it here would
+/// make a context link promise a write the agent cannot perform.
+pub const fn is_context_source(kind: &ItemKind) -> bool {
+    matches!(kind, ItemKind::AgentNote { .. } | ItemKind::FileTree { .. })
+}
+
+/// What a connector between `start_kind` and `end_kind` means.
+///
+/// `None` for either kind is an endpoint pinned to the canvas rather than to an item — an
+/// unbound end cannot be an agent, so such a connector is always [`LinkKind::Plain`].
+pub fn link_kind(
+    start_kind: Option<&ItemKind>,
+    end_kind: Option<&ItemKind>,
+    start_arrow: ArrowKind,
+    end_arrow: ArrowKind,
+) -> LinkKind {
+    let (Some(start), Some(end)) = (start_kind, end_kind) else {
+        return LinkKind::Plain;
+    };
+
+    if is_agent(start) && is_agent(end) {
+        // The arrowhead sits on the end it points *at*, so a head on `end` means
+        // start → end. A head on both, or on neither, is a line that does not choose.
+        let direction = match (start_arrow != ArrowKind::None, end_arrow != ArrowKind::None) {
+            (false, true) => Direction::Forward,
+            (true, false) => Direction::Backward,
+            _ => Direction::Both,
+        };
+        return LinkKind::Message(direction);
+    }
+
+    // Context is symmetric: an agent joined to a note reads that note whichever way the
+    // line was drawn. Requiring the user to draw it "the right way round" would be a rule
+    // nothing on screen states.
+    if (is_agent(start) && is_context_source(end)) || (is_context_source(start) && is_agent(end)) {
+        return LinkKind::Context;
+    }
+
+    LinkKind::Plain
+}
+
+impl LinkKind {
+    /// Whether this link is one the Agent Canvas draws differently from an ordinary
+    /// connector.
+    pub const fn is_agent_link(self) -> bool {
+        !matches!(self, Self::Plain)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use vellum_agent::{Provider, ProviderChoice};
+
+    fn agent() -> ItemKind {
+        ItemKind::Agent { model: String::new(), label: vellum_doc::StyledText::plain("a") }
+    }
+
+    fn note() -> ItemKind {
+        ItemKind::AgentNote { model: String::new(), title: vellum_doc::StyledText::plain("n") }
+    }
+
+    fn sticky() -> ItemKind {
+        ItemKind::Sticky { text: vellum_doc::StyledText::plain("s"), background: None }
+    }
+
+    const NONE: ArrowKind = ArrowKind::None;
+    const HEAD: ArrowKind = ArrowKind::FilledTriangle;
+
+    /// The whole derivation: two agents joined by a line may talk, and the arrowhead — a
+    /// control the user already has — says which way.
+    #[test]
+    fn two_agents_joined_by_a_line_can_talk_and_the_arrowhead_says_which_way() {
+        let (a, b) = (agent(), agent());
+        assert_eq!(
+            link_kind(Some(&a), Some(&b), NONE, HEAD),
+            LinkKind::Message(Direction::Forward)
+        );
+        assert_eq!(
+            link_kind(Some(&a), Some(&b), HEAD, NONE),
+            LinkKind::Message(Direction::Backward)
+        );
+        // No head, or a head at both ends, is a line that does not choose — so both may
+        // speak. An undecorated connector is the commonest thing anyone draws, and making
+        // it mean "nobody may speak" would leave the feature switched off by default.
+        assert_eq!(link_kind(Some(&a), Some(&b), NONE, NONE), LinkKind::Message(Direction::Both));
+        assert_eq!(link_kind(Some(&a), Some(&b), HEAD, HEAD), LinkKind::Message(Direction::Both));
+    }
+
+    #[test]
+    fn direction_gates_travel_in_the_way_it_names() {
+        assert!(Direction::Forward.allows_forward() && !Direction::Forward.allows_backward());
+        assert!(Direction::Backward.allows_backward() && !Direction::Backward.allows_forward());
+        assert!(Direction::Both.allows_forward() && Direction::Both.allows_backward());
+    }
+
+    /// An agent joined to a note reads it, whichever way round the line was drawn —
+    /// requiring a direction here would be a rule nothing on screen states.
+    #[test]
+    fn an_agent_joined_to_a_note_reads_it_either_way_round() {
+        let (a, n) = (agent(), note());
+        assert_eq!(link_kind(Some(&a), Some(&n), NONE, HEAD), LinkKind::Context);
+        assert_eq!(link_kind(Some(&n), Some(&a), NONE, HEAD), LinkKind::Context);
+
+        let tree = ItemKind::FileTree { model: String::new() };
+        assert_eq!(link_kind(Some(&a), Some(&tree), NONE, NONE), LinkKind::Context);
+    }
+
+    /// A sticky is deliberately not a context source. Its words are document content only
+    /// Velm can write, and a context link to one would promise an agent a write it cannot
+    /// perform — which is the whole reason notes are a separate kind.
+    #[test]
+    fn a_sticky_is_not_context_however_it_is_wired() {
+        let (a, s) = (agent(), sticky());
+        assert_eq!(link_kind(Some(&a), Some(&s), NONE, HEAD), LinkKind::Plain);
+        assert_eq!(link_kind(Some(&s), Some(&a), NONE, HEAD), LinkKind::Plain);
+        assert!(!is_context_source(&sticky()));
+    }
+
+    /// An unbound end cannot be an agent, so a half-attached connector stays ordinary. The
+    /// case matters: dragging a connector out of an agent and dropping it on bare canvas is
+    /// something people do constantly, and it must not produce a live message wire to
+    /// nothing.
+    #[test]
+    fn a_connector_with_a_free_end_is_never_an_agent_link() {
+        let a = agent();
+        assert_eq!(link_kind(Some(&a), None, NONE, HEAD), LinkKind::Plain);
+        assert_eq!(link_kind(None, Some(&a), NONE, HEAD), LinkKind::Plain);
+        assert_eq!(link_kind(None, None, NONE, NONE), LinkKind::Plain);
+    }
+
+    #[test]
+    fn only_agent_links_are_drawn_differently() {
+        assert!(!LinkKind::Plain.is_agent_link());
+        assert!(LinkKind::Message(Direction::Both).is_agent_link());
+        assert!(LinkKind::Context.is_agent_link());
+    }
+
+    /// Two notes joined to each other are not an agent link — note chaining is a property
+    /// of the markdown inside them, not of a line on the board. Deriving it from a
+    /// connector as well would give a note two ways to link with different semantics.
+    #[test]
+    fn two_notes_joined_to_each_other_are_an_ordinary_connector() {
+        assert_eq!(link_kind(Some(&note()), Some(&note()), NONE, HEAD), LinkKind::Plain);
+    }
 
     /// An unreadable token must cost the node's settings and never the node. A decode that
     /// could fail would put an item on the board that cannot be drawn, selected or deleted.
@@ -444,6 +668,56 @@ mod tests {
         let line = subtitle(&kimi);
         assert!(line.starts_with("Orchestrator · "), "{line}");
         assert!(line.ends_with("API"), "{line}");
+    }
+
+    /// An orchestrator placed with no territory can never spawn — `vellum_agent`'s own
+    /// refusal, and correct. So one is born owning a region, and the region has to be big
+    /// enough for the cap it is also born with, or the feature is refusals all the way down.
+    #[test]
+    fn a_new_orchestrator_owns_a_region_big_enough_for_its_own_cap() {
+        let placement = vellum_doc::Placement::new(0.0, 0.0, DEFAULT_SIZE.0, DEFAULT_SIZE.1);
+        let region = default_territory(&placement);
+        assert!(!region.is_empty());
+        assert!(region.contains_box(0.0, 0.0, DEFAULT_SIZE.0, DEFAULT_SIZE.1), "no room for itself");
+
+        // Room for the default cap's worth of children — asked of the **real packer**
+        // rather than recomputed here. The first version of this assertion did the
+        // arithmetic itself, assumed a single row, and failed a territory that was in fact
+        // large enough: 2600 wide against a row needing 2720, when `place_in` packs
+        // row-major and would have used two rows. A test that reimplements the thing it is
+        // checking is a test that can be wrong on its own account, which is exactly what
+        // happened.
+        let cap = AgentModel::DEFAULT_SPAWN_CAP as usize;
+        let room = vellum_agent::orchestrator::capacity(&region, DEFAULT_SIZE.0, DEFAULT_SIZE.1);
+        assert!(
+            room >= cap,
+            "a default territory holds {room} children but the cap it ships with is {cap}"
+        );
+    }
+
+    /// The property that ruled out using the viewport: the same gesture must produce the
+    /// same territory however far out the board is scrolled. A zoom-dependent default is
+    /// one the user cannot predict and cannot later reason about.
+    #[test]
+    fn a_default_territory_does_not_depend_on_the_zoom() {
+        let a = default_territory(&vellum_doc::Placement::new(10.0, 20.0, 520.0, 400.0));
+        let b = default_territory(&vellum_doc::Placement::new(10.0, 20.0, 520.0, 400.0));
+        assert_eq!(a, b);
+        // And it follows the node, so two orchestrators far apart do not overlap.
+        let far = default_territory(&vellum_doc::Placement::new(9000.0, 20.0, 520.0, 400.0));
+        assert!(!far.contains_point(10.0, 20.0), "two distant orchestrators claim the same ground");
+    }
+
+    /// A tiny node must not get a tiny territory — an orchestrator dragged out at 60x40
+    /// would otherwise own a region no child could fit in, and every spawn would come back
+    /// `RegionFull`, which reads as broken rather than as full.
+    #[test]
+    fn a_small_orchestrator_still_gets_a_usable_region() {
+        let tiny = default_territory(&vellum_doc::Placement::new(0.0, 0.0, 60.0, 40.0));
+        assert!(
+            tiny.contains_box(0.0, 0.0, DEFAULT_SIZE.0, DEFAULT_SIZE.1),
+            "a small orchestrator's region cannot hold one default-sized child"
+        );
     }
 
     /// A node that never chose a mode follows the app-wide default, so changing that

@@ -46,6 +46,27 @@ pub fn of(kind: &ItemKind) -> Vec<String> {
         ItemKind::Chart { spec } => crate::chart::words(&crate::chart::decode(spec)),
         ItemKind::MindMap { model } => crate::mindmap::words(&crate::mindmap::decode(model)),
         ItemKind::Kanban { board } => crate::kanban::words(&crate::kanban::decode(board)),
+        // An agent's role and a note's title already came through `ItemKind::text` above.
+        // These two are the fields a *user typed* that happen to live inside a token: the
+        // page a browser node points at, and the directory a file tree is rooted in.
+        //
+        // The line this follows is the one `ItemKind::text` already draws — words the user
+        // wrote are searchable, and metadata scraped from somebody else's page is not. So a
+        // browser's **title**, which the page supplied, is deliberately absent while its
+        // **url**, which the user typed, is present.
+        ItemKind::Browser { model } => {
+            let page = crate::browser::decode(model);
+            if page.url.trim().is_empty() { Vec::new() } else { vec![page.url] }
+        }
+        ItemKind::FileTree { model } => {
+            let tree = crate::filetree::decode(model);
+            if tree.root.trim().is_empty() { Vec::new() } else { vec![tree.root] }
+        }
+        // A note's *file content* is deliberately not searched. It is on disk and can be
+        // megabytes; the find bar runs this once per keystroke over every item on the
+        // board, and reading every note's file to answer a keystroke is the kind of cost
+        // this whole application exists not to pay. Searching note contents is a job for
+        // the index in `vellum-search`, not for a substring scan.
         _ => Vec::new(),
     }
 }

@@ -292,6 +292,15 @@ pub enum PlacingLook {
     /// The form the shape flyout has armed — drawn through the same SDF path the placed
     /// shape uses, so an ellipse previews as an ellipse rather than as its bounding box.
     Shape(Shape),
+    /// The four Agent Canvas nodes: the surface card with its hairline, which is exactly
+    /// what each of them is built on.
+    ///
+    /// Its own look rather than [`PlacingLook::Ghost`] because the answer *is* known here —
+    /// an agent, a note, a file tree and a browser are all a bordered card before anything
+    /// fills them — and feedback 23's rule is that a preview which disagrees with what it
+    /// previews is worse than none, since it is believed. The corollary holds too: a
+    /// preview that could tell the truth and does not is a smaller version of the same fault.
+    Card,
     /// Everything whose final look is not known until it exists: a table, a chart, a mind
     /// map, a kanban, a text box. An accent ghost, like the marquee — it reports the box
     /// honestly and does not pretend to be a picture of the result.
@@ -4019,6 +4028,15 @@ fn push_placing(list: &mut DrawList, ctx: &DrawContext<'_>, board: u32) {
             list.push_quad(
                 QuadInstance::solid(origin, size, theme.sticky)
                     .with_corner_radius(STICKY_RADIUS),
+            );
+        }
+        // The same surface, radius and hairline the placed node draws with, so the preview
+        // and the item are one picture rather than two that happen to agree.
+        PlacingLook::Card => {
+            list.push_quad(
+                QuadInstance::solid(origin, size, theme.surface)
+                    .with_corner_radius(CARD_RADIUS)
+                    .with_border(theme.border, hairline),
             );
         }
         PlacingLook::Shape(shape) => {

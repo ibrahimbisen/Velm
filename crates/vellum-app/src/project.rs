@@ -371,7 +371,15 @@ impl Projection {
             ItemKind::Sticky { text: slot, .. }
             | ItemKind::Text { text: slot }
             | ItemKind::Shape { text: slot, .. }
-            | ItemKind::Frame { title: slot, .. } => {
+            | ItemKind::Frame { title: slot, .. }
+            // An agent's role and a note's title are the item's own text, so they type on
+            // the canvas at the same cost as every other field. Leaving them out is not a
+            // missing feature but a *silently half-working* one: `ItemKind::text` already
+            // answers for both, so the caret opens and accepts keystrokes, and only the
+            // live redraw is absent — the words appear a gesture late, on the next
+            // reprojection. That is the worst kind of gap, because it looks like lag.
+            | ItemKind::Agent { label: slot, .. }
+            | ItemKind::AgentNote { title: slot, .. } => {
                 *slot = text;
                 // Caches keyed on the projection's generation — laid-out glyphs above
                 // all — have to notice, or the old words stay on screen.

@@ -553,6 +553,15 @@ impl Chrome {
         self.toolbar.shape
     }
 
+    /// Which of the three agent roles the agent tool will place.
+    pub const fn agent_role(&self) -> vellum_agent::RoleKind {
+        self.toolbar.agent_role
+    }
+
+    pub const fn set_agent_role(&mut self, role: vellum_agent::RoleKind) {
+        self.toolbar.agent_role = role;
+    }
+
     /// The pen tool's current settings.
     pub const fn pen(&self) -> PenPreset {
         self.toolbar.pen

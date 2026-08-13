@@ -4543,6 +4543,7 @@ name = "vellum-ui"
 version = "1.0.0"
 dependencies = [
  "egui",
+ "vellum-agent",
  "vellum-connect",
  "vellum-doc",
  "vellum-shapes",

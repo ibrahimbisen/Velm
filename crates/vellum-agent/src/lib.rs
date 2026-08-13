@@ -52,7 +52,11 @@ pub use model::{
     AgentModel, AgentRules, BrowserModel, ContextSource, DisplayMode, FileTreeModel, NoteModel,
     NoteScope, RoleKind, Territory,
 };
+pub use notes::{Freshness, NoteStore, Requester, Save};
+pub use orchestrator::{AgentNode, NodeBox, Refusal};
 pub use provider::{Provider, ProviderChoice, Transport};
+pub use rules::{Layer, Permissions, ResolvedRules, RuleFile};
+pub use summary::{Activity, AgentDigest, Attention, Digest};
 pub use schedule::{Completion, Recurrence, Schedule, Timestamp, Trigger};
 pub use transcript::{
     AgentRef, Choice, RequestId, ToolCallId, TranscriptEvent, TurnId, TurnOutcome,

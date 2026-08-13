@@ -486,6 +486,12 @@ impl Shell {
         self.chrome.sticky_color()
     }
 
+    /// Which of the three agent roles the next placed agent node takes, from the agent
+    /// tool's flyout.
+    pub fn agent_role(&self) -> vellum_agent::RoleKind {
+        self.chrome.agent_role()
+    }
+
     /// Offers the picker the families the shaper can actually use.
     ///
     /// **Only families with faces**, which the hardcoded list did not promise: it named

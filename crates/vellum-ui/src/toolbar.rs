@@ -59,6 +59,13 @@ pub struct ToolbarState {
     pub sticky: Option<vellum_doc::Color>,
     /// The shape a click on the shape tool will place, shown on the tool button.
     pub shape: Shape,
+    /// Which of the three agent roles the agent tool will place.
+    ///
+    /// On the toolbar rather than decided after placement, for the reason the sticky's
+    /// colour is: an orchestrator and a worker are configured differently from the moment
+    /// they exist — an orchestrator wants a territory drawn and a cap set — so placing one
+    /// and converting it afterwards is a step every single time.
+    pub agent_role: vellum_agent::RoleKind,
     pub pen: PenPreset,
     /// What the eraser takes. Miro puts this in the eraser's own flyout, and so does this.
     pub eraser: EraserMode,
@@ -77,6 +84,7 @@ impl Default for ToolbarState {
             open_flyout: None,
             sticky: None,
             shape: Shape::Rectangle,
+            agent_role: vellum_agent::RoleKind::Worker,
             pen: PenPreset::default(),
             eraser: EraserMode::default(),
             search: String::new(),
@@ -396,6 +404,7 @@ fn flyout_window(
                 Flyout::Shape => shape_picker(ui, palette, state, custom, events),
                 Flyout::Pen => pen_picker(ui, palette, state, events),
                 Flyout::Eraser => eraser_picker(ui, palette, state, events),
+                Flyout::Agent => agent_picker(ui, palette, state, events),
                 Flyout::More => more_picker(ui, palette, state, active, events),
             });
             paint_glass_edge(ui.painter(), inner.response.rect, palette, Backing::Canvas);
@@ -929,6 +938,58 @@ fn eraser_picker(ui: &mut Ui, palette: Palette, state: &mut ToolbarState, events
             }
         }
     });
+}
+
+/// Which of the three roles the agent tool places: a worker, an orchestrator, or the meta
+/// agent.
+///
+/// A flyout rather than a conversion after the fact, for the sticky picker's reason: the
+/// three are configured differently from the moment they exist — an orchestrator is born
+/// owning a region of the board and a spawn cap — so placing a worker and converting it is an
+/// extra step every single time.
+///
+/// Each row carries a line saying what the role *is*. Three nouns alone would not do it:
+/// "Orchestrator" and "Meta agent" are the same word to somebody who has not used either,
+/// which is the same argument that put a drawn swatch beside each accent colour rather than
+/// its name.
+fn agent_picker(ui: &mut Ui, palette: Palette, state: &mut ToolbarState, events: &mut EventSink) {
+    use vellum_agent::RoleKind;
+
+    ui.set_max_width(space::of(56));
+    section_header(ui, palette, "Agent");
+
+    let roles: Vec<Segment<RoleKind>> =
+        RoleKind::ALL.iter().map(|role| Segment::text(*role, role.label())).collect();
+    if let Some(role) = segmented(ui, palette, &Field::Uniform(state.agent_role), &roles) {
+        state.agent_role = role;
+        events.push(UiEvent::AgentRoleChosen(role));
+        // Choosing arms the tool, exactly as choosing a sticky colour does: a picker that
+        // set a setting and left the pointer on Select would need a second click to do the
+        // thing the first click plainly meant.
+        events.push(UiEvent::ToolChanged(Tool::Agent));
+    }
+
+    ui.add_space(space::UNIT);
+    ui.label(
+        egui::RichText::new(agent_role_hint(state.agent_role)).size(11.0).color(palette.muted),
+    );
+}
+
+/// One line saying what a role does, for the picker.
+///
+/// Written for somebody who has not used one: what it is *for*, and — for the two that carry
+/// a power the others do not — what that power is, because a limit the user cannot see is one
+/// they cannot reason about.
+const fn agent_role_hint(role: vellum_agent::RoleKind) -> &'static str {
+    match role {
+        vellum_agent::RoleKind::Worker => "Does the work: writes, researches, answers.",
+        vellum_agent::RoleKind::Orchestrator => {
+            "Manages other agents. Owns a region of the board and a cap on how many it may run."
+        }
+        vellum_agent::RoleKind::Meta => {
+            "Talks to you about the board. The only role that may edit other agents' settings."
+        }
+    }
 }
 
 /// A width swatch drawn as a dot of that width, clamped so the widest still fits.

@@ -11,6 +11,13 @@ egui.workspace = true
 # being redeclared here, so the app never translates between two spellings of the
 # same value on its way to a panel.
 vellum-doc.workspace = true
+# The Agent Canvas layer's configuration types — roles, providers, display modes,
+# schedules. The panels and pickers that edit an agent node need to name what they are
+# editing, and every one of these is a plain serialisable value with no transport, no
+# thread and no socket attached: `vellum-agent`'s own header is explicit that the crate
+# costs nothing until a node exists. So this stays a crate that builds and tests on a
+# machine with no graphics stack.
+vellum-agent.workspace = true
 # The shape flyout draws real silhouettes from the catalogue, so adding a shape to
 # `vellum-shapes` adds it to the picker with no change here.
 vellum-shapes.workspace = true

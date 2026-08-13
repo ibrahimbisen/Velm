@@ -31,10 +31,21 @@ pub enum Tool {
     MindMap,
     Kanban,
     Image,
+    /// Places a live agent node. The Agent Canvas layer's headline tool, and the one of
+    /// the four that is on the palette itself rather than behind **More** — see
+    /// [`Tool::OCCASIONAL`].
+    Agent,
+    /// Places a note node: a markdown file on disk that agents read and write.
+    Note,
+    /// Places a file-tree node, scoped to one agent.
+    FileTree,
+    /// Places a browser node. Opt-in and RAM-gated; the tool exists whether or not an
+    /// engine is enabled, because the node is legible either way.
+    Browser,
 }
 
 impl Tool {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 18] = [
         Self::Select,
         Self::Hand,
         Self::Sticky,
@@ -49,6 +60,10 @@ impl Tool {
         Self::MindMap,
         Self::Kanban,
         Self::Image,
+        Self::Agent,
+        Self::Note,
+        Self::FileTree,
+        Self::Browser,
     ];
 
     /// The tools folded behind the palette's **More** button.
@@ -61,13 +76,20 @@ impl Tool {
     ///
     /// Every one keeps its keyboard shortcut, so nothing here got slower for anyone who
     /// knows the key — folding changes the palette, not the bindings.
-    pub const OCCASIONAL: [Self; 6] = [
+    /// **The agent tool itself is deliberately not here.** Three of the Agent Canvas tools
+    /// are — a note, a file tree and a browser are things you place occasionally, around
+    /// the agents — but placing an agent is the layer's whole verb, and a headline feature
+    /// folded behind a **More** button is one nobody discovers.
+    pub const OCCASIONAL: [Self; 9] = [
         Self::Table,
         Self::Chart,
         Self::Kanban,
         Self::MindMap,
         Self::Image,
         Self::Connector,
+        Self::Note,
+        Self::FileTree,
+        Self::Browser,
     ];
 
     /// Whether this tool lives behind **More** rather than on the palette itself.
@@ -91,6 +113,10 @@ impl Tool {
             Self::MindMap => "Mind map",
             Self::Kanban => "Kanban board",
             Self::Image => "Image",
+            Self::Agent => "Agent",
+            Self::Note => "Note",
+            Self::FileTree => "File tree",
+            Self::Browser => "Browser",
         }
     }
 
@@ -107,8 +133,17 @@ impl Tool {
             Self::Eraser => Key::E,
             Self::Connector => Key::C,
             Self::Frame => Key::F,
+            // `A` for an agent. It is free — `⌘A` is Select all, and a bare letter is a
+            // different binding from a chord, exactly as bare `V`, `N` and `T` already are.
+            Self::Agent => Key::A,
             // Miro has no bare key for a table; `T` is text and already taken.
             Self::Table | Self::Chart | Self::MindMap | Self::Kanban => return None,
+            // No bare key for the other three. Every remaining letter that reads as one of
+            // these is taken by a tool the hand uses far more often — `N` is a sticky note,
+            // `F` is a frame, `B` would be the obvious browser key and is one keystroke from
+            // being pressed by accident while a caret is not up. A tool nobody places daily
+            // does not earn a scarce single key.
+            Self::Note | Self::FileTree | Self::Browser => return None,
             Self::Image => return None,
         })
     }
@@ -158,6 +193,10 @@ impl Tool {
             Self::MindMap => Icon::MindMap,
             Self::Kanban => Icon::Kanban,
             Self::Image => Icon::Image,
+            Self::Agent => Icon::Agent,
+            Self::Note => Icon::Note,
+            Self::FileTree => Icon::FileTree,
+            Self::Browser => Icon::Browser,
         }
     }
 
@@ -168,6 +207,7 @@ impl Tool {
             Self::Pen => Some(Flyout::Pen),
             Self::Eraser => Some(Flyout::Eraser),
             Self::Sticky => Some(Flyout::Sticky),
+            Self::Agent => Some(Flyout::Agent),
             _ => None,
         }
     }
@@ -187,7 +227,14 @@ pub enum Flyout {
     Shape,
     Pen,
     Eraser,
-    /// The six tools that are not everyday work — see [`Tool::OCCASIONAL`].
+    /// Which of the three roles the agent tool places: worker, orchestrator or meta.
+    ///
+    /// A flyout rather than a conversion after the fact, for the sticky's reason: the three
+    /// are configured differently from the moment they exist — an orchestrator wants a
+    /// territory drawn on the board and a cap set — so placing a worker and changing it
+    /// afterwards is an extra step every single time.
+    Agent,
+    /// The tools that are not everyday work — see [`Tool::OCCASIONAL`].
     More,
 }
 

@@ -248,13 +248,24 @@ Three layers, each inheriting from the one above unless it overrides:
 
 | layer | stored in | applies to |
 |---|---|---|
-| Global | `Vellum/rules/global.md` + `rules.json` | every agent, every board |
+| Global | `<data-dir>/rules/global.md` | every agent, every board |
 | Project | `<board dir>/.velm/rules.md` | every agent on that board |
 | Agent | the node's `AgentModel` | that node alone |
 
 - Rules are **markdown with a small front-matter block**, so they are readable and editable in
   any editor, and so an existing `CLAUDE.md`/`AGENTS.md`/`.cursorrules` can be pointed at
-  directly rather than copied.
+  directly rather than copied. Project discovery order is `.velm/rules.md` → `AGENTS.md` →
+  `CLAUDE.md` → `.cursorrules`, **first hit wins rather than merged**: a project with two of
+  these has two opinions, and silently concatenating them produces a rule set neither file's
+  author wrote.
+- **The structured settings live in the front matter and nowhere else.** An earlier draft of
+  this document paired `global.md` with a `rules.json`; that was wrong and is withdrawn. Two
+  files describing the same four settings is a second source of truth for hand-edited values,
+  which is the exact failure this file keeps recording — one of the pair inevitably becomes
+  the one nothing reads.
+- An unrecognised value for a structured setting **falls through to the layer above**, not to
+  a default. That matters most for the permission posture: a permission granted by a typo is
+  the one failure this cascade cannot be allowed to have.
 - `rules::resolve(global, project, agent)` returns a `ResolvedRules` that records, per field,
   **which layer supplied it**. The inspector shows *inherited* versus *set here* from that
   record rather than by re-deriving it, so the display cannot disagree with what the agent got.
@@ -277,9 +288,24 @@ disk and nowhere else.
   edited on the canvas holds the buffer until the caret leaves, then writes. A conflict —
   changed on both sides — keeps both, writing `<slug>.velm-conflict.md`, and says so on the node.
 - **Note-to-note links** are ordinary markdown links to sibling notes. An agent asked to follow
-  a chain gets the transitive closure, depth-bounded.
+  a chain gets the transitive closure, depth-bounded — and cycle-safe, because two notes
+  pointing at each other is the first thing anyone builds.
 - Writes are debounced and atomic (write temp, rename), so an agent reading mid-write never
   sees half a file.
+- **A board with no project directory still gets notes**, at
+  `<data-dir>/agents/<board-key>/notes/`. A note must always have somewhere to live: the
+  alternative is a note node that cannot be created on a board that is not a code project,
+  which is most boards.
+
+### 8a. Credentials
+
+API keys live in `<data-dir>/credentials.json`, created mode `0600`, and **nowhere else**.
+Never in a board file, never in a transcript, never in an error message, never in a log line.
+The repository is public and a key pasted into a fixture is a key that is published; this is
+stated here so that no module has to decide it for itself.
+
+Most agents need no key at all — that is what §5a is for. A key is required only for
+[`Transport::Http`] against a hosted provider, and never for a local model.
 
 ---
 

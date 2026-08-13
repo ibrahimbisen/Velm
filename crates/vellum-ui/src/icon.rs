@@ -171,6 +171,21 @@ pub enum Icon {
     Moon,
     /// A folder, for the board library's filing.
     Folder,
+    // The Agent Canvas layer's four node types. Each had to be legible at 16pt and
+    // distinguishable from every icon already here, which is what ruled out the obvious
+    // drawings: a plain rounded box is the shape tool, a folded corner is a sticky, and a
+    // rectangle with content in it is the image.
+    /// An agent: a terminal prompt — a chevron and a caret rule — inside a box. Says
+    /// "something is running in here" rather than "this is a rectangle".
+    Agent,
+    /// A note: a page with a folded top-right corner and two written lines. The fold is
+    /// the opposite corner from [`Icon::Sticky`]'s, which is what tells the two apart at
+    /// palette size.
+    Note,
+    /// A file tree: a root, a stem, and two branches ending in rows.
+    FileTree,
+    /// A browser: a frame with a chrome bar and two dots in it.
+    Browser,
 }
 
 impl Icon {
@@ -515,6 +530,46 @@ impl Icon {
             ] },
             Self::Folder => const { &[
                 outline(&[(0.833, 0.833), (0.855, 0.830), (0.875, 0.822), (0.892, 0.809), (0.906, 0.792), (0.914, 0.772), (0.917, 0.750), (0.917, 0.333), (0.914, 0.312), (0.906, 0.292), (0.892, 0.274), (0.875, 0.261), (0.855, 0.253), (0.833, 0.250), (0.504, 0.250), (0.484, 0.248), (0.464, 0.240), (0.447, 0.228), (0.434, 0.212), (0.400, 0.163), (0.387, 0.147), (0.370, 0.135), (0.351, 0.128), (0.330, 0.125), (0.167, 0.125), (0.145, 0.128), (0.125, 0.136), (0.108, 0.149), (0.094, 0.167), (0.086, 0.187), (0.083, 0.208), (0.083, 0.750), (0.086, 0.772), (0.094, 0.792), (0.108, 0.809), (0.125, 0.822), (0.145, 0.830), (0.167, 0.833)]),
+            ] },
+            // A terminal prompt inside a box. The chevron and the rule under it are what
+            // make this read as "a thing that is running" rather than as another
+            // rectangle — the shape tool's square and the image's frame are both already
+            // rectangles at this size, so the box alone carries no meaning.
+            Self::Agent => const { &[
+                outline(rect_pts!(0.12, 0.18, 0.88, 0.82)),
+                line(&[(0.28, 0.38), (0.41, 0.50), (0.28, 0.62)]),
+                line(&[(0.50, 0.62), (0.72, 0.62)]),
+            ] },
+            // A page with the fold at the **top** right. `Icon::Sticky` folds at the
+            // bottom right, and at 16pt the corner is the only thing distinguishing the
+            // two silhouettes — so they fold opposite ways deliberately.
+            Self::Note => const { &[
+                outline(&[
+                    (0.26, 0.10), (0.62, 0.10), (0.76, 0.24),
+                    (0.76, 0.90), (0.26, 0.90),
+                ]),
+                line(&[(0.62, 0.10), (0.62, 0.24), (0.76, 0.24)]),
+                line(&[(0.36, 0.44), (0.66, 0.44)]),
+                line(&[(0.36, 0.60), (0.66, 0.60)]),
+                line(&[(0.36, 0.76), (0.54, 0.76)]),
+            ] },
+            // A root, a stem, and two branches ending in rows — the shape every file
+            // browser draws, and the one thing that cannot be confused with a table.
+            Self::FileTree => const { &[
+                outline(rect_pts!(0.10, 0.10, 0.42, 0.24)),
+                line(&[(0.20, 0.24), (0.20, 0.72)]),
+                line(&[(0.20, 0.42), (0.42, 0.42)]),
+                outline(rect_pts!(0.44, 0.35, 0.90, 0.49)),
+                line(&[(0.20, 0.72), (0.42, 0.72)]),
+                outline(rect_pts!(0.44, 0.65, 0.90, 0.79)),
+            ] },
+            // A window: a frame with a chrome bar and two dots in it. The dots are what
+            // say "browser" rather than "picture frame".
+            Self::Browser => const { &[
+                outline(rect_pts!(0.10, 0.20, 0.90, 0.80)),
+                line(&[(0.10, 0.36), (0.90, 0.36)]),
+                Prim::Circle { c: (0.20, 0.28), r: 0.032, fill: true },
+                Prim::Circle { c: (0.30, 0.28), r: 0.032, fill: true },
             ] },
             Self::Sun => const { &[
                 Prim::Circle { c: (0.50, 0.50), r: 0.19, fill: true },

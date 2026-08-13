@@ -749,7 +749,12 @@ impl Board {
             ItemKind::Sticky { .. }
             | ItemKind::Text { .. }
             | ItemKind::Frame { .. }
-            | ItemKind::Shape { .. } => {
+            | ItemKind::Shape { .. }
+            // Same container, same scaffolding — see [`Board::set_text`]. A redo that did
+            // not re-create this container for an agent node would replay its role edit
+            // into nothing.
+            | ItemKind::Agent { .. }
+            | ItemKind::AgentNote { .. } => {
                 meta.ensure_mergeable_text(key::TEXT)?;
             }
             ItemKind::Connector { captions, .. } if !captions.is_empty() => {
@@ -788,11 +793,19 @@ impl Board {
             ItemKind::Sticky { .. }
             | ItemKind::Text { .. }
             | ItemKind::Frame { .. }
-            | ItemKind::Shape { .. } => {}
+            | ItemKind::Shape { .. }
+            // An agent's role and a note's title live in the same `TEXT` container the
+            // four above use, so they are the same operation. Leaving them out would be
+            // the half-wired shape this file has been bitten by before: `ItemKind::text`
+            // already answers for both, so search finds them and the caret opens on them,
+            // and only the *write* would fail — with `WrongKind`, at the end of a gesture
+            // the user had already completed.
+            | ItemKind::Agent { .. }
+            | ItemKind::AgentNote { .. } => {}
             other => {
                 return Err(DocError::WrongKind {
                     id,
-                    expected: "sticky, text, frame or shape",
+                    expected: "sticky, text, frame, shape, agent or note",
                     found: other.tag(),
                 });
             }
@@ -2882,6 +2895,57 @@ mod tests {
             },
             ItemKind::Browser { model: r#"{"url":"https://example.com"}"#.into() },
         ]
+    }
+
+    /// An agent's role and a note's title are editable through the path every other text
+    /// kind uses. This is the assertion for the half-wired shape: [`ItemKind::text`] answers
+    /// for both, so search finds them and the on-canvas caret opens on them — and before
+    /// this, [`Board::set_text`] answered `WrongKind`, so the *write* failed at the end of a
+    /// gesture the user had already finished. Every layer green except the one that stores it.
+    #[test]
+    fn an_agents_role_and_a_notes_title_are_editable_like_any_other_text() {
+        let mut board = Board::new();
+        let agent = board
+            .add(NewItem::new(
+                ItemKind::Agent {
+                    model: r#"{"role_kind":"worker"}"#.into(),
+                    label: StyledText::plain("Agent"),
+                },
+                Placement::new(0.0, 0.0, 400.0, 300.0),
+            ))
+            .unwrap();
+        let note = board
+            .add(NewItem::new(
+                ItemKind::AgentNote {
+                    model: r#"{"path":"a.md"}"#.into(),
+                    title: StyledText::plain("Note"),
+                },
+                Placement::new(0.0, 0.0, 200.0, 200.0),
+            ))
+            .unwrap();
+
+        board.set_text(agent, StyledText::plain("Frontend Developer")).expect("agent role");
+        board.set_text(note, StyledText::plain("Migration plan")).expect("note title");
+
+        let ItemKind::Agent { label, model } = &board.item(agent).unwrap().kind else {
+            panic!("the agent stopped being an agent");
+        };
+        assert_eq!(label.to_plain(), "Frontend Developer");
+        assert_eq!(model, r#"{"role_kind":"worker"}"#, "editing the role rewrote the token");
+
+        let ItemKind::AgentNote { title, .. } = &board.item(note).unwrap().kind else {
+            panic!("the note stopped being a note");
+        };
+        assert_eq!(title.to_plain(), "Migration plan");
+
+        // The kinds with no text of their own still refuse, so the gate is a gate.
+        let tree = board
+            .add(NewItem::new(
+                ItemKind::FileTree { model: String::new() },
+                Placement::default(),
+            ))
+            .unwrap();
+        assert!(board.set_text(tree, StyledText::plain("x")).is_err());
     }
 
     /// RULE ZERO, at the only level this crate can check it: **a board that uses none of

@@ -240,9 +240,13 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>> {
 ///
 /// **Untracked files count.** An agent's work is usually files that did not exist before, so
 /// a check that only looked at tracked changes would report a directory full of new source
-/// as clean and let [`remove`] delete it. Ignored files do *not* count, which is the user's
-/// own `.gitignore` saying that `target/` is disposable — and it is the difference between
-/// this check being useful and it refusing every removal forever.
+/// as clean and let [`remove`] delete it. A/B'd rather than assumed: with `git diff
+/// --name-only` in place of `git status --porcelain`, a worktree holding a freshly written
+/// `agent-notes.md` reports **`[]`** and the removal goes through.
+///
+/// Ignored files do *not* count, which is the user's own `.gitignore` saying that `target/`
+/// is disposable — and it is the difference between this check being useful and it refusing
+/// every removal forever.
 pub fn dirty(worktree: &Path) -> Result<Vec<String>> {
     let mut command = Command::new("git");
     command.arg("-C").arg(worktree).args(["status", "--porcelain"]);
@@ -362,12 +366,11 @@ fn parse_list(porcelain: &str) -> Vec<Worktree> {
                 out.push(previous);
             }
             current = Some(Worktree { path: PathBuf::from(path.trim()), branch: None });
-        } else if let Some(reference) = line.strip_prefix("branch ") {
-            if let Some(entry) = current.as_mut() {
-                let name = reference.trim();
-                entry.branch =
-                    Some(name.strip_prefix("refs/heads/").unwrap_or(name).to_owned());
-            }
+        } else if let Some(reference) = line.strip_prefix("branch ")
+            && let Some(entry) = current.as_mut()
+        {
+            let name = reference.trim();
+            entry.branch = Some(name.strip_prefix("refs/heads/").unwrap_or(name).to_owned());
         }
     }
     if let Some(last) = current {
