@@ -409,7 +409,7 @@ fn build_request(parsed: &Parsed) -> Result<Request, Failure> {
                 Ok(Request::NoteWrite { path, text, append: parsed.append })
             }
             "list" => Ok(Request::NoteList),
-            other if other.is_empty() => {
+            "" => {
                 Err(Failure::usage("note needs read, write or list after it"))
             }
             other => Err(Failure::usage(format!(

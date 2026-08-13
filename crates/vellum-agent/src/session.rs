@@ -587,10 +587,10 @@ mod tests {
         assert!(session.status().needs_attention(), "a blocked agent must ask for a person");
         assert!(session.status().is_busy(), "the turn has not ended");
         assert_eq!(session.detail(), "write to src/main.rs");
-        assert_eq!(session.pending_permissions(), [asking.clone()]);
+        assert_eq!(session.pending_permissions(), std::slice::from_ref(&asking));
 
         session.answer_permission(&asking, true).unwrap();
-        assert_eq!(fake.answered.lock().unwrap().as_slice(), [(asking.clone(), true)]);
+        assert_eq!(*fake.answered.lock().unwrap(), [(asking.clone(), true)]);
 
         // The transport is what emits the answer, so the state follows the stream rather
         // than the call — which is what keeps the sidecar's record and the node in step.

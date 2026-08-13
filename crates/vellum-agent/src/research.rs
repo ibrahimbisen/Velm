@@ -790,7 +790,7 @@ impl CookieJar {
         }
         // Longest path first, which is the order RFC 6265 asks for and the order servers that
         // read only the first occurrence of a name are written against.
-        matched.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        matched.sort_by_key(|cookie| std::cmp::Reverse(cookie.path.len()));
         Some(
             matched
                 .iter()
@@ -2468,6 +2468,13 @@ mod cap_tests {
     /// this repo has measured — YouTube's, which closes at byte 692,232 — with the article
     /// still behind it.
     #[test]
+    #[expect(
+        clippy::assertions_on_constants,
+        reason = "both sides are const *today*, which is the whole point: this is a guard \
+                  on the constant, and it fires the moment somebody lowers the cap below \
+                  the largest head this repo has measured. Deleting it because it cannot \
+                  fail right now would remove the only thing that makes the number checkable"
+    )]
     fn the_byte_cap_clears_the_largest_measured_head_and_is_still_a_cap() {
         assert!(DEFAULT_MAX_BYTES > 692_232 * 2, "a page's body must fit behind its head");
         assert!(DEFAULT_MAX_BYTES <= 8 * 1024 * 1024, "still a cap, not a crawler");
