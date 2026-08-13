@@ -47,6 +47,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use vellum_agent::{DisplayMode, Status, TranscriptEvent};
+// `vellum_agent::filetree::View` and `vellum_render::View` are both `View`, and this file
+// uses the second one on every frame. Renamed on the way in rather than written out at each
+// use, so the one that means "a draw list's coordinate space" keeps the bare name.
+use vellum_agent::filetree::View as TreeView;
 use vellum_connect::Router;
 use vellum_doc::{
     Align, CardMode, ItemKind, Pattern, Style, StyledText as DocText, TextSpan as DocSpan,
@@ -60,6 +65,8 @@ use vellum_scene::{Camera, ItemId as SceneId, ScreenPoint, WorldPoint};
 use vellum_shapes::{Shape, Size, TessellationOptions as ShapeTessellation};
 use vellum_text::{FitBox, GlyphImage, GlyphKey};
 
+use crate::agent::{AgentLayout, Rect as NodeRect};
+use crate::agent_view::AgentView;
 use crate::assets::{self, Assets};
 use crate::connector;
 use crate::project::{Projected, Projection};
@@ -514,6 +521,14 @@ pub struct Painter {
     mindmaps: HashMap<SceneId, CachedMindMap>,
     /// Laid-out kanban boards, one frame at a time. See [`CachedKanban`].
     kanbans: HashMap<SceneId, CachedKanban>,
+    /// The Agent Canvas nodes' pieces — transcript runs, tree rows, option cards.
+    ///
+    /// Unlike every other cache here this is keyed on a **frame counter** as well as on the
+    /// projection, because what an agent node draws is not in the document: see
+    /// [`CachedNode::frame`].
+    nodes: HashMap<SceneId, CachedNode>,
+    /// Bumped once per [`Painter::paint`]. See [`CachedNode::frame`].
+    frame: u64,
     /// Tessellated silhouettes for the shapes an SDF cannot express.
     ///
     /// Keyed on the LOD band as well as the item, like the ink cache: the mesh's
@@ -564,6 +579,8 @@ impl Painter {
             tables: HashMap::new(),
             mindmaps: HashMap::new(),
             kanbans: HashMap::new(),
+            nodes: HashMap::new(),
+            frame: 0,
             router: Router::default(),
             order: Vec::new(),
             glyphs: Vec::new(),
@@ -646,6 +663,7 @@ impl Painter {
             self.tables.clear();
             self.mindmaps.clear();
             self.kanbans.clear();
+            self.nodes.clear();
             self.shapes.clear();
             return;
         }
@@ -658,6 +676,7 @@ impl Painter {
         self.tables.retain(|id, _| projection.get(*id).is_some());
         self.mindmaps.retain(|id, _| projection.get(*id).is_some());
         self.kanbans.retain(|id, _| projection.get(*id).is_some());
+        self.nodes.retain(|id, _| projection.get(*id).is_some());
         self.shapes.retain(|key, _| projection.get(key.id).is_some());
     }
 
@@ -678,6 +697,11 @@ impl Painter {
         let mut stats = PaintStats::default();
         list.clear();
         self.text_spent = Duration::ZERO;
+        // An Agent Canvas node's contents are not in the document, so nothing the projection
+        // knows about moves when an agent speaks. This counter is what retires last frame's
+        // layout of one — see [`CachedNode::frame`]. Wrapping, because a counter that
+        // saturated would silently stop invalidating after 2^64 frames rather than loudly.
+        self.frame = self.frame.wrapping_add(1);
 
         // Images the decode workers finished, onto the GPU — **before** the list that
         // references them is built, so one that arrived since the last frame is drawn
@@ -784,7 +808,7 @@ impl Painter {
             if clipped_by_frame(projected, ctx.projection) {
                 continue;
             }
-            for slot in 0..self.slots_of(id, projected, projected.generation) {
+            for slot in 0..self.slots_of(id, projected, projected.generation, ctx) {
                 let block = match self.block(id, projected, slot, ctx) {
                     Some(Painted::Glyphs(block)) => block,
                     // A greeked block rasterises nothing — that is the point of it.
@@ -1290,26 +1314,162 @@ impl Painter {
                 stats.kanbans += 1;
             }
 
-            // A group is a container, not a drawing. `vellum_doc::ItemKind::Group`
-            // is explicit that it has no visual payload of its own.
-            // The four Agent Canvas kinds. WAVE2-PENDING: each draws its own chrome —
-            // status ring, transcript, tree rows, page poster. Until then every one draws
-            // the card its content will sit on, so a placed node is a real, selectable,
-            // movable box from the moment it exists rather than an invisible item.
+            // The four Agent Canvas kinds — `docs/07-agent-canvas.md` features 1, 2 and 14.
+            //
+            // One arm, because all four are a card with pieces laid on it and every piece
+            // comes from [`NodePaint`]; what differs is the *chrome*, which is matched on
+            // below. Four arms would have put the card, the plate loop and the image loop in
+            // four places that then have to agree about all three.
             ItemKind::Agent { .. }
             | ItemKind::FileTree { .. }
             | ItemKind::AgentNote { .. }
             | ItemKind::Browser { .. } => {
+                let hairline = (f64::from(HAIRLINE) / camera.zoom()) as f32;
+                let (w, h) = projected.item.placement.scaled_size();
+                // A node's rectangles are in the item's own space with its top-left at
+                // `(0, 0)` and are **already scaled**, and this list is in the board view
+                // where a unit is a world unit — so placing one is a plain addition and
+                // nothing needs a scale factor. Multiplying by `camera.zoom()` here is the
+                // mistake `card_layout`'s own note records, and it looks *nearly* right.
+                let at = |rect: NodeRect| {
+                    (
+                        [position[0] + rect.x as f32, position[1] + rect.y as f32],
+                        [rect.width as f32, rect.height as f32],
+                    )
+                };
+
+                // The card first. It is what all four are built on, and it is what makes a
+                // freshly placed node a real, selectable, movable box before anything at all
+                // has filled it.
                 let fill = projected.item.style.fill.map_or(theme.surface, theme::convert);
-                list.push_quad(
-                    QuadInstance::solid(position, size, fill)
-                        .with_corner_radius(CARD_RADIUS)
-                        .with_rotation(rotation)
-                        .with_opacity(opacity)
-                        .with_border(theme.border, 1.0),
-                );
+                push_node_card(list, position, size, fill, rotation, opacity, &theme, hairline);
+
+                // Plates under the words, then pictures, then the chrome on top. Copied out
+                // of the cache first because `assets` borrows the renderer and this borrow
+                // of `self` would otherwise still be live across it.
+                let (plates, images, twisties) = {
+                    let paint = self.node_paint(id, projected, ctx);
+                    (paint.plates.clone(), paint.images.clone(), paint.twisties.clone())
+                };
+                for plate in &plates {
+                    push_node_plate(list, at(plate.rect), *plate, rotation, opacity, &theme, hairline);
+                }
+                for image in &images {
+                    let (origin, extent) = at(image.rect);
+                    match assets.texture(device, queue, renderer.textures_mut(), &image.blob) {
+                        Some((texture, source)) => {
+                            renderer.textures_mut().mark(texture, 0.0);
+                            list.push_image(
+                                texture,
+                                // Cropped to its band rather than stretched into it. An
+                                // agent's screenshot is whatever shape its window was and the
+                                // band is not, so `UvRect::FULL` here is feedback 23's *"the
+                                // images are all distoreted"* waiting to happen a second time.
+                                ImageInstance::new(
+                                    origin,
+                                    extent,
+                                    cover_uv(source, (image.rect.width, image.rect.height)),
+                                )
+                                .with_corner_radius(CARD_RADIUS * 0.75)
+                                .with_rotation(rotation)
+                                .with_opacity(opacity),
+                            );
+                        }
+                        None => {
+                            stats.images_pending += 1;
+                            push_placeholder(list, origin, extent, rotation, opacity, &theme);
+                        }
+                    }
+                }
+
+                // Everything below is positioned from the **unrotated** box and spun in
+                // place, which is the convention every structured widget here follows: a
+                // rotated table draws its grid straight, and the press path agrees with what
+                // is on screen rather than with what would be tidier.
+                match &projected.item.kind {
+                    ItemKind::Agent { model, .. } => {
+                        let laid = crate::agent::layout(w, h);
+                        // The status the runtime reports, or `Idle` for a node it has not
+                        // attached a session to — which is what a freshly placed agent is.
+                        let view = ctx.agents.get(id);
+                        let status = view.map_or(Status::Idle, |view| view.status);
+                        let colour = status_colour(status, &theme);
+                        if laid.too_small {
+                            push_compact_stripe(list, position, size, colour, rotation, opacity);
+                        } else {
+                            push_status_dot(
+                                list,
+                                at(laid.status),
+                                colour,
+                                view.is_some_and(AgentView::needs_attention),
+                                rotation,
+                                opacity,
+                            );
+                            let raw = match view {
+                                Some(view) => matches!(view.mode, DisplayMode::Raw),
+                                // No session yet, so the node's own configuration answers —
+                                // resolved through `agent::display_mode`, which is the one
+                                // place `None` means "follow the app-wide default".
+                                None => matches!(
+                                    crate::agent::display_mode(
+                                        &crate::agent::decode(model),
+                                        DisplayMode::default(),
+                                    ),
+                                    DisplayMode::Raw
+                                ),
+                            };
+                            push_mode_toggle(
+                                list, at(laid.mode), raw, rotation, opacity, &theme, hairline,
+                            );
+                            push_run_button(
+                                list,
+                                at(laid.run),
+                                status.is_busy(),
+                                rotation,
+                                opacity,
+                                &theme,
+                                hairline,
+                            );
+                        }
+                    }
+
+                    ItemKind::FileTree { .. } => {
+                        for (rect, expanded) in &twisties {
+                            push_twisty(list, at(*rect), *expanded, rotation, opacity, &theme);
+                        }
+                    }
+
+                    ItemKind::Browser { .. } => {
+                        let laid = crate::browser::layout(w, h);
+                        if !laid.too_small {
+                            push_reload_button(
+                                list, at(laid.reload), rotation, opacity, &theme, hairline,
+                            );
+                            // **The card's own badge, not a second drawing of one.** Same
+                            // plate, same three-quad `↗` — see `push_open_badge` for why the
+                            // arrow is geometry rather than U+2197 — so the one button on the
+                            // board that leaves the application looks the same wherever it
+                            // appears, and there is one hitbox to keep honest rather than two.
+                            let pixel = (1.0 / camera.zoom()) as f32;
+                            push_open_badge(
+                                list,
+                                at(laid.open_external),
+                                rotation,
+                                opacity,
+                                &theme,
+                                ctx.hovered_badge == Some(id),
+                                pixel,
+                            );
+                        }
+                    }
+
+                    // A note draws its title and body as runs and needs no chrome.
+                    _ => {}
+                }
             }
 
+            // A group is a container, not a drawing. `vellum_doc::ItemKind::Group`
+            // is explicit that it has no visual payload of its own.
             ItemKind::Group => {}
 
             ItemKind::Image { asset_id, crop } => {
@@ -1382,8 +1542,8 @@ impl Painter {
                 list.push_meshes(start..end);
             }
 
-            ItemKind::Connector { color, .. } => {
-                let Some(routed) = connector::route(
+            ItemKind::Connector { color, start, end, .. } => {
+                let Some(mut routed) = connector::route(
                     &projected.item.kind,
                     &projected.item.placement,
                     |target| ctx.projection.placement_of(target),
@@ -1398,22 +1558,101 @@ impl Painter {
                     // is 40 px on screen is thousands of wasted triangles.
                     tolerance: (0.5 / camera.zoom()).clamp(0.05, 64.0),
                 };
+
+                // **What this line means is derived, never stored** — `docs/07` §3, and
+                // `crate::agent::link_kind` is the single derivation, asked here rather than
+                // reproduced. A stored "this is an agent link" flag would be a second source
+                // of truth that can disagree with the endpoints it describes, which this
+                // repository has already paid for twice.
+                //
+                // Gated on `AgentViews::is_empty`, which is the promise that a board with no
+                // agents on it costs exactly what it did before this layer existed: one
+                // boolean per connector rather than two projection lookups.
+                let link = if ctx.agents.is_empty() {
+                    crate::agent::LinkKind::Plain
+                } else {
+                    let kind_of = |end: &vellum_doc::ConnectorEnd| {
+                        end.target
+                            .and_then(|target| ctx.projection.scene_id(target))
+                            .and_then(|scene| ctx.projection.get(scene))
+                            .map(|projected| &projected.item.kind)
+                    };
+                    crate::agent::link_kind(
+                        kind_of(start),
+                        kind_of(end),
+                        start.arrowhead,
+                        end.arrowhead,
+                    )
+                };
+
+                let mut line = color.map_or(theme.stroke, theme::convert);
+                if let Some((dash, tint)) = agent_link_look(link, &theme) {
+                    // The user's own colour still wins if they set one — a connector they
+                    // deliberately made red stays red — but a link that has never been
+                    // coloured takes the one that says which relationship it is.
+                    if color.is_none() {
+                        line = tint;
+                    }
+                    // **The cadence rides on the thickness**, because `vellum_connect`
+                    // derives its dash pattern from it (`LineStyle::dash_pattern`). Setting
+                    // the thickness in device pixels therefore makes the *pattern* screen-
+                    // constant as well as the weight, which is the whole requirement: a
+                    // world-unit cadence is a solid smear at a fitted 4% zoom and three
+                    // dashes across the window at 8×, exactly as `push_grid` records for the
+                    // board's own dots. It also keeps the arrowhead — which scales with
+                    // thickness — a constant size, and arrowheads are how `docs/07` §3 says
+                    // direction is expressed, so losing them was never an option. Doing our
+                    // own dashing would have.
+                    routed.style.thickness = AGENT_LINK_WIDTH / camera.zoom();
+                    routed.style.line = dash;
+                    // …unless that would cost more dashes than a frame should spend. A link
+                    // between two far-apart agents is mostly off screen and `vellum_connect`
+                    // has no viewport to clip against, so the cadence is dropped rather than
+                    // stretched: still the link's colour, still legible as an agent link, and
+                    // a rhythm nobody can see says nothing worth thousands of triangles.
+                    // `GUIDE_MAX_DASHES` is the same backstop for the same arithmetic.
+                    if let Some(pattern) = dash.dash_pattern(routed.style.thickness) {
+                        let period = pattern.on + pattern.off;
+                        if period > 0.0 && routed.path.length() / period > AGENT_LINK_MAX_DASHES {
+                            routed.style.line = vellum_connect::LineStyle::Solid;
+                        }
+                    }
+                }
+
                 let Ok(mesh) = vellum_connect::tessellate(&routed.path, &routed.style, &options)
                 else {
                     return;
                 };
-                let line = color.map_or(theme.stroke, theme::convert);
                 let transform = list.meshes_mut().push_transform(MeshTransform::at(
                     camera.to_camera_relative(WorldPoint::new(mesh.origin.x, mesh.origin.y)),
                 ));
-                let start = list.meshes().indices().len() as u32;
+                // `first`/`last` rather than `start`/`end`, which are this arm's two
+                // `ConnectorEnd`s: shadowing them would compile and would make the next
+                // reader check twice which one a name meant.
+                let first = list.meshes().indices().len() as u32;
                 list.meshes_mut().push_connector(
                     &mesh,
                     line.with_alpha(line.a * opacity),
                     transform,
                 );
-                let end = list.meshes().indices().len() as u32;
-                list.push_meshes(start..end);
+                let last = list.meshes().indices().len() as u32;
+                list.push_meshes(first..last);
+
+                // The message in flight, on top of the line it is travelling. Only ever
+                // asked of a link that *is* one, and only when something is actually in
+                // flight — `AgentViews::pulses` is empty on an idle board, which is what
+                // makes this a lookup in a vector of length zero rather than an animation.
+                if link.is_agent_link()
+                    && let Some(pulse) = ctx.agents.pulse(id)
+                {
+                    push_link_pulse(
+                        list,
+                        ctx,
+                        &routed.path.flatten(options.tolerance),
+                        pulse,
+                        line,
+                    );
+                }
             }
 
             // Both card kinds draw the same way, which is the point of them carrying the same
@@ -1555,7 +1794,7 @@ impl Painter {
         // they occupy rather than scaled by the camera; greeked bars stay in the board
         // view, where they coalesce with the geometry above instead of paying for the
         // view flip.
-        for slot in 0..self.slots_of(id, projected, projected.generation) {
+        for slot in 0..self.slots_of(id, projected, projected.generation, ctx) {
             match self.block(id, projected, slot, ctx) {
                 Some(Painted::Glyphs(block)) => {
                     list.use_view(screen);
@@ -1700,6 +1939,12 @@ impl Painter {
         {
             return self.kanban_run_block(id, projected, slot, ctx);
         }
+        // An agent's transcript, a note's body, a tree's rows, a browser's address: all
+        // flattened into one run list, so a slot is an index into it exactly as a kanban's
+        // is. See [`NodeRun`].
+        if is_node(&projected.item.kind) && slot >= CELL_SLOT_BASE {
+            return self.node_run_block(id, projected, slot, ctx);
+        }
 
         // Set by the card arm below; unused by every other kind.
         let mut card_line_budget = usize::MAX;
@@ -1751,6 +1996,43 @@ impl Painter {
                         .text_color
                         .map_or(theme.text, theme::convert),
                     projected.item.style.clone(),
+                )
+            }
+
+            // **An agent's role and a note's title are the item's own `StyledText`**, which
+            // is precisely what `docs/07` §2 keeps them beside the token for: it puts both
+            // inside search, the on-canvas caret and `Board::set_text` with no new path.
+            // Everything else either node draws is a run, because it is not the user's text.
+            //
+            // The caret exception is the sticky's, and it has to be restated rather than
+            // assumed — feedback 25 is the record of what happens when an exception is taught
+            // at two call sites out of three: an empty slot holding the cursor must still
+            // produce a block, or there is no origin to draw the caret against and
+            // double-clicking a blank role does nothing at all.
+            (
+                ItemKind::Agent { label: words, .. } | ItemKind::AgentNote { title: words, .. },
+                BlockKey::PRIMARY,
+            ) => {
+                if words.is_empty() && !caret_here {
+                    return None;
+                }
+                let size = placement.scaled_size();
+                let font = node_font_size(size.0);
+                let (x, y, box_w, box_h) = node_title_box(&projected.item.kind, size, font);
+                (
+                    FitBox::new(box_w.max(1.0) as f32, box_h.max(1.0) as f32),
+                    Anchor::Inset(x, y),
+                    projected
+                        .item
+                        .style
+                        .text_color
+                        .map_or(theme.text, theme::convert),
+                    Style {
+                        font_size: Some(font * ROLE_SCALE),
+                        line_height: Some(NODE_LINE_HEIGHT),
+                        align: Some(Align::Left),
+                        ..projected.item.style.clone()
+                    },
                 )
             }
 
@@ -1956,6 +2238,11 @@ impl Painter {
                 }
                 (ItemKind::Text { text }, _) => text::convert(text),
                 (ItemKind::Frame { title, .. }, _) => text::convert(title),
+                (
+                    ItemKind::Agent { label: words, .. }
+                    | ItemKind::AgentNote { title: words, .. },
+                    _,
+                ) => text::convert(words),
                 _ => card_text(kind, slot, card_line_budget),
             }
         });
@@ -2093,7 +2380,21 @@ impl Painter {
     /// of those, and a **mind map** one per visible node, because each is an
     /// independently positioned, independently styled block — which is exactly what a
     /// slot is for.
-    fn slots_of(&mut self, id: SceneId, projected: &Projected, generation: u64) -> u16 {
+    fn slots_of(
+        &mut self,
+        id: SceneId,
+        projected: &Projected,
+        generation: u64,
+        ctx: &DrawContext<'_>,
+    ) -> u16 {
+        // The four Agent Canvas kinds flatten their labels the way a kanban does, so a slot
+        // is an index into a run list. `ctx` is here for them alone: what they draw comes
+        // from a per-frame snapshot rather than from the document, so the count cannot be
+        // derived from the item.
+        if is_node(&projected.item.kind) {
+            let runs = self.node_paint(id, projected, ctx).runs();
+            return CELL_SLOT_BASE.saturating_add(u16::try_from(runs).unwrap_or(u16::MAX));
+        }
         match &projected.item.kind {
             ItemKind::Table { .. } => {
                 let cells = self.table_layout(id, projected, generation).layout.cells.len();
@@ -2259,6 +2560,122 @@ impl Painter {
             origin: ScreenPoint::new(device.x.round(), device.y.round()),
             font_size,
             color: if run.muted { theme.text_muted } else { theme.text },
+        }))
+    }
+
+    /// An Agent Canvas node's pieces, built at most once per frame per node.
+    ///
+    /// # Why this cache is keyed on a frame counter and nothing else is
+    ///
+    /// Every other layout cache here compares [`Projected::generation`], because everything
+    /// else a widget draws *is* in the document and a change to it moves that stamp. An
+    /// agent's transcript is not: `docs/07` §4 keeps it in a disposable sidecar precisely so
+    /// that agent output never enters the Loro document, and a note's body is a `.md` file on
+    /// disk. So the document is silent when the thing on screen changes, and a
+    /// generation-keyed cache would draw the previous sentence forever.
+    ///
+    /// One rebuild per visible node per frame is the honest cost of that, and it is bounded
+    /// by the viewport rather than by the board — an off-screen node is never asked, which is
+    /// `docs/07` §5d's rule that culling stops the *drawing* and never the process.
+    fn node_paint(
+        &mut self,
+        id: SceneId,
+        projected: &Projected,
+        ctx: &DrawContext<'_>,
+    ) -> &NodePaint {
+        let size = projected.item.placement.scaled_size();
+        let generation = projected.generation;
+        let frame = self.frame;
+        let signature = node_signature(&projected.item.kind, ctx.agents.get(id));
+        let stale = self.nodes.get(&id).is_none_or(|cached| {
+            cached.frame != frame
+                || cached.generation != generation
+                || cached.size != size
+                || cached.signature != signature
+        });
+        if stale {
+            let paint =
+                build_node_paint(&projected.item.kind, ctx.agents.get(id), ctx, id, size);
+            self.nodes.insert(id, CachedNode { frame, generation, size, signature, paint });
+        }
+        &self.nodes[&id].paint
+    }
+
+    /// One run of an Agent Canvas node's text, as a block.
+    ///
+    /// A slot is an index into the node's flattened run list, so this knows nothing about
+    /// transcripts, tree rows or option cards — the same division [`KanbanRun`] makes, and
+    /// for the same reason: two flattenings of the same list is a caret that appears on one
+    /// card and types into its neighbour.
+    fn node_run_block(
+        &mut self,
+        id: SceneId,
+        projected: &Projected,
+        slot: u16,
+        ctx: &DrawContext<'_>,
+    ) -> Option<Painted> {
+        let index = usize::from(slot - CELL_SLOT_BASE);
+        let placement = projected.item.placement;
+        let theme = ctx.theme;
+
+        // Copied out before the engine is borrowed to shape, as every other indexed path
+        // here does: the run list lives in `self.nodes` and the shaping needs `self.text`.
+        let run = self.node_paint(id, projected, ctx).run(index)?.clone();
+        if run.text.trim().is_empty() {
+            return None;
+        }
+
+        // A run's rectangle is in the item's own space with the item's top-left at the
+        // origin, so the world position is one addition — the table's and the kanban's rule.
+        let (item_w, item_h) = placement.scaled_size();
+        let origin = WorldPoint::new(
+            placement.x - item_w / 2.0 + run.rect.x,
+            placement.y - item_h / 2.0 + run.rect.y,
+        );
+
+        let style = Style {
+            font_size: Some(run.font_size),
+            line_height: Some(NODE_LINE_HEIGHT),
+            align: Some(run.align),
+            ..Style::default()
+        };
+        let fit = FitBox::new(run.rect.width.max(1.0) as f32, run.rect.height.max(1.0) as f32);
+        let colour = tone_colour(run.tone, &theme);
+        let zoom = ctx.camera.zoom();
+
+        // **Greeked rather than dropped, and greeked per run.** A kanban card returns `None`
+        // below the threshold, which is right for a handful of short labels on a coloured
+        // box; a transcript is nothing *but* text, so a node that dropped it would be an
+        // empty rectangle on a zoomed-out board — the exact failure `Painted::Greeked` was
+        // added for, since `ItemKind::Text` has no geometry to fall back on either. One bar
+        // per run is what a stack of short paragraphs looks like from far away, and the
+        // count is bounded by the run list, which is bounded by the node's own box.
+        if run.font_size * zoom < f64::from(MIN_DEVICE_FONT_SIZE) {
+            return Some(Painted::Greeked(Greek {
+                origin,
+                column: run.rect.width,
+                align: run.align,
+                color: colour,
+                lines: GreekLines::Single {
+                    width: run.rect.width,
+                    height: greek_bar_height(run.font_size * NODE_LINE_HEIGHT, zoom),
+                },
+            }));
+        }
+
+        let key = BlockKey::new(id, slot);
+        // **The run's own stamp, not the projection's generation** — see [`NodeRun::stamp`].
+        // Mixed with the generation so that moving or resizing the item still invalidates,
+        // which the content hash alone would not.
+        let stamp = run.stamp ^ projected.generation;
+        let text = vellum_text::StyledText::plain(&run.text);
+        let (_, font_size) = self.text.layout(key, stamp, &style, Some(fit), || text.clone());
+
+        let device = ctx.camera.world_to_screen(origin);
+        Some(Painted::Glyphs(Block {
+            origin: ScreenPoint::new(device.x.round(), device.y.round()),
+            font_size,
+            color: colour,
         }))
     }
 

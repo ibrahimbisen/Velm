@@ -1116,6 +1116,678 @@ impl ActiveState {
         }
     }
 
+    // ----- the Agent Canvas --------------------------------------------------------
+
+    /// The transcript key for the board on screen, cached.
+    ///
+    /// Cached because `BoardKey::for_board` canonicalises the path — a filesystem call — and
+    /// this is asked twice a frame on a board with agents on it. See
+    /// [`crate::agent_runtime::BoardStamp`] for the rest of the gate.
+    fn agent_board_key(&mut self) -> vellum_agent::BoardKey {
+        let path = self.editor.path().map(Path::to_path_buf);
+        if let Some(stamp) = &self.agent_board
+            && stamp.path == path
+        {
+            return stamp.key.clone();
+        }
+        let key = match path.as_deref() {
+            Some(path) => vellum_agent::BoardKey::for_board(path),
+            // A board with no file yet — the blank editor behind the library tab. It still
+            // gets a key rather than none, so an agent placed before the first save has
+            // somewhere to write; the key moves when the board is saved, which costs that
+            // transcript and never any board content.
+            None => vellum_agent::BoardKey::from_raw("unsaved"),
+        };
+        self.agent_board = Some(crate::agent_runtime::BoardStamp {
+            path,
+            key: key.clone(),
+            // Nothing has been derived at this key yet, and no generation is ever this.
+            epoch: u64::MAX,
+            items: usize::MAX,
+            has_nodes: false,
+        });
+        key
+    }
+
+    /// Which node an item is, on this board.
+    fn agent_key(&mut self, doc: DocId) -> crate::agent_runtime::NodeKey {
+        let board = self.agent_board_key();
+        crate::agent_runtime::NodeKey::new(&board, doc.to_string())
+    }
+
+    /// The item a node key names, if it is on the board in front.
+    fn agent_doc(&self, key: &crate::agent_runtime::NodeKey) -> Option<DocId> {
+        let doc: DocId = key.item.parse().ok()?;
+        self.editor.board().contains(doc).then_some(doc)
+    }
+
+    /// The configuration and the role label of an agent node.
+    fn agent_model(&self, doc: DocId) -> Option<(vellum_agent::AgentModel, String)> {
+        let item = self.editor.board().item(doc).ok()?;
+        match &item.kind {
+            ItemKind::Agent { model, label } => {
+                Some((crate::agent::decode(model), label.to_plain()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Re-derive this board's agent wiring: who is an agent, who may talk to whom, what each
+    /// one's role is, and what is scheduled.
+    ///
+    /// One walk of the **projection** — which already holds every item, materialised — rather
+    /// than of the document, and only when [`crate::agent_runtime::BoardStamp::needs_resync`]
+    /// says so.
+    fn sync_agent_wiring(&mut self) {
+        let board = self.agent_board_key();
+        let epoch = self.editor.projection().generation();
+        let items = self.editor.projection().len();
+
+        let mut nodes: Vec<(String, String, bool)> = Vec::new();
+        let mut roles: Vec<(String, vellum_agent::RoleKind)> = Vec::new();
+        let mut schedules: Vec<(crate::agent_runtime::NodeKey, vellum_agent::Schedule)> =
+            Vec::new();
+        let mut agents: HashSet<DocId> = HashSet::new();
+        let mut wires: Vec<(DocId, DocId, vellum_doc::ArrowKind, vellum_doc::ArrowKind)> =
+            Vec::new();
+        // The first agent node that names a working directory decides where this board's
+        // notes live. §8 wants `<project>/.velm/notes` for a board that *is* a code project
+        // and `<data-dir>/agents/<board-key>/notes` otherwise, and a board has no other way
+        // of saying which it is — nothing else in the application knows a board's project.
+        let mut project: Option<PathBuf> = None;
+
+        for (_, projected) in self.editor.projection().iter() {
+            match &projected.item.kind {
+                ItemKind::Agent { model, label } => {
+                    let config = crate::agent::decode(model);
+                    let key = crate::agent_runtime::NodeKey::new(
+                        &board,
+                        projected.doc_id.to_string(),
+                    );
+                    let wire = key.wire();
+                    let name = label.to_plain();
+                    // A label rather than the id is what an agent will type at
+                    // `velm-agent-cli send`, and an unnamed node would resolve to nothing —
+                    // so one with no label answers to its id, which is at least addressable.
+                    let name = if name.trim().is_empty() { wire.clone() } else { name };
+                    agents.insert(projected.doc_id);
+                    roles.push((wire.clone(), config.role_kind));
+                    nodes.push((wire, name, config.accepts_messages));
+                    if project.is_none()
+                        && let Some(dir) = &config.working_dir
+                        && !dir.trim().is_empty()
+                    {
+                        project = Some(PathBuf::from(dir));
+                    }
+                    if let Some(schedule) = config.schedule.clone()
+                        && schedule.enabled
+                    {
+                        schedules.push((key, schedule));
+                    }
+                }
+                ItemKind::Connector { start, end, .. } => {
+                    if let (Some(a), Some(b)) = (start.target, end.target) {
+                        wires.push((a, b, start.arrowhead, end.arrowhead));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // A connector is an agent link when **both** of its endpoints are agents — the §3
+        // derivation, and nothing is stored on the connector to say so. Resolved here rather
+        // than by `agent::link_kind` because the bus wants a `LinkDirection` and that is the
+        // one place the arrowhead rule is written (`LinkDirection::from_arrowheads`).
+        let links: Vec<(String, String, vellum_agent::LinkDirection)> = wires
+            .into_iter()
+            .filter(|(a, b, _, _)| agents.contains(a) && agents.contains(b))
+            .map(|(a, b, at_start, at_end)| {
+                (
+                    crate::agent_runtime::NodeKey::new(&board, a.to_string()).wire(),
+                    crate::agent_runtime::NodeKey::new(&board, b.to_string()).wire(),
+                    vellum_agent::LinkDirection::from_arrowheads(
+                        at_start != vellum_doc::ArrowKind::None,
+                        at_end != vellum_doc::ArrowKind::None,
+                    ),
+                )
+            })
+            .collect();
+
+        let has_nodes = !nodes.is_empty();
+        self.agent_runtime.register_board(&board, project.as_deref());
+        self.agent_runtime.set_wiring(&board, epoch, nodes, links, roles);
+        self.agent_runtime
+            .set_schedules(schedules, crate::agent_runtime::unix_now());
+
+        if let Some(stamp) = self.agent_board.as_mut() {
+            stamp.epoch = epoch;
+            stamp.items = items;
+            stamp.has_nodes = has_nodes;
+        }
+    }
+
+    /// Everything the agent layer has to do this frame.
+    ///
+    /// Called once per frame from `app.rs`, **before the occlusion guard** and from the
+    /// occluded tick as well — see [`crate::agent_runtime::AgentRuntime::drain`] for why
+    /// hiding the window must not stop an agent's output reaching disk.
+    ///
+    /// On a board with no agent nodes this is two comparisons and a `dormant()` check.
+    pub(crate) fn poll_agents(&mut self) {
+        let path = self.editor.path();
+        let epoch = self.editor.projection().generation();
+        let items = self.editor.projection().len();
+        let stale = self
+            .agent_board
+            .as_ref()
+            .is_none_or(|stamp| stamp.needs_resync(path, epoch, items));
+        if stale {
+            self.sync_agent_wiring();
+        }
+        if self.agent_runtime.dormant() {
+            return;
+        }
+
+        let now = crate::agent_runtime::unix_now();
+        self.agent_runtime.drain(now);
+        self.report_agent_runs();
+
+        // **The rule this file keeps relearning.** Everything below touches the document, so
+        // it waits rather than committing: a command is something the user just asked for and
+        // closing their edit to serve it is reasonable, while an agent's request arriving
+        // mid-gesture must not end an edit in progress. Nothing is lost — the jobs stay
+        // queued and this runs again next frame. `apply_link_fetches` carries the same guard
+        // for the same reason.
+        if self.busy_with_a_group() {
+            return;
+        }
+        self.run_due_agents(now);
+        self.serve_agent_jobs();
+    }
+
+    /// Put what a scheduled run found in front of the user.
+    fn report_agent_runs(&mut self) {
+        for (key, said) in self.agent_runtime.take_reports() {
+            let name = self
+                .agent_doc(&key)
+                .and_then(|doc| self.agent_model(doc))
+                .map_or_else(|| "An agent".to_owned(), |(_, label)| label);
+            self.ok(format!("{name}: {said}"));
+        }
+    }
+
+    /// Run the schedules that have come due.
+    fn run_due_agents(&mut self, now: vellum_agent::Timestamp) {
+        for key in self.agent_runtime.take_due() {
+            let Some(doc) = self.agent_doc(&key) else { continue };
+            let Some((config, role)) = self.agent_model(doc) else { continue };
+            let Some(schedule) = config.schedule.clone() else { continue };
+
+            if !self.agent_trigger_holds(&schedule, &config) {
+                // Not an error and not silent: a schedule that declined is a thing that
+                // happened, and a node that showed nothing would read as one that never fired.
+                let message = format!(
+                    "skipped the scheduled run: {}",
+                    schedule.trigger.label().to_lowercase()
+                );
+                self.agent_runtime.record(
+                    &key,
+                    now,
+                    &vellum_agent::TranscriptEvent::Text { text: message },
+                );
+                continue;
+            }
+
+            // `last_run` goes in the document, so the next fire time is computed from it and
+            // the scheduler is re-armed by the epoch change this write causes — which is what
+            // closes the loop without a second source of truth about when it last ran.
+            let mut next = config.clone();
+            if let Some(schedule) = next.schedule.as_mut() {
+                schedule.last_run = Some(now);
+                schedule.last_failed = false;
+            }
+            self.write_agent_model(doc, &next);
+
+            self.agent_runtime
+                .expect_completion(&key, schedule.completion.clone());
+            let prompt = if schedule.prompt.trim().is_empty() {
+                "Carry on with your standing instructions.".to_owned()
+            } else {
+                schedule.prompt.clone()
+            };
+            self.start_agent_at(doc, Some(prompt), &role, &config);
+        }
+    }
+
+    /// Whether a schedule's trigger condition holds right now.
+    ///
+    /// Two of the four are questions about the filesystem, which is why the check is here
+    /// rather than in `vellum-agent`: that crate reads no clock and no disk on purpose.
+    fn agent_trigger_holds(
+        &self,
+        schedule: &vellum_agent::Schedule,
+        config: &vellum_agent::AgentModel,
+    ) -> bool {
+        let since = schedule.last_run.unwrap_or(0);
+        match &schedule.trigger {
+            vellum_agent::Trigger::Always => true,
+            vellum_agent::Trigger::LastRunFailed => schedule.last_failed,
+            vellum_agent::Trigger::FilesChanged => {
+                let Some(dir) = config.working_dir.as_deref() else {
+                    // No working directory, so there is nothing this condition could be
+                    // about. Running is the safer answer than never running: a schedule
+                    // that silently never fires is the failure this whole file is against.
+                    return true;
+                };
+                crate::agent_runtime::newest_mtime(Path::new(dir))
+                    .is_none_or(|newest| newest > since)
+            }
+            vellum_agent::Trigger::NoteChanged { path } => {
+                vellum_agent::notes::stamp(Path::new(path))
+                    .is_ok_and(|(mtime, _)| mtime > since)
+            }
+        }
+    }
+
+    /// Serve the requests that need the document.
+    ///
+    /// ⚠ Only reachable from [`Self::poll_agents`] **after** its `busy_with_a_group` guard.
+    fn serve_agent_jobs(&mut self) {
+        for pending in self.agent_runtime.take_document_jobs() {
+            let crate::agent_runtime::Pending { work, reply } = pending;
+            match work {
+                crate::agent_runtime::DocumentWork::Spawn { parent, request } => {
+                    self.spawn_agent(&parent, &request, reply);
+                }
+                crate::agent_runtime::DocumentWork::ReadConfig { node } => {
+                    match self.agent_doc(&node).and_then(|doc| self.agent_model(doc)) {
+                        Some((model, _)) => reply.config(model),
+                        None => reply.refuse("that node is not an agent on any open board"),
+                    }
+                }
+                crate::agent_runtime::DocumentWork::WriteConfig { node, model } => {
+                    match self.agent_doc(&node) {
+                        Some(doc) => {
+                            self.write_agent_model(doc, &model);
+                            reply.done();
+                        }
+                        None => reply.refuse("that node is not an agent on any open board"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// An orchestrator asked for a sub-agent.
+    ///
+    /// The **cap and the territory are not re-implemented here** —
+    /// `vellum_agent::orchestrator` owns both, and a second copy of that arithmetic is how a
+    /// limit comes to be enforced in one place and not the other. This supplies the two
+    /// things that crate deliberately does not know: how big a node is, and where its
+    /// siblings actually are.
+    fn spawn_agent(
+        &mut self,
+        parent: &crate::agent_runtime::NodeKey,
+        request: &vellum_agent::ipc::SpawnRequest,
+        reply: crate::agent_runtime::Answering,
+    ) {
+        let Some(parent_doc) = self.agent_doc(parent) else {
+            reply.refuse("that orchestrator is not on the board in front");
+            return;
+        };
+        let Some((boss, _)) = self.agent_model(parent_doc) else {
+            reply.refuse("that node is not an agent");
+            return;
+        };
+
+        // Every agent on this board, with the parent it was spawned by, so `count_children`
+        // can count what this orchestrator is responsible for — which is not the same number
+        // as "agents it has ever spawned".
+        let mut records: Vec<(String, Option<String>, vellum_agent::orchestrator::NodeBox)> =
+            Vec::new();
+        for (_, projected) in self.editor.projection().iter() {
+            let ItemKind::Agent { model, .. } = &projected.item.kind else { continue };
+            let config = crate::agent::decode(model);
+            let key =
+                crate::agent_runtime::NodeKey::new(&parent.board, projected.doc_id.to_string());
+            let placement = &projected.item.placement;
+            let (width, height) = placement.scaled_size();
+            records.push((
+                key.wire(),
+                config.spawned_by.clone(),
+                vellum_agent::orchestrator::NodeBox::new(
+                    placement.x,
+                    placement.y,
+                    width,
+                    height,
+                ),
+            ));
+        }
+        let nodes: Vec<vellum_agent::AgentNode<'_>> = records
+            .iter()
+            .map(|(id, by, _)| vellum_agent::AgentNode::raw(id.as_str(), by.as_deref()))
+            .collect();
+        let parent_wire = parent.wire();
+        let live = vellum_agent::orchestrator::count_children(&parent_wire, &nodes);
+        let siblings: Vec<vellum_agent::orchestrator::NodeBox> = records
+            .iter()
+            .filter(|(_, by, _)| by.as_deref() == Some(parent_wire.as_str()))
+            .map(|(_, _, box_)| *box_)
+            .collect();
+
+        let (width, height) = crate::agent::DEFAULT_SIZE;
+        let placed = match request.at {
+            // A position the orchestrator chose: checked, never trusted.
+            Some((x, y)) => {
+                let proposed = vellum_agent::orchestrator::NodeBox::new(x, y, width, height);
+                vellum_agent::orchestrator::may_spawn(&boss, live, proposed).map(|()| proposed)
+            }
+            None => vellum_agent::orchestrator::plan_spawn(
+                &boss, live, &siblings, width, height,
+            ),
+        };
+        let placed = match placed {
+            Ok(placed) => placed,
+            Err(refusal) => {
+                // Both, deliberately, because they have different readers: the reply is what
+                // `velm-agent-cli` prints back into the agent's own tool output, and the
+                // transcript line is what the board shows a person looking at the node. §9's
+                // *"reports the refusal into the transcript, so the orchestrator can adapt
+                // rather than silently failing"*.
+                let message = refusal.message();
+                self.agent_runtime.record(
+                    parent,
+                    crate::agent_runtime::unix_now(),
+                    &refusal.into_event(),
+                );
+                reply.refuse(message);
+                return;
+            }
+        };
+
+        let label = if request.label.trim().is_empty() {
+            "Agent".to_owned()
+        } else {
+            request.label.clone()
+        };
+        let mut child = vellum_agent::AgentModel::worker();
+        child.role_kind = request.role;
+        // **Without this the cap cannot count its own children**, and an orchestrator with a
+        // cap of five spawns without limit.
+        child.spawned_by = Some(parent.wire());
+        child.working_dir = boss.working_dir.clone();
+
+        let kind = ItemKind::Agent {
+            model: crate::agent::encode(&child),
+            label: StyledText::plain(label.clone()),
+        };
+        let placement = Placement::new(placed.x, placed.y, placed.width, placed.height);
+        let created = self
+            .editor
+            .edit(|board| Ok(board.add(NewItem::new(kind, placement))?));
+        let doc = match created {
+            Ok(doc) => doc,
+            Err(error) => {
+                self.failed("spawning an agent", &error);
+                reply.refuse("Velm could not put the new agent on the board");
+                return;
+            }
+        };
+        self.shell.invalidate_selection();
+
+        let key = crate::agent_runtime::NodeKey::new(&parent.board, doc.to_string());
+        // The wiring has to know about the new node before anything is sent to it, and the
+        // item count has moved, so the next `poll_agents` would do it anyway — doing it here
+        // means the reply the orchestrator gets is already true.
+        self.sync_agent_wiring();
+        if let Some(prompt) = request.prompt.clone() {
+            self.start_agent_at(doc, Some(prompt), &label, &child);
+        }
+        reply.spawned(&key);
+    }
+
+    /// Write a node's configuration back into its token, keeping its label.
+    fn write_agent_model(&mut self, doc: DocId, model: &vellum_agent::AgentModel) {
+        let Ok(item) = self.editor.board().item(doc) else { return };
+        let ItemKind::Agent { label, .. } = item.kind else { return };
+        let kind = ItemKind::Agent { model: crate::agent::encode(model), label };
+        // One `set_kind`, no undo group: a group is what the caret and the eraser hold open
+        // and what everything in this file has to be careful about. A single call needs none.
+        if let Err(error) = self.editor.edit(|board| Ok(board.set_kind(doc, kind)?)) {
+            self.failed("saving an agent's settings", &error);
+        }
+    }
+
+    /// The launch specification for one node: provider, working directory, and the resolved
+    /// system context.
+    ///
+    /// The three-layer cascade is `vellum_agent::rules`' and is **called**, never re-derived:
+    /// `ResolvedRules` records which layer supplied each field so the inspector can show
+    /// *inherited* against *set here* from what the agent actually got.
+    fn agent_launch_spec(
+        &self,
+        key: &crate::agent_runtime::NodeKey,
+        model: &vellum_agent::AgentModel,
+        role: &str,
+    ) -> vellum_agent::LaunchSpec {
+        let data_dir = crate::editor::data_directory();
+        let global = vellum_agent::rules::load_global(&data_dir);
+        let working = model.working_dir.as_deref().map(Path::new);
+        let project = working.map_or_else(
+            || vellum_agent::RuleFile::parse(""),
+            vellum_agent::rules::load_project,
+        );
+        let resolved = vellum_agent::rules::resolve(&global, &project, &model.rules, role);
+
+        let mut context = resolved.system_context();
+        if !model.context.is_empty() {
+            context.push_str("\n## Context you were given\n\n");
+            for source in &model.context {
+                let label = if source.label.is_empty() { &source.source } else { &source.label };
+                context.push_str(&format!("- {label} ({})\n", source.source));
+            }
+        }
+
+        vellum_agent::LaunchSpec {
+            provider: model.provider.clone().unwrap_or_default(),
+            command: None,
+            args: Vec::new(),
+            cwd: working.map(Path::to_path_buf),
+            // How `velm-agent-cli` finds its way home (§6). The token is *not* here: the
+            // shim reads it out of the runtime file, which is mode 0600, so it never appears
+            // in a process listing.
+            env: vec![
+                (
+                    "VELM_IPC".to_owned(),
+                    self.agent_runtime.runtime_file().display().to_string(),
+                ),
+                ("VELM_AGENT_ID".to_owned(), key.wire()),
+            ],
+            system_context: context,
+            base_url: None,
+            api_key: None,
+            data_dir: Some(data_dir),
+            terminal: None,
+        }
+    }
+
+    /// Start an agent, optionally with a first prompt.
+    ///
+    /// Answers with a toast either way — a missing binary is the commonest failure by a wide
+    /// margin and the one with a specific remedy, so it is **named** rather than logged.
+    fn start_agent_at(
+        &mut self,
+        doc: DocId,
+        prompt: Option<String>,
+        role: &str,
+        config: &vellum_agent::AgentModel,
+    ) {
+        let key = self.agent_key(doc);
+        if !self.agent_runtime.is_running(&key) {
+            let spec = self.agent_launch_spec(&key, config, role);
+            if let Err(error) = self.agent_runtime.start(&key, spec) {
+                let message = error.to_string();
+                // On the node as well as in a toast: a toast is gone in ten seconds and the
+                // node is where somebody looks tomorrow.
+                self.agent_runtime.record(
+                    &key,
+                    crate::agent_runtime::unix_now(),
+                    &vellum_agent::TranscriptEvent::Error { message: message.clone() },
+                );
+                self.gap(&message);
+                return;
+            }
+        }
+        if let Some(prompt) = prompt
+            && let Err(error) = self.agent_runtime.prompt(&key, &prompt)
+        {
+            self.gap(&error.to_string());
+        }
+    }
+
+    /// Start the agent under the Run button, or send it whatever is in its prompt row.
+    pub(crate) fn run_agent(&mut self, doc: DocId) {
+        // A caret or an eraser sweep is closed first, for the reason `run` closes one: this
+        // is something the user just asked for.
+        self.settle();
+        let Some((config, role)) = self.agent_model(doc) else {
+            self.gap("that item is not an agent node");
+            return;
+        };
+        let key = self.agent_key(doc);
+        let draft = self.agent_runtime.take_draft(&key);
+        let prompt = (!draft.trim().is_empty()).then_some(draft);
+        self.start_agent_at(doc, prompt, &role, &config);
+    }
+
+    /// Stop the turn in flight on this node.
+    pub(crate) fn stop_agent(&mut self, doc: DocId) {
+        let key = self.agent_key(doc);
+        if let Err(error) = self.agent_runtime.cancel(&key) {
+            self.gap(&error.to_string());
+        }
+    }
+
+    /// Answer a permission request the node is blocked on.
+    pub(crate) fn answer_agent_permission(
+        &mut self,
+        doc: DocId,
+        id: &vellum_agent::RequestId,
+        allowed: bool,
+    ) {
+        let key = self.agent_key(doc);
+        if let Err(error) = self.agent_runtime.answer_permission(&key, id, allowed) {
+            self.gap(&error.to_string());
+        }
+    }
+
+    /// What the user has typed into a node's prompt row.
+    pub(crate) fn agent_draft(&mut self, doc: DocId) -> String {
+        let key = self.agent_key(doc);
+        self.agent_runtime.draft(&key).to_owned()
+    }
+
+    pub(crate) fn set_agent_draft(&mut self, doc: DocId, text: impl Into<String>) {
+        let key = self.agent_key(doc);
+        self.agent_runtime.set_draft(&key, text);
+    }
+
+    /// Flip one node between Raw and Clean.
+    ///
+    /// Writes the node's *own* choice, so it stops following the app-wide default — which is
+    /// what a toggle on the node means, and `crate::agent::display_mode` is the one place
+    /// that resolution happens.
+    pub(crate) fn toggle_agent_display(&mut self, doc: DocId) {
+        self.settle();
+        let Some((config, _)) = self.agent_model(doc) else { return };
+        let current = crate::agent::display_mode(&config, vellum_agent::DisplayMode::default());
+        let mut next = config;
+        next.display = Some(current.toggled());
+        self.write_agent_model(doc, &next);
+    }
+
+    /// Fill in what the painter is told about this board's agents.
+    ///
+    /// **The early-out is the whole cost on an ordinary board**: a board with no agent nodes
+    /// and no views already built returns before it touches the camera or the R-tree.
+    pub(crate) fn rebuild_agent_views(&mut self) {
+        let has_nodes = self.agent_board.as_ref().is_some_and(|stamp| stamp.has_nodes);
+        if !has_nodes {
+            // The last node was deleted, or there never were any. Handing the painter a
+            // fresh empty set once is what makes `AgentViews::is_empty` true again.
+            if !self.agents.is_empty() {
+                self.agents = crate::agent_view::AgentViews::new();
+            }
+            return;
+        }
+        let board = self.agent_board_key();
+        let visible = self.camera.visible_world_rect();
+        let now_ms = crate::agent_runtime::unix_now().saturating_mul(1_000);
+        // The app-wide default a node with no choice of its own follows. A constant until
+        // Preferences carries the setting — see this module's note in the handover.
+        let fallback = vellum_agent::DisplayMode::default();
+        self.agents = self.agent_runtime.rebuild_views(
+            &board,
+            self.editor.projection(),
+            visible,
+            fallback,
+            now_ms,
+        );
+    }
+
+    /// The window gained or lost focus. Feature 15's app-side half.
+    pub(crate) fn agent_focus_changed(&mut self, focused: bool) {
+        let now = crate::agent_runtime::unix_now();
+        let Some(since) = self.agent_runtime.focus_changed(focused, now) else {
+            return;
+        };
+        self.agent_digest(since, now);
+    }
+
+    /// Build and surface the away-mode digest.
+    ///
+    /// `vellum_agent::summary` does all of it; the app's contribution is *when* — which is
+    /// exactly why `Digest::new` takes `since` as a parameter rather than reading a clock.
+    fn agent_digest(&mut self, since: vellum_agent::Timestamp, now: vellum_agent::Timestamp) {
+        let board = self.agent_board_key();
+        let nodes = self.agent_runtime.nodes_on(&board);
+        if nodes.is_empty() {
+            return;
+        }
+        let mut digest = vellum_agent::Digest::new(since, now);
+        for node in nodes {
+            // `since`, not `tail`: the digest splits *state* from *news*, and the state is
+            // often older than the cutoff — a permission request asked before the user
+            // walked away is still blocking now.
+            let Ok(tail) = self
+                .agent_runtime
+                .sidecar()
+                .since(&node.board, &node.item, since)
+            else {
+                continue;
+            };
+            let name = self
+                .agent_doc(&node)
+                .and_then(|doc| self.agent_model(doc))
+                .map_or_else(|| node.item.clone(), |(_, label)| label);
+            let events: Vec<(vellum_agent::Timestamp, &vellum_agent::TranscriptEvent)> =
+                tail.records.iter().map(|record| (record.at, &record.event)).collect();
+            digest.add(vellum_agent::AgentRef::new(node.wire(), name), events);
+        }
+        if digest.is_quiet() {
+            return;
+        }
+        // The panel form goes to the log, where an unattended run can read it; the headline
+        // goes on screen, because a paragraph as a toast is a paragraph nobody reads.
+        log::info!("agents, while you were away:\n{}", digest.panel_text());
+        self.ok(digest.headline());
+    }
+
+    /// Stop every agent. Called on quit, alongside the flush of every open board.
+    pub(crate) fn shutdown_agents(&mut self) {
+        self.agent_runtime.shutdown();
+    }
+
     fn gap(&mut self, what: &str) {
         log::info!("not implemented: {what}");
         self.shell.toast(Toast::info(what.to_owned()));

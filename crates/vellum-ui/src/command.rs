@@ -99,6 +99,7 @@ impl Menu {
                     Item(C::SelectAll),
                     Separator,
                     Sub(Submenu::Arrange),
+                    Sub(Submenu::Agent),
                 ]
             },
             Self::View => const {
@@ -135,6 +136,14 @@ impl Menu {
                     Item(C::ToggleLinkPreviews),
                     Entry::Sub(Submenu::Transparency),
                     Entry::Sub(Submenu::Accent),
+                    Separator,
+                    // The Agent Canvas band. Both toggles are off by default and both carry
+                    // a `Command::note` saying why, because a switch whose cost is invisible
+                    // from the switch is one people turn on and then report as a defect.
+                    Entry::Sub(Submenu::AgentDisplay),
+                    Entry::Sub(Submenu::Providers),
+                    Item(C::ToggleWorktrees),
+                    Item(C::ToggleBrowserNodes),
                     Separator,
                     Item(C::KeyboardShortcuts),
                     Item(C::Documentation),
@@ -189,10 +198,32 @@ pub enum Submenu {
     /// How see-through the grid is — the same field as [`Self::GridColor`], written on the
     /// alpha channel rather than the other three.
     GridOpacity,
+    /// Edit ▸ Agent — everything the selected agent nodes can be asked to do.
+    ///
+    /// A submenu under Edit rather than a fifth top-level menu: `docs/04-ui-reference.md`
+    /// §4's bar is **Board · Edit · View · Preferences**, transcribed from Miro's, and the
+    /// four names are the ones the user's hands already know. Its rows are ordinary
+    /// commands, which is what makes every row the right button offers also reachable from
+    /// the bar — the rule `crate::context_menu`'s own test enforces.
+    Agent,
+    /// Preferences ▸ Agent output — the app-wide default display mode new nodes inherit.
+    ///
+    /// Built from runtime state like [`Self::Accent`], and for the same reason: the rows
+    /// are `vellum_agent::DisplayMode`'s own values with a tick on the current one, so the
+    /// command table would need one command per mode and would have to be kept in step with
+    /// that enum.
+    AgentDisplay,
+    /// Preferences ▸ Providers — which models are reachable, and how each one is paid for.
+    ///
+    /// Runtime state again: the list is `Provider::ALL` crossed with what the app found on
+    /// the machine. **No row ever shows a key** — `docs/07-agent-canvas.md` §8a — and a
+    /// provider that runs on a subscription the user already holds is drawn as a row that
+    /// says so rather than as a sign-in that would take a credential it does not need.
+    Providers,
 }
 
 impl Submenu {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 12] = [
         Self::Export,
         Self::MoveToSpace,
         Self::Arrange,
@@ -202,6 +233,9 @@ impl Submenu {
         Self::Accent,
         Self::GridColor,
         Self::GridOpacity,
+        Self::Agent,
+        Self::AgentDisplay,
+        Self::Providers,
     ];
 
     pub const fn title(self) -> &'static str {
@@ -215,6 +249,9 @@ impl Submenu {
             Self::Accent => "Accent colour",
             Self::GridColor => "Grid colour",
             Self::GridOpacity => "Grid opacity",
+            Self::Agent => "Agent",
+            Self::AgentDisplay => "Agent output",
+            Self::Providers => "Providers",
         }
     }
 
@@ -223,8 +260,10 @@ impl Submenu {
         match self {
             Self::Export | Self::MoveToSpace | Self::Background => Menu::Board,
             Self::Grid | Self::GridColor | Self::GridOpacity => Menu::View,
-            Self::Arrange => Menu::Edit,
-            Self::Transparency | Self::Accent => Menu::Preferences,
+            Self::Arrange | Self::Agent => Menu::Edit,
+            Self::Transparency | Self::Accent | Self::AgentDisplay | Self::Providers => {
+                Menu::Preferences
+            }
         }
     }
 
@@ -279,12 +318,28 @@ impl Submenu {
                     Entry::Sub(Self::GridOpacity),
                 ]
             },
+            // Ordinary rows, all of them, which is the point: every verb the right button
+            // offers on an agent node is a row here too, so a user who never right-clicks
+            // still finds it and the shortcut sheet still lists it.
+            Self::Agent => const {
+                &[
+                    Item(C::RunAgent),
+                    Item(C::StopAgent),
+                    Separator,
+                    Item(C::ToggleAgentRaw),
+                    Separator,
+                    Item(C::EditAgentRules),
+                    Item(C::EditAgentSchedule),
+                ]
+            },
             Self::MoveToSpace
             | Self::Background
             | Self::Transparency
             | Self::Accent
             | Self::GridColor
-            | Self::GridOpacity => &[],
+            | Self::GridOpacity
+            | Self::AgentDisplay
+            | Self::Providers => &[],
         }
     }
 
@@ -327,8 +382,21 @@ impl Submenu {
             // Always available, and needs no board: the accent is the whole interface's,
             // not a board's, and the board library wears it too — a user who wants the
             // colour changed before opening anything should not have to open something.
-            Self::Accent => {
-                Availability::Enabled
+            //
+            // The two agent preference lists join it. The default display mode and the
+            // provider roster are the application's, not a board's, and a user setting up
+            // their providers before opening anything should not have to open something.
+            Self::Accent | Self::AgentDisplay | Self::Providers => Availability::Enabled,
+            // A submenu whose every row would be greyed out is a menu of things you cannot
+            // do. Disabled as a whole, with the same reason its rows would each have given.
+            Self::Agent => {
+                if !ctx.board_open {
+                    Availability::Disabled(reason::NO_BOARD)
+                } else if ctx.agents_selected == 0 {
+                    Availability::Disabled(reason::NO_AGENT)
+                } else {
+                    Availability::Enabled
+                }
             }
         }
     }
@@ -354,6 +422,14 @@ pub mod reason {
     pub const UNSAVED_BOARD: &str = "Save the board first";
     pub const NO_SPACES: &str = "No folders yet — add one in the board library";
     pub const SYSTEM_OPAQUE: &str = "Turned off in the system's accessibility settings";
+    pub const NO_AGENT: &str = "Select an agent node";
+    pub const ONE_AGENT: &str = "Select one agent node";
+    pub const AGENT_RUNNING: &str = "Already running";
+    pub const NO_AGENT_RUNNING: &str = "Nothing selected is running";
+    /// Why a hand-off target cannot be offered. Feature 10's rule, stated where the reader
+    /// is: a message travels along a connector the user drew, so an agent with no line to
+    /// anywhere has nobody to hand off to.
+    pub const NO_AGENT_LINK: &str = "Draw a connector to another agent first";
 }
 
 /// Whether a command can act, and why not when it cannot.
@@ -471,6 +547,35 @@ pub enum Command {
     /// User-initiated on purpose. Fetching on open would tell a third party every link on the
     /// board the moment it was opened; `crate::event::UiEvent` carries no timer for this.
     FetchLinkPreviews,
+    // Agent — Edit ▸ Agent
+    //
+    // Under Edit rather than as a fifth top-level menu. `docs/04-ui-reference.md` §4's tree
+    // is **Board · Edit · View · Preferences** and it is the one the user's hands know from
+    // Miro; a fifth name is a change to the bar they read, for a submenu's worth of rows.
+    /// Start the selected agents.
+    RunAgent,
+    /// Stop them. A separate command rather than a toggle on [`Self::RunAgent`], because a
+    /// mixed selection — one running, one idle — has a sensible answer to each of them and
+    /// no sensible answer to "toggle".
+    StopAgent,
+    /// Show every tool call and reasoning step on the selected nodes rather than only the
+    /// answer — feature 2's per-node half. A toggle, so the menu ticks it.
+    ToggleAgentRaw,
+    /// The three-layer rule cascade for the one selected agent — feature 11.
+    EditAgentRules,
+    /// When it runs by itself, and what it does afterwards — feature 10.
+    EditAgentSchedule,
+    // Preferences
+    /// Whether a browser node may run a real web engine at all — feature 13.
+    ///
+    /// Off by default, and [`Self::note`] says why on the row rather than leaving the user
+    /// to find out by turning it on.
+    ToggleBrowserNodes,
+    /// Whether each coding agent on this board gets its own `git worktree` — feature 4.
+    ///
+    /// One switch per project, which is the feature's own wording: *"a single clear toggle
+    /// in the project's settings rather than something enabled per-agent inconsistently"*.
+    ToggleWorktrees,
     KeyboardShortcuts,
     Documentation,
     About,
@@ -535,6 +640,13 @@ impl Command {
         Self::ToggleAlignObjects,
         Self::SnapToGrid,
         Self::FetchLinkPreviews,
+        Self::RunAgent,
+        Self::StopAgent,
+        Self::ToggleAgentRaw,
+        Self::EditAgentRules,
+        Self::EditAgentSchedule,
+        Self::ToggleBrowserNodes,
+        Self::ToggleWorktrees,
         Self::KeyboardShortcuts,
         Self::Documentation,
         Self::About,
@@ -599,6 +711,16 @@ impl Command {
             Self::ToggleAlignObjects => "Align objects",
             Self::SnapToGrid => "Snap to grid",
             Self::FetchLinkPreviews => "Fill in link cards",
+            Self::RunAgent => "Run",
+            Self::StopAgent => "Stop",
+            // Not "Raw mode": the row is a tick beside a noun, and the noun is what the
+            // node shows. `DisplayMode::Raw.label()` is the same word, which is what stops
+            // the menu and the inspector calling one thing two things.
+            Self::ToggleAgentRaw => "Raw output",
+            Self::EditAgentRules => "Rules…",
+            Self::EditAgentSchedule => "Schedule…",
+            Self::ToggleBrowserNodes => "Browser nodes",
+            Self::ToggleWorktrees => "Worktree isolation",
             Self::KeyboardShortcuts => "Keyboard shortcuts",
             Self::Documentation => "Documentation",
             Self::About => "About Velm",
@@ -648,7 +770,12 @@ impl Command {
             | Self::AlignMiddleVertical
             | Self::AlignBottom
             | Self::DistributeHorizontally
-            | Self::DistributeVertically => Menu::Edit,
+            | Self::DistributeVertically
+            | Self::RunAgent
+            | Self::StopAgent
+            | Self::ToggleAgentRaw
+            | Self::EditAgentRules
+            | Self::EditAgentSchedule => Menu::Edit,
             Self::ZoomIn
             | Self::ZoomOut
             | Self::ZoomToFit
@@ -666,6 +793,8 @@ impl Command {
             Self::ToggleTranslucency
             | Self::ToggleLinkPreviews
             | Self::ToggleAlignObjects
+            | Self::ToggleBrowserNodes
+            | Self::ToggleWorktrees
             | Self::KeyboardShortcuts
             | Self::Documentation
             | Self::About => Menu::Preferences,
@@ -719,6 +848,39 @@ impl Command {
             Self::NewBoard => Icon::Plus,
             Self::Undo => Icon::Undo,
             Self::Redo => Icon::Redo,
+            Self::RunAgent => Icon::Play,
+            Self::StopAgent => Icon::Stop,
+            Self::EditAgentRules | Self::EditAgentSchedule => Icon::Agent,
+            Self::ToggleBrowserNodes => Icon::Browser,
+            _ => return None,
+        })
+    }
+
+    /// A sentence shown on hovering the row **while it is enabled**.
+    ///
+    /// Distinct from [`Availability::reason`], which says why a row cannot be clicked. This
+    /// says why a row that *can* be clicked is set the way it is, and it exists for the two
+    /// preferences that are off by default for a cost the user cannot see from the switch.
+    /// `docs/07-agent-canvas.md` §0's third rule asks for a legible explanation rather than
+    /// a bare toggle; a switch with no stated cost is how somebody turns on a feature that
+    /// spends 150MB a page and reports it as a memory leak.
+    ///
+    /// Deliberately **not** on every command. A tooltip on a row whose label already says
+    /// everything is noise that trains people to ignore tooltips.
+    pub const fn note(self) -> Option<&'static str> {
+        Some(match self {
+            Self::ToggleBrowserNodes => {
+                "Off by default. A browser node runs a real web engine, which costs roughly \
+                 60–150MB of memory per page while it sits there and more while it plays. \
+                 With this off, a browser node draws as a card that offers to open the page \
+                 in your own browser."
+            }
+            Self::ToggleWorktrees => {
+                "Off by default. Each coding agent on this board gets its own `git worktree` \
+                 — a second checkout on disk, on its own branch, so two agents cannot edit \
+                 the same file underneath each other. Removing one is deliberate: a \
+                 worktree with uncommitted work in it is never force-removed."
+            }
             _ => return None,
         })
     }
@@ -818,10 +980,17 @@ impl Command {
             // `docs/05-design-language.md` §3a asks for the override, not for a lie.
             Self::ToggleTranslucency => gate(!ctx.transparency_blocked, reason::SYSTEM_OPAQUE),
             // Always offerable: it is the switch that decides whether anything is fetched, so
-            // it cannot be gated on a fetch being possible.
-            Self::ToggleLinkPreviews | Self::ToggleAlignObjects => Enabled,
-            // Gated on a board, unlike the two above: there is no grid to snap to without one.
+            // it cannot be gated on a fetch being possible. `ToggleBrowserNodes` joins them
+            // for the same reason — it is the permission, so it cannot need the thing it
+            // permits to already exist.
+            Self::ToggleLinkPreviews | Self::ToggleAlignObjects | Self::ToggleBrowserNodes => {
+                Enabled
+            }
+            // Gated on a board, unlike the three above: there is no grid to snap to without
+            // one, and worktree isolation is **per project** — the open board is the
+            // project, so on the library screen there is nothing for the switch to be about.
             Self::SnapToGrid => gate(ctx.board_open, "Open a board first"),
+            Self::ToggleWorktrees => gate(ctx.board_open, reason::NO_BOARD),
             Self::FetchLinkPreviews => gate(ctx.board_open, reason::NO_BOARD),
 
             _ if !ctx.board_open => Disabled(reason::NO_BOARD),
@@ -875,6 +1044,34 @@ impl Command {
                 }
             }
             Self::Unlock => gate(ctx.any_locked, reason::NOTHING_LOCKED),
+
+            // Run and Stop are two commands rather than one toggle, so each is gated on the
+            // half of the selection it can actually act on: Run is available while
+            // *anything* selected is idle, Stop while anything is running. A mixed selection
+            // offers both, which is the only honest answer — a toggle would have to pick one
+            // and be wrong about the rest.
+            Self::RunAgent => {
+                if ctx.agents_selected == 0 {
+                    Disabled(reason::NO_AGENT)
+                } else {
+                    gate(!ctx.all_agents_running, reason::AGENT_RUNNING)
+                }
+            }
+            Self::StopAgent => {
+                if ctx.agents_selected == 0 {
+                    Disabled(reason::NO_AGENT)
+                } else {
+                    gate(ctx.any_agent_running, reason::NO_AGENT_RUNNING)
+                }
+            }
+            Self::ToggleAgentRaw => gate(ctx.agents_selected > 0, reason::NO_AGENT),
+            // One node. A rule cascade and a schedule are single-node configuration —
+            // `crate::event::AgentEdit` says why — so the editors that produce them are
+            // offered for exactly one selected agent rather than for a selection that
+            // happens to contain one.
+            Self::EditAgentRules | Self::EditAgentSchedule => {
+                gate(ctx.agents_selected == 1, reason::ONE_AGENT)
+            }
 
             Self::Group => gate(ctx.selected > 1, reason::NEEDS_TWO),
             Self::Ungroup => gate(ctx.any_group, reason::NO_GROUP),
@@ -951,6 +1148,11 @@ impl Command {
                 | Self::AlignBottom
                 | Self::DistributeHorizontally
                 | Self::DistributeVertically
+                // Writes `AgentModel::display` into the node's token, which is a document
+                // edit like any other. Run and Stop are **not** here: a transcript lives in
+                // a sidecar outside the document (`docs/07-agent-canvas.md` §4), so starting
+                // an agent changes no board and must not end an edit in progress.
+                | Self::ToggleAgentRaw
         )
     }
 
@@ -966,6 +1168,9 @@ impl Command {
                 | Self::ToggleLinkPreviews
                 | Self::ToggleAlignObjects
                 | Self::SnapToGrid
+                | Self::ToggleAgentRaw
+                | Self::ToggleBrowserNodes
+                | Self::ToggleWorktrees
         )
     }
 }
@@ -995,6 +1200,16 @@ pub struct CommandContext {
     /// The OS has switched translucency off — Reduce Transparency or high contrast —
     /// so the in-app override cannot turn it back on.
     pub transparency_blocked: bool,
+    /// How many selected items are agent nodes.
+    ///
+    /// Counted rather than inferred from `selected`, because a selection can hold an agent
+    /// and four stickies and the agent verbs still apply to the one — the same abstention
+    /// rule `crate::selection::Field` applies to every other property.
+    pub agents_selected: usize,
+    pub any_agent_running: bool,
+    /// True only when at least one agent is selected and every one of them is running,
+    /// which is what makes *Run* refuse rather than start something twice.
+    pub all_agents_running: bool,
 }
 
 /// Renders a shortcut for display.
@@ -1487,8 +1702,139 @@ mod tests {
                 Command::ToggleLinkPreviews,
                 Command::ToggleAlignObjects,
                 Command::SnapToGrid,
+                Command::ToggleAgentRaw,
+                Command::ToggleBrowserNodes,
+                Command::ToggleWorktrees,
             ]
         );
+    }
+
+    /// The two preferences that are off by default say **why** on the row.
+    ///
+    /// `docs/07-agent-canvas.md` §0's third rule is that everything expensive degrades to a
+    /// legible explanation rather than a dead button — and a switch whose cost is invisible
+    /// from the switch is the version of that failure nobody notices, because the control
+    /// works perfectly and the consequence arrives an hour later. The assertion is about
+    /// the *cost being named*, not about the wording.
+    #[test]
+    fn the_expensive_preferences_explain_themselves_on_the_row() {
+        let browser = Command::ToggleBrowserNodes.note().expect("browser nodes carry a note");
+        assert!(browser.contains("Off by default"), "{browser}");
+        assert!(browser.contains("MB"), "the memory cost is the whole reason it is off");
+
+        let worktrees = Command::ToggleWorktrees.note().expect("worktrees carry a note");
+        assert!(worktrees.contains("Off by default"), "{worktrees}");
+        assert!(worktrees.contains("worktree"), "{worktrees}");
+
+        // Not on every row. A tooltip on a row whose label already says everything trains
+        // people to stop reading tooltips, including the two above.
+        for quiet in [Command::Copy, Command::ZoomIn, Command::Save, Command::RunAgent] {
+            assert!(quiet.note().is_none(), "{quiet:?} does not need explaining");
+        }
+    }
+
+    /// None of the agent commands takes a key.
+    ///
+    /// Deliberate, and worth pinning. `⌘↵` was the obvious binding for *Run*, and it is
+    /// exactly the chord a user presses while a caret is open in a sticky — so it would
+    /// have started an agent from inside an edit, which is the family of bug trap 9 and
+    /// feedback 27 are both about. A menu row that cannot be pressed by accident is worth
+    /// more here than a shortcut nobody asked for.
+    #[test]
+    fn no_agent_command_claims_a_key() {
+        for command in [
+            Command::RunAgent,
+            Command::StopAgent,
+            Command::ToggleAgentRaw,
+            Command::EditAgentRules,
+            Command::EditAgentSchedule,
+        ] {
+            assert_eq!(command.shortcut(), None, "{command:?}");
+            assert_eq!(command.alternate_shortcut(), None, "{command:?}");
+        }
+    }
+
+    /// Run and Stop are gated on the half of the selection each can act on, and a mixed
+    /// selection gets both. A toggle would have to pick one and be wrong about the rest.
+    #[test]
+    fn run_and_stop_are_each_offered_only_where_they_can_act() {
+        let idle = CommandContext {
+            board_open: true,
+            selected: 1,
+            agents_selected: 1,
+            ..CommandContext::default()
+        };
+        assert!(Command::RunAgent.is_enabled(&idle));
+        assert!(!Command::StopAgent.is_enabled(&idle));
+
+        let running = CommandContext {
+            any_agent_running: true,
+            all_agents_running: true,
+            ..idle
+        };
+        assert!(!Command::RunAgent.is_enabled(&running));
+        assert!(Command::StopAgent.is_enabled(&running));
+
+        let mixed = CommandContext {
+            selected: 2,
+            agents_selected: 2,
+            any_agent_running: true,
+            all_agents_running: false,
+            ..idle
+        };
+        assert!(Command::RunAgent.is_enabled(&mixed), "one of them is idle");
+        assert!(Command::StopAgent.is_enabled(&mixed), "one of them is running");
+
+        // And nothing agent-shaped is offered without an agent — with the reason named,
+        // rather than a row that can be clicked and does nothing.
+        let none = CommandContext { board_open: true, selected: 3, ..CommandContext::default() };
+        for command in [Command::RunAgent, Command::StopAgent, Command::ToggleAgentRaw] {
+            assert_eq!(
+                command.availability(&none).reason(),
+                Some(reason::NO_AGENT),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// A rule cascade and a schedule belong to **one** node, so their editors are offered
+    /// for exactly one selected agent. Two agents have two cascades and two schedules;
+    /// there is no shared one to edit, and offering it would write one over both.
+    #[test]
+    fn the_agent_editors_need_exactly_one_agent() {
+        let base = CommandContext { board_open: true, selected: 1, ..CommandContext::default() };
+        for command in [Command::EditAgentRules, Command::EditAgentSchedule] {
+            assert!(!command.is_enabled(&CommandContext { agents_selected: 0, ..base }));
+            assert!(command.is_enabled(&CommandContext { agents_selected: 1, ..base }));
+            assert_eq!(
+                command
+                    .availability(&CommandContext { agents_selected: 2, selected: 2, ..base })
+                    .reason(),
+                Some(reason::ONE_AGENT),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// The agent submenu hangs under Edit rather than becoming a fifth top-level menu, and
+    /// every one of its rows is an ordinary command — which is what makes the right-click
+    /// menu's reachability rule satisfiable.
+    #[test]
+    fn the_agent_verbs_live_under_edit_and_are_all_real_commands() {
+        assert_eq!(Submenu::Agent.parent(), Menu::Edit);
+        assert!(Menu::Edit.entries().contains(&Entry::Sub(Submenu::Agent)));
+        assert!(
+            Submenu::Agent.entries().iter().any(|e| matches!(e, Entry::Item(_))),
+            "a submenu drawn from the table must have rows in the table"
+        );
+        for entry in Submenu::Agent.entries() {
+            if let Entry::Item(command) = entry {
+                assert_eq!(command.menu(), Menu::Edit, "{command:?}");
+            }
+        }
+        // Disabled as a whole rather than opening onto four greyed rows.
+        let empty = CommandContext { board_open: true, ..CommandContext::default() };
+        assert_eq!(Submenu::Agent.availability(&empty).reason(), Some(reason::NO_AGENT));
     }
 
     /// The palette shows where a command lives, and the trail is derived so it cannot

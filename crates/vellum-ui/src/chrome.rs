@@ -106,6 +106,18 @@ pub struct ChromeState<'a> {
     /// the app holds the camera that converts them. `None` — nothing selected, or a
     /// selection scrolled off screen — draws no bar, which is correct either way.
     pub selection_rect: Option<Rect>,
+    /// The display mode a **new** agent node inherits — feature 2's second half. The app
+    /// owns it and persists it, exactly as it does the accent.
+    pub default_display: vellum_agent::DisplayMode,
+    /// Whether browser nodes may run a real engine at all — feature 13. Off by default.
+    pub browser_nodes: bool,
+    /// Whether coding agents on this board get their own worktrees — feature 4. Off by
+    /// default, and **per project**: the open board is the project, so this travels with the
+    /// board rather than with the application.
+    pub worktrees: bool,
+    /// Which providers this machine can reach and how each is paid for. Never a key —
+    /// see [`ProviderStatus`](crate::ProviderStatus).
+    pub providers: &'a [crate::menu::ProviderStatus],
 }
 
 impl Default for ChromeState<'_> {
@@ -126,6 +138,10 @@ impl Default for ChromeState<'_> {
             snap_to_grid: false,
             grid: crate::event::GridSettings::default(),
             selection_rect: None,
+            default_display: vellum_agent::DisplayMode::Clean,
+            browser_nodes: false,
+            worktrees: false,
+            providers: &[],
         }
     }
 }
@@ -135,7 +151,16 @@ impl ChromeState<'_> {
     /// the app cannot get them subtly out of step with the selection it passed.
     pub fn command_context(&self) -> CommandContext {
         let locked = self.selection.iter().filter(|i| i.locked).count();
+        // Counted from the summaries rather than from the facets, for the reason
+        // `crate::selection` records at every other property: a selection can hold one agent
+        // and four stickies, and the agent verbs still apply to the one.
+        let agents = self.selection.iter().filter_map(|i| i.agent.as_ref());
+        let running = agents.clone().filter(|a| a.running).count();
+        let agents_selected = agents.count();
         CommandContext {
+            agents_selected,
+            any_agent_running: running > 0,
+            all_agents_running: agents_selected > 0 && running == agents_selected,
             board_open: self.screen == Screen::Board,
             board_saved: self.board.path.is_some(),
             board_starred: self.board.starred,
@@ -643,6 +668,17 @@ impl Chrome {
             starred: state.board.starred,
             translucent: palette.translucent,
             properties_panel: self.properties_open,
+            // The **resolved** mode, not the stored one. A node that inherits a raw default
+            // is showing raw, and a tick derived from `AgentModel::display` would report it
+            // as clean — the tick has to agree with what is on the node, not with what is
+            // written on it.
+            agent_raw: {
+                let mut agents = state.selection.iter().filter_map(|i| i.agent.as_ref()).peekable();
+                agents.peek().is_some()
+                    && agents.all(|a| a.effective_display() == vellum_agent::DisplayMode::Raw)
+            },
+            browser_nodes: state.browser_nodes,
+            worktrees: state.worktrees,
         };
 
         self.shortcuts(ctx, state, &cmd_ctx, &mut events);
@@ -724,6 +760,8 @@ impl Chrome {
             spaces: &self.library.spaces,
             glass_opacity: self.glass_opacity(),
             accent: self.accent,
+            default_display: state.default_display,
+            providers: state.providers,
             flags,
         };
 

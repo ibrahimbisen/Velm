@@ -63,5 +63,31 @@ portable-pty = "0.9"
 flate2.workspace = true
 zip.workspace = true
 
+# Microphone capture for push-to-talk, and the **only** optional dependency in this crate.
+# `cpal` is the cross-platform audio abstraction on both platforms Velm ships on and drags in
+# no async runtime — the same reasoning that chose `portable-pty` over raw `forkpty`.
+cpal = { version = "0.18", optional = true }
+
+[features]
+# Push-to-talk microphone capture. **Off by default**, for three separate reasons, any one of
+# which would be enough:
+#
+# - It is the only thing in the workspace that opens a recording device. A build that cannot
+#   record cannot leak, and a microphone is the most private input in the application.
+# - `docs/07-agent-canvas.md` §0 requires a board with no agent nodes to cost nothing.
+# - On macOS `cpal` reaches `coreaudio-sys`, whose build script runs `bindgen` and therefore
+#   needs libclang — a build-environment requirement no other crate in this workspace imposes.
+#   Leaving it off by default means the ordinary build is unaffected by that, which matters on
+#   a machine that has kernel-panicked twice during compilation.
+#
+# With the feature off, `voice::Unavailable` answers with a named, actionable message rather
+# than the control silently doing nothing — nothing in this app is inert.
+#
+# Turning it on also needs `NSMicrophoneUsageDescription` in the bundle's `Info.plist`, or
+# macOS kills the process at the first `start()`. Note that the bare `target/` binary and the
+# signed bundle get *different* TCC records, so "works in dev, dies in the app" is a symptom
+# of the plist and not of this code.
+voice = ["dep:cpal"]
+
 [dev-dependencies]
 tempfile.workspace = true

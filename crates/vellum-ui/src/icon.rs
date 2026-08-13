@@ -186,6 +186,14 @@ pub enum Icon {
     FileTree,
     /// A browser: a frame with a chrome bar and two dots in it.
     Browser,
+    /// Start — a filled triangle, drawn rather than the character `▶`.
+    ///
+    /// U+25B6 is outside every plain sans face this app ships or falls back to (trap 10),
+    /// so the character would draw tofu on the one button whose job is to be unmistakable.
+    Play,
+    /// Stop — a filled square, which is what every transport control in existence uses and
+    /// the only shape that cannot be mistaken for *close* the way an ✕ can.
+    Stop,
 }
 
 impl Icon {
@@ -571,6 +579,10 @@ impl Icon {
                 Prim::Circle { c: (0.20, 0.28), r: 0.032, fill: true },
                 Prim::Circle { c: (0.30, 0.28), r: 0.032, fill: true },
             ] },
+            // Optically centred, not geometrically: a triangle's centroid sits a third of
+            // the way from its base, so a triangle centred on 0.50 reads as sitting left.
+            Self::Play => const { &[solid(&[(0.32, 0.20), (0.32, 0.80), (0.82, 0.50)])] },
+            Self::Stop => const { &[solid(rect_pts!(0.26, 0.26, 0.74, 0.74))] },
             Self::Sun => const { &[
                 Prim::Circle { c: (0.50, 0.50), r: 0.19, fill: true },
                 line(&[(0.50, 0.08), (0.50, 0.20)]),
@@ -695,6 +707,12 @@ mod tests {
         Icon::Info,
         Icon::Sun,
         Icon::Moon,
+        Icon::Agent,
+        Icon::Note,
+        Icon::FileTree,
+        Icon::Browser,
+        Icon::Play,
+        Icon::Stop,
     ];
 
     /// An icon whose geometry escapes the unit box gets clipped by whatever button

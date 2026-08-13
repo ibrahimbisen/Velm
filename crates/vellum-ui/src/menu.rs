@@ -41,6 +41,15 @@ pub struct MenuFlags {
     /// Whether the docked properties panel is showing. Off by default — the floating
     /// [`crate::context_bar`] is what a selection gets now.
     pub properties_panel: bool,
+    /// Whether every selected agent is showing its working. The **resolved** mode, not the
+    /// stored one: a node that inherits a raw default is showing raw, and a tick that read
+    /// the stored `Option` would say otherwise.
+    pub agent_raw: bool,
+    /// Whether browser nodes may run a real engine at all. Off by default — feature 13.
+    pub browser_nodes: bool,
+    /// Whether coding agents on this board get their own worktrees. Off by default —
+    /// feature 4.
+    pub worktrees: bool,
 }
 
 impl MenuFlags {
@@ -54,7 +63,65 @@ impl MenuFlags {
             Command::ToggleTranslucency => self.translucent,
             Command::ToggleLinkPreviews => self.link_previews,
             Command::ToggleAlignObjects => self.align_objects,
+            Command::ToggleAgentRaw => self.agent_raw,
+            Command::ToggleBrowserNodes => self.browser_nodes,
+            Command::ToggleWorktrees => self.worktrees,
             _ => false,
+        }
+    }
+}
+
+/// One provider, as the app found it on this machine.
+///
+/// **No key, ever.** `docs/07-agent-canvas.md` §8a puts credentials in one file and nowhere
+/// else, and this crate is on the far side of that line: it is told *whether* one is stored,
+/// never what it is. [`Self::has_key`] is the whole of what a menu row is allowed to know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderStatus {
+    pub provider: vellum_agent::Provider,
+    /// Whether the provider is reachable — its CLI is installed, or its endpoint answers.
+    ///
+    /// Probed rather than assumed: `Provider::supports_subscription` says a CLI *exists to
+    /// delegate to*, not that this machine has it, and a missing binary must degrade to a
+    /// named row rather than to a wrong assumption.
+    pub available: bool,
+    /// Whether a credential is stored for it. Never *which*.
+    pub has_key: bool,
+    /// What the app found, in one line — "claude 2.1.4", "not installed",
+    /// "localhost:11434". Shown on hover, so a provider that is not working says why.
+    pub detail: String,
+}
+
+impl ProviderStatus {
+    /// Whether this provider runs on a subscription the user already holds.
+    ///
+    /// Both halves: the provider must have a CLI to delegate to **and** that CLI must
+    /// actually be here. Reporting an uninstalled `claude` as *subscription* would be the
+    /// one lie the row exists to avoid — the user would take it as configured and discover
+    /// otherwise on their first run.
+    pub const fn on_subscription(&self) -> bool {
+        self.available && self.provider.supports_subscription()
+    }
+
+    /// Whether signing in would achieve anything.
+    ///
+    /// A local model needs no key by definition, and a provider already running on a
+    /// subscription needs none either — offering *Sign in* on those is a control that
+    /// collects a credential nothing will read.
+    pub const fn wants_a_key(&self) -> bool {
+        self.provider.needs_api_key() && !self.on_subscription()
+    }
+
+    /// The word beside the name: who pays, or why it is not usable.
+    pub fn billing(&self) -> &'static str {
+        if self.on_subscription() {
+            "Subscription"
+        } else if !self.provider.needs_api_key() {
+            "Your own machine"
+        } else if self.has_key {
+            "API key · billed per token"
+        } else {
+            "No key yet"
         }
     }
 }
@@ -85,6 +152,10 @@ pub struct MenuHeader<'a> {
     pub glass_opacity: u8,
     /// Which colour the primary accent wears, for Preferences ▸ Accent colour's tick.
     pub accent: crate::theme::Accent,
+    /// The mode a **new** agent node inherits, for Preferences ▸ Agent output's tick.
+    pub default_display: vellum_agent::DisplayMode,
+    /// Which providers this machine can reach, and how each is paid for. Never a key.
+    pub providers: &'a [ProviderStatus],
     pub flags: MenuFlags,
 }
 
@@ -430,7 +501,9 @@ pub(crate) fn submenu(
                     Submenu::GridOpacity => grid_opacity(ui, palette, header, events),
                     Submenu::Transparency => transparency(ui, palette, header, events),
                     Submenu::Accent => accent(ui, palette, header, events),
-                    Submenu::Export | Submenu::Arrange => {
+                    Submenu::AgentDisplay => agent_display(ui, palette, header, events),
+                    Submenu::Providers => providers(ui, palette, header, events),
+                    Submenu::Export | Submenu::Arrange | Submenu::Agent => {
                         entries(ui, palette, sub.entries(), cmd_ctx, header, events);
                     }
                 })
@@ -878,6 +951,117 @@ fn accent(ui: &mut Ui, palette: Palette, header: &MenuHeader<'_>, events: &mut E
     );
 }
 
+/// Preferences ▸ Agent output — the mode a **new** agent node inherits.
+///
+/// Feature 2's second half, and the reason `AgentModel::display` is an `Option`: this row
+/// moves every node that never chose for itself, and leaves the ones that did. The line
+/// underneath says so, because "default" on its own does not distinguish a setting that
+/// applies from here on from one that applies to everything.
+fn agent_display(ui: &mut Ui, palette: Palette, header: &MenuHeader<'_>, events: &mut EventSink) {
+    ui.set_min_width(space::of(40));
+    for mode in vellum_agent::DisplayMode::ALL {
+        let response = ui.add(row_button(mode.label()).min_size(vec2(row_width(ui), 0.0)));
+        if mode == header.default_display {
+            tick(ui, palette, &response);
+        }
+        if response.clicked() {
+            events.push(UiEvent::DefaultDisplayModeChanged(mode));
+        }
+    }
+
+    ui.add_space(space::UNIT);
+    ui.label(
+        egui::RichText::new(
+            "New agents, and every agent still set to inherit. A node with its own mode \
+             keeps it.",
+        )
+        .color(palette.faint)
+        .size(crate::theme::text::LABEL),
+    );
+}
+
+/// Preferences ▸ Providers — which models this machine can reach, and who pays for each.
+///
+/// **Nothing here is a key and nothing here shows one.** `docs/07-agent-canvas.md` §8a puts
+/// credentials in one file at mode `0600`; this list is told only whether one exists.
+///
+/// The rule that shapes the rows: a provider already running on a subscription the user
+/// holds is **disabled**, with the reason as its tooltip — because signing in would collect
+/// a credential nothing would ever read, and a control that succeeds and changes nothing is
+/// worse than one that plainly cannot be pressed. That is feature 17 made visible: the whole
+/// point of ACP is that `claude`, `codex` and `gemini` already hold the subscription.
+fn providers(ui: &mut Ui, palette: Palette, header: &MenuHeader<'_>, events: &mut EventSink) {
+    ui.set_min_width(space::of(52));
+    ui.set_max_width(space::of(80));
+
+    if header.providers.is_empty() {
+        ui.label(
+            egui::RichText::new("No providers have been looked for yet.")
+                .color(palette.faint)
+                .size(crate::theme::text::LABEL),
+        );
+        return;
+    }
+
+    for status in header.providers {
+        // The billing word is the second column, in the same right-hand slot a shortcut
+        // takes elsewhere in this bar — so the eye reads name, then cost, down the list.
+        let button = row_button(status.provider.label())
+            .min_size(vec2(row_width(ui), 0.0))
+            .shortcut_text(crate::theme::numeric(status.billing()).color(palette.faint));
+
+        if status.wants_a_key() {
+            let response = ui.add(button).on_hover_text(if status.has_key {
+                format!("{} — sign in again to replace the stored key", status.detail)
+            } else {
+                format!("{} — sign in to use it", status.detail)
+            });
+            if response.clicked() {
+                events.push(UiEvent::ProviderSignIn(status.provider));
+            }
+            if status.has_key {
+                tick(ui, palette, &response);
+            }
+        } else {
+            // Disabled and explained, never absent: a provider missing from the list looks
+            // like one Velm cannot reach at all.
+            let why = if status.on_subscription() {
+                format!("{} — runs on your subscription, so it needs no key", status.detail)
+            } else if !status.provider.needs_api_key() {
+                format!("{} — a model on your own machine needs no key", status.detail)
+            } else {
+                format!("{} — not found on this machine", status.detail)
+            };
+            let response = ui.add_enabled(false, button).on_disabled_hover_text(why);
+            if status.on_subscription() {
+                tick(ui, palette, &response);
+            }
+        }
+    }
+
+    if header.providers.iter().any(|status| status.has_key) {
+        ui.add_space(space::UNIT);
+        crate::widgets::hairline(ui, palette);
+        ui.add_space(space::UNIT);
+        for status in header.providers.iter().filter(|status| status.has_key) {
+            let label = format!("Forget the {} key", status.provider.label());
+            if ui.add(row_button(&label).min_size(vec2(row_width(ui), 0.0))).clicked() {
+                events.push(UiEvent::ProviderForget(status.provider));
+            }
+        }
+    }
+
+    ui.add_space(space::UNIT);
+    ui.label(
+        egui::RichText::new(
+            "Keys are stored in Velm's own credentials file and are never written to a \
+             board, a transcript or a log.",
+        )
+        .color(palette.faint)
+        .size(crate::theme::text::LABEL),
+    );
+}
+
 /// Board ▸ Move to — the reference folders, with the one the board is already in
 /// ticked, and a row that takes it out again.
 fn move_to_space(
@@ -995,6 +1179,15 @@ pub(crate) fn menu_item(
     let mut response = ui.add_enabled(available.is_enabled(), button);
     if let Some(why) = available.reason() {
         response = response.on_disabled_hover_text(why);
+    }
+    // …and the other kind of explanation: why a row that *can* be clicked is set the way it
+    // is. Two preferences carry one, both of them off by default for a cost the switch
+    // cannot show — see `Command::note`. On an enabled row only, so it never competes with
+    // the disabled reason above.
+    if let Some(note) = command.note()
+        && available.is_enabled()
+    {
+        response = response.on_hover_text(note);
     }
     if ticked {
         tick(ui, palette, &response);
