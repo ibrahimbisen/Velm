@@ -223,6 +223,26 @@ def build(dest: Path) -> Path:
     if not (app / "Contents" / "MacOS" / "Velm").is_file():
         die(f"make-app.sh reported success but {app} has no executable")
 
+    # The agent shims, beside the main executable — where `vellum_agent::transport::Shim`
+    # looks for them. This is the icon lesson applied to a second thing macOS reads and we
+    # do not: an .app whose shims are missing launches perfectly and every agent on every
+    # board silently loses messaging, notes, spawn and options, because the app is written
+    # to degrade rather than fail. A degradation nothing checks is a feature that quietly
+    # stops shipping.
+    #
+    # `os.access(X_OK)` rather than `is_file()`: the runtime requires the execute bit, so
+    # that is the question worth asking.
+    for shim in ("velm-agent-cli", "velm-mcp"):
+        path = app / "Contents" / "MacOS" / shim
+        if not path.is_file():
+            die(
+                f"make-app.sh reported success but {app} has no {shim}",
+                "Agents would launch and be unable to message each other, read the "
+                "board's notes or spawn helpers.",
+            )
+        if not os.access(path, os.X_OK):
+            die(f"{path} is not executable — the app would not find it at runtime")
+
     # An .app is a directory that macOS reads three things out of, and only one of
     # them is the executable. A bundle with a blank icon shipped once because this
     # check stopped at the line above: the icon was built and the plist naming it was

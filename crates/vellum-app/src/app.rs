@@ -764,6 +764,17 @@ impl ApplicationHandler for Vellum {
             // the user was away is a fact the window knows and that crate never guesses.
             WindowEvent::Focused(focused) => state.agent_focus_changed(focused),
 
+            // A file dragged from Finder onto an agent node — the producer
+            // `vellum_agent::ingest` never had. Three thousand lines of extractor, and
+            // `DroppedFile` did not appear anywhere in the repository, so nothing in the
+            // application ever wrote `AgentModel::context`: it could only ever be read from
+            // and removed from.
+            //
+            // Deliberately **not** gated on `taken`. egui has no idea a drop is happening —
+            // it is a platform event with no pointer button behind it — so asking whether
+            // the chrome wanted it would be asking a question about a gesture it never saw.
+            WindowEvent::DroppedFile(path) => state.attach_dropped_file(&path),
+
             WindowEvent::Resized(size) => {
                 state.surface.resize(size.width, size.height);
                 let (width, height) = state.surface.size();
@@ -965,6 +976,143 @@ impl ApplicationHandler for Vellum {
 }
 
 impl ActiveState {
+    /// A file dropped from the file manager: attach it to an agent node as context.
+    ///
+    /// # This is the producer `vellum_agent::ingest` did not have
+    ///
+    /// That module is three thousand lines — PDFs, `.docx`, web pages, YouTube captions,
+    /// audio and video hand-off — and it had **no caller in the workspace**. Nothing wrote
+    /// `AgentModel::context`; the panel could only ever list it and detach from it, so an
+    /// agent could be *given* nothing. The word `DroppedFile` did not appear in the
+    /// repository either, which is why this arm is new rather than moved.
+    ///
+    /// # Which node it lands on, and why it is not simply "the one under the pointer"
+    ///
+    /// ⚠ **A drop carries no coordinates.** `winit` reports `DroppedFile(path)` and nothing
+    /// else, and macOS delivers no `CursorMoved` while a drag from Finder is in flight — so
+    /// the last position this application knows is wherever the pointer was *before* the
+    /// drag began, which may be anywhere. Aiming at it alone would attach the file to a node
+    /// the user was not pointing at, silently, which is worse than refusing.
+    ///
+    /// So it is a ladder, each rung a stronger claim than the one below:
+    ///
+    /// 1. an agent node under the last known pointer — right whenever the pointer really was
+    ///    over the node, which is the common case for a drop that crosses the window;
+    /// 2. otherwise the **selected** agent, when exactly one is selected — a deliberate act
+    ///    that says which node is being worked on;
+    /// 3. otherwise nothing is guessed, and it says what to do.
+    ///
+    /// Never a multi-selection: attaching one file to nine agents is one gesture that costs
+    /// nine configurations, and no drop means that.
+    pub(crate) fn attach_dropped_file(&mut self, path: &std::path::Path) {
+        let Some(target) = self.agent_drop_target() else {
+            self.shell.toast(vellum_ui::Toast::info(
+                "Drop a file on an agent node, or select one first — that is who gets it."
+                    .to_owned(),
+            ));
+            return;
+        };
+        self.attach_context_to(target, &path.to_string_lossy());
+    }
+
+    /// The agent node a drop or an *Attach a file…* belongs to. See
+    /// [`Self::attach_dropped_file`] for the ladder and why it is one.
+    fn agent_drop_target(&self) -> Option<vellum_doc::ItemId> {
+        let world = self.camera.screen_to_world(self.input.cursor(&self.camera));
+        let under = self
+            .editor
+            .projection()
+            .scene()
+            .hit_test(world)
+            .and_then(|scene| self.editor.projection().get(scene))
+            .filter(|projected| {
+                matches!(projected.item.kind, vellum_doc::ItemKind::Agent { .. })
+            })
+            .map(|projected| projected.doc_id);
+        if under.is_some() {
+            return under;
+        }
+
+        // Exactly one, never "the first of several" — see the doc comment above.
+        let selection = self.editor.selection();
+        if selection.len() != 1 {
+            return None;
+        }
+        self.editor
+            .projection()
+            .get(selection[0])
+            .filter(|projected| {
+                matches!(projected.item.kind, vellum_doc::ItemKind::Agent { .. })
+            })
+            .map(|projected| projected.doc_id)
+    }
+
+    /// *Attach a file…* from the panel: the picker half of the same gesture.
+    ///
+    /// The other way in for a file that is not on screen, and for anyone who would rather
+    /// not drag. `rfd` is the same picker `attach_archive_from_picker` already uses.
+    pub(crate) fn attach_context_from_picker(&mut self) {
+        let Some(target) = self.agent_drop_target() else {
+            self.shell.toast(vellum_ui::Toast::info(
+                "Select one agent node first — a file is attached to a node, not to a board."
+                    .to_owned(),
+            ));
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new().set_title("Attach a file to this agent").pick_file()
+        else {
+            return;
+        };
+        self.attach_context_to(target, &path.to_string_lossy());
+    }
+
+    /// Read a source and record it on one agent node.
+    ///
+    /// # What is reported, and why the outcome is not a boolean
+    ///
+    /// `Outcome` distinguishes *read whole*, *read in part and here is what is missing*,
+    /// *the converter for this is not installed*, *this is not a thing text comes out of*
+    /// and *it could not be reached at all* — and its own `message()` is the sentence for
+    /// each. Reducing that to "attached" would produce the failure its doc comment names:
+    /// *attached — 0 characters*, a failure wearing a success's clothes.
+    ///
+    /// ⚠ **The read happens on this thread**, so an enormous PDF costs a frame. That is
+    /// acceptable for a gesture the user just made and is not acceptable for anything
+    /// automatic; the shape to grow into is `crate::links`' worker pool, and the reason it
+    /// is not that today is that a drop is one file at a time and a pool would have to carry
+    /// the target node across the wait — during which the node can be deleted.
+    fn attach_context_to(&mut self, doc: vellum_doc::ItemId, source: &str) {
+        let ingested = vellum_agent::ingest::ingest(source);
+        let Ok(item) = self.editor.board().item(doc) else { return };
+        let vellum_doc::ItemKind::Agent { model, label } = &item.kind else { return };
+        let mut config = crate::agent::decode(model);
+        config.context.push(ingested.source.clone());
+        let kind = vellum_doc::ItemKind::Agent {
+            model: crate::agent::encode(&config),
+            label: label.clone(),
+        };
+        if let Err(error) = self.editor.edit(|board| Ok(board.set_kind(doc, kind)?)) {
+            self.shell
+                .toast(vellum_ui::Toast::error(format!("that file could not be attached: {error}")));
+            return;
+        }
+        self.shell.invalidate_selection();
+
+        let label = if ingested.source.label.is_empty() {
+            source.to_owned()
+        } else {
+            ingested.source.label.clone()
+        };
+        // The ingester's own sentence, never a second one composed here: it is the only
+        // thing that knows whether a converter is missing or the file was simply long.
+        let message = format!("{label} — {}", ingested.outcome.message());
+        if matches!(ingested.outcome, vellum_agent::ingest::Outcome::Failed { .. }) {
+            self.shell.toast(vellum_ui::Toast::error(message));
+        } else {
+            self.shell.toast(vellum_ui::Toast::info(message));
+        }
+    }
+
     /// Miro's command bindings that the chrome does **not** already own.
     ///
     /// Almost nothing is left here on purpose. `vellum-ui`'s command table binds Undo,
@@ -1603,6 +1751,11 @@ impl ActiveState {
                 vellum_agent::Provider::default(),
             ),
             browser_nodes_allowed: shell.library.browser_nodes(),
+            // What this build can do, not what the user asked for. `vellum-app`'s own
+            // `voice` feature forwards to `vellum-agent/voice`, so one `cfg!` here answers
+            // for the whole application — and with the feature off the panel still draws
+            // the control and says the build has no microphone in it.
+            voice_available: cfg!(feature = "voice"),
             running: &running,
             connected: &connected,
             rules: &rules,

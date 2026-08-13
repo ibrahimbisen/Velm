@@ -454,6 +454,7 @@ mod tests {
                 connected: Vec::new(),
                 accepts_messages: true,
                 voice: false,
+                voice_available: false,
             }),
             ..SelectionItem::new(id(n), ItemFacet::Agent, Placement::new(0.0, 0.0, 400.0, 300.0))
         }

@@ -120,5 +120,22 @@ wry = { version = "0.56", optional = true }
 # browser. Nothing is inert.
 browser = ["dep:wry"]
 
+# Push-to-talk on an agent node — feature 14. **Off by default**, and the only thing this
+# line does is *forward*: the capability, the reasoning and the refusal all live in
+# `vellum-agent`'s own `voice` feature, whose comment gives the three reasons it is opt-in
+# (a recording device, `docs/07-agent-canvas.md` §0's cost rule, and `coreaudio-sys` needing
+# libclang on macOS — a build requirement no other crate here imposes).
+#
+# ⚠ **Without this line the feature was unreachable from a shipped binary at all.** Nothing
+# in this manifest mentioned `voice`, so `--features voice` on `vellum-app` failed and
+# `vellum-agent/voice` could only be turned on by building that crate directly — which is
+# not how Velm is built. `voice.rs`'s 2,250 lines could never be in the application.
+#
+# With it off, `vellum_agent::voice::NOT_BUILT_IN` is what the panel's Voice row says when
+# it is pressed on: the control is drawn, disabled, and names the feature. Nothing is
+# inert, and nothing is silently missing — an absent control would leave the user with no
+# way to discover that the feature exists.
+voice = ["vellum-agent/voice"]
+
 [dev-dependencies]
 tempfile.workspace = true

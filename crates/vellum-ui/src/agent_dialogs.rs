@@ -57,6 +57,39 @@ pub(crate) enum Answer {
 // The rules editor — feature 11
 // ============================================================================
 
+/// One inherited rule layer's file: where it is, and whether it is there.
+///
+/// # Why a path is worth a row
+///
+/// The cascade has three layers and the editor could only ever write **one** of them. The
+/// global layer is `<data-dir>/rules/global.md` and a project's is a `rules.md` beside the
+/// board; nothing in the application wrote either, showed either, or named either — so the
+/// two layers a user is most likely to want ("this is how I want every agent to talk")
+/// existed only for somebody who had read `rules.rs` and gone looking with a file manager.
+///
+/// Naming the path is the smallest honest fix: it turns *"inherited from your global rules"*
+/// from a claim about a file nobody can find into an instruction. Revealing it is the next
+/// smallest, and it is offered exactly when there is something to reveal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleFilePath {
+    /// The absolute path, for display and for [`crate::UiEvent::RevealPath`].
+    pub path: String,
+    /// Whether it is on disk. A file that is not there cannot be revealed, and a button that
+    /// opens nothing is the inert control this house does not ship.
+    pub exists: bool,
+}
+
+/// The two layers above the node's own, as files.
+///
+/// Both are `Option` because a caller may genuinely have neither: a board saved nowhere has
+/// no project, and a test has no data directory. An absent layer draws no row rather than a
+/// row about a path that does not apply.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuleFiles {
+    pub global: Option<RuleFilePath>,
+    pub project: Option<RuleFilePath>,
+}
+
 /// The node's own rule layer, as a form.
 ///
 /// Held as separate fields rather than as the [`AgentRules::text`] the document stores,
@@ -223,6 +256,12 @@ pub(crate) fn rules_editor(
     palette: Palette,
     form: &mut RulesForm,
     resolved: &ResolvedRules,
+    files: &RuleFiles,
+    // Set when a *Show* button was pressed. An out-parameter rather than an `EventSink`,
+    // because the caller holds one and the modal's closure borrows too much to hand it in —
+    // and because this editor emits exactly one kind of event, so a whole sink would be a
+    // channel carrying one message.
+    reveal: &mut Option<std::path::PathBuf>,
     confirm: &str,
 ) -> Option<Answer> {
     let mut answer = None;
@@ -258,6 +297,8 @@ pub(crate) fn rules_editor(
             });
         });
     }
+
+    rule_files(ui, palette, files, reveal);
 
     ui.add_space(space::of(2));
     hairline(ui, palette);
@@ -361,6 +402,75 @@ pub(crate) fn rules_editor(
     });
 
     answer
+}
+
+/// The two layers this editor cannot write, named and revealed.
+///
+/// The cascade's top two layers are files, and the editor writes only the bottom one. Before
+/// this, nothing in the application said where those files were — so *"Inherited from your
+/// global rules"* pointed at something the user had no way to find, let alone change. The row
+/// is the whole of the fix: a heading that says which layer, the path itself, and a *Show*
+/// button when there is a file to show.
+///
+/// **Absent is a state, not an omission.** A layer with no file yet still gets its row, with
+/// the path it *would* be at, because "create this file" is only actionable if you are told
+/// what to create and where. The button is disabled and says so rather than opening nothing.
+fn rule_files(
+    ui: &mut Ui,
+    palette: Palette,
+    files: &RuleFiles,
+    reveal: &mut Option<std::path::PathBuf>,
+) {
+    if files.global.is_none() && files.project.is_none() {
+        return;
+    }
+
+    ui.add_space(space::of(2));
+    hairline(ui, palette);
+    section_header(ui, palette, "Inherited from");
+
+    for (layer, file) in
+        [(Layer::Global, files.global.as_ref()), (Layer::Project, files.project.as_ref())]
+    {
+        let Some(file) = file else { continue };
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                egui::vec2(space::of(24), ui.spacing().interact_size.y),
+                egui::Label::new(egui::RichText::new(layer.heading()).color(palette.muted))
+                    .selectable(false),
+            );
+            // Truncated rather than wrapped: a home directory is long, and a path that took
+            // three lines would push the settings this dialog is actually for off the
+            // screen. The whole of it is on the hover, and on the button beside it.
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(file.path.as_str())
+                        .color(if file.exists { palette.text } else { palette.faint })
+                        .size(crate::theme::text::LABEL),
+                )
+                .selectable(true)
+                .wrap_mode(egui::TextWrapMode::Truncate),
+            )
+            .on_hover_text(file.path.clone());
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let button = egui::Button::new("Show").frame(true);
+                let response = ui.add_enabled(file.exists, button);
+                if file.exists {
+                    if response.on_hover_text(file.path.clone()).clicked() {
+                        *reveal = Some(file.path.clone().into());
+                    }
+                } else {
+                    response.on_disabled_hover_text(format!(
+                        "There is no {} yet. Create that file and every agent that inherits \
+                         this layer picks it up — the front matter takes the same four \
+                         settings this dialog writes.",
+                        file.path
+                    ));
+                }
+            });
+        });
+    }
 }
 
 /// What a field would resolve to if this node stopped setting it — the placeholder in the
@@ -1029,9 +1139,34 @@ mod tests {
             "Reviewer",
         );
         let mut form = RulesForm::from_rules(&AgentRules::default());
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let _ = rules_editor(ui, Palette::LIGHT, &mut form, &resolved, "Save");
-        });
+        // Both file states, because they draw different things: one row offers *Show* and
+        // the other refuses with the path it would be at.
+        for files in [
+            RuleFiles::default(),
+            RuleFiles {
+                global: Some(RuleFilePath {
+                    path: "/tmp/velm/rules/global.md".to_owned(),
+                    exists: true,
+                }),
+                project: Some(RuleFilePath {
+                    path: "/tmp/project/rules.md".to_owned(),
+                    exists: false,
+                }),
+            },
+        ] {
+            let mut reveal = None;
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = rules_editor(
+                    ui,
+                    Palette::LIGHT,
+                    &mut form,
+                    &resolved,
+                    &files,
+                    &mut reveal,
+                    "Save",
+                );
+            });
+        }
 
         let mut key = SecretKey::default();
         for provider in [Provider::Claude, Provider::Kimi] {
@@ -1039,5 +1174,96 @@ mod tests {
                 let _ = sign_in(ui, Palette::LIGHT, provider, false, &mut key, "Sign in");
             });
         }
+    }
+
+    /// Every run of text one pass painted.
+    fn painted(full: &egui::FullOutput) -> Vec<String> {
+        full.shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The two layers this editor cannot write are **named**, whether or not they exist.
+    ///
+    /// Nothing wrote `<data-dir>/rules/global.md` or a project `rules.md`, and nothing showed
+    /// either path anywhere in the application — so the top two thirds of a three-layer
+    /// cascade were reachable only by someone who had read `rules.rs` and gone looking with a
+    /// file manager. A row that says *"Inherited from your global rules"* and cannot say
+    /// *which file* is a claim the user has no way to act on.
+    ///
+    /// A missing file still gets its row, with the path it would be at: "create this" is only
+    /// actionable if you are told what to create and where.
+    #[test]
+    fn the_rules_editor_names_the_two_files_it_cannot_write() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, crate::theme::Theme::Light);
+
+        let resolved = vellum_agent::rules::resolve(
+            &RuleFile::parse("---\ntone: warm\n---"),
+            &RuleFile::default(),
+            &AgentRules::default(),
+            "Reviewer",
+        );
+        let mut form = RulesForm::from_rules(&AgentRules::default());
+        let files = RuleFiles {
+            global: Some(RuleFilePath {
+                path: "/tmp/velm/rules/global.md".to_owned(),
+                exists: true,
+            }),
+            // Absent on disk, and still named.
+            project: Some(RuleFilePath {
+                path: "/tmp/project/rules.md".to_owned(),
+                exists: false,
+            }),
+        };
+
+        let mut reveal = None;
+        let full = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = rules_editor(
+                ui,
+                Palette::LIGHT,
+                &mut form,
+                &resolved,
+                &files,
+                &mut reveal,
+                "Save",
+            );
+        });
+
+        let words = painted(&full);
+        assert!(
+            words.iter().any(|t| t.contains("/tmp/velm/rules/global.md")),
+            "the global layer's file was never named: {words:?}"
+        );
+        assert!(
+            words.iter().any(|t| t.contains("/tmp/project/rules.md")),
+            "a project layer that does not exist yet has to be named too: {words:?}"
+        );
+
+        // …and with neither, the section withdraws rather than drawing headings over
+        // nothing. A caller with no data directory and no project has two layers that do not
+        // apply, and a row about a path that does not apply is worse than no row.
+        let bare = RuleFiles::default();
+        let mut reveal = None;
+        let full = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = rules_editor(
+                ui,
+                Palette::LIGHT,
+                &mut form,
+                &resolved,
+                &bare,
+                &mut reveal,
+                "Save",
+            );
+        });
+        // Uppercased by `section_label`, which is why this compares the shouted form.
+        assert!(
+            !painted(&full).iter().any(|t| t == "INHERITED FROM"),
+            "a heading with nothing under it"
+        );
     }
 }

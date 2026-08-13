@@ -502,13 +502,17 @@ fn draw(
 
         Control::NoteScope => {
             let private = matches!(model.note_private, Field::Uniform(true));
-            // Only one direction is reachable from a toolbar. Making a note private needs an
-            // *owner*, and which agent owns it is which agent it is connected to — a board
-            // gesture, not a button. So the shared state is disabled and says so, rather
-            // than flipping a label and emitting nothing.
             let button = egui::Button::selectable(private, if private { "Private" } else { "Shared" })
                 .frame(true)
                 .min_size(Vec2::splat(CONTROL));
+            // Both directions are reachable now. The bar used to disable *Shared* under a
+            // sentence telling the user to "connect it to one agent" — a gesture nothing
+            // implemented, so following the instruction did nothing and the note stayed
+            // shared for ever. The connector was the right idea and it is what the menu
+            // below reads: `NoteSummary::connected` is the agents on the other end of a line
+            // the user drew.
+            let connected: &[crate::AgentLink] =
+                model.note.as_ref().map_or(&[], |note| note.connected.as_slice());
             if private {
                 if ui
                     .add(button)
@@ -519,11 +523,37 @@ fn draw(
                         vellum_agent::NoteScope::Shared,
                     )));
                 }
-            } else {
+            } else if connected.is_empty() {
+                // Still disabled — and now for a reason that names a gesture that exists.
                 ui.add_enabled(false, button).on_disabled_hover_text(
-                    "Shared with every agent on this board. Connect it to one agent to make \
-                     it that agent's own.",
+                    "Shared with every agent on this board. Draw a connector from it to one \
+                     agent to make it that agent's own.",
                 );
+            } else {
+                // A menu, not a toggle: *private* is "private to whom", and with two lines
+                // drawn a button would have to guess which agent was meant.
+                egui::ComboBox::from_id_salt("velm-bar-note-scope")
+                    .selected_text("Shared")
+                    .width(CONTROL * 2.5)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(true, "Shared with every agent").clicked() {
+                            events.push(UiEvent::Agent(crate::AgentEdit::NoteScope(
+                                vellum_agent::NoteScope::Shared,
+                            )));
+                        }
+                        for link in connected {
+                            if ui
+                                .selectable_label(false, format!("Private to {}", link.label))
+                                .clicked()
+                            {
+                                events.push(UiEvent::Agent(crate::AgentEdit::NoteScope(
+                                    vellum_agent::NoteScope::Private { agent: link.id.clone() },
+                                )));
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Who may read and write this note");
             }
         }
 
@@ -1024,6 +1054,7 @@ mod tests {
                 connected: Vec::new(),
                 accepts_messages: true,
                 voice: false,
+                voice_available: false,
             }),
             ..bare(1, ItemFacet::Agent)
         }
@@ -1038,6 +1069,8 @@ mod tests {
                 conflicted: false,
                 links: 0,
                 on_disk: true,
+                title: "Plan".to_owned(),
+                connected: Vec::new(),
             }),
             ..bare(1, ItemFacet::Note)
         }
@@ -1059,7 +1092,10 @@ mod tests {
         SelectionItem {
             file_tree: Some(crate::FileTreeSummary {
                 root: String::new(),
+                project_dir: None,
                 agent: None,
+                agent_id: None,
+                connected: Vec::new(),
                 show_ignored: false,
             }),
             ..bare(1, ItemFacet::FileTree)

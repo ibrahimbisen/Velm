@@ -103,6 +103,16 @@ pub struct LaunchSpec {
     /// The pseudo-terminal's size in (columns, rows). `None` takes [`pty::DEFAULT_SIZE`].
     /// Ignored by the other two transports.
     pub terminal: Option<(u16, u16)>,
+
+    /// Where Velm's own agent-facing binaries are, if they were found. See [`Shim`].
+    ///
+    /// **Data on the spec rather than a global lookup inside each transport**, for the same
+    /// reason `system_context` is: a transport that resolved this for itself could not be
+    /// handed a fake one by a test, and the whole of `docs/07` §6 — messaging, notes, spawn,
+    /// options — is reachable only if this is right. `None` means the shim was not found and
+    /// the agent runs with no way to act on the board; it is a degraded session, not a
+    /// failed one.
+    pub shim: Option<Shim>,
 }
 
 /// ⚠ **Hand-written, and this is the most exposed of the crate's four secrets.**
@@ -130,6 +140,9 @@ impl std::fmt::Debug for LaunchSpec {
             .field("api_key", &self.api_key.as_ref().map(|_| "<set>"))
             .field("data_dir", &self.data_dir)
             .field("terminal", &self.terminal)
+            // Paths to our own binaries — no secret, and *"was the shim found"* is the first
+            // question when an agent cannot reach the board.
+            .field("shim", &self.shim)
             .finish_non_exhaustive()
     }
 }
@@ -162,9 +175,81 @@ impl LaunchSpec {
         self.command.as_deref().or_else(|| self.provider.provider.default_command())
     }
 
-    /// The API base, resolving `None` through the provider.
+    pub fn with_shim(mut self, shim: Shim) -> Self {
+        self.shim = Some(shim);
+        self
+    }
+
+    /// The API base, resolving `None` through the node's own choice and then the provider.
+    ///
+    /// **Three layers, and the middle one is new.** [`crate::provider::Provider::Local`] and
+    /// [`crate::provider::Provider::Custom`] deliberately have no default — they *are* their
+    /// endpoint — so before [`ProviderChoice::base_url`] existed there was no way to say
+    /// where a local model was listening except by setting this field, which nothing in the
+    /// application did. The order is caller override, then the node, then the provider's
+    /// fixed default; an empty string is treated as unset, because that is what a config
+    /// field the user cleared answers.
     pub fn resolved_base_url(&self) -> Option<&str> {
-        self.base_url.as_deref().or_else(|| self.provider.provider.default_base_url())
+        self.base_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .or_else(|| self.provider.base_url.as_deref().filter(|url| !url.trim().is_empty()))
+            .or_else(|| self.provider.provider.default_base_url())
+    }
+
+    /// A variable this spec will put in the child's environment.
+    ///
+    /// The IPC coordinates travel in [`LaunchSpec::env`] because that is how they reach the
+    /// child, and an MCP server entry has to repeat them in its own `env` block — so the two
+    /// must be read from one place or they will come to disagree about which board an agent
+    /// is on.
+    pub fn env_value(&self, name: &str) -> Option<&str> {
+        self.env.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+    }
+
+    /// The MCP server document to hand a client that speaks MCP, as `{"mcpServers": {…}}`.
+    ///
+    /// `None` when there is no `velm-mcp` to point at, which is the degradation: the agent
+    /// is started with no MCP configuration at all rather than with one naming a binary that
+    /// is not there.
+    pub fn mcp_config(&self) -> Option<serde_json::Value> {
+        let shim = self.shim.as_ref()?;
+        // Built rather than written as a `json!` literal because the key is a constant:
+        // `MCP_SERVER_NAME` is part of every tool name the agent sees, so it is spelled once
+        // and reused, and a macro key has to be a literal.
+        let mut servers = serde_json::Map::new();
+        servers.insert(MCP_SERVER_NAME.to_owned(), shim.mcp_entry(self)?);
+        Some(serde_json::json!({ "mcpServers": serde_json::Value::Object(servers) }))
+    }
+
+    /// The same servers in the shape the Agent Client Protocol asks for: an **array** of
+    /// entries that name themselves, with `env` as a list of `{name, value}` pairs.
+    ///
+    /// Empty when there is nothing to register, which is exactly the `[]` this used to be
+    /// hardcoded to — so a client that would have worked before still works.
+    pub fn mcp_servers_acp(&self) -> Vec<serde_json::Value> {
+        let Some(shim) = self.shim.as_ref() else {
+            return Vec::new();
+        };
+        let Some(mcp) = shim.mcp() else {
+            return Vec::new();
+        };
+        vec![serde_json::json!({
+            "name": MCP_SERVER_NAME,
+            "command": mcp.display().to_string(),
+            "args": [],
+            "env": self.ipc_env().into_iter().map(|(name, value)| {
+                serde_json::json!({ "name": name, "value": value })
+            }).collect::<Vec<_>>(),
+        })]
+    }
+
+    /// The two variables that tell a child which Velm and which node it belongs to.
+    fn ipc_env(&self) -> Vec<(&'static str, String)> {
+        [crate::mcp::IPC_ENV, crate::mcp::AGENT_ID_ENV]
+            .into_iter()
+            .filter_map(|name| self.env_value(name).map(|value| (name, value.to_owned())))
+            .collect()
     }
 }
 
@@ -384,6 +469,162 @@ pub fn probe_command(command: &str) -> Result<PathBuf> {
     Err(AgentError::MissingCommand { command: command.to_owned() })
 }
 
+// ---------------------------------------------------------------------------------------
+// The shim — how an agent reaches back into Velm
+// ---------------------------------------------------------------------------------------
+
+/// The shim an agent shells out to. `crates/vellum-agent/src/bin/velm_agent_cli.rs`.
+///
+/// Spelled here rather than repeated at the four sites that need it, because it is
+/// simultaneously a `[[bin]]` name in `Cargo.toml`, a file the packaging scripts copy, a
+/// word in the system context an agent reads, and the thing this module probes for. Those
+/// four agreeing is the entire feature.
+pub const AGENT_CLI: &str = "velm-agent-cli";
+
+/// Velm's MCP stdio server. `crates/vellum-agent/src/bin/velm_mcp.rs`.
+pub const MCP_SERVER: &str = "velm-mcp";
+
+/// The name an MCP client files Velm's server under.
+///
+/// It is not cosmetic: Claude Code exposes an MCP tool as `mcp__<server>__<tool>`, so this
+/// word is part of every tool name the agent sees. Short and lowercase for that reason.
+pub const MCP_SERVER_NAME: &str = "velm";
+
+/// Where Velm's own agent-facing binaries are.
+///
+/// # Why `current_exe`'s directory, and why it is probed rather than assumed
+///
+/// The shim has to be found from inside a running Velm, and the two places Velm ever runs
+/// from put it in the same relation: in a `.app` bundle both binaries sit in
+/// `Contents/MacOS/` beside the main executable, and in a Cargo build they sit in
+/// `target/<profile>/` beside it. So the answer is *"the directory I was loaded from"* in
+/// both, and it is the only answer that does not encode a build layout into the program.
+///
+/// It is **probed** — [`Shim::beside`] stats each name — because a bundle built before this
+/// existed, or one updated by a script that copies a single executable, has the main binary
+/// and neither shim. That must produce [`Shim::gap`]'s named message rather than agents that
+/// silently cannot reach the board, which is the state this whole change exists to end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shim {
+    dir: PathBuf,
+    cli: Option<PathBuf>,
+    mcp: Option<PathBuf>,
+}
+
+impl Shim {
+    /// What is beside `dir`. **Pure**: it stats, and it reads no environment.
+    pub fn beside(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        let cli = executable_in(&dir, AGENT_CLI);
+        let mcp = executable_in(&dir, MCP_SERVER);
+        Self { dir, cli, mcp }
+    }
+
+    /// What is beside the running executable, or `None` if the platform will not say where
+    /// that is. Not cached here — see [`shim`].
+    pub fn locate() -> Option<Self> {
+        let exe = std::env::current_exe().ok()?;
+        Some(Self::beside(exe.parent()?))
+    }
+
+    /// The directory the child gets on its `PATH`.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn cli(&self) -> Option<&Path> {
+        self.cli.as_deref()
+    }
+
+    pub fn mcp(&self) -> Option<&Path> {
+        self.mcp.as_deref()
+    }
+
+    /// Whether anything at all was found. `false` is the "nothing was shipped" case.
+    pub fn any(&self) -> bool {
+        self.cli.is_some() || self.mcp.is_some()
+    }
+
+    /// What is missing, in a sentence the user can act on — `None` when nothing is.
+    ///
+    /// It names the script that fixes it, because *"velm-agent-cli was not found"* is a
+    /// sentence a user cannot do anything with and *"rebuild the bundle"* is one they can.
+    pub fn gap(&self) -> Option<String> {
+        let missing: Vec<&str> = [(AGENT_CLI, self.cli.is_some()), (MCP_SERVER, self.mcp.is_some())]
+            .into_iter()
+            .filter(|(_, found)| !found)
+            .map(|(name, _)| name)
+            .collect();
+        if missing.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Velm's agent tools ({}) are not beside the application in {} — agents will run \
+             but cannot message each other, read notes or spawn helpers. Rebuild with \
+             scripts/make-app.sh.",
+            missing.join(" and "),
+            self.dir.display()
+        ))
+    }
+
+    /// The `PATH` a child should get: this directory first, then whatever Velm inherited.
+    ///
+    /// **Prepended, never replaced.** A child that lost the inherited `PATH` would lose
+    /// `git`, `node`, the user's toolchain and — for a delegated CLI — the very binary
+    /// `probe_command` resolved, so a coding agent would come up unable to do the work it
+    /// was placed on the board for.
+    pub fn path_env(&self) -> (String, String) {
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let mut directories = vec![self.dir.clone()];
+        directories.extend(std::env::split_paths(&inherited).filter(|entry| entry != &self.dir));
+        let joined = std::env::join_paths(directories)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| self.dir.display().to_string());
+        ("PATH".to_owned(), joined)
+    }
+
+    /// One `mcpServers` entry, in the shape Claude Code's own configuration file uses.
+    ///
+    /// The `env` block repeats the IPC coordinates rather than trusting inheritance. It is
+    /// belt and braces on the transports here, which do pass `env` through — and it is not
+    /// belt and braces at all for a client that starts its MCP servers from a scrubbed
+    /// environment, which several do.
+    fn mcp_entry(&self, spec: &LaunchSpec) -> Option<serde_json::Value> {
+        let mcp = self.mcp.as_ref()?;
+        let env: serde_json::Map<String, serde_json::Value> = spec
+            .ipc_env()
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), serde_json::Value::String(value)))
+            .collect();
+        Some(serde_json::json!({
+            "command": mcp.display().to_string(),
+            "args": [],
+            "env": env,
+        }))
+    }
+}
+
+/// The shim beside this process, resolved once.
+///
+/// Cached because [`Shim::beside`] stats two files and this is asked on every agent launch,
+/// and because the answer cannot change while the process runs: the executable is open.
+pub fn shim() -> Option<&'static Shim> {
+    static FOUND: std::sync::OnceLock<Option<Shim>> = std::sync::OnceLock::new();
+    FOUND.get_or_init(Shim::locate).as_ref()
+}
+
+/// `dir/name`, if that is something we could run. Tries the Windows spelling too.
+fn executable_in(dir: &Path, name: &str) -> Option<PathBuf> {
+    let bare = dir.join(name);
+    if is_executable(&bare) {
+        return Some(bare);
+    }
+    // Not gated on `cfg(windows)`: a bundle assembled on one platform is occasionally
+    // inspected on another, and looking for a name that cannot be there costs one `stat`.
+    let suffixed = dir.join(format!("{name}.exe"));
+    is_executable(&suffixed).then_some(suffixed)
+}
+
 /// Whether this path names a file we could run.
 ///
 /// On Unix that is a file with any execute bit set; elsewhere the existence of the file is
@@ -547,5 +788,152 @@ mod tests {
         let after = park_blob(&blobs, "image/png", vec![9]);
         assert_ne!(after, first, "a placeholder was reused after the queue was drained");
         assert_ne!(after, second);
+    }
+
+    /// A fake bundle: a directory with whichever of the two shims the test asks for, marked
+    /// executable, because [`is_executable`] is the thing under test on Unix and a file with
+    /// no execute bit is exactly the "copied but not runnable" case.
+    fn fake_bundle(names: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        for name in names {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+        }
+        dir
+    }
+
+    /// The header's claim, measured: what is beside the executable is found, and what is not
+    /// there is **named**. The half that matters is the second one — a bundle built before
+    /// the shims were shipped has the main binary and neither of these, and the failure mode
+    /// this whole path exists to end is that state being silent.
+    #[test]
+    fn the_shim_is_found_beside_the_executable_and_named_when_it_is_not() {
+        let both = fake_bundle(&[AGENT_CLI, MCP_SERVER]);
+        let shim = Shim::beside(both.path());
+        assert_eq!(shim.cli(), Some(both.path().join(AGENT_CLI).as_path()));
+        assert_eq!(shim.mcp(), Some(both.path().join(MCP_SERVER).as_path()));
+        assert!(shim.any());
+        assert_eq!(shim.gap(), None, "nothing was missing and something was reported");
+
+        // The shape an `update.sh` that copied only the main executable leaves behind.
+        let neither = fake_bundle(&[]);
+        let empty = Shim::beside(neither.path());
+        assert!(!empty.any());
+        let gap = empty.gap().expect("a missing shim must be named");
+        assert!(gap.contains(AGENT_CLI), "{gap}");
+        assert!(gap.contains(MCP_SERVER), "{gap}");
+        assert!(gap.contains("make-app.sh"), "the remedy is the point of the message: {gap}");
+
+        // Half a bundle names only the half that is missing, or the user goes looking for a
+        // file that is sitting right there.
+        let partial = fake_bundle(&[AGENT_CLI]);
+        let half = Shim::beside(partial.path());
+        let gap = half.gap().expect("half a shim is still a gap");
+        assert!(gap.contains(MCP_SERVER), "{gap}");
+        assert!(!gap.contains(AGENT_CLI), "it named a binary that was found: {gap}");
+    }
+
+    /// The child's `PATH` must gain the shim's directory and lose nothing.
+    ///
+    /// Replacing it instead of prepending is the plausible mistake and the expensive one: a
+    /// coding agent with no inherited `PATH` has no `git`, no toolchain, and — for a
+    /// delegated CLI — not even the binary it is running as.
+    #[test]
+    fn the_child_gets_the_shim_first_and_keeps_the_inherited_path() {
+        let dir = fake_bundle(&[AGENT_CLI]);
+        let (name, value) = Shim::beside(dir.path()).path_env();
+        assert_eq!(name, "PATH");
+
+        let entries: Vec<_> = std::env::split_paths(&value).collect();
+        assert_eq!(entries.first().map(PathBuf::as_path), Some(dir.path()), "{value}");
+
+        for inherited in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+            assert!(entries.contains(&inherited), "{} was dropped from PATH", inherited.display());
+        }
+    }
+
+    /// The MCP document, both shapes, from one shim.
+    ///
+    /// Asserted structurally rather than as a string: these are guesses at two other tools'
+    /// configuration formats (see `claude_cli`'s `MCP_CONFIG_FLAG`), so what is worth pinning
+    /// is that the binary and the two IPC variables are *in* the document — a client that
+    /// starts `velm-mcp` without them gets a server that refuses every `velm_*` tool.
+    #[test]
+    fn the_mcp_documents_name_the_server_and_carry_the_ipc_coordinates() {
+        let dir = fake_bundle(&[AGENT_CLI, MCP_SERVER]);
+        let mut spec = LaunchSpec::new(ProviderChoice::new(Provider::Claude))
+            .with_shim(Shim::beside(dir.path()));
+        spec.env = vec![
+            (crate::mcp::IPC_ENV.into(), "/tmp/ipc.json".into()),
+            (crate::mcp::AGENT_ID_ENV.into(), "board:4@7".into()),
+        ];
+
+        let config = spec.mcp_config().expect("a shipped shim configures an MCP server");
+        let entry = &config["mcpServers"][MCP_SERVER_NAME];
+        assert_eq!(entry["command"], dir.path().join(MCP_SERVER).display().to_string());
+        assert_eq!(entry["env"][crate::mcp::IPC_ENV], "/tmp/ipc.json");
+        assert_eq!(entry["env"][crate::mcp::AGENT_ID_ENV], "board:4@7");
+
+        // ACP spells the same thing as an array of self-naming entries with `env` as pairs.
+        let servers = spec.mcp_servers_acp();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["name"], MCP_SERVER_NAME);
+        let pairs = servers[0]["env"].as_array().expect("env is a list of pairs");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0]["name"], crate::mcp::IPC_ENV);
+        assert_eq!(pairs[0]["value"], "/tmp/ipc.json");
+    }
+
+    /// **The degradation, which is the requirement rather than a nicety.** With no shim
+    /// found there must be no MCP configuration at all — a document naming a binary that is
+    /// not there is a client that fails to start its server, which on some clients fails the
+    /// whole session. `[]`/`None` is what the code did before any of this existed.
+    #[test]
+    fn a_missing_shim_configures_no_mcp_server_rather_than_a_broken_one() {
+        let bare = LaunchSpec::new(ProviderChoice::new(Provider::Claude));
+        assert!(bare.mcp_config().is_none());
+        assert!(bare.mcp_servers_acp().is_empty());
+
+        // Present but incomplete: the `velm-mcp` half is what an MCP entry points at, so a
+        // bundle carrying only the CLI must still configure nothing.
+        let dir = fake_bundle(&[AGENT_CLI]);
+        let partial = LaunchSpec::new(ProviderChoice::new(Provider::Claude))
+            .with_shim(Shim::beside(dir.path()));
+        assert!(partial.mcp_config().is_none(), "an MCP entry pointed at a missing binary");
+        assert!(partial.mcp_servers_acp().is_empty());
+    }
+
+    /// Feature 16's other half: a local model *is* its endpoint, so the node must be able to
+    /// say where it is listening. Before [`ProviderChoice::base_url`] there was no such field
+    /// and `LaunchSpec::base_url` was hardcoded `None` at the one place it was built — so a
+    /// local model could be chosen and never reached.
+    #[test]
+    fn a_node_can_say_where_its_local_model_is_listening() {
+        let local = LaunchSpec::new(
+            ProviderChoice::new(Provider::Local).with_base_url("http://127.0.0.1:11434/v1"),
+        );
+        assert_eq!(local.resolved_base_url(), Some("http://127.0.0.1:11434/v1"));
+
+        // The caller's own override still wins over the node's, and the node's over the
+        // provider default — three layers, in that order.
+        let overridden =
+            LaunchSpec { base_url: Some("http://elsewhere/v1".into()), ..local.clone() };
+        assert_eq!(overridden.resolved_base_url(), Some("http://elsewhere/v1"));
+
+        let claude = LaunchSpec::new(
+            ProviderChoice::new(Provider::Claude).with_base_url("https://proxy.internal"),
+        );
+        assert_eq!(claude.resolved_base_url(), Some("https://proxy.internal"));
+
+        // A field the user cleared is unset, not an empty endpoint — an empty base URL
+        // builds a request to nowhere and reports it as a network failure.
+        let cleared = LaunchSpec::new(ProviderChoice::new(Provider::Claude).with_base_url("  "));
+        assert_eq!(cleared.resolved_base_url(), Some("https://api.anthropic.com"));
     }
 }

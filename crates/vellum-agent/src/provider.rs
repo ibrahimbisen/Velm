@@ -233,11 +233,28 @@ pub struct ProviderChoice {
     /// `None` takes [`Provider::default_transport`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<Transport>,
+    /// Where this node's endpoint is, when the provider has no fixed one.
+    ///
+    /// **This is the other half of feature 16.** [`Provider::Local`] and [`Provider::Custom`]
+    /// deliberately answer `None` from [`Provider::default_base_url`] — they *are* their
+    /// endpoint, and guessing `localhost:11434` would silently talk to whichever of the four
+    /// local servers happened to be up. That is right, and until this field existed it also
+    /// meant there was **no way to tell Velm where a local model was listening**: the two
+    /// providers whose whole point is a user-supplied address had nowhere to put one.
+    ///
+    /// Per node, like everything else here, so one board can hold an agent on a model served
+    /// from this machine and another on a model served from the next desk.
+    ///
+    /// `#[serde(default)]` on the struct plus `skip_serializing_if` here is what keeps this
+    /// lossless in both directions: an agent token written before this field existed parses,
+    /// and a node that has not set one is written byte for byte as it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 impl ProviderChoice {
     pub fn new(provider: Provider) -> Self {
-        Self { provider, model: None, transport: None }
+        Self { provider, model: None, transport: None, base_url: None }
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
@@ -248,6 +265,31 @@ impl ProviderChoice {
     pub fn with_transport(mut self, transport: Transport) -> Self {
         self.transport = Some(transport);
         self
+    }
+
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// The endpoint this choice resolves to, its own first and the provider's default after.
+    ///
+    /// `None` means *this node has no endpoint yet*, which is only reachable for the two
+    /// providers that have no default — and it is the state the interface must offer a field
+    /// for, rather than the state it fails a request from.
+    pub fn effective_base_url(&self) -> Option<&str> {
+        self.base_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .or_else(|| self.provider.default_base_url())
+    }
+
+    /// Whether this node is reachable at all: an endpoint it needs and has not been given is
+    /// the one configuration error that produces a network failure instead of a refusal.
+    ///
+    /// What the inspector should gate its *Start* on for a local or custom provider.
+    pub fn needs_a_base_url(&self) -> bool {
+        self.effective_transport() == Transport::Http && self.effective_base_url().is_none()
     }
 
     /// The transport actually used, resolving `None` through the provider.
@@ -354,6 +396,32 @@ mod tests {
         for provider in Provider::ALL {
             assert_eq!(ProviderChoice::new(provider).model, None, "{provider:?}");
         }
+    }
+
+    /// A node can now say where its own endpoint is — and a token written before it could
+    /// must round-trip **byte for byte**.
+    ///
+    /// The second half is the RULE ZERO half: this struct is serialised into every agent
+    /// node on every board on disk, so a new field that serialised as `"base_url":null`
+    /// would rewrite all of them the first time they were touched.
+    #[test]
+    fn a_node_carries_its_own_endpoint_and_an_older_token_is_unchanged() {
+        let local = ProviderChoice::new(Provider::Local).with_base_url("http://127.0.0.1:8080/v1");
+        assert_eq!(local.effective_base_url(), Some("http://127.0.0.1:8080/v1"));
+        assert!(!local.needs_a_base_url());
+
+        // The state the interface has to offer a field for: chosen, and not yet reachable.
+        let unset = ProviderChoice::new(Provider::Local);
+        assert_eq!(unset.effective_base_url(), None);
+        assert!(unset.needs_a_base_url(), "a local model with no address must be flagged");
+
+        // A delegated CLI is not an endpoint, so it is never "missing" one.
+        assert!(!ProviderChoice::new(Provider::Claude).needs_a_base_url());
+
+        let older = r#"{"provider":"local","model":"qwen3-coder"}"#;
+        let parsed: ProviderChoice = serde_json::from_str(older).unwrap();
+        assert_eq!(parsed.base_url, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), older, "an old token was rewritten");
     }
 
     /// Only the two that have no fixed home are without a base URL — those are the ones

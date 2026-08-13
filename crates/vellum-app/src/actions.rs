@@ -1833,7 +1833,22 @@ impl ActiveState {
         );
         let resolved = vellum_agent::rules::resolve(&global, &project, &model.rules, role);
 
-        let mut context = resolved.system_context();
+        // What this agent can reach on the board, and therefore what it is told about.
+        //
+        // `None` when nothing was shipped beside the application: an agent told about a
+        // command it has not got is worse than one told nothing, and the missing shim is
+        // reported to the user once, by `start_agent_at`, rather than being narrated by every
+        // agent that fails to use it.
+        let shim = vellum_agent::transport::shim().filter(|shim| shim.any());
+        let tools = shim.and_then(vellum_agent::transport::Shim::cli).map(|_| {
+            vellum_agent::rules::BoardTools {
+                command: vellum_agent::transport::AGENT_CLI.to_owned(),
+                may_spawn: model.role_kind.may_spawn(),
+                mcp: shim.is_some_and(|shim| shim.mcp().is_some()),
+            }
+        });
+
+        let mut context = resolved.system_context_with(tools.as_ref());
         if !model.context.is_empty() {
             context.push_str("\n## Context you were given\n\n");
             for source in &model.context {
@@ -1850,18 +1865,42 @@ impl ActiveState {
             // How `velm-agent-cli` finds its way home (§6). The token is *not* here: the
             // shim reads it out of the runtime file, which is mode 0600, so it never appears
             // in a process listing.
-            env: vec![
-                (
-                    "VELM_IPC".to_owned(),
-                    self.agent_runtime.runtime_file().display().to_string(),
-                ),
-                ("VELM_AGENT_ID".to_owned(), key.wire()),
-            ],
+            env: {
+                let mut env = vec![
+                    // The constants, not the literals they used to be spelled as. The MCP
+                    // server entry a transport builds has to repeat these two names in its
+                    // own `env` block (`LaunchSpec::ipc_env`), and two spellings of one
+                    // variable is an agent that is handed an endpoint under a name its
+                    // server does not read.
+                    (
+                        vellum_agent::mcp::IPC_ENV.to_owned(),
+                        self.agent_runtime.runtime_file().display().to_string(),
+                    ),
+                    (vellum_agent::mcp::AGENT_ID_ENV.to_owned(), key.wire()),
+                ];
+                // ⚠ **This is what makes the two environment variables above worth setting.**
+                // They tell a child where Velm is; `velm-agent-cli` is the thing that *uses*
+                // them, and `ipc.rs`'s own header has always assumed it was on the agent's
+                // `PATH` while nothing put it there. Prepended, never replacing — see
+                // `Shim::path_env`, and note that a child which lost the inherited `PATH`
+                // would lose `git` and the user's toolchain with it.
+                if let Some(shim) = shim {
+                    env.push(shim.path_env());
+                }
+                env
+            },
             system_context: context,
+            // The node's own endpoint is resolved through `ProviderChoice` now
+            // (`LaunchSpec::resolved_base_url`), which is the only way a local model can be
+            // told where it is listening. This stays `None`: it is the *caller's* override,
+            // and the caller has nothing to say that the node has not.
             base_url: None,
             api_key: None,
             data_dir: Some(data_dir),
             terminal: None,
+            // Carried on the spec rather than looked up inside each transport, so the MCP
+            // registration a transport builds names the same binaries the `PATH` above does.
+            shim: shim.cloned(),
         }
     }
 
@@ -1878,7 +1917,17 @@ impl ActiveState {
     ) {
         let key = self.agent_key(doc);
         if !self.agent_runtime.is_running(&key) {
-            let spec = self.agent_launch_spec(&key, config, role);
+            self.report_shim_gap();
+            let worktree = self.ensure_worktree(doc, &key, config);
+            let mut spec = self.agent_launch_spec(&key, config, role);
+            // After the spec, not inside it: the *rules* are still loaded from the node's own
+            // working directory. A worktree is a checkout of the same repository, so the two
+            // are the same file — but the project's rules are a property of the project and
+            // reading them from a directory this agent may be about to change is asking for
+            // an agent that rewrote its own instructions mid-session.
+            if let Some(worktree) = worktree {
+                spec.cwd = Some(worktree);
+            }
             if let Err(error) = self.agent_runtime.start(&key, spec) {
                 let message = error.to_string();
                 // On the node as well as in a toast: a toast is gone in ten seconds and the
@@ -1899,6 +1948,115 @@ impl ActiveState {
         }
     }
 
+    /// Say — once — that Velm's own agent binaries are not beside the application.
+    ///
+    /// An agent whose shim is missing still answers questions; what it cannot do is message
+    /// its neighbours, read the board's notes, spawn a helper or offer the user a choice. That
+    /// is six features quietly absent, and the failure has no other symptom: the agent is not
+    /// told the tools exist (`rules::BoardTools`), so it never tries and never reports one.
+    /// **Nothing in this application is inert** — so it is named, with the remedy.
+    ///
+    /// Once per run of Velm rather than once per agent, because the answer cannot change
+    /// while the process lives and a board of eight agents would otherwise stack eight
+    /// identical toasts on the first Start.
+    fn report_shim_gap(&mut self) {
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let Some(gap) = vellum_agent::transport::shim().and_then(vellum_agent::transport::Shim::gap)
+        else {
+            return;
+        };
+        if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            self.gap(&gap);
+        }
+    }
+
+    /// The directory this agent should work in: its own git worktree, when it asked for one.
+    ///
+    /// # What was broken
+    ///
+    /// `vellum_agent::worktree` has had create, list, remove, prune and dirty since it was
+    /// written, with tests, and **no caller at all**. The project toggle wrote
+    /// `AgentModel::worktree`, the inspector read `worktree_path`, and nothing ever assigned
+    /// it — so a worktree-on agent read *"Pending"* for ever and ran in the project directory
+    /// beside every other agent, which is the one outcome the feature exists to prevent.
+    ///
+    /// # Three things this deliberately does not do
+    ///
+    /// - **It never removes one.** `docs/07` §9: removal is explicit and confirmed, and
+    ///   `worktree::remove` refuses a dirty tree. Creating on start and removing on stop would
+    ///   make an agent's uncommitted work disappear when its node was closed.
+    /// - **It reuses a recorded path rather than making a second checkout.** Re-opening a
+    ///   board must not fail — or fork — because the agent's directory is where it was left.
+    /// - **It falls back to the working directory rather than refusing to start.** A project
+    ///   that is not a repository, a machine with no `git`, a repository with no commit yet:
+    ///   all three are ordinary, all three are *named*, and none of them is a reason an agent
+    ///   cannot answer a question.
+    fn ensure_worktree(
+        &mut self,
+        doc: DocId,
+        key: &crate::agent_runtime::NodeKey,
+        config: &vellum_agent::AgentModel,
+    ) -> Option<PathBuf> {
+        if !config.worktree {
+            return None;
+        }
+
+        // Already made, and still there. The `is_dir` matters: a state directory cleared by
+        // hand leaves the path recorded and the checkout gone, and handing that to a child as
+        // its `cwd` is a spawn failure with no useful message.
+        if let Some(recorded) = config.worktree_path.as_deref() {
+            let path = PathBuf::from(recorded);
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+
+        // Named rather than skipped. A node with the worktree switch on and no folder is the
+        // most likely way to end up here, and its symptom — the inspector reading *"Pending"*
+        // for ever — is exactly the silence this whole method exists to end.
+        let Some(working) = config.working_dir.as_deref().map(Path::new) else {
+            self.gap(
+                "this agent asked for its own git worktree and has no working folder — give \
+                 the node a folder, or the board a project.",
+            );
+            return None;
+        };
+        let state_dir = crate::editor::data_directory();
+
+        let made = vellum_agent::worktree::repo_root(working).and_then(|repo| {
+            if !vellum_agent::worktree::has_commits(&repo)? {
+                return Err(vellum_agent::AgentError::Refused(format!(
+                    "{} has no commits yet, so there is nothing to branch from — this agent \
+                     works in the project directory until you make one.",
+                    repo.display()
+                )));
+            }
+            // Recovery for a state directory that was emptied by hand: without it git keeps
+            // refusing to create a worktree it believes is already registered. It deletes
+            // nothing that exists, so it is safe to run every time.
+            let _ = vellum_agent::worktree::prune(&repo);
+            vellum_agent::worktree::create(&repo, &state_dir, &key.item)
+        });
+
+        match made {
+            Ok(worktree) => {
+                let path = worktree.path.clone();
+                // Recorded on the node, which is what the inspector reads and what stops the
+                // next start making a second checkout.
+                let mut updated = config.clone();
+                updated.worktree_path = Some(path.display().to_string());
+                self.write_agent_model(doc, &updated);
+                Some(path)
+            }
+            Err(error) => {
+                self.gap(&format!(
+                    "{error} This agent is working in {} instead.",
+                    working.display()
+                ));
+                None
+            }
+        }
+    }
 }
 
 /// What to call an agent node: its role label if it has one, its kind otherwise.
@@ -3227,6 +3385,7 @@ impl ActiveState {
             "agent-message" => self.demo_agent_message(),
             "agent-prompt" => self.demo_agent_prompt(),
             "agent-controls" => self.demo_agent_controls(),
+            "agent-launch" => self.demo_agent_launch(),
             // Not a fixture, but the same "do it on the first frame so an unattended
             // run can check it" need — an export is a menu row and nothing else can
             // reach one.
@@ -3239,7 +3398,7 @@ impl ActiveState {
                  (shapes, empty, table, chart, mindmap, kanban, card-drag, typing, caret, connector, placing, snapping, \
                   object-eraser, group-handles, locked-arrange, widget-edit, links, copy-paste, context-menu, \
                   edit-then-delete, frame-marquee, grid-snap, agent, agent-transcript, agent-message, \
-                  agent-prompt, agent-controls, export-svg, export-pdf, export-png, present)"
+                  agent-prompt, agent-controls, agent-launch, export-svg, export-pdf, export-png, present)"
             ),
         }
     }
@@ -3350,6 +3509,93 @@ impl ActiveState {
             self.gap(&format!(
                 "the wiring produced {message} message link(s), {context} context link(s) \
                  and {plain} plain connector(s); expected 1, 1 and 0"
+            ));
+        }
+    }
+
+    /// Everything an agent needs in order to reach the board, read back out of the **real**
+    /// launch specification.
+    ///
+    /// # Why a fixture and not a unit test
+    ///
+    /// `agent_launch_spec` is a method on `ActiveState`, which owns a window and a GPU, so
+    /// nothing offline can build one — and every one of the pieces it assembles was *already*
+    /// individually tested while the whole chain was dead. `Shim::beside` had no caller,
+    /// `rules::BoardTools` had no caller, and `velm-agent-cli` was never built: six features
+    /// terminated in a command that did not exist, and every test in the workspace was green.
+    /// This enters at the production function and asks what the child would actually get.
+    ///
+    /// It **cannot** start an agent — that would need `claude` installed, a subscription and
+    /// a network — so what it proves is the wiring up to the spawn. The one hop past it is
+    /// noted in the report rather than claimed.
+    fn demo_agent_launch(&mut self) {
+        self.place_agent(-260.0);
+        // A placement leaves the caret in the new node's role field; feedback 27's rule.
+        self.settle();
+
+        let Some(doc) = self
+            .editor
+            .board()
+            .item_ids()
+            .into_iter()
+            .find(|id| matches!(self.editor.board().item(*id).map(|i| i.kind), Ok(ItemKind::Agent { .. })))
+        else {
+            self.gap("the agent tool placed no agent");
+            return;
+        };
+        let Ok(item) = self.editor.board().item(doc) else {
+            self.gap("the agent it placed is not on the board");
+            return;
+        };
+        let ItemKind::Agent { model, .. } = &item.kind else {
+            self.gap("the item the agent tool placed is not an agent");
+            return;
+        };
+        let config = crate::agent::decode(model);
+
+        let key = self.agent_key(doc);
+        let spec = self.agent_launch_spec(&key, &config, "Reviewer");
+
+        // What the child's environment would be. `PATH` is the whole point: `ipc.rs`'s header
+        // has always assumed `velm-agent-cli` was on it, and nothing put it there.
+        let value = |name: &str| spec.env_value(name).unwrap_or_default().to_owned();
+        let path = value("PATH");
+        let shim_dir = spec.shim.as_ref().map(|shim| shim.dir().display().to_string());
+        let on_path = shim_dir.as_deref().is_some_and(|dir| {
+            std::env::split_paths(&path).any(|entry| entry.as_path() == Path::new(dir))
+        });
+        let inherited_kept = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .all(|entry| std::env::split_paths(&path).any(|kept| kept == entry));
+
+        let ipc = !value(vellum_agent::mcp::IPC_ENV).is_empty();
+        let id = value(vellum_agent::mcp::AGENT_ID_ENV) == key.wire();
+        let told = spec.system_context.contains(vellum_agent::transport::AGENT_CLI);
+        let mcp = spec.mcp_config().is_some();
+
+        // A missing shim is a legitimate answer here — a bare `target/` binary run before
+        // `cargo build -p vellum-agent` has one — and it must read as *degraded*, not as a
+        // pass. The two halves are reported apart so a green line cannot hide a grey one.
+        let Some(dir) = shim_dir else {
+            self.gap(
+                "no shim beside this executable, so an agent would run with no way to reach \
+                 the board. Build it: cargo build -p vellum-agent --bins.",
+            );
+            return;
+        };
+
+        if on_path && inherited_kept && ipc && id && told {
+            self.ok(format!(
+                "an agent would launch with {} on its PATH (inherited PATH kept), VELM_IPC and \
+                 VELM_AGENT_ID set, a system context that names the shim, and {} MCP server(s) \
+                 configured — from {dir}",
+                vellum_agent::transport::AGENT_CLI,
+                u8::from(mcp),
+            ));
+        } else {
+            self.gap(&format!(
+                "the launch is incomplete: shim on PATH {on_path}, inherited PATH kept \
+                 {inherited_kept}, VELM_IPC {ipc}, VELM_AGENT_ID {id}, system context names the \
+                 shim {told}, MCP configured {mcp}"
             ));
         }
     }
@@ -7695,8 +7941,13 @@ impl ActiveState {
         let resolved = self.resolve_rules(&config);
         let title = format!("Rules for {}", node_name(label, config.role_kind));
         let own = config.rules.clone();
+        // The two layers above the node's own, as paths the editor can show and reveal.
+        // Both are `Option` because a caller may genuinely have neither: a board saved
+        // nowhere has no project. A layer nobody can find is a layer nobody edits, which is
+        // what made the top two of a three-layer cascade read-only.
+        let files = self.rule_files();
         self.shell.ask(
-            move |id| vellum_ui::Dialog::rules(id, title, &own, resolved),
+            move |id| vellum_ui::Dialog::rules(id, title, &own, resolved, files),
             crate::shell::Ask::AgentRules(doc),
         );
     }
@@ -7719,6 +7970,33 @@ impl ActiveState {
         );
     }
 
+
+    /// Where the two inherited rule layers live, and whether they exist yet.
+    ///
+    /// The paths are reported even when the file is absent, because *"there is no global
+    /// rules file and here is where it would go"* is the useful answer — the alternative is
+    /// a cascade whose top two layers the user cannot find without reading `rules.rs`.
+    fn rule_files(&self) -> vellum_ui::RuleFiles {
+        let described = |path: std::path::PathBuf| vellum_ui::RuleFilePath {
+            exists: path.exists(),
+            path: path.display().to_string(),
+        };
+        let data_dir = self.agent_runtime.data_dir();
+        vellum_ui::RuleFiles {
+            global: Some(described(vellum_agent::rules::global_rules_path(data_dir))),
+            // The project layer comes from the **selected agent's own working directory**,
+            // which is where `agent_launch_spec` loads it from — not from the board's folder.
+            // Reading it from a second place is how the editor comes to show a `CLAUDE.md`
+            // the agent never saw and miss the one it did.
+            project: self
+                .selected_agent()
+                .and_then(|doc| self.agent_model(doc))
+                .and_then(|(config, _)| config.working_dir.clone())
+                .map(std::path::PathBuf::from)
+                .and_then(|project| vellum_agent::rules::project_rules_path(&project))
+                .map(described),
+        }
+    }
 
     /// The three-layer cascade for one node, resolved from the files on disk.
     pub(crate) fn resolve_rules(
@@ -7870,6 +8148,14 @@ impl ActiveState {
         if self.editor.selection().len() != 1 {
             return;
         }
+        // Attaching a file opens a picker and reads a file. Neither is a token write, and it
+        // needs `&mut self` — so it takes its own path here, **before** the projection is
+        // borrowed below, and never reaches the re-encode.
+        if matches!(edit, E::AttachContext) {
+            self.attach_context_from_picker();
+            return;
+        }
+
         let Some(projected) = self.editor.projection().get(scene) else { return };
         let doc = projected.doc_id;
         let kind = projected.item.kind.clone();
@@ -7918,22 +8204,74 @@ impl ActiveState {
                         }
                         config.context.remove(*index);
                     }
-                    E::NoteScope(_) | E::ShowIgnored(_) | E::BrowserUrl(_) | E::BrowserLive(_) => {
-                        return;
-                    }
+                    E::AttachContext => unreachable!("handled above"),
+                    E::NoteScope(_)
+                    | E::ShowIgnored(_)
+                    | E::BrowserUrl(_)
+                    | E::BrowserLive(_)
+                    | E::CreateNoteFile(_)
+                    | E::TreeRoot(_)
+                    | E::TreeOwner(_) => return,
                 }
                 ItemKind::Agent { model: crate::agent::encode(&config), label }
             }
             ItemKind::AgentNote { model, title } => {
                 let mut note = crate::note::decode(&model);
-                let E::NoteScope(scope) = edit else { return };
-                note.scope = scope.clone();
+                match edit {
+                    E::NoteScope(scope) => note.scope = scope.clone(),
+                    // **Feature 8 starts here.** An empty path addresses no file, so until
+                    // this runs nothing is ever written to disk and the node says "not
+                    // written yet" for ever. Never a rename: the row only offers this while
+                    // the path is empty, because *create* and *move* are different
+                    // consequences and only one of them is on offer.
+                    E::CreateNoteFile(stem) => {
+                        if !note.path.is_empty() {
+                            return;
+                        }
+                        let heading = format!("# {}\n", title.to_plain());
+                        let board = self.agent_board_key();
+                        let Some(store) = self.agent_runtime.note_store(&board).cloned() else {
+                            self.gap("this board has no note folder yet");
+                            return;
+                        };
+                        // `Requester::User` — the canvas acting for the person at the
+                        // keyboard, who is never refused by a private note's scope.
+                        match store.create(
+                            stem,
+                            note.scope.clone(),
+                            &heading,
+                            vellum_agent::Requester::User,
+                        ) {
+                            Ok(created) => note = created,
+                            Err(error) => {
+                                self.gap(&format!(
+                                    "that note's file could not be created: {error}"
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                    _ => return,
+                }
                 ItemKind::AgentNote { model: crate::note::encode(&note), title }
             }
             ItemKind::FileTree { model } => {
                 let mut tree = crate::filetree::decode(&model);
-                let E::ShowIgnored(on) = edit else { return };
-                tree.show_ignored = *on;
+                match edit {
+                    E::ShowIgnored(on) => tree.show_ignored = *on,
+                    // Changing the root invalidates every expanded path under it: those are
+                    // relative to the root, so keeping them reopens directories that are not
+                    // there any more — and a tree that opens the wrong folders on a new root
+                    // reads as a tree that ignored the change.
+                    E::TreeRoot(root) => {
+                        if tree.root != *root {
+                            tree.root.clone_from(root);
+                            tree.expanded.clear();
+                        }
+                    }
+                    E::TreeOwner(agent) => tree.agent = agent.clone(),
+                    _ => return,
+                }
                 ItemKind::FileTree { model: crate::filetree::encode(&tree) }
             }
             ItemKind::Browser { model } => {

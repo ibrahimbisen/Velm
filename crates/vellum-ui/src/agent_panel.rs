@@ -69,6 +69,10 @@ pub enum AgentRow {
     SpawnCap,
     /// Whether connected agents may message this one.
     Messages,
+    /// Push-to-talk — feature 14. Present whatever the build can do, and disabled with
+    /// [`vellum_agent::voice::NOT_BUILT_IN`] when it cannot record: a control that is simply
+    /// absent leaves the user with no way to discover that the feature exists and is off.
+    Voice,
     /// The files, pages and media attached as context.
     Context,
     /// The three-layer cascade, with each field's provenance — feature 11.
@@ -119,6 +123,7 @@ pub fn rows(model: &PanelModel) -> Vec<AgentRow> {
                 out.push(AgentRow::SpawnCap);
             }
             out.push(AgentRow::Messages);
+            out.push(AgentRow::Voice);
             out.push(AgentRow::Context);
             out.push(AgentRow::Rules);
         }
@@ -165,6 +170,13 @@ pub struct AgentPanelState {
     working_dir: Option<(ItemId, String)>,
     model_name: Option<(ItemId, String)>,
     browser_url: Option<(ItemId, String)>,
+    /// The file name offered for a note that has none yet. Seeded from the note's own
+    /// title through [`NoteSummary::proposed_stem`], and left alone afterwards so a user
+    /// who typed a name does not watch it change under them as they rename the node.
+    ///
+    /// [`NoteSummary::proposed_stem`]: crate::NoteSummary::proposed_stem
+    note_stem: Option<(ItemId, String)>,
+    tree_root: Option<(ItemId, String)>,
 }
 
 impl AgentPanelState {
@@ -333,12 +345,21 @@ fn draw(
                 }
                 // Reported rather than offered. A rectangle is drawn on the board, not
                 // typed into a panel — four number fields for a region you can see is the
-                // control nobody uses — and the gesture that draws one belongs to the app.
+                // control nobody uses.
+                //
+                // **The words say what happens, not what to do.** They used to read
+                // *"Drag a region on the board while this orchestrator is selected"*, and
+                // there is no such gesture: nothing in `input.rs` sweeps a territory and
+                // nothing in `draw.rs` tints one. An instruction the app cannot honour is
+                // worse than none, because the user tries it and concludes the app is
+                // broken. Restore the sentence only alongside the gesture.
                 _ => {
                     ui.add_enabled(false, egui::Button::new("Not set").frame(true))
                         .on_disabled_hover_text(
-                            "Drag a region on the board while this orchestrator is selected. \
-                             It may only spawn inside it.",
+                            "A region is given to a node when it is made a manager, from the \
+                             area around it. This one has none, so it may spawn anywhere on \
+                             the board — switching it back to Worker and to Manager again is \
+                             what makes one.",
                         );
                 }
             });
@@ -384,62 +405,49 @@ fn draw(
             });
         }
 
+        AgentRow::Voice => {
+            let Some(agent) = &model.agent else { return };
+            let on = agent.voice;
+            let built_in = agent.voice_available;
+            row(ui, palette, "Voice", |ui| {
+                // Two yeses again, and the outer one belongs to the binary rather than to
+                // the user — the `browser` arm's arrangement, for the same reason. A build
+                // that cannot record still draws the control and says so; hiding it would
+                // make an off feature indistinguishable from one that does not exist.
+                let button =
+                    egui::Button::selectable(on && built_in, if on { "On" } else { "Off" })
+                        .frame(true);
+                let response = ui.add_enabled(built_in, button);
+                if built_in {
+                    if response
+                        .on_hover_text(if on {
+                            "Hold the key on this node to talk to it."
+                        } else {
+                            "Offer push-to-talk on this node. The microphone opens while the \
+                             key is held and at no other time."
+                        })
+                        .clicked()
+                    {
+                        events.agent(AgentEdit::Voice(!on));
+                    }
+                } else {
+                    // The crate's own sentence, not a second one. It names the feature
+                    // rather than a command line, deliberately — see its doc comment.
+                    response.on_disabled_hover_text(vellum_agent::voice::NOT_BUILT_IN);
+                }
+            });
+            if !built_in {
+                caption(ui, palette, "Not built into this copy of Velm.");
+            }
+        }
+
         AgentRow::Context => context(ui, palette, model, events),
 
         AgentRow::Rules => rules(ui, palette, model, cmd_ctx, events),
 
-        AgentRow::NotePath => {
-            let Some(note) = &model.note else { return };
-            row(ui, palette, "File", |ui| {
-                readout(ui, palette, note.path.clone()).on_hover_text(note.path.clone());
-            });
-            if note.on_disk
-                && ui
-                    .add(egui::Button::new("Show the file").frame(true))
-                    .on_hover_text("A note is a real `.md` file; open it in any editor.")
-                    .clicked()
-            {
-                events.push(UiEvent::RevealPath(note.path.clone().into()));
-            }
-        }
+        AgentRow::NotePath => note_file(ui, palette, state, model, events),
 
-        AgentRow::NoteScope => {
-            // **Only one direction is reachable from a panel, and the other is disabled
-            // rather than dead.** Making a note private needs an *owner*, and nothing here
-            // can pick one: which agent a note belongs to is which agent it is connected to,
-            // and a connector is a board gesture. A button that flipped the label and
-            // emitted nothing would be the exact failure `CLAUDE.md`'s font-family lesson
-            // is about — a control that reports success and does nothing.
-            let private = matches!(model.note_private, Field::Uniform(true));
-            row(ui, palette, "Scope", |ui| {
-                if model.note_private.is_mixed() {
-                    mixed_placeholder(ui, palette);
-                    return;
-                }
-                if private {
-                    let owner = model.note.as_ref().and_then(|n| n.owner.clone());
-                    if ui
-                        .add(egui::Button::selectable(true, "Private").frame(true))
-                        .on_hover_text(owner.map_or_else(
-                            || "One agent only. Click to share it with every agent.".to_owned(),
-                            |who| format!("{who} only. Click to share it with every agent."),
-                        ))
-                        .clicked()
-                    {
-                        events.agent(AgentEdit::NoteScope(NoteScope::Shared));
-                    }
-                } else {
-                    ui.add_enabled(
-                        false,
-                        egui::Button::selectable(false, "Shared").frame(true),
-                    )
-                    .on_disabled_hover_text(
-                        "Every agent on this board may read and write it. Connect the note to \
-                         one agent to make it that agent's own.",
-                    );
-                }
-            });
-        }
+        AgentRow::NoteScope => note_scope(ui, palette, model, events),
 
         AgentRow::NoteState => {
             let Some(note) = &model.note else { return };
@@ -463,26 +471,9 @@ fn draw(
             }
         }
 
-        AgentRow::TreeRoot => {
-            let Some(tree) = &model.file_tree else { return };
-            row(ui, palette, "Root", |ui| {
-                let shown =
-                    if tree.root.is_empty() { "The board's folder" } else { tree.root.as_str() };
-                readout(ui, palette, shown.to_owned());
-            });
-        }
+        AgentRow::TreeRoot => tree_root(ui, palette, state, model, events),
 
-        AgentRow::TreeOwner => {
-            let Some(tree) = &model.file_tree else { return };
-            row(ui, palette, "Scoped to", |ui| match &tree.agent {
-                Some(agent) => {
-                    readout(ui, palette, agent.clone());
-                }
-                None => {
-                    ui.label(egui::RichText::new("Nobody in particular").color(palette.muted));
-                }
-            });
-        }
+        AgentRow::TreeOwner => tree_owner(ui, palette, model, events),
 
         AgentRow::TreeIgnored => {
             let on = matches!(model.tree_show_ignored, Field::Uniform(true));
@@ -678,6 +669,254 @@ fn display(ui: &mut Ui, palette: Palette, model: &PanelModel, events: &mut Event
     caption(ui, palette, &line);
 }
 
+/// Which file a note is, and — for a note that has none — the gesture that makes one.
+///
+/// # A note with an empty path is the state this row exists for
+///
+/// The note tool places a node with `NoteModel::default()`, whose path is empty, and an empty
+/// path addresses no file: the poller skips it, nothing is ever written, and the node reads
+/// *"Not written yet"* for the rest of its life. That is the whole of feature 8 failing to
+/// start, and it failed here — the row was a readout of a string that was always empty.
+///
+/// So the row has two shapes. **No file**: a name, offered rather than demanded, and a button
+/// that creates it. **A file**: its path, and the way to open it in a real editor, which is
+/// the reason notes are files at all.
+///
+/// The name is a *stem*. Which directory it lands in follows from the note's scope, and
+/// `NoteStore::dir_for` is the only thing that knows that — a panel that composed a path
+/// would put every private note in the shared folder.
+fn note_file(
+    ui: &mut Ui,
+    palette: Palette,
+    state: &mut AgentPanelState,
+    model: &PanelModel,
+    events: &mut EventSink,
+) {
+    let (Some(note), Some(id)) = (&model.note, model.single_id) else { return };
+
+    if !note.path.is_empty() {
+        row(ui, palette, "File", |ui| {
+            readout(ui, palette, note.path.clone()).on_hover_text(note.path.clone());
+        });
+        // Enabled only when it is really there. Handing a path that does not exist to the
+        // file manager opens nothing and explains nothing, which is the inert button this
+        // house does not ship.
+        let reveal = ui.add_enabled(
+            note.on_disk,
+            egui::Button::new("Show the file").frame(true),
+        );
+        if note.on_disk {
+            if reveal
+                .on_hover_text("A note is a real `.md` file; open it in any editor.")
+                .clicked()
+            {
+                events.push(UiEvent::RevealPath(note.path.clone().into()));
+            }
+        } else {
+            reveal.on_disabled_hover_text(format!(
+                "{} has not been written yet. It appears the moment something is saved into \
+                 it.",
+                note.path
+            ));
+        }
+        return;
+    }
+
+    let proposed = note.proposed_stem();
+    // Read back out of the closure rather than off the buffer afterwards, which is the
+    // idiom every other field here uses: the buffer is borrowed out of `state` and the
+    // closure is what holds it, so touching it on both sides of `row` is two borrows for
+    // one value.
+    let mut typed = String::new();
+    let buffer = AgentPanelState::buffer(&mut state.note_stem, id, &proposed);
+    row(ui, palette, "File", |ui| {
+        ui.add(
+            egui::TextEdit::singleline(buffer)
+                .desired_width(CONTROL_WIDTH)
+                .hint_text(proposed.as_str()),
+        )
+        .on_hover_text(
+            "The file's name, without the .md. Velm adds a number if that name is taken.",
+        );
+        typed = buffer.trim().to_owned();
+    });
+
+    // Empty is not refused — it is the offer. The hint already shows what an empty field
+    // means, and a button that greys out because the user cleared a field they never filled
+    // in is a dead end in the one place the whole feature starts.
+    let stem = if typed.is_empty() { proposed.clone() } else { typed };
+    if ui
+        .add(egui::Button::new("Create the file").frame(true).min_size(egui::vec2(CONTROL_WIDTH, 0.0)))
+        .on_hover_text(format!(
+            "Writes {stem}.md and points this note at it. Everything typed into the note \
+             after that is that file's contents, and any editor — or any agent — can change \
+             it."
+        ))
+        .clicked()
+    {
+        events.agent(AgentEdit::CreateNoteFile(stem));
+    }
+    caption(ui, palette, "This note has no file yet, so nothing can read it.");
+}
+
+/// Shared with every agent, or private to one — **both directions**.
+///
+/// # What was missing, and why it was missing
+///
+/// Only `Shared` had a writer. The other half told the user to *"connect the note to one
+/// agent to make it that agent's own"*, and connecting it did nothing at all: no code turned
+/// a connector into a scope. So the instruction described a gesture that did not exist, which
+/// is worse than describing none — the user does it, watches nothing happen, and concludes
+/// the feature is broken rather than absent.
+///
+/// The connector was the right idea and it is what this reads. `NoteSummary::connected` is
+/// the agents on the other end of a line the user drew, and each one is offered by name. The
+/// scope carries an **id**, because two agents may share a label.
+///
+/// With no line drawn, the button is disabled and says so — and *that* instruction is one the
+/// app can honour, because drawing a connector is a gesture that exists.
+fn note_scope(ui: &mut Ui, palette: Palette, model: &PanelModel, events: &mut EventSink) {
+    let private = matches!(model.note_private, Field::Uniform(true));
+    row(ui, palette, "Scope", |ui| {
+        if model.note_private.is_mixed() {
+            mixed_placeholder(ui, palette);
+            return;
+        }
+        if private {
+            let owner = model.note.as_ref().and_then(|n| n.owner.clone());
+            if ui
+                .add(egui::Button::selectable(true, "Private").frame(true))
+                .on_hover_text(owner.map_or_else(
+                    || "One agent only. Click to share it with every agent.".to_owned(),
+                    |who| format!("{who} only. Click to share it with every agent."),
+                ))
+                .clicked()
+            {
+                events.agent(AgentEdit::NoteScope(NoteScope::Shared));
+            }
+            return;
+        }
+
+        let connected: &[crate::AgentLink] =
+            model.note.as_ref().map_or(&[], |note| note.connected.as_slice());
+        if connected.is_empty() {
+            ui.add_enabled(false, egui::Button::selectable(false, "Shared").frame(true))
+                .on_disabled_hover_text(
+                    "Every agent on this board may read and write it. Draw a connector from \
+                     this note to one agent to make it that agent's own.",
+                );
+            return;
+        }
+
+        // A menu rather than a toggle, because *private* is not the opposite of *shared* —
+        // it is "private to whom", and with two lines drawn the button would have to guess.
+        egui::ComboBox::from_id_salt("velm-note-scope")
+            .selected_text("Shared")
+            .width(CONTROL_WIDTH)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(true, "Shared with every agent").clicked() {
+                    events.agent(AgentEdit::NoteScope(NoteScope::Shared));
+                }
+                for link in connected {
+                    if ui
+                        .selectable_label(false, format!("Private to {}", link.label))
+                        .clicked()
+                    {
+                        events.agent(AgentEdit::NoteScope(NoteScope::Private {
+                            agent: link.id.clone(),
+                        }));
+                    }
+                }
+            })
+            .response
+            .on_hover_text(
+                "A private note is one agent's own memory; a shared one is the board's.",
+            );
+    });
+}
+
+/// Which directory a file tree shows.
+///
+/// Editable, where it was a readout — so every tree on a board showed the same derived
+/// project root and there was no way to point one at `crates/` and another at `docs/`, which
+/// is most of what two trees are for.
+///
+/// Relative to the project, like a note's path and for the same reason: a project that moves
+/// keeps working. Empty is the root itself, which is what an unset tree already means, so
+/// clearing the field is a real answer rather than a refusal.
+fn tree_root(
+    ui: &mut Ui,
+    palette: Palette,
+    state: &mut AgentPanelState,
+    model: &PanelModel,
+    events: &mut EventSink,
+) {
+    let (Some(tree), Some(id)) = (&model.file_tree, model.single_id) else { return };
+    let buffer = AgentPanelState::buffer(&mut state.tree_root, id, &tree.root);
+    row(ui, palette, "Root", |ui| {
+        let field = ui.add(
+            egui::TextEdit::singleline(buffer)
+                .desired_width(CONTROL_WIDTH)
+                .hint_text("The board's folder"),
+        );
+        // On losing focus, exactly as Role and Folder are: one directory is one edit, and
+        // re-reading the filesystem on every keystroke of a path being typed would walk a
+        // directory per character.
+        if field.lost_focus() {
+            events.agent(AgentEdit::TreeRoot(buffer.trim().to_owned()));
+        }
+    });
+    let resolved = match (&tree.project_dir, tree.root.is_empty()) {
+        (Some(project), true) => format!("Showing {project}."),
+        (Some(project), false) => format!("Showing {project}/{}.", tree.root),
+        (None, _) => "This board has no folder, so there is nothing to show.".to_owned(),
+    };
+    caption(ui, palette, &resolved);
+}
+
+/// Which agent a tree belongs to — feature 7's hard requirement, and it had no writer either.
+///
+/// The same shape as a private note's owner, deliberately: the answer is a line the user drew
+/// on the board, the picker offers labels and emits ids, and with no line drawn it says so
+/// rather than offering an empty menu.
+fn tree_owner(ui: &mut Ui, palette: Palette, model: &PanelModel, events: &mut EventSink) {
+    let Some(tree) = &model.file_tree else { return };
+    row(ui, palette, "Scoped to", |ui| {
+        let shown = tree.agent.clone().unwrap_or_else(|| "Nobody in particular".to_owned());
+        if tree.connected.is_empty() && tree.agent_id.is_none() {
+            ui.add_enabled(false, egui::Button::new(shown).frame(true))
+                .on_disabled_hover_text(
+                    "Draw a connector from this tree to an agent to scope it to that agent. \
+                     Until then it is yours, and no agent is given it.",
+                );
+            return;
+        }
+
+        egui::ComboBox::from_id_salt("velm-tree-owner")
+            .selected_text(shown)
+            .width(CONTROL_WIDTH)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(tree.agent_id.is_none(), "Nobody in particular")
+                    .clicked()
+                {
+                    events.agent(AgentEdit::TreeOwner(None));
+                }
+                for link in &tree.connected {
+                    let on = tree.agent_id.as_deref() == Some(link.id.as_str());
+                    if ui.selectable_label(on, link.label.clone()).clicked() {
+                        events.agent(AgentEdit::TreeOwner(Some(link.id.clone())));
+                    }
+                }
+            })
+            .response
+            .on_hover_text(
+                "A tree scoped to an agent is that agent's view of the project — feature 7's \
+                 whole point is that two agents do not share one.",
+            );
+    });
+}
+
 /// The files, pages and media this agent has been given.
 fn context(ui: &mut Ui, palette: Palette, model: &PanelModel, events: &mut EventSink) {
     let Some(agent) = &model.agent else { return };
@@ -685,17 +924,18 @@ fn context(ui: &mut Ui, palette: Palette, model: &PanelModel, events: &mut Event
         row(ui, palette, "Context", |ui| {
             ui.label(egui::RichText::new("Nothing attached").color(palette.muted));
         });
-        caption(
-            ui,
-            palette,
-            "Connect a note or a file tree to this agent, or drop a file on it.",
-        );
-        return;
+        // **Both halves of this sentence were false when it shipped.** Connecting a note
+        // to an agent wrote nothing into `AgentModel::context`, and there was no
+        // `WindowEvent::DroppedFile` arm anywhere in the application — the word *drop* did
+        // not appear in the repository. The drop is real now; the button below is the other
+        // way in, for a file that is not on screen and for anyone who would rather not drag.
+        caption(ui, palette, "Drop a file on this node, or attach one here.");
+    } else {
+        row(ui, palette, "Context", |ui| {
+            readout(ui, palette, format!("{} attached", agent.context.len()));
+        });
     }
 
-    row(ui, palette, "Context", |ui| {
-        readout(ui, palette, format!("{} attached", agent.context.len()));
-    });
     for (index, source) in agent.context.iter().enumerate() {
         ui.horizontal(|ui| {
             let label =
@@ -718,6 +958,35 @@ fn context(ui: &mut Ui, palette: Palette, model: &PanelModel, events: &mut Event
                 }
             });
         });
+    }
+
+    attach(ui, palette, events);
+}
+
+/// *Attach a file…* — the picker half of context ingestion.
+///
+/// `vellum_agent::ingest` is 3,000 lines that had **no caller in the workspace**: nothing
+/// wrote `AgentModel::context` at all, so PDFs, documents, audio and pages could be read and
+/// never asked for. Two gestures reach it now and this is the one a panel can offer; the
+/// other is a file dropped on the node, which is a window event and never comes through here.
+///
+/// It carries no path, because this crate opens no dialogs and touches no files. What
+/// happens to the file — what kind it is, how much came out, whether a converter is missing —
+/// is `ingest`'s answer and arrives back as a toast.
+fn attach(ui: &mut Ui, palette: Palette, events: &mut EventSink) {
+    if ui
+        .add(
+            egui::Button::new(egui::RichText::new("Attach a file…").color(palette.text))
+                .frame(true)
+                .min_size(egui::vec2(CONTROL_WIDTH, 0.0)),
+        )
+        .on_hover_text(
+            "A PDF, a document, a page or a recording. Velm reads the text out of it and \
+             gives it to this agent; what it could not read, it says.",
+        )
+        .clicked()
+    {
+        events.agent(AgentEdit::AttachContext);
     }
 }
 
@@ -870,6 +1139,7 @@ mod tests {
                 connected: Vec::new(),
                 accepts_messages: true,
                 voice: false,
+                voice_available: false,
             }),
             ..SelectionItem::new(id(n), ItemFacet::Agent, Placement::new(0.0, 0.0, 400.0, 300.0))
         }
@@ -894,6 +1164,73 @@ mod tests {
             assert!(rows.contains(&AgentRow::Territory), "{managing:?}");
             assert!(rows.contains(&AgentRow::SpawnCap), "{managing:?}");
         }
+    }
+
+    /// Push-to-talk gets a row whatever the build can do — feature 14's control had **no
+    /// emitter at all**: `AgentEdit::Voice` was defined and handled and nothing anywhere
+    /// produced one.
+    ///
+    /// Present rather than conditional on the feature, deliberately. A control that vanishes
+    /// in a default build leaves the user with no way to find out that voice exists and is
+    /// off, which is exactly the state this shipped in; the row draws and refuses instead,
+    /// naming `voice::NOT_BUILT_IN`.
+    #[test]
+    fn an_agent_gets_a_voice_row_whatever_the_build_can_do() {
+        for available in [true, false] {
+            let mut item = agent_item(1, RoleKind::Worker);
+            item.agent.as_mut().expect("an agent").voice_available = available;
+            assert!(
+                of(std::slice::from_ref(&item)).contains(&AgentRow::Voice),
+                "no voice row with available={available}"
+            );
+        }
+
+        // …and not for a note, which has no microphone to offer.
+        let mut note =
+            SelectionItem::new(id(9), ItemFacet::Note, Placement::new(0.0, 0.0, 1.0, 1.0));
+        note.note = Some(NoteSummary {
+            path: String::new(),
+            scope: NoteScope::Shared,
+            owner: None,
+            conflicted: false,
+            links: 0,
+            on_disk: false,
+            title: "Plan".to_owned(),
+            connected: Vec::new(),
+        });
+        assert!(!of(std::slice::from_ref(&note)).contains(&AgentRow::Voice));
+    }
+
+    /// A note that has never been written still gets its file row, because that row is the
+    /// only place a file can be asked for.
+    ///
+    /// The row used to be a readout of `NoteModel::path`, which is empty for every note the
+    /// note tool places — so it drew an empty box, and `NoteStore::create` was never called
+    /// by anything. A row that is only useful once the thing it describes exists cannot be
+    /// the way that thing comes to exist.
+    #[test]
+    fn a_note_with_no_file_still_gets_the_row_that_makes_one() {
+        let mut note =
+            SelectionItem::new(id(1), ItemFacet::Note, Placement::new(0.0, 0.0, 1.0, 1.0));
+        note.note = Some(NoteSummary {
+            path: String::new(),
+            scope: NoteScope::Shared,
+            owner: None,
+            conflicted: false,
+            links: 0,
+            on_disk: false,
+            title: "Engine bay".to_owned(),
+            connected: Vec::new(),
+        });
+        let rows = of(std::slice::from_ref(&note));
+        assert!(rows.contains(&AgentRow::NotePath), "{rows:?}");
+
+        // …and the name it offers is the store's own slug of the title, not a second
+        // spelling of one. Two answers to "what is this file called" is the user watching
+        // the name they accepted turn into a different one.
+        let summary = note.note.as_ref().expect("a note");
+        assert_eq!(summary.proposed_stem(), "engine-bay");
+        assert_eq!(summary.proposed_stem(), vellum_agent::notes::slug("Engine bay"));
     }
 
     /// The four folding properties survive a multi-selection; the single-node configuration
@@ -925,6 +1262,8 @@ mod tests {
             conflicted: false,
             links: 0,
             on_disk: true,
+            title: "Plan".to_owned(),
+            connected: Vec::new(),
         });
         let rows = of(std::slice::from_ref(&note));
         assert!(rows.contains(&AgentRow::NoteScope) && rows.contains(&AgentRow::NotePath));
@@ -934,7 +1273,10 @@ mod tests {
             SelectionItem::new(id(2), ItemFacet::FileTree, Placement::new(0.0, 0.0, 1.0, 1.0));
         tree.file_tree = Some(FileTreeSummary {
             root: String::new(),
+            project_dir: None,
             agent: None,
+            agent_id: None,
+            connected: Vec::new(),
             show_ignored: false,
         });
         let rows = of(std::slice::from_ref(&tree));
@@ -976,6 +1318,8 @@ mod tests {
             conflicted: false,
             links: 0,
             on_disk: false,
+            title: "Plan".to_owned(),
+            connected: Vec::new(),
         });
         assert_eq!(heading(&PanelModel::derive(&[note.clone()])), "Note");
         assert_eq!(
@@ -1055,6 +1399,8 @@ mod tests {
             conflicted: true,
             links: 3,
             on_disk: true,
+            title: "Plan".to_owned(),
+            connected: Vec::new(),
         });
 
         let mut browser =

@@ -23,14 +23,33 @@ DEST="${1:-$HOME/Desktop}"
 APP="$DEST/Velm.app"
 PROFILE="${PROFILE:-release}"
 
-echo "building the $PROFILE binary…"
-cargo build --profile "$PROFILE" -p vellum-app
+# Three binaries, one invocation — `cargo build` runs the whole workspace's dependency
+# graph once, and two invocations would build it twice.
+#
+# `velm-agent-cli` and `velm-mcp` are not decoration. An agent runs in its own process and
+# reaches back into Velm through them: agent-to-agent messages, the shared notes, spawning a
+# sub-agent, posting an image, offering the user a choice. `vellum_agent::ipc`'s header has
+# always assumed they were on the agent's PATH, and until this line they **were never
+# built** — so every one of those features terminated in a command that did not exist.
+echo "building the $PROFILE binaries…"
+cargo build --profile "$PROFILE" \
+  -p vellum-app -p vellum-agent \
+  --bin vellum-app --bin velm-agent-cli --bin velm-mcp
 
 mkdir -p "$DEST"
 echo "assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "target/$PROFILE/vellum-app" "$APP/Contents/MacOS/Velm"
+
+# Beside the main executable, which is where `vellum_agent::transport::Shim` looks: it
+# resolves `std::env::current_exe()`'s directory, so this location and `target/$PROFILE`
+# are the same relation and no build layout is encoded in the program. Their names are
+# **not** renamed to match the product the way `vellum-app` → `Velm` is — an agent is told
+# to run `velm-agent-cli`, and that string is in the system context, the shim's own help and
+# `vellum_agent::transport::AGENT_CLI`.
+cp "target/$PROFILE/velm-agent-cli" "$APP/Contents/MacOS/velm-agent-cli"
+cp "target/$PROFILE/velm-mcp" "$APP/Contents/MacOS/velm-mcp"
 
 # Inter is compiled into the binary (`vellum_text::BUNDLED_FONTS`), not loaded from here —
 # so this copy is the *licence*, not the font. The SIL Open Font License requires the notice
@@ -157,6 +176,13 @@ PLIST
 # failed build instead.
 plutil -lint "$APP/Contents/Info.plist"
 test -f "$APP/Contents/Resources/Velm.icns"
+
+# The agent shims, checked as executables rather than as files. A `cp` of something the
+# build did not produce fails under `set -e` above, so this is really asking the question
+# the app asks at runtime: `Shim::beside` requires the execute bit, and a bundle whose
+# shims are not runnable degrades silently into agents that cannot reach the board.
+test -x "$APP/Contents/MacOS/velm-agent-cli"
+test -x "$APP/Contents/MacOS/velm-mcp"
 
 # Unsigned bundles are quarantined when they arrive from anywhere but the local
 # filesystem. Ad-hoc signing keeps Gatekeeper quiet for a locally built app.

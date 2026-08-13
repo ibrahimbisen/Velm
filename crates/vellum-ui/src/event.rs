@@ -272,13 +272,44 @@ pub enum AgentEdit {
     Schedule(Option<Schedule>),
     AcceptsMessages(bool),
     Voice(bool),
+    /// Attach a file as context, through the app's **own** file picker.
+    ///
+    /// No payload, and that is the whole design: this crate opens no dialogs and reads no
+    /// files, so all it can say is *the user asked for the picker on the selected node*.
+    /// The path, what kind of thing it turns out to be and how much of it could be read are
+    /// all `vellum_agent::ingest`'s answers, and the app is the only side that can ask.
+    ///
+    /// The other way in is a **file dropped on the node**, which never reaches this crate at
+    /// all — a drop is a window event. Two gestures, one code path behind them.
+    AttachContext,
+    /// Write the `.md` file a note has never had, under the stem the user accepted.
+    ///
+    /// A **stem**, not a path: the directory a note belongs in is decided by its scope
+    /// (`NoteStore::dir_for`), and a panel that composed a path would be a second answer to
+    /// where notes live — one that would be wrong for every private note.
+    ///
+    /// Its own verb rather than a `NotePath(String)` write, because *create* and *move* are
+    /// different consequences and only one of them is offered: a note whose file exists shows
+    /// its path as a readout with a reveal beside it, and nothing in the panel renames it.
+    CreateNoteFile(String),
+    /// A note's scope — shared with every agent on the board, or private to one.
+    NoteScope(NoteScope),
+    /// The directory a file tree shows, relative to the project root. Empty is the root
+    /// itself, which is what an unset tree already means.
+    TreeRoot(String),
+    /// Which agent a file tree is scoped to, as an **item id** string — feature 7's hard
+    /// requirement that a tree belongs to an agent rather than to the board.
+    ///
+    /// An id rather than a label, because two agents may be called *Reviewer* and the tree
+    /// has to name one of them. The panel offers labels and emits the id behind the one
+    /// picked, exactly as a private note's owner does. `None` is a tree the user placed for
+    /// themselves.
+    TreeOwner(Option<String>),
     /// Detach the context source at this index of [`AgentSummary::context`] — an index,
     /// because that list is the one the panel just drew, from the one selected node.
     ///
     /// [`AgentSummary::context`]: crate::AgentSummary::context
     DropContext(usize),
-    /// A note's scope — shared with every agent on the board, or private to one.
-    NoteScope(NoteScope),
     /// Whether a file tree shows what git ignores.
     ShowIgnored(bool),
     /// A browser node's address.

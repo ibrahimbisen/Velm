@@ -77,12 +77,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -140,11 +141,121 @@ const FLAGS: [&str; 6] = [
     "--verbose",
 ];
 
+/// The flag `claude` takes an MCP server configuration through.
+///
+/// ⚠ **This is the tool's flag, not ours, and it may be renamed or dropped.** It is spelled
+/// once, here, so that when it moves there is one line to change — the same reason
+/// [`crate::provider::Provider::default_command`] is a default rather than a fact.
+///
+/// It takes the JSON document [`LaunchSpec::mcp_config`] builds, inline. A file would also be
+/// accepted and is worse: it would have to be written somewhere, cleaned up when the session
+/// ended, and would survive a crash as litter naming a socket that is gone.
+const MCP_CONFIG_FLAG: &str = "--mcp-config";
+
+// **No `--allowed-tools` beside it, deliberately.** The CLI already asks before it uses a
+// tool — that is the `can_use_tool` control request this transport answers by putting the
+// question to the user (`ClaudeCli::answer_permission`) — so pre-allowing Velm's own MCP
+// tools would take a decision away from the user that they are currently being asked to
+// make. The tools arrive gated, which is the correct posture for a verb that can spawn a
+// process on their machine.
+
+/// How long to wait for a `--help` while deciding whether a flag exists. See
+/// [`supports_flag`].
+///
+/// `claude` is a Node program: measured elsewhere, that is a few hundred milliseconds. Two
+/// seconds is generous rather than tuned, and it is a **ceiling on a stall the user asked
+/// for** — this runs on the thread that starts an agent, from a Start they just clicked, and
+/// only once per binary.
+const HELP_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How many lines of the child's stderr are kept to explain an exit.
 ///
 /// A **bounded tail** rather than a log: without the bound a chatty child left running
 /// overnight would grow Velm's memory by everything it ever printed.
 const STDERR_TAIL: usize = 40;
+
+/// Whether `program --help` mentions `flag`.
+///
+/// # Why this exists rather than just passing the flag
+///
+/// [`MCP_CONFIG_FLAG`] is a guess at another tool's command line. Passing a flag `claude`
+/// does not know is not a degraded session — commander.js exits non-zero on an unknown
+/// option, so the child dies at the first prompt and the node reports an error. That would
+/// mean a wrong guess here **breaks every Claude agent on every board**, including for users
+/// who never wanted MCP. Asking first turns that into *the agent simply lacks the tools*,
+/// which is the failure the whole shim path is required to degrade to.
+///
+/// # The cost, honestly
+///
+/// One `--help` per binary per run of Velm, on the thread that starts an agent, bounded at
+/// [`HELP_TIMEOUT`]. `claude` is a Node program and answers in well under a second; a machine
+/// where it does not is a machine where starting the agent was going to be slow anyway. The
+/// probe runs **only when there is a configuration to pass** — a board with no shim beside it
+/// never pays for it.
+///
+/// A timeout answers *"no"*: not registering the server costs the board verbs, and guessing
+/// *"yes"* at a binary that has not answered costs the whole session.
+fn supports_flag(program: &Path, flag: &str) -> bool {
+    static HELP: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+    let cache = HELP.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let cached =
+        cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(program).cloned();
+    if let Some(text) = cached {
+        return text.contains(flag);
+    }
+
+    // ⚠ **A timeout is not cached, and a real answer is.** Caching "it did not answer in two
+    // seconds" would cost the board's verbs for the rest of the session on the strength of one
+    // slow start — on a machine that swaps, which this one does. Not caching it means a
+    // genuinely wedged binary is asked again at the next start, which is a stall the user
+    // caused by clicking Start a second time.
+    let Some(text) = help_text(program) else {
+        return false;
+    };
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(program.to_path_buf(), text.clone());
+    text.contains(flag)
+}
+
+/// Runs `program --help` on a thread and waits [`HELP_TIMEOUT`] for it. `None` if it did not
+/// answer in time — which is *"do not know"*, not *"no"*.
+///
+/// The thread rather than a plain `output()` **is** the timeout: a child that never exits
+/// would otherwise hang the caller for good, and the caller is the thread that starts agents.
+/// The thread is left to finish on its own; it holds nothing and its process will exit or be
+/// reaped when Velm does.
+///
+/// stdin is closed so a program that decides to prompt gets an immediate end of file rather
+/// than waiting for a user who is looking at a canvas. Both output streams are captured:
+/// tools disagree about where `--help` belongs, and reading only stdout would answer *"the
+/// flag does not exist"* for every tool that chose stderr — and would also let a help text
+/// through to Velm's own terminal.
+fn help_text(program: &Path) -> Option<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let program = program.to_path_buf();
+    std::thread::spawn(move || {
+        let text = Command::new(&program)
+            .arg("--help")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map(|done| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&done.stdout),
+                    String::from_utf8_lossy(&done.stderr)
+                )
+            });
+        // A binary that cannot be run at all answers with the empty string rather than
+        // nothing: that is a definite "no flags", and it is worth caching.
+        let _ = sender.send(text.unwrap_or_default());
+    });
+    receiver.recv_timeout(HELP_TIMEOUT).ok()
+}
 
 // ---------------------------------------------------------------------------------------
 // Decoding
@@ -165,6 +276,15 @@ pub struct Facts {
     /// advertised, so reading this to decide would be a way to break cancel on a version that
     /// spelled its capabilities differently.
     pub capabilities: Vec<String>,
+    /// The MCP servers the CLI actually loaded, as it names them back to us.
+    ///
+    /// **This is the only evidence that [`MCP_CONFIG_FLAG`] was understood.** Nothing offline
+    /// can check a guess at another tool's command line, and the capture that established
+    /// this protocol already carries the field (`"mcp_servers":[]`, from a run with no
+    /// configuration) — so an `init` line listing `velm` is the measurement, and one that
+    /// does not is the flag being wrong. Recorded, never acted on: gating anything on it
+    /// would break a version that spelled it differently.
+    pub mcp_servers: Vec<String>,
     /// Where the CLI got its credentials. See the module header — nothing acts on it yet.
     pub api_key_source: Option<String>,
     /// The CLI's own version, for a bug report that would otherwise say "it broke".
@@ -392,6 +512,20 @@ fn facts(value: &Value) -> Facts {
             .as_array()
             .map(|list| list.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect())
             .unwrap_or_default(),
+        // Entries are objects in some versions and bare names in others, so take a `name`
+        // when there is one and the string itself otherwise. Neither shape is worth failing
+        // over: this is a diagnostic, and an empty list must mean "it said nothing", never
+        // "it said something we could not read".
+        mcp_servers: value["mcp_servers"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|item| {
+                        item["name"].as_str().or_else(|| item.as_str()).map(str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         api_key_source: value["apiKeySource"].as_str().map(str::to_owned),
         version: value["claude_code_version"].as_str().map(str::to_owned),
     }
@@ -582,6 +716,25 @@ impl ClaudeCli {
         if let Some(model) = spec.provider.model.as_deref().filter(|name| !name.is_empty()) {
             args.push("--model".to_owned());
             args.push(model.to_owned());
+        }
+        // Velm's own MCP server, so the agent can message its neighbours, read and write the
+        // board's notes, post a picture or offer the user a choice (`docs/07` §6). Two guards,
+        // and both are the difference between a degraded session and a dead one:
+        //
+        // - `mcp_config` answers `None` when `velm-mcp` was not found beside us, so we never
+        //   hand the CLI a configuration naming a binary that is not there.
+        // - `supports_flag` asks the binary whether it knows the flag, because an unknown
+        //   option is a non-zero exit rather than an ignored argument.
+        //
+        // The agent also gets the `velm-agent-cli` shim on its `PATH` (the app puts it in
+        // `spec.env`), so the same verbs are reachable by shelling out even when this is
+        // skipped. That redundancy is on purpose: it is the one path that needs no agreement
+        // with another tool's command line.
+        if let Some(config) = spec.mcp_config()
+            && supports_flag(&program, MCP_CONFIG_FLAG)
+        {
+            args.push(MCP_CONFIG_FLAG.to_owned());
+            args.push(config.to_string());
         }
         args.extend(spec.args.iter().cloned());
 
@@ -1458,6 +1611,111 @@ mod tests {
         let spec =
             LaunchSpec::new(crate::provider::ProviderChoice::new(crate::provider::Provider::Kimi));
         assert!(matches!(ClaudeCli::start(&spec, sender), Err(AgentError::Refused(_))));
+    }
+
+    /// A stand-in for `claude`: a script whose `--help` says whatever the test needs it to.
+    ///
+    /// The point is that [`supports_flag`] asks a *binary*, so the only honest test of it is
+    /// one that runs a binary. Two of them, differing in one line of help text, is what makes
+    /// the assertion about the probe rather than about the arguments.
+    fn fake_cli(help: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let script = dir.path().join("fake-claude");
+        std::fs::write(&script, format!("#!/bin/sh\ncat <<'EOF'\n{help}\nEOF\n")).expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        // The shim lives beside it, which is also the real arrangement.
+        for name in [crate::transport::AGENT_CLI, crate::transport::MCP_SERVER] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+        }
+        (dir, script)
+    }
+
+    fn spec_for(script: &Path, dir: &Path) -> LaunchSpec {
+        let mut spec =
+            LaunchSpec::new(crate::provider::ProviderChoice::new(crate::provider::Provider::Claude))
+                .with_command(script.display().to_string())
+                .with_shim(crate::transport::Shim::beside(dir));
+        spec.env = vec![
+            (crate::mcp::IPC_ENV.into(), "/tmp/ipc.json".into()),
+            (crate::mcp::AGENT_ID_ENV.into(), "board:4@7".into()),
+        ];
+        spec
+    }
+
+    /// ⚠ **The guess, and its degradation, measured against two real binaries.**
+    ///
+    /// `--mcp-config` is a flag belonging to a tool that ships on its own schedule, and
+    /// getting it wrong is not a missing feature: an unknown option is a non-zero exit, so a
+    /// wrong guess here would kill *every* Claude agent on *every* board. The requirement is
+    /// therefore that a CLI which does not advertise the flag is launched **without** it and
+    /// simply lacks the tools.
+    ///
+    /// A/B in one test, because either half alone passes on a broken build: a version that
+    /// never passes the flag satisfies the second assertion, and one that always passes it
+    /// satisfies the first.
+    #[cfg(unix)]
+    #[test]
+    fn the_mcp_flag_is_passed_only_to_a_cli_that_advertises_it() {
+        let (modern, script) = fake_cli("Usage: claude [options]\n  --mcp-config <configs...>");
+        let (sender, _events) = channel();
+        let started = ClaudeCli::start(&spec_for(&script, modern.path()), sender).expect("start");
+        let args = &started.launch.args;
+        let at = args.iter().position(|arg| arg == MCP_CONFIG_FLAG).expect("the flag was not passed");
+        let document: Value = serde_json::from_str(&args[at + 1]).expect("valid JSON");
+        assert_eq!(
+            document["mcpServers"][crate::transport::MCP_SERVER_NAME]["command"],
+            modern.path().join(crate::transport::MCP_SERVER).display().to_string()
+        );
+        assert_eq!(
+            document["mcpServers"][crate::transport::MCP_SERVER_NAME]["env"][crate::mcp::IPC_ENV],
+            "/tmp/ipc.json"
+        );
+
+        // The same spec against a CLI that has never heard of the flag.
+        let (older, script) = fake_cli("Usage: claude [options]\n  --model <model>");
+        let (sender, _events) = channel();
+        let started = ClaudeCli::start(&spec_for(&script, older.path()), sender).expect("start");
+        assert!(
+            !started.launch.args.iter().any(|arg| arg == MCP_CONFIG_FLAG),
+            "a flag the binary does not know was passed anyway: {:?}",
+            started.launch.args
+        );
+        // Everything else still built, so this is a degraded launch and not a broken one.
+        assert!(started.launch.args.contains(&"--verbose".to_owned()));
+    }
+
+    /// The evidence that the guess above landed, when there is a real `claude` to ask.
+    ///
+    /// The capture reports `"mcp_servers":[]` from a run with no configuration; a session
+    /// launched with one names it here. Nothing gates on it — it is what a bug report should
+    /// quote when an agent says it has no Velm tools.
+    #[test]
+    fn the_init_line_reports_which_mcp_servers_were_loaded() {
+        let Line::Learned(none) = read_line(INIT_LINE, &Blobs::default()) else {
+            panic!("init did not decode as facts");
+        };
+        assert!(none.mcp_servers.is_empty(), "the capture was taken with no MCP configuration");
+
+        let configured = INIT_LINE.replace(
+            r#""mcp_servers":[]"#,
+            r#""mcp_servers":[{"name":"velm","status":"connected"}]"#,
+        );
+        let Line::Learned(facts) = read_line(&configured, &Blobs::default()) else {
+            panic!("init did not decode as facts");
+        };
+        assert_eq!(facts.mcp_servers, vec!["velm".to_owned()]);
     }
 
     /// The one line of input that has to be right, and it is the one that was measured.

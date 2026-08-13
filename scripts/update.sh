@@ -45,7 +45,12 @@ if [[ ! -d "$APP" ]]; then
 fi
 
 echo "▸ building"
-cargo build --release -p vellum-app
+# The agent shims travel with the executable. They are versioned with it — they speak
+# `vellum_agent::ipc`'s wire format, which is the same crate — so swapping one and not the
+# others is how a build ends up with an agent that cannot talk to the Velm that started it.
+cargo build --release \
+  -p vellum-app -p vellum-agent \
+  --bin vellum-app --bin velm-agent-cli --bin velm-mcp
 
 # The running app holds its own executable open, and macOS refuses to overwrite a busy
 # binary ("Text file busy"). Ask it to quit properly first — a hard kill would skip the
@@ -66,6 +71,13 @@ fi
 
 echo "▸ swapping the executable"
 cp target/release/vellum-app "$EXE"
+
+# Beside it, where `vellum_agent::transport::Shim` looks — `current_exe()`'s directory.
+# A bundle made by an older `make-app.sh` has neither of these; copying them here is what
+# lets this script bring an existing bundle up to date rather than requiring a full rebuild
+# for a feature that is only two files.
+cp target/release/velm-agent-cli "$APP/Contents/MacOS/velm-agent-cli"
+cp target/release/velm-mcp "$APP/Contents/MacOS/velm-mcp"
 
 # Re-sign, or macOS refuses to launch a bundle whose signature no longer matches its
 # contents. Ad-hoc, matching `make-app.sh`. Not muted: a signing failure here is the whole

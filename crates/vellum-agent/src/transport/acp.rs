@@ -358,6 +358,10 @@ struct Shared {
     events: Sender<TranscriptEvent>,
     cwd: String,
     system: String,
+    /// Velm's own MCP server, in the shape `session/new` asks for. Empty when `velm-mcp` was
+    /// not found beside the application — see [`LaunchSpec::mcp_servers_acp`], and see
+    /// [`run_turn`] for what happens when an agent refuses the entry.
+    mcp_servers: Vec<Value>,
 }
 
 impl Shared {
@@ -547,6 +551,7 @@ impl AcpTransport {
             events,
             cwd: cwd.to_string_lossy().into_owned(),
             system: spec.system_context.clone(),
+            mcp_servers: spec.mcp_servers_acp(),
         });
 
         let reader = stdout.map(|stdout| {
@@ -740,6 +745,48 @@ impl Drop for AcpTransport {
     }
 }
 
+/// Opens the ACP session, offering Velm's MCP server and **giving it up rather than the
+/// session** if the agent will not take it.
+///
+/// # Why the retry, rather than getting it right
+///
+/// `mcpServers` used to be hardcoded `[]`, which is why nothing in `docs/07` §6 was reachable
+/// from an ACP agent. Filling it in means sending another tool a document shaped the way the
+/// protocol describes — and the two agents this transport is a default for, `codex` and
+/// `gemini`, have **never been run from here** (see [`crate::provider`]). So the entry is a
+/// guess, and a guess on `session/new` is not a missing feature: it is the handshake, and a
+/// refusal there means the node never starts at all.
+///
+/// One retry with the empty list restores exactly the behaviour that shipped before, so the
+/// worst case is the state we were already in. It is attempted **once** and only after a
+/// refusal, so an agent that is simply broken fails on its own terms rather than twice.
+fn open_session(shared: &Shared) -> Result<Value> {
+    if shared.mcp_servers.is_empty() {
+        return shared.request(method::SESSION_NEW, json!({ "cwd": shared.cwd, "mcpServers": [] }));
+    }
+
+    let offered = shared.request(
+        method::SESSION_NEW,
+        json!({ "cwd": shared.cwd, "mcpServers": shared.mcp_servers }),
+    );
+    match offered {
+        Ok(opened) => Ok(opened),
+        Err(refused) => {
+            // Worth saying: the agent is about to run without any of the board verbs, and the
+            // silence would otherwise be indistinguishable from an agent that has them and
+            // chooses not to use them.
+            shared.emit(TranscriptEvent::Error {
+                message: format!(
+                    "this agent would not accept Velm's tools, so it is running without them \
+                     ({refused}). It can still answer; it cannot message other agents or read \
+                     the board's notes."
+                ),
+            });
+            shared.request(method::SESSION_NEW, json!({ "cwd": shared.cwd, "mcpServers": [] }))
+        }
+    }
+}
+
 /// The handshake and one turn, on the turn thread.
 fn run_turn(shared: &Shared, prompt: &str) -> Result<TurnOutcome> {
     let session = {
@@ -763,10 +810,7 @@ fn run_turn(shared: &Shared, prompt: &str) -> Result<TurnOutcome> {
                         },
                     }),
                 )?;
-                let opened = shared.request(
-                    method::SESSION_NEW,
-                    json!({ "cwd": shared.cwd, "mcpServers": [] }),
-                )?;
+                let opened = open_session(shared)?;
                 let id = opened["sessionId"]
                     .as_str()
                     .ok_or_else(|| AgentError::Transport {

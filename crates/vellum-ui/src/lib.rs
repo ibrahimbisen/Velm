@@ -134,7 +134,9 @@ pub mod tool;
 pub mod toolbar;
 pub mod widgets;
 
-pub use agent_dialogs::{RulesForm, compose as compose_rules, schedule_problem};
+pub use agent_dialogs::{
+    RuleFilePath, RuleFiles, RulesForm, compose as compose_rules, schedule_problem,
+};
 pub use agent_panel::{AgentPanelState, AgentRow};
 pub use chrome::{BoardState, Chrome, ChromeOutput, ChromeState, Screen, ViewState};
 pub use color::{ColorPicker, Hsv, SWATCHES, from_egui, parse_hex, to_egui};

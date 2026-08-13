@@ -351,6 +351,15 @@ pub struct AgentSummary {
     pub connected: Vec<AgentLink>,
     pub accepts_messages: bool,
     pub voice: bool,
+    /// Whether this **build** can record at all — `vellum-agent`'s `voice` feature, forwarded
+    /// through `vellum-app` and off by default.
+    ///
+    /// Reported rather than assumed, and separate from [`Self::voice`] for
+    /// [`BrowserSummary::allowed`]'s reason: one is a capability the binary either has or has
+    /// not, the other is an instruction this node was given. Without the split a default
+    /// build would either hide the control — leaving the user with no way to find out why
+    /// push-to-talk is missing — or offer one that does nothing.
+    pub voice_available: bool,
 }
 
 impl AgentSummary {
@@ -402,11 +411,35 @@ pub struct NoteSummary {
     /// Whether the file exists yet. A note that has never been written is not an error;
     /// it is a note nobody has typed in.
     pub on_disk: bool,
+    /// The note's own title, as it is on the board.
+    ///
+    /// Here so the panel can *offer* a file name rather than asking for one: a note called
+    /// "Engine bay" proposes `engine-bay.md` through [`vellum_agent::notes::slug`], which is
+    /// the same function the store would use. Naming it here and slugging it there would be
+    /// two answers to what the file is called, and the user would watch the name they
+    /// accepted turn into a different one.
+    pub title: String,
+    /// The agents this note is joined to by a connector, by id and label.
+    ///
+    /// This is what makes *private* reachable. A private note belongs to exactly one agent,
+    /// which agent that is is a fact about the **board** — the line the user drew — and the
+    /// panel cannot walk connectors. Empty means the honest answer is *connect it to an
+    /// agent first*, which is a gesture that exists.
+    pub connected: Vec<AgentLink>,
 }
 
 impl NoteSummary {
     pub const fn is_private(&self) -> bool {
         self.scope.is_private()
+    }
+
+    /// The file name this note would get, if one were made for it now.
+    ///
+    /// [`vellum_agent::notes::slug`]'s answer, never a second spelling of it. The store
+    /// appends `-2` for a collision (`NoteStore::free_stem`) and this cannot know about
+    /// files, so it is a *proposal* — which is exactly what a hint in a text field is.
+    pub fn proposed_stem(&self) -> String {
+        vellum_agent::notes::slug(&self.title)
     }
 }
 
@@ -415,8 +448,18 @@ impl NoteSummary {
 pub struct FileTreeSummary {
     /// Empty means the board's project root.
     pub root: String,
+    /// What that root resolves to, so a tree showing the project can say *which* project
+    /// rather than leaving the reader to guess. `None` when the board has no folder.
+    pub project_dir: Option<String>,
     /// The agent this tree is scoped to, by label. Feature 7's hard requirement.
     pub agent: Option<String>,
+    /// The same agent by **item id**, which is what a write has to carry: two nodes may
+    /// share a label and only one of them owns this tree. The label is what is shown, the
+    /// id is what is emitted — the arrangement a private note's owner already uses.
+    pub agent_id: Option<String>,
+    /// The agents this tree is joined to by a connector, by id and label. What the owner
+    /// picker offers; empty means *draw a line to an agent first*.
+    pub connected: Vec<AgentLink>,
     pub show_ignored: bool,
 }
 
@@ -1004,6 +1047,7 @@ mod tests {
             connected: Vec::new(),
             accepts_messages: true,
             voice: false,
+            voice_available: false,
         }
     }
 
@@ -1087,6 +1131,8 @@ mod tests {
             conflicted: false,
             links: 2,
             on_disk: true,
+            title: "Plan".to_owned(),
+            connected: Vec::new(),
         });
         let model = PanelModel::derive(std::slice::from_ref(&note));
         assert!(model.has_note() && model.has_agent_family());
@@ -1098,7 +1144,10 @@ mod tests {
             SelectionItem::new(id(2), ItemFacet::FileTree, Placement::new(0.0, 0.0, 1.0, 1.0));
         tree.file_tree = Some(FileTreeSummary {
             root: "crates".to_owned(),
+            project_dir: None,
             agent: Some("Reviewer".to_owned()),
+            agent_id: Some("9@1".to_owned()),
+            connected: Vec::new(),
             show_ignored: false,
         });
         let model = PanelModel::derive(std::slice::from_ref(&tree));

@@ -389,3 +389,58 @@ Nothing here is done because it compiles. Per the repo's culture:
 - **Anything that could pass on the unfixed build** — A/B it, and record the measured
   before/after.
 - Every gap answers with a toast naming what is missing. Nothing is inert.
+
+
+---
+
+## 14. What is actually reachable
+
+A contract that describes what was designed, with no record of what a user can reach, is how
+nine separate features come to be written, tested and callerless in one codebase. This section
+is the honest ledger, from a reachability audit that traced each feature from the gesture to
+the effect and verified every hop had a caller by grep.
+
+**The distinction that matters:** *implemented* means the code exists and its tests pass.
+*Reachable* means a person can get to it. Nearly everything here was implemented long before it
+was reachable, and the gap between the two was invisible to a green suite.
+
+| Feature | Gesture | State |
+|---|---|---|
+| 1 Live agent nodes | Palette ▸ Agent (or `A`), drag; Run on the node | Reachable |
+| 2 Raw / clean per node | The node's mode toggle; the bar; Edit ▸ Agent; Preferences for the default | Reachable |
+| 3 Agent-to-agent messaging | Connector between two agents; arrowhead sets direction | Delivery reachable; an agent *initiating* one needs the shim |
+| 4 Worktree isolation | Preferences ▸ Worktree isolation, then run a coding agent | Reachable — created at launch, recorded, used as cwd. Removal is deliberately manual |
+| 5 Custom role labels | Double-click the role, or the panel | Reachable, and folded into the system context |
+| 6 Meta agent | Palette ▸ Agent ▸ Meta | Placeable; its configure power runs over the shim |
+| 7 File tree nodes | More ▸ File tree | Reachable; per-agent scoping needs its editor |
+| 8 Note nodes | More ▸ Note | Reachable once a note is given a file |
+| 9 Orchestrator territory + cap | Palette ▸ Agent ▸ Orchestrator | Cap enforced; spawn runs over the shim; the territory drag is not built |
+| 10 Scheduled agents | Edit ▸ Agent ▸ Schedule… | Reachable, end to end |
+| 11 Hierarchical rules | Edit ▸ Agent ▸ Rules… | Agent layer editable; the two above are shown and revealable |
+| 12 Voice | Push-to-talk on the node | Needs `--features voice`; a default build says so |
+| 13 Browser nodes | More ▸ Browser + Preferences + Load | Card reachable; live pages need `--features browser` |
+| 14 Images and options | An agent emits them | Images reachable; option sets arrive over the shim |
+| 15 Away summaries | Leave the window, come back | Reachable, as a headline |
+| 16 Provider per node | The context bar, or the panel | Reachable; a local model needs its endpoint field |
+| 17 Bring-your-own-subscription | Provider ▸ Claude | **Reachable and measured** — no API key |
+| 18 File-type ingestion | Drop a file on an agent, or attach from the panel | Needs its producer wired |
+| 19 Web research | An agent calls the MCP tool | Runs over the shim and its MCP registration |
+
+### The chain six of these share
+
+Messaging-initiation, the meta agent's configure, orchestrator spawn, option sets, an agent's
+note access and web research **all** terminate at `velm-agent-cli` / `velm-mcp`. That chain had
+three independent breaks, any one fatal: the binaries were not built or shipped; nothing put
+them on a launched agent's `PATH` or registered the MCP server; and the system context never
+mentioned they existed. All three are closed — but note what is still not proven: **a real
+agent process invoking the shim and Velm's handler answering has never been driven end to
+end.** Every layer is tested and one hop is not. That is trap 9's exact shape, and a
+*"messaging does nothing"* report should start there rather than in the bus.
+
+### The rule this section exists to enforce
+
+**Never describe a gesture the user cannot perform.** Three strings shipped in this layer
+telling the user to drop a file on a node, drag a region on the board, and connect a note to an
+agent — none of which existed. A disabled control with a tooltip naming what is missing is the
+house style; an enabled-looking instruction for a gesture that does not exist is worse than
+silence, because it costs the user their time before it costs them their trust.

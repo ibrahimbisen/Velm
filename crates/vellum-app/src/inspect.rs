@@ -111,6 +111,15 @@ pub struct AgentFacts<'a> {
     pub inherited_provider: vellum_agent::ProviderChoice,
     /// Whether browser nodes are permitted app-wide. Distinct from a node's own `live`.
     pub browser_nodes_allowed: bool,
+    /// Whether this **binary** can capture audio at all — `vellum-agent`'s `voice` feature,
+    /// forwarded by `vellum-app` and off by default.
+    ///
+    /// A build fact rather than a preference, which is why it is here beside
+    /// [`Self::browser_nodes_allowed`] rather than on the node: `cfg!(feature = "voice")` is
+    /// the answer and only the crate that is compiled with the flag can read it. The panel
+    /// draws the control either way and names the feature when it cannot act — a control
+    /// that is simply missing tells the user nothing about why.
+    pub voice_available: bool,
     /// Whether this node has a live session right now.
     pub running: &'a dyn Fn(ItemId) -> bool,
     /// The agents this one may hand off to, along a connector.
@@ -148,6 +157,10 @@ impl AgentFacts<'_> {
                 vellum_agent::Provider::default(),
             ),
             browser_nodes_allowed: false,
+            // A build fact, read from the crate that carries the flag rather than assumed:
+            // `unknown()` describes an app with nothing to say, and what this binary was
+            // compiled with is not one of the things it does not know.
+            voice_available: cfg!(feature = "voice"),
             running: &|_| false,
             connected: &|_| Vec::new(),
             // Built through the real resolver with three empty layers rather than a
@@ -175,8 +188,11 @@ pub fn describe(
 ) -> SelectionItem {
     SelectionItem {
         agent: agent_of(id, item, agents),
-        note: note_of(&item.kind, agents),
-        file_tree: file_tree_of(&item.kind, agents),
+        // Both take the item's id now, and both need it for the same reason: what a note or
+        // a tree *belongs to* is the agent on the other end of a connector, and that is a
+        // question about this node's place on the board rather than about its token.
+        note: note_of(id, &item.kind, agents),
+        file_tree: file_tree_of(id, &item.kind, agents),
         browser: browser_of(&item.kind, agents),
         id,
         facet: facet_of(&item.kind),
@@ -236,15 +252,29 @@ fn agent_of(
         connected: (agents.connected)(id),
         accepts_messages: config.accepts_messages,
         voice: config.voice,
+        voice_available: agents.voice_available,
     })
 }
 
 /// A note node, for the panel's Note section.
-fn note_of(kind: &ItemKind, agents: &AgentFacts<'_>) -> Option<vellum_ui::NoteSummary> {
-    let ItemKind::AgentNote { model, .. } = kind else { return None };
+///
+/// Two fields here exist to make a gesture reachable rather than to describe the token.
+/// **`title`** is what the file name is proposed from, so the panel can offer
+/// `engine-bay.md` instead of demanding a name — and it is the node's own words, which is
+/// where a note's title lives. **`connected`** is the agents joined to it by a connector,
+/// which is the only way a note can be made *private*: the scope names an owner, and which
+/// agent owns a note is the line the user drew.
+fn note_of(
+    id: ItemId,
+    kind: &ItemKind,
+    agents: &AgentFacts<'_>,
+) -> Option<vellum_ui::NoteSummary> {
+    let ItemKind::AgentNote { model, title } = kind else { return None };
     let note = crate::note::decode(model);
     let (on_disk, conflicted) = (agents.note_state)(&note.path);
     Some(vellum_ui::NoteSummary {
+        title: title.to_plain(),
+        connected: (agents.connected)(id),
         // The owner is resolved to a *label* here. The scope carries an item id, and a row
         // that prints `42@7` at somebody has told them nothing.
         owner: match &note.scope {
@@ -259,11 +289,24 @@ fn note_of(kind: &ItemKind, agents: &AgentFacts<'_>) -> Option<vellum_ui::NoteSu
     })
 }
 
-fn file_tree_of(kind: &ItemKind, agents: &AgentFacts<'_>) -> Option<vellum_ui::FileTreeSummary> {
+/// A file tree, for the panel's File tree section.
+///
+/// The owner is reported **twice on purpose**: `agent` is the label a row shows and
+/// `agent_id` is what a write has to carry. Two nodes may both be called *Reviewer*, so a
+/// picker that emitted the label would scope the tree to whichever one the app looked up
+/// first — and the two would disagree the moment somebody renamed a node.
+fn file_tree_of(
+    id: ItemId,
+    kind: &ItemKind,
+    agents: &AgentFacts<'_>,
+) -> Option<vellum_ui::FileTreeSummary> {
     let ItemKind::FileTree { model } = kind else { return None };
     let tree = crate::filetree::decode(model);
     Some(vellum_ui::FileTreeSummary {
         agent: tree.agent.as_deref().and_then(|id| (agents.label_of)(id)),
+        agent_id: tree.agent.clone(),
+        connected: (agents.connected)(id),
+        project_dir: agents.project_dir.clone(),
         root: tree.root,
         show_ignored: tree.show_ignored,
     })

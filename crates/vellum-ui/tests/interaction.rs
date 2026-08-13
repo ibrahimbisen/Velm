@@ -2274,6 +2274,9 @@ fn agent_node(running: bool) -> vellum_ui::SelectionItem {
             connected: Vec::new(),
             accepts_messages: true,
             voice: false,
+            // The shipping default: `vellum-app`'s `voice` feature is off, so the control is
+            // drawn and refuses. The tests that care flip this per case.
+            voice_available: false,
         }),
         opacity: Some(1.0),
         ..SelectionItem::new(
@@ -2454,5 +2457,299 @@ fn the_inspector_shows_where_an_agents_rules_came_from() {
     assert!(
         painted.iter().any(|t| t.contains("subscription")),
         "the billing was never stated: {painted:?}"
+    );
+}
+
+// ============================================================================
+// The Agent Canvas gestures a reachability audit found missing
+// ============================================================================
+//
+// Every test below drives a **real click** at the widget the user would aim at, and asserts
+// on the event the app is waiting for. That is the only kind of test that could have caught
+// what they cover, because in every case the machinery underneath was written and tested and
+// *no gesture reached it*: `NoteStore::create` had no caller, `NoteScope::Private` had no
+// writer, `FileTreeModel::{root, agent}` were written nowhere, and `ingest.rs` — three
+// thousand lines — had no producer at all. Unit tests of all four passed throughout.
+
+/// A note node as the app describes one: which file it has, and who it is joined to.
+fn note_node(path: &str, connected: Vec<vellum_ui::AgentLink>) -> vellum_ui::SelectionItem {
+    use vellum_ui::{ItemFacet, NoteSummary, Placement, SelectionItem};
+    SelectionItem {
+        note: Some(NoteSummary {
+            path: path.to_owned(),
+            scope: vellum_ui::vellum_agent::NoteScope::Shared,
+            owner: None,
+            conflicted: false,
+            links: 0,
+            on_disk: !path.is_empty(),
+            title: "Engine bay".to_owned(),
+            connected,
+        }),
+        opacity: Some(1.0),
+        ..SelectionItem::new(
+            "1@1".parse().expect("well-formed item id"),
+            ItemFacet::Note,
+            Placement::new(0.0, 0.0, 320.0, 380.0),
+        )
+    }
+}
+
+/// A file tree as the app describes one.
+fn tree_node(
+    owner: Option<&str>,
+    connected: Vec<vellum_ui::AgentLink>,
+) -> vellum_ui::SelectionItem {
+    use vellum_ui::{FileTreeSummary, ItemFacet, Placement, SelectionItem};
+    SelectionItem {
+        file_tree: Some(FileTreeSummary {
+            root: String::new(),
+            project_dir: Some("/tmp/project".to_owned()),
+            agent: owner.map(|_| "Reviewer".to_owned()),
+            agent_id: owner.map(str::to_owned),
+            connected,
+            show_ignored: false,
+        }),
+        opacity: Some(1.0),
+        ..SelectionItem::new(
+            "2@1".parse().expect("well-formed item id"),
+            ItemFacet::FileTree,
+            Placement::new(0.0, 0.0, 260.0, 420.0),
+        )
+    }
+}
+
+fn link(id: &str, label: &str) -> vellum_ui::AgentLink {
+    vellum_ui::AgentLink { id: id.to_owned(), label: label.to_owned() }
+}
+
+/// Every event a click on the widget carrying `label` produces, on a fresh chrome.
+///
+/// Located by the **painted text**, not by position: the panel's rows shift the moment a
+/// caption is added above them, and a test that aimed at "the ninth widget" would fail for
+/// reasons that have nothing to do with what it is checking. A fresh `Chrome` per click, so
+/// one control's popup cannot be open while the next is aimed at.
+fn click_labelled(
+    state: &ChromeState<'_>,
+    label: &str,
+    then: Option<&str>,
+) -> Vec<UiEvent> {
+    let ctx = Context::default();
+    let mut chrome = Chrome::new();
+    chrome.set_properties_open(true);
+    settle(&ctx, &mut chrome, state);
+
+    let full = frame_painted(&ctx, &mut chrome, state, input());
+    let at = painted_text(&full)
+        .into_iter()
+        .find(|(_, text, _)| text == label)
+        .unwrap_or_else(|| {
+            let all: Vec<String> =
+                painted_text(&full).into_iter().map(|(_, t, _)| t).collect();
+            panic!("nothing painted {label:?}; the panel drew {all:?}")
+        })
+        .2;
+    let mut events = frame(&ctx, &mut chrome, state, click_at(at.center())).events;
+
+    // A second aim, for a control that opens a menu: the first click opens it and emits
+    // nothing, and what the user chose is in the popup that appears on the next pass.
+    if let Some(row) = then {
+        let full = frame_painted(&ctx, &mut chrome, state, input());
+        let at = painted_text(&full)
+            .into_iter()
+            .find(|(_, text, _)| text == row)
+            .unwrap_or_else(|| {
+                let all: Vec<String> =
+                    painted_text(&full).into_iter().map(|(_, t, _)| t).collect();
+                panic!("the menu never offered {row:?}; it drew {all:?}")
+            })
+            .2;
+        events.extend(frame(&ctx, &mut chrome, state, click_at(at.center())).events);
+    }
+    events
+}
+
+/// **Gap 1.** A placed note gets `NoteModel::default()`, whose path is empty — and an empty
+/// path addresses no file, so nothing was ever written and the node said *"Not written yet"*
+/// for ever. `NoteStore::create` had no caller in the workspace.
+///
+/// The name is *offered*, from the note's own title through the same `slug` the store uses,
+/// so the gesture is one click rather than a demand that the user invent a file name.
+#[test]
+fn a_note_with_no_file_offers_to_create_one_named_after_itself() {
+    let selection = [note_node("", Vec::new())];
+    let state = selected_state(&selection, Some(SELECTED));
+
+    let events = click_labelled(&state, "Create the file", None);
+    assert!(
+        events.contains(&UiEvent::Agent(vellum_ui::AgentEdit::CreateNoteFile(
+            "engine-bay".to_owned()
+        ))),
+        "creating a note's file emitted {events:?}"
+    );
+}
+
+/// …and a note that already has one offers to **show** it instead, never to make a second.
+#[test]
+fn a_note_that_has_a_file_reveals_it_rather_than_offering_another() {
+    let selection = [note_node("notes/engine-bay.md", Vec::new())];
+    let state = selected_state(&selection, Some(SELECTED));
+
+    let events = click_labelled(&state, "Show the file", None);
+    assert!(
+        events.contains(&UiEvent::RevealPath("notes/engine-bay.md".into())),
+        "showing a note's file emitted {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            UiEvent::Agent(vellum_ui::AgentEdit::CreateNoteFile(_))
+        )),
+        "a note with a file was offered a second one: {events:?}"
+    );
+}
+
+/// **Gap 2.** `NoteScope::Private` had no writer anywhere: only `Shared` was ever emitted,
+/// while the panel and the bar both instructed the user to *"connect the note to one agent to
+/// make it that agent's own"* — a gesture that did nothing.
+///
+/// The connector was the right idea, so it is what the picker reads. The scope carries the
+/// agent's **id**, which is what this asserts: emitting the label would scope the note to
+/// whichever node happened to be looked up first the day two of them share a name.
+#[test]
+fn a_note_joined_to_an_agent_can_be_made_that_agents_own() {
+    let selection = [note_node("notes/engine-bay.md", vec![link("7@1", "Reviewer")])];
+    let state = selected_state(&selection, Some(SELECTED));
+
+    let events = click_labelled(&state, "Shared", Some("Private to Reviewer"));
+    assert!(
+        events.contains(&UiEvent::Agent(vellum_ui::AgentEdit::NoteScope(
+            vellum_ui::vellum_agent::NoteScope::Private { agent: "7@1".to_owned() }
+        ))),
+        "making a note private emitted {events:?}"
+    );
+}
+
+/// With no connector drawn there is nobody to be private *to*, so the control refuses — and
+/// the refusal names a gesture that exists, which the old one did not.
+#[test]
+fn a_note_joined_to_nothing_cannot_be_made_private() {
+    let ctx = Context::default();
+    let mut chrome = Chrome::new();
+    chrome.set_properties_open(true);
+    let selection = [note_node("notes/engine-bay.md", Vec::new())];
+    let state = selected_state(&selection, Some(SELECTED));
+    settle(&ctx, &mut chrome, &state);
+
+    for control in widgets(&ctx, |_| true) {
+        let ctx = Context::default();
+        let mut chrome = Chrome::new();
+        chrome.set_properties_open(true);
+        settle(&ctx, &mut chrome, &state);
+        let events = frame(&ctx, &mut chrome, &state, click_at(control.center())).events;
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                UiEvent::Agent(vellum_ui::AgentEdit::NoteScope(
+                    vellum_ui::vellum_agent::NoteScope::Private { .. }
+                ))
+            )),
+            "an unconnected note was made private by a click: {events:?}"
+        );
+    }
+}
+
+/// **Gap 3.** `FileTreeModel::agent` was written nowhere, so every tree belonged to
+/// *"Nobody in particular"* — the exact opposite of feature 7's requirement that a tree is
+/// scoped per agent.
+#[test]
+fn a_file_tree_can_be_scoped_to_the_agent_it_is_joined_to() {
+    let selection = [tree_node(None, vec![link("7@1", "Reviewer")])];
+    let state = selected_state(&selection, Some(SELECTED));
+
+    let events = click_labelled(&state, "Nobody in particular", Some("Reviewer"));
+    assert!(
+        events.contains(&UiEvent::Agent(vellum_ui::AgentEdit::TreeOwner(Some(
+            "7@1".to_owned()
+        )))),
+        "scoping a tree to an agent emitted {events:?}"
+    );
+}
+
+/// **Gap 4.** `ingest.rs` is three thousand lines with no producer: nothing in the
+/// application ever wrote `AgentModel::context`, so an agent could be given nothing.
+///
+/// This is the picker half. The other half is a file dropped on the node, which is a window
+/// event and never reaches this crate — `vellum-app`'s `attach_dropped_file` owns it.
+#[test]
+fn an_agent_can_be_given_a_file_to_read() {
+    let selection = [agent_node(false)];
+    let state = selected_state(&selection, Some(SELECTED));
+
+    let events = click_labelled(&state, "Attach a file…", None);
+    assert!(
+        events.contains(&UiEvent::Agent(vellum_ui::AgentEdit::AttachContext)),
+        "attaching a file emitted {events:?}"
+    );
+}
+
+/// **Gap 5.** `AgentEdit::Voice` was defined and handled and **nothing emitted it** — no
+/// panel row, no bar control, no command. With `vellum-app`'s `voice` feature off, the
+/// control still has to be *there*: a missing control leaves the user with no way to discover
+/// that push-to-talk exists, which is the state this shipped in.
+///
+/// So the assertion is a pair, and both halves matter. A build that can record emits the
+/// edit; a build that cannot emits nothing from any control in the panel — while still
+/// drawing the row, which the sibling test checks.
+#[test]
+fn voice_is_offered_when_the_build_can_record_and_refuses_when_it_cannot() {
+    for available in [true, false] {
+        let mut node = agent_node(false);
+        node.agent.as_mut().expect("an agent").voice_available = available;
+        let selection = [node];
+        let state = selected_state(&selection, Some(SELECTED));
+
+        let ctx = Context::default();
+        let mut chrome = Chrome::new();
+        chrome.set_properties_open(true);
+        settle(&ctx, &mut chrome, &state);
+
+        let emitted = widgets(&ctx, |_| true).into_iter().any(|control| {
+            let ctx = Context::default();
+            let mut chrome = Chrome::new();
+            chrome.set_properties_open(true);
+            settle(&ctx, &mut chrome, &state);
+            frame(&ctx, &mut chrome, &state, click_at(control.center()))
+                .events
+                .iter()
+                .any(|e| matches!(e, UiEvent::Agent(vellum_ui::AgentEdit::Voice(_))))
+        });
+        assert_eq!(
+            emitted, available,
+            "with voice available={available}, some control emitted Voice: {emitted}"
+        );
+    }
+}
+
+/// The row is drawn either way, and a build that cannot record **says so**.
+///
+/// `voice::NOT_BUILT_IN` existed as the intended message and had zero references, so a
+/// default build offered nothing and explained nothing. Asserted on the painted words rather
+/// than on the tooltip, because a tooltip needs a hover this cannot hold across passes — the
+/// caption under the row is what a user sees without doing anything.
+#[test]
+fn a_build_without_voice_says_so_rather_than_hiding_the_control() {
+    let ctx = Context::default();
+    let mut chrome = Chrome::new();
+    chrome.set_properties_open(true);
+    let selection = [agent_node(false)];
+    let state = selected_state(&selection, Some(SELECTED));
+    settle(&ctx, &mut chrome, &state);
+
+    let full = frame_painted(&ctx, &mut chrome, &state, input());
+    let painted: Vec<String> = painted_text(&full).into_iter().map(|(_, t, _)| t).collect();
+    assert!(painted.iter().any(|t| t == "Voice"), "no Voice row at all: {painted:?}");
+    assert!(
+        painted.iter().any(|t| t.contains("Not built into this copy")),
+        "the build's own silence about voice: {painted:?}"
     );
 }

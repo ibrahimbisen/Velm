@@ -20,6 +20,13 @@ use std::collections::VecDeque;
 
 /// A question that blocks the board until it is answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the Rules variant carries a whole resolved cascade and its two file paths, and \
+              the Schedule variant a schedule plus its hand-off targets. Boxing either would \
+              put an allocation behind every dialog in the application to save bytes on a \
+              value of which exactly one exists at a time — a modal is singular by definition"
+)]
 pub enum Dialog {
     Confirm {
         id: DialogId,
@@ -122,6 +129,13 @@ pub enum Dialog {
         title: String,
         form: crate::agent_dialogs::RulesForm,
         resolved: vellum_agent::ResolvedRules,
+        /// Where the two layers this editor **cannot** write live on disk.
+        ///
+        /// Supplied by the app because only the app knows its data directory and which
+        /// folder the board is in. Without it the editor names the layers a value came from
+        /// and can say nothing about how to change them, which is the state feature 11
+        /// shipped in: two of its three layers were reachable only by reading the source.
+        files: crate::agent_dialogs::RuleFiles,
         confirm: String,
     },
     /// A provider credential — features 16 and 17.
@@ -287,17 +301,24 @@ impl Dialog {
     /// Takes the node's own layer and the resolution it participated in. The form is derived
     /// here so the caller never has to know that the four structured settings live in the
     /// front matter of one string.
+    ///
+    /// `files` names the global and project layers on disk — a required argument rather than
+    /// a builder step, deliberately. It is the only way the two inherited layers become
+    /// findable at all, and a caller that could forget it would leave the cascade's top two
+    /// thirds invisible exactly as they were.
     pub fn rules(
         id: DialogId,
         title: impl Into<String>,
         rules: &vellum_agent::AgentRules,
         resolved: vellum_agent::ResolvedRules,
+        files: crate::agent_dialogs::RuleFiles,
     ) -> Self {
         Self::Rules {
             id,
             title: title.into(),
             form: crate::agent_dialogs::RulesForm::from_rules(rules),
             resolved,
+            files,
             confirm: "Save".to_owned(),
         }
     }
@@ -451,6 +472,11 @@ impl DialogStack {
         let Some(dialog) = self.pending.front_mut() else { return };
         let id = dialog.id();
         let mut outcome = None;
+        // A file the dialog asked to be shown. Collected out of the modal's closure rather
+        // than pushed from inside it, because `events` is borrowed for the whole of
+        // `show_dialog` and the closure already holds `dialog` mutably. Revealing a file is
+        // not an answer to the dialog — the editor stays open — so it cannot ride `outcome`.
+        let mut reveal: Option<std::path::PathBuf> = None;
 
         // Opaque, always: a modal exists to stop everything else, and one you can see
         // through undermines its own job. `dialog_frame` cannot be made glass even
@@ -653,7 +679,7 @@ impl DialogStack {
                             }
                         });
                     }
-                    Dialog::Rules { title, form, resolved, confirm, .. } => {
+                    Dialog::Rules { title, form, resolved, files, confirm, .. } => {
                         ui.label(screen_title(title.as_str()).color(palette.text));
                         ui.add_space(space::of(3));
                         egui::ScrollArea::vertical().max_height(space::of(150)).show(ui, |ui| {
@@ -662,6 +688,8 @@ impl DialogStack {
                                 palette,
                                 form,
                                 resolved,
+                                files,
+                                &mut reveal,
                                 confirm.as_str(),
                             ) {
                                 Some(crate::agent_dialogs::Answer::Save) => {
@@ -708,6 +736,13 @@ impl DialogStack {
         // never nothing, which would leave a dialog that cannot be dismissed.
         if outcome.is_none() && modal.should_close() {
             outcome = Some(DialogEvent::Cancelled(id));
+        }
+
+        // Before the outcome, so a *Show* pressed on the same frame something closed the
+        // dialog still reaches the app. Nothing here can produce both, and depending on that
+        // is how the one case that does arrive later gets dropped.
+        if let Some(path) = reveal {
+            events.push(UiEvent::RevealPath(path));
         }
 
         if let Some(outcome) = outcome {
