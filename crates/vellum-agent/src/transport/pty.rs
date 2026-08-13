@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use portable_pty::{
-    Child, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize, SlavePty,
+    Child, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize,
     native_pty_system,
 };
 

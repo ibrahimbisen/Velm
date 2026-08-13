@@ -49,5 +49,19 @@ ureq.workspace = true
 # runtime.
 portable-pty = "0.9"
 
+# Reading what other people's formats keep compressed inside themselves.
+#
+# `flate2` is for PDF content streams, which are `FlateDecode`d in nearly every real
+# document — without it the built-in extractor reads only the uncompressed minority and
+# every other PDF falls back to "install pdftotext", which is a refusal the user cannot act
+# on if they are on Windows.
+#
+# `zip` is for `.docx`, which is a ZIP of XML. The alternative on the table was shelling out
+# to macOS's `textutil`, and that is not a cross-platform answer: it would mean Word
+# documents work on the primary target and nowhere else, which is the kind of gap that gets
+# discovered by the one user who is not on a Mac.
+flate2.workspace = true
+zip.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

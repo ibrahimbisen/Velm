@@ -178,6 +178,13 @@ pub struct DrawContext<'a> {
     /// comes up, so without this the board is unchanged for the whole gesture and the item
     /// appears from nowhere at the end of it.
     pub placing: Option<Placing>,
+    /// The agents running on this board, as the painter sees them.
+    ///
+    /// A snapshot filled once per frame by `crate::agent_runtime`, never the sessions
+    /// themselves — see [`crate::agent_view`] for why the painter is deliberately given
+    /// something it cannot start a turn with. Empty on every board that has no agent nodes,
+    /// which is what keeps this layer free for boards that do not use it.
+    pub agents: &'a crate::agent_view::AgentViews,
     /// The alignment guides the gesture in flight is reporting, in **world** units.
     ///
     /// Miro's *Align objects*. Resolved by the app together with the correction they
@@ -4644,6 +4651,7 @@ mod tests {
     /// needs around it.
     fn context<'a>(camera: &'a Camera, projection: &'a Projection) -> DrawContext<'a> {
         DrawContext {
+            agents: crate::agent_view::AgentViews::empty(),
             camera,
             projection,
             theme: Theme::LIGHT,
@@ -5977,6 +5985,7 @@ mod tests {
             WorldPoint::new(70.0, 60.0),
         ];
         let ctx = DrawContext {
+            agents: crate::agent_view::AgentViews::empty(),
             camera: &camera,
             projection: &projection,
             theme: Theme::LIGHT,
@@ -6011,6 +6020,7 @@ mod tests {
 
         let points = [WorldPoint::new(10.0, 10.0)];
         let ctx = DrawContext {
+            agents: crate::agent_view::AgentViews::empty(),
             camera: &camera,
             projection: &projection,
             theme: Theme::LIGHT,
@@ -6051,6 +6061,7 @@ mod tests {
             WorldPoint::new(far + 60.0, far + 50.0),
         ];
         let ctx = DrawContext {
+            agents: crate::agent_view::AgentViews::empty(),
             camera: &camera,
             projection: &projection,
             theme: Theme::LIGHT,
@@ -6087,6 +6098,7 @@ mod tests {
         let screen = list.view(View::screen(camera.viewport()));
 
         let ctx = DrawContext {
+            agents: crate::agent_view::AgentViews::empty(),
             camera: &camera,
             projection: &projection,
             theme: Theme::LIGHT,
@@ -6130,6 +6142,7 @@ mod tests {
             let mut list = DrawList::new();
             let board = list.view(View::board(&camera));
             let ctx = DrawContext {
+                agents: crate::agent_view::AgentViews::empty(),
                 camera: &camera,
                 projection: &projection,
                 theme: Theme::LIGHT,
@@ -6230,6 +6243,7 @@ mod tests {
         push_marquee(
             &mut list,
             &DrawContext {
+                agents: crate::agent_view::AgentViews::empty(),
                 camera: &camera,
                 projection: &projection,
                 theme: Theme::LIGHT,
@@ -6275,6 +6289,7 @@ mod tests {
             painter.push_selection(
                 &mut list,
                 &DrawContext {
+                    agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
                     camera: &camera,
                     projection: &projection,
@@ -6317,6 +6332,7 @@ mod tests {
             let mut list = DrawList::new();
             let board = list.view(View::board(&camera));
             let ctx = DrawContext {
+                agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
                 camera: &camera,
                 projection: &projection,
@@ -6369,6 +6385,7 @@ mod tests {
         let mut list = DrawList::new();
         let board = list.view(View::board(&camera));
         let ctx = DrawContext {
+            agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
             camera: &camera,
             projection: &projection,
@@ -6412,6 +6429,7 @@ mod tests {
         painter.push_selection(
             &mut list,
             &DrawContext {
+                agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
                 camera: &camera,
                 projection: &projection,

@@ -1280,18 +1280,30 @@ mod tests {
         assert!(listed.is_empty());
     }
 
-    /// The folded six are the user's list, in the user's order.
+    /// The folded six are the user's list, in the user's order — **still the first six, and
+    /// still in that order**, with the Agent Canvas's three added after them.
     ///
-    /// Pinned because it is a *preference*, not a derivation — nothing about a chart
-    /// makes it occasional, and the next reader has no way to tell this list was chosen
-    /// rather than computed. *"put table charts kanabn and mindmap image and the
-    /// connector into a smaller menu in this bar i just dont use those enough"*.
+    /// Pinned because it is a *preference*, not a derivation — nothing about a chart makes
+    /// it occasional, and the next reader has no way to tell this list was chosen rather
+    /// than computed. *"put table charts kanabn and mindmap image and the connector into a
+    /// smaller menu in this bar i just dont use those enough"*.
+    ///
+    /// The assertion is written as a **prefix** check rather than a whole-array one so that
+    /// the user's six keep their identity as the user's six. Rewriting it to compare all
+    /// nine would have quietly turned a recorded preference into a list anybody may edit,
+    /// which is exactly the distinction the original test existed to preserve.
     #[test]
-    fn more_holds_exactly_the_six_the_user_named() {
+    fn more_holds_exactly_the_six_the_user_named_then_the_agent_canvas_three() {
+        let (theirs, ours) = Tool::OCCASIONAL.split_at(6);
         assert_eq!(
-            Tool::OCCASIONAL,
+            theirs,
             [Tool::Table, Tool::Chart, Tool::Kanban, Tool::MindMap, Tool::Image, Tool::Connector]
         );
+        // A note, a file tree and a browser are things you place occasionally *around* the
+        // agents. The agent tool itself is deliberately not here: a headline feature folded
+        // behind a More button is one nobody discovers.
+        assert_eq!(ours, [Tool::Note, Tool::FileTree, Tool::Browser]);
+        assert!(!Tool::Agent.is_occasional(), "the agent tool was folded behind More");
         for tool in Tool::OCCASIONAL {
             assert!(tool.is_occasional(), "{tool:?}");
         }

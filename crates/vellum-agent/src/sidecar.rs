@@ -232,11 +232,9 @@ impl Sidecar {
             .len();
         if length > 0 {
             let mut last = [0u8; 1];
-            let torn = file
-                .seek(SeekFrom::Start(length - 1))
-                .and_then(|_| file.read_exact(&mut last))
-                .map(|()| last[0] != b'\n')
-                .unwrap_or(false);
+            let read = file.seek(SeekFrom::Start(length - 1)).is_ok()
+                && file.read_exact(&mut last).is_ok();
+            let torn = read && last[0] != b'\n';
             if torn {
                 file.write_all(b"\n")
                     .map_err(|error| AgentError::file(path.display().to_string(), &error))?;
@@ -714,15 +712,26 @@ mod tests {
         let (_scratch, sidecar) = sidecar();
         let board = BoardKey::from_raw("b");
 
-        let escaping = sidecar.path_for(&board, "../../etc/passwd");
-        assert!(
-            escaping.starts_with(sidecar.root().join("b")),
-            "an id escaped its board's directory: {}",
-            escaping.display()
-        );
-        assert!(!escaping.to_string_lossy().contains(".."));
+        for hostile in ["../../etc/passwd", "..", "../sibling", "a/../../b", ".", "/etc/passwd"] {
+            let path = sidecar.path_for(&board, hostile);
+            assert!(
+                path.starts_with(sidecar.root().join("b")),
+                "`{hostile}` escaped its board's directory: {}",
+                path.display()
+            );
+            // The filename is one component with nothing to traverse in it — asserted on
+            // the *name*, because a `..` that the join happened to normalise away today is
+            // still a traversal the next platform performs.
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(!name.contains(".."), "`{hostile}` kept a traversal: {name}");
+            assert!(!name.contains('/') && !name.contains('\\'), "{name}");
+            assert_eq!(path.components().count(), sidecar.root().components().count() + 2);
+        }
 
+        // Two ids that sanitise to the same characters must still be two files, or one
+        // agent's transcript silently overwrites another's.
         assert_ne!(safe_name("1/2"), safe_name("1_2"));
+        assert_ne!(safe_name(".."), safe_name("._"));
         // An ordinary Loro id is left exactly as it is — the sanitiser must not rename every
         // transcript on the machine.
         assert_eq!(safe_name("42@7"), "42@7");

@@ -143,6 +143,12 @@ rfd = { version = "0.15", default-features = false }
 
 # Geometry. `lyon` tessellates paths (ink strokes, connectors, non-analytic shapes)
 # into triangles for the GPU; analytic shapes stay in SDF shaders instead.
+# Deflate, for reading what other people's file formats keep inside themselves: a PDF's
+# content streams are `FlateDecode`d in the overwhelming majority of real documents, so
+# without this the built-in text extractor reads only the uncompressed minority and every
+# other PDF degrades to "install pdftotext". Pure Rust via `miniz_oxide` — no C, and it is
+# already in the tree underneath `zip`'s `deflate` feature, so it costs no new build.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 lyon = "1"
 # Text shaping, layout and editing, including IME. The long pole of the project.
 cosmic-text = "0.14"

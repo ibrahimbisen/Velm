@@ -105,6 +105,13 @@ pub struct RpcError {
     pub message: String,
 }
 
+/// What a request we sent came back as.
+///
+/// An alias rather than the type spelled out, because it appears nested three deep in
+/// [`Shared::waiting`] and the shape stops being readable at that depth — and because
+/// `crate::Result` pins its own error type, so the standard one has to be named in full.
+type RpcAnswer = std::result::Result<Value, RpcError>;
+
 /// What one line from the agent was.
 #[derive(Debug, Clone, PartialEq)]
 enum Incoming {
@@ -113,7 +120,7 @@ enum Incoming {
     /// Has an `id`: **it is waiting for an answer**, and the id is echoed back verbatim.
     Request { id: Value, method: String, params: Value },
     /// An answer to something we sent.
-    Response { id: u64, answer: std::result::Result<Value, RpcError> },
+    Response { id: u64, answer: RpcAnswer },
     /// Not JSON, or not a JSON-RPC message. Ignored.
     Ignore,
 }
@@ -370,7 +377,7 @@ struct Pending {
 struct Shared {
     stdin: Mutex<Option<ChildStdin>>,
     /// Requests we sent and are waiting on, by our own id.
-    waiting: Mutex<HashMap<u64, Sender<std::result::Result<Value, RpcError>>>>,
+    waiting: Mutex<HashMap<u64, Sender<RpcAnswer>>>,
     /// Permission requests the agent is blocked on, by the id the user will answer with.
     permissions: Mutex<HashMap<String, Pending>>,
     next_id: AtomicU64,
@@ -432,7 +439,7 @@ impl Shared {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => Err(AgentError::Transport {
                 transport: "acp",
-                message: format!("{} refused `{method}`: {}", "the agent", error.message),
+                message: format!("the agent refused `{method}`: {}", error.message),
             }),
             Err(_) => Err(AgentError::Transport {
                 transport: "acp",

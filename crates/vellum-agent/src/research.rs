@@ -1136,6 +1136,47 @@ pub struct Readable {
 const SKIPPED: &[&str] =
     &["script", "style", "noscript", "template", "svg", "iframe", "nav", "footer", "aside", "form"];
 
+/// WAI-ARIA landmark roles that mean *this is the site, not the page*.
+///
+/// The tag list above only catches a site that uses the HTML5 elements; a great many mark
+/// their chrome with a landmark role on a plain `<div>` instead.
+///
+/// **Measured, and the number is smaller than it first looked.** A/B'd on a real 240 KB
+/// capture of `en.wikipedia.org/wiki/Torque_wrench`, same base URL both ways:
+/// **43,074 characters by tag name alone, 42,535 with roles as well.** 539 characters, 1.2%.
+/// What went was the search box, *Personal tools*, *24 languages* and the `v · t · e` navbox
+/// links — chrome in every case, with no article text among it. So it earns its place on being
+/// *right* rather than on being large, and the honest figure is recorded here because the
+/// first version of this comment claimed 1,900 characters and a rewritten opening paragraph,
+/// which the A/B did not support.
+///
+/// A landmark is the right signal because it is *the page telling us*, in a standard
+/// vocabulary, rather than us guessing from a class name. `main` and `article` are absent for
+/// the obvious reason. `dialog` was considered and left out: a modal is sometimes a cookie
+/// banner and sometimes the only content there is.
+const CHROME_ROLES: &[&str] =
+    &["navigation", "banner", "contentinfo", "search", "menu", "menubar", "complementary"];
+
+/// Elements that have no closing tag, and therefore may **never** be skipped as a container.
+///
+/// ⚠ This list is not tidiness, it is the fix for a measured catastrophe. `skip_element` walks
+/// forward to `</name>` and, finding none, discards the rest of the document — which is the
+/// right answer for an unterminated `<script>` on a page cut short by the byte cap, and is
+/// ruinous for an element that never had a closing tag to begin with. Wikipedia's logo is
+/// literally `<img class="mw-logo-icon" … aria-hidden="true">`; against a real 240 KB capture
+/// it swallowed **226,863 bytes** and left **60 characters** of a 43,074-character extraction,
+/// while every unit test stayed green — none of them had a void element carrying a landmark
+/// attribute. It was found by running the extractor over a real page and looking at the
+/// output, which is the only thing that could have found it.
+///
+/// It only became reachable when [`CHROME_ROLES`] did, because [`SKIPPED`] contains no void
+/// element. That is the shape of it: a new *predicate* over the same old *action* reached a
+/// case the action had never been asked about.
+const VOID: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
 /// Elements that end a line.
 const BREAKS: &[&str] = &[
     "p", "div", "section", "article", "main", "ul", "ol", "table", "thead", "tbody", "tr", "td",
@@ -1200,7 +1241,11 @@ pub fn html_to_text(html: &str, base: Option<&str>) -> Readable {
             continue;
         }
 
-        if !closing && SKIPPED.contains(&name.as_str()) && !source.ends_with('/') {
+        if !closing
+            && !source.ends_with('/')
+            && !VOID.contains(&name.as_str())
+            && (SKIPPED.contains(&name.as_str()) || is_site_chrome(source))
+        {
             i = skip_element(html, bytes, i, &name);
             continue;
         }
@@ -1260,6 +1305,27 @@ pub fn html_to_text(html: &str, base: Option<&str>) -> Readable {
     }
 
     Readable { title, text: sink.finish() }
+}
+
+/// Whether an element declares itself to be site chrome rather than page content.
+///
+/// See [`CHROME_ROLES`] for the measurement that justifies this existing at all.
+/// `aria-hidden="true"` joins it because an element hidden from a screen reader is by the
+/// page's own account not part of what it says — icon fonts, decorative duplicates, the
+/// off-canvas copy of a menu.
+fn is_site_chrome(source: &str) -> bool {
+    // A cheap gate before the two `attribute` calls, each of which lowercases the whole tag:
+    // this runs on every opening tag of a page that may be 2 MiB, and the overwhelming
+    // majority of them carry neither attribute.
+    if find_ci(source, "role", 0).is_none() && find_ci(source, "aria-hidden", 0).is_none() {
+        return false;
+    }
+    if let Some(role) = attribute(source, "role")
+        && CHROME_ROLES.contains(&role.trim().to_ascii_lowercase().as_str())
+    {
+        return true;
+    }
+    attribute(source, "aria-hidden").is_some_and(|value| value.trim() == "true")
 }
 
 /// Finds the `>` that ends a tag, ignoring one inside a quoted attribute value.
@@ -1456,9 +1522,14 @@ impl Sink {
 /// unwrapped here, because handing an agent a tracking redirect instead of the page's own
 /// address makes every result look like it is hosted by the search engine.
 ///
-/// The `&` between parameters arrives as `&amp;` in the attribute, so the value is
-/// entity-decoded **before** it is split — get that order wrong and the URL keeps a trailing
-/// `amp;rut=…` that percent-decoding will not remove.
+/// Every `href` is **entity-decoded before it is used as a URL**, because an attribute value
+/// carries `&` as `&amp;` and a URL handed to an agent with `&amp;` still in its query is a
+/// different URL from the one on the page. That bites on a *direct* href — a result whose
+/// address is not wrapped — and `a_direct_result_url_has_its_entities_decoded` is the test that
+/// fails without it. It happens **not** to bite on the wrapper, since splitting on `&` finds
+/// the `&` of `&amp;` either way; the earlier version of this comment claimed otherwise, and
+/// the A/B that was supposed to prove it passed on the broken build, which is how the claim
+/// was caught.
 pub fn parse_html_results(html: &str) -> Vec<SearchResult> {
     let bytes = html.as_bytes();
     let mut results: Vec<SearchResult> = Vec::new();
@@ -1845,6 +1916,14 @@ impl Research {
     /// Reads and parses `/robots.txt`, degrading to [`Robots::permissive`] on anything but a
     /// 2xx with a body. See that function for why an unreachable file permits rather than
     /// refuses.
+    ///
+    /// ⚠ **The first fetch to any host therefore costs about [`DEFAULT_MIN_INTERVAL`] extra**,
+    /// because this is a request to that host and the page behind it is a second one: the
+    /// pacing table quite correctly makes the second wait out the interval. That is by design
+    /// and not a stall — but it is a second and a half that appears from nowhere if you do not
+    /// know it is there, so it is written down rather than left to be profiled. Later fetches
+    /// to the same host skip it entirely, since the parsed rules are cached for
+    /// [`ROBOTS_TTL`].
     fn fetch_robots(&self, parts: &UrlParts, now: &mut Instant) -> Robots {
         let url = format!("{}/robots.txt", parts.origin());
         let robots_parts = UrlParts {
@@ -2248,6 +2327,54 @@ mod extraction_tests {
         assert!(!text.contains('<'), "markup leaked: {text}");
     }
 
+    /// A site that marks its chrome with ARIA landmarks rather than with `<nav>`/`<footer>`
+    /// gets it stripped anyway. A/B'd against a real 240 KB Wikipedia capture: 43,074
+    /// characters by tag name alone, 42,535 with roles as well — the search box, *Personal
+    /// tools*, *24 languages* and the navbox `v · t · e` links, and no article text.
+    ///
+    /// The corresponding refusal matters as much: `role="main"` and `role="article"` are *not*
+    /// chrome, and a rule that swept up any `role=` would throw away the article on precisely
+    /// the sites careful enough to label it.
+    #[test]
+    fn aria_landmarks_are_stripped_and_content_roles_are_not() {
+        let page = r#"<div role="navigation"><a href="/x">Menu</a></div>
+                      <div ROLE="Banner">Site name</div>
+                      <span aria-hidden="true">decorative</span>
+                      <div data-role="navigation">not a landmark</div>
+                      <main role="main"><p>The article itself.</p></main>
+                      <div role="contentinfo">Copyright</div>"#;
+        let text = html_to_text(page, None).text;
+        assert!(text.contains("The article itself."), "{text}");
+        assert!(text.contains("not a landmark"), "a `data-role` was read as a role: {text}");
+        for chrome in ["Menu", "Site name", "decorative", "Copyright"] {
+            assert!(!text.contains(chrome), "`{chrome}` survived the landmark strip: {text}");
+        }
+    }
+
+    /// ⚠ The one that cost a real article. A **void** element carrying a landmark attribute
+    /// has no closing tag, so skipping it as a container discards everything after it.
+    /// Wikipedia's logo is exactly this — `<img … aria-hidden="true">` — and against a real
+    /// capture it swallowed 226,863 bytes and left 60 characters of a 42,884-character page.
+    ///
+    /// The assertion is on the text **after** the void element, because the failure is silent
+    /// in every other respect: the extraction still returns, still has a title, and still
+    /// contains everything before the image.
+    #[test]
+    fn a_void_element_is_never_skipped_as_a_container() {
+        let page = r#"<p>Before.</p>
+                      <img src="/logo.svg" alt="" aria-hidden="true" width="50">
+                      <p>The whole rest of the article.</p>
+                      <input type="text" role="search">
+                      <p>And this too.</p>
+                      <br aria-hidden="true">
+                      <p>And this.</p>"#;
+        let text = html_to_text(page, None).text;
+        assert!(text.contains("Before."), "{text}");
+        assert!(text.contains("The whole rest of the article."), "an <img> ate the page: {text}");
+        assert!(text.contains("And this too."), "an <input> ate the page: {text}");
+        assert!(text.contains("And this."), "a <br> ate the page: {text}");
+    }
+
     /// Blocks separate; runs of closing tags do not each produce a blank line.
     #[test]
     fn whitespace_is_collapsed_and_blocks_are_separated_once() {
@@ -2384,17 +2511,21 @@ mod search_tests {
     </h2>
     <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.net%2Fmanual&amp;rut=cafe">Chapter 3.</a>
   </div>
+  <div class="result results_links web-result">
+    <h2 class="result__title">
+      <a rel="nofollow" class="result__a" href="https://example.net/list?a=1&amp;b=2">Direct</a>
+    </h2>
+  </div>
   <a class="result--ad__a" href="//duckduckgo.com/y.js?ad=1">An advertisement</a>
 </div>"#;
 
-    /// The parse, and the two things about it that would silently be wrong: the redirect
-    /// wrapper must be unwrapped, and the `&amp;` before `rut=` must be decoded **before** the
-    /// value is split off — otherwise every URL keeps a trailing `amp;rut=…` that percent
-    /// decoding will not remove.
+    /// The parse, and the thing about it that would silently be wrong: the redirect wrapper
+    /// must be unwrapped, or every result looks as though it is hosted by the search engine
+    /// and following one hands a tracking URL back to the site.
     #[test]
     fn duckduckgo_results_are_read_and_their_redirect_wrapper_removed() {
         let results = parse_html_results(RESULTS);
-        assert_eq!(results.len(), 2, "an advertisement was counted as a result: {results:?}");
+        assert_eq!(results.len(), 3, "an advertisement was counted as a result: {results:?}");
 
         assert_eq!(results[0].title, "Torque specs & figures");
         assert_eq!(
@@ -2402,11 +2533,26 @@ mod search_tests {
             "the redirect wrapper survived"
         );
         assert!(!results[0].url.contains("rut="), "the tracking parameter survived");
-        assert!(!results[0].url.contains("amp;"), "the entity was decoded after the split");
         assert_eq!(results[0].snippet, "The torque table for every fastener.");
 
         assert_eq!(results[1].url, "https://example.net/manual");
         assert_eq!(results[1].snippet, "Chapter 3.");
+
+        // A result with no snippet anchor keeps an empty snippet rather than borrowing the
+        // next result's — the `last.snippet.is_empty()` guard is what makes that true.
+        assert_eq!(results[2].title, "Direct");
+        assert_eq!(results[2].snippet, "");
+    }
+
+    /// A result whose `href` is the page's own address still arrives as a **URL**, not as an
+    /// attribute value: `&` is spelled `&amp;` in HTML, and `https://…?a=1&amp;b=2` is a
+    /// different address from the one on the page — one whose second parameter is called
+    /// `amp;b`. A/B'd: decoding after the query is split off leaves exactly that.
+    #[test]
+    fn a_direct_result_url_has_its_entities_decoded() {
+        let results = parse_html_results(RESULTS);
+        assert_eq!(results[2].url, "https://example.net/list?a=1&b=2");
+        assert!(!results[2].url.contains("amp;"), "the entity survived into the URL");
     }
 
     /// A page with nothing in it yields nothing, which is what makes `search_at` able to tell

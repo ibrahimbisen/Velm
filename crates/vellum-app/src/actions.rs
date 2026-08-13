@@ -1468,7 +1468,7 @@ impl ActiveState {
     ///   "there is an agent link here" and is wrong.
     fn demo_agent(&mut self) {
         // Placed through the tools, not through `board.add` — see the doc comment.
-        let mut place = |actions: &mut Self, tool: Tool, x: f64, size: (f64, f64)| {
+        let place = |actions: &mut Self, tool: Tool, x: f64, size: (f64, f64)| {
             actions.choose_tool(tool);
             let from = actions.camera.world_to_screen(WorldPoint::new(x, 0.0));
             let to = actions
@@ -1509,7 +1509,7 @@ impl ActiveState {
         let (first, second, note) = (*first, *second, *note);
 
         self.fit_board();
-        let mut wire = |actions: &mut Self, a: f64, b: f64| {
+        let wire = |actions: &mut Self, a: f64, b: f64| {
             actions.choose_tool(Tool::Connector);
             let from = actions.camera.world_to_screen(WorldPoint::new(a, 200.0));
             let to = actions.camera.world_to_screen(WorldPoint::new(b, 200.0));
@@ -8055,6 +8055,7 @@ impl ActiveState {
         {
             let (projection, _, assets) = self.editor.frame_parts();
             let context = crate::draw::DrawContext {
+                agents: &self.agents,
                 camera: &camera,
                 projection,
                 theme,

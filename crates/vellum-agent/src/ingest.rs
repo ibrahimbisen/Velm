@@ -13,18 +13,31 @@
 //! indistinguishable from a boring file — an agent given zero characters of context does not
 //! complain, it just answers badly.
 //!
-//! # Shelling out is a real implementation, not a fallback
+//! # What is read here, and what still needs a tool
 //!
-//! This crate's dependency list is `serde`, `serde_json`, `thiserror`, `anyhow`, `ureq` and
-//! `portable-pty`. There is no flate decoder in it and no ZIP reader, so the compressed
-//! halves of PDF and `.docx` cannot be read here. Rather than pretend, [`Tools`] probes
-//! `PATH` for `pdftotext` and macOS's `textutil` and uses them when they are there — the
-//! user's own machine already carries the right converter surprisingly often, `textutil`
-//! ships with macOS, and a tool that exists is a better answer than a dependency that has to
-//! be argued for. When neither is present the outcome names the missing binary.
+//! `flate2` and `zip` are dependencies, so the two formats that matter are read in-process
+//! and on every platform:
 //!
-//! **The probe is injectable** ([`Tools::none`]) so the degraded message is an ordinary unit
-//! test rather than something only reproducible on a machine that happens to lack the tool.
+//! - **PDF** — `FlateDecode`d content streams are inflated and tokenised, which is nearly
+//!   every real document. `pdftotext` is no longer the answer for an ordinary PDF; it stays
+//!   as the *better* reader where it is installed, because it resolves font encodings and
+//!   `/ToUnicode` maps and this extractor does not.
+//! - **`.docx`, `.pptx`, `.xlsx`** — a ZIP of XML, read directly. **These do not need
+//!   `textutil`**, which is the whole point: `textutil` is macOS-only, so relying on it meant
+//!   Word documents working on the primary target and nowhere else.
+//!
+//! `textutil` is kept for the formats that are *not* ZIP-of-XML — `.doc`, `.rtf`, `.odt`,
+//! `.pages` — where it is the only reader available, and as a fallback for an Office file
+//! this crate cannot open. Those degrade to a named message off macOS.
+//!
+//! **The tool probe is injectable** ([`Tools::none`]) so a degraded message is an ordinary
+//! unit test rather than something only reproducible on a machine that lacks the tool.
+//!
+//! # Compressed input is bounded
+//!
+//! Everything decompressed here comes from a file the user was given, so every inflate is
+//! capped ([`MAX_INFLATED_BYTES`], [`MAX_PART_BYTES`]). A zip bomb is a hundred kilobytes on
+//! disk and a terabyte in memory, and this crate runs inside the application's own process.
 //!
 //! # What is tested and what is not
 //!
@@ -65,6 +78,19 @@ pub const WEB_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// page's number, not a distribution, and it is a cap rather than a target.
 pub const YOUTUBE_MAX_BYTES: usize = 3 * 1024 * 1024;
 
+/// The most any single PDF stream may inflate to.
+///
+/// A bound on *someone else's* file, not a tuning knob. A page of text is a few kilobytes
+/// inflated; 64MB is four orders of magnitude of headroom and still refuses the classic
+/// deflate bomb, which is a few hundred kilobytes on disk and unbounded in memory.
+pub const MAX_INFLATED_BYTES: usize = 64 * 1024 * 1024;
+
+/// The most any single part of an Office file may be read as.
+///
+/// `word/document.xml` for a long report is a few megabytes; a `.xlsx` sheet with a hundred
+/// thousand rows is larger, which is why this is not smaller.
+pub const MAX_PART_BYTES: usize = 32 * 1024 * 1024;
+
 /// Named as ourselves. The same reasoning `vellum-link` records: plenty of sites serve less
 /// to an unrecognised agent, and impersonating a browser is a lie that also goes stale.
 const USER_AGENT: &str = concat!("Velm/", env!("CARGO_PKG_VERSION"), " (agent context)");
@@ -78,8 +104,17 @@ pub enum Kind {
     /// Plain text, markdown, source code, JSON, CSV — anything that is already characters.
     Text,
     Pdf,
-    /// A word processor document: `.docx`, `.doc`, `.rtf`, `.odt`.
+    /// A Word document. Read here, on every platform.
     Docx,
+    /// A PowerPoint deck. Read here: the same ZIP of XML, one part per slide.
+    Pptx,
+    /// An Excel workbook. Read here, as tab-separated rows.
+    Xlsx,
+    /// A word processor document that is **not** ZIP-of-XML — `.doc`, `.rtf`, `.odt`,
+    /// `.pages`. Its own kind because it is the only family left that needs an external
+    /// converter, and lumping it in with `.docx` would have made the message for both of
+    /// them wrong: one of them now always works.
+    LegacyDoc,
     Audio,
     Video,
     Image,
@@ -100,6 +135,9 @@ impl Kind {
             Self::Text | Self::Unknown => "text",
             Self::Pdf => "pdf",
             Self::Docx => "docx",
+            Self::Pptx => "pptx",
+            Self::Xlsx => "xlsx",
+            Self::LegacyDoc => "document",
             Self::Audio => "audio",
             Self::Video => "video",
             Self::Image => "image",
@@ -292,7 +330,16 @@ pub fn classify(source: &str) -> Kind {
             Kind::Text
         }
         "pdf" => Kind::Pdf,
-        "docx" | "doc" | "rtf" | "odt" | "pages" => Kind::Docx,
+        "docx" => Kind::Docx,
+        "pptx" => Kind::Pptx,
+        "xlsx" => Kind::Xlsx,
+        // `.docm`/`.pptm`/`.xlsm` are the same ZIP with macros in it, and the text parts are
+        // identical — so they are read by the same path rather than refused for carrying a
+        // macro this crate never executes.
+        "docm" => Kind::Docx,
+        "pptm" => Kind::Pptx,
+        "xlsm" => Kind::Xlsx,
+        "doc" | "rtf" | "odt" | "pages" => Kind::LegacyDoc,
         "mp3" | "wav" | "m4a" | "aac" | "flac" | "ogg" | "oga" | "opus" | "aiff" | "aif"
         | "wma" => Kind::Audio,
         "mp4" | "mov" | "m4v" | "mkv" | "avi" | "webm" | "wmv" | "mpg" | "mpeg" => Kind::Video,
@@ -386,7 +433,8 @@ fn file(source: &str, kind: Kind, options: &Options) -> Ingested {
             },
         ),
         Kind::Pdf => pdf(source, &label, path, options),
-        Kind::Docx => docx(source, &label, path, options),
+        Kind::Docx | Kind::Pptx | Kind::Xlsx => office(source, &label, path, kind, options),
+        Kind::LegacyDoc => legacy_document(source, &label, path, options),
         Kind::Text | Kind::Unknown => text_file(source, &label, path, kind, options),
         Kind::Web | Kind::YouTube => unreachable!("a URL never reaches the file path"),
     }
@@ -514,7 +562,7 @@ fn pdf(source: &str, label: &str, path: &Path, options: &Options) -> Ingested {
             };
             Ingested::new(source, Kind::Pdf, label, text, outcome)
         }
-        PdfText::Compressed { streams } => Ingested::new(
+        PdfText::Unreadable { streams } => Ingested::new(
             source,
             Kind::Pdf,
             label,
@@ -522,9 +570,10 @@ fn pdf(source: &str, label: &str, path: &Path, options: &Options) -> Ingested {
             Outcome::NeedsTool {
                 tool: "pdftotext",
                 message: format!(
-                    "{label} keeps its text in {streams} compressed stream(s), and Velm has \
-                     no decompressor built in. Install `pdftotext` (it comes with poppler: \
-                     `brew install poppler`) and attach the file again."
+                    "{label} keeps its text in {streams} stream(s) that Velm could not read — \
+                     an older compression, or a damaged file. `pdftotext` reads more than \
+                     this does (poppler: `brew install poppler`); with it installed, attach \
+                     the file again."
                 ),
             },
         ),
@@ -556,9 +605,11 @@ fn pdf(source: &str, label: &str, path: &Path, options: &Options) -> Ingested {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PdfText {
     Text(String),
-    /// The content streams are `FlateDecode`d, and there is no flate decoder in this crate's
-    /// dependency set. The count is reported so the message can be specific.
-    Compressed { streams: usize },
+    /// Content streams that could not be read. **No longer the ordinary case**: `FlateDecode`
+    /// is inflated in-process, so this is now only LZW compression, a `/Predictor` this
+    /// extractor will not guess at, or a stream too damaged to inflate. The count is reported
+    /// so the message can be specific about how much was lost.
+    Unreadable { streams: usize },
     /// It parsed and showed no text at all — a scanned page, essentially.
     NoText,
     NotPdf,
@@ -572,15 +623,19 @@ pub enum PdfText {
 /// and nesting, and hex `<…>` strings, are both decoded; a `Td`, `TD`, `T*` or `ET` becomes a
 /// line break, which is the only positioning this pays attention to.
 ///
-/// **What it does not do**, and this is most PDFs: decompress anything. Producers have
-/// emitted `FlateDecode`d content streams by default for twenty years, so the common case
-/// answers [`PdfText::Compressed`] and the message names `pdftotext`. It also does not
-/// resolve font encodings or `/ToUnicode` maps — a document in a subset-encoded font will
-/// come out as the wrong letters, and there is no way to notice that from inside here —
-/// does not handle cross-reference streams, object streams, or encryption, and makes no
-/// attempt at reading order across columns.
+/// **`FlateDecode` is inflated** ([`inflate`]), which is the difference between reading the
+/// uncompressed minority of PDFs and reading nearly all of them — producers have emitted
+/// compressed content streams by default for twenty years.
 ///
-/// This is offered as the honest partial answer rather than as a PDF reader.
+/// **What it still does not do.** It does not resolve font encodings or `/ToUnicode` maps, so
+/// a document set in a subset-encoded font comes out as the wrong letters — and there is no
+/// way to notice that from in here, which is the most important limitation on this list
+/// because it fails *silently*. It does not un-apply a `/Predictor`, does not do LZW, does
+/// not decrypt, does not follow object streams to find content, and makes no attempt at
+/// reading order across columns or at telling a header from a paragraph.
+///
+/// So `pdftotext` remains the better reader where it exists, and [`pdf`] prefers it. This is
+/// the honest in-process answer, not a PDF library.
 pub fn pdf_text(bytes: &[u8]) -> PdfText {
     // Some producers put junk before the header, so the marker is looked for rather than
     // required at byte zero.
@@ -601,7 +656,7 @@ pub fn pdf_text(bytes: &[u8]) -> PdfText {
             continue;
         }
 
-        let dictionary = bytes.get(rfind_bytes(&bytes[..at], b"<<").unwrap_or(0)..at).unwrap_or(&[]);
+        let dictionary = dictionary_before(bytes, at);
         // The keyword is followed by CRLF or LF, and the payload starts after it.
         let mut body_start = at + 6;
         if bytes.get(body_start) == Some(&b'\r') {
@@ -613,20 +668,38 @@ pub fn pdf_text(bytes: &[u8]) -> PdfText {
         let body_end = find_bytes(bytes, b"endstream", body_start).unwrap_or(bytes.len());
         let body = bytes.get(body_start..body_end).unwrap_or(&[]);
 
-        if find_bytes(dictionary, b"/Filter", 0).is_some() {
-            // An image stream is filtered too and is not a failure to read text from, so
-            // only the compression filters are counted towards the "needs a tool" verdict.
-            if find_bytes(dictionary, b"FlateDecode", 0).is_some()
-                || find_bytes(dictionary, b"LZWDecode", 0).is_some()
-            {
-                compressed += 1;
-            }
-        } else {
-            let text = pdf_content_text(body);
+        let mut take = |data: &[u8]| {
+            let text = pdf_content_text(data);
             if !text.trim().is_empty() {
                 collected.push_str(&text);
                 collected.push('\n');
             }
+        };
+
+        if is_not_content(dictionary) {
+            // A font, an image, a thumbnail, an object stream or the cross-reference table.
+            // Skipped for cost rather than for correctness — `pdf_content_text` emits only
+            // on a text-showing *operator*, which none of these contain, so the result would
+            // be empty anyway. Cheap to skip a megabyte of JPEG.
+        } else if find_bytes(dictionary, b"/Filter", 0).is_none() {
+            take(body);
+        } else if find_bytes(dictionary, b"FlateDecode", 0).is_some() {
+            // ⚠ A `/Predictor` in `/DecodeParms` means the inflated bytes are PNG- or
+            // TIFF-predicted and have to be un-predicted before they mean anything. That is
+            // used for cross-reference and object streams rather than for page content, so
+            // rather than emit scrambled text it is counted as unread and named.
+            if find_bytes(dictionary, b"/Predictor", 0).is_some() {
+                compressed += 1;
+            } else {
+                match inflate(body) {
+                    Some(data) => take(&data),
+                    None => compressed += 1,
+                }
+            }
+        } else if find_bytes(dictionary, b"LZWDecode", 0).is_some() {
+            // The one compression PDF still allows that `flate2` cannot do. Rare enough
+            // since Acrobat 4 that implementing it would be work with no reader.
+            compressed += 1;
         }
         index = body_end + 9;
     }
@@ -635,10 +708,84 @@ pub fn pdf_text(bytes: &[u8]) -> PdfText {
     if !text.is_empty() {
         PdfText::Text(text)
     } else if compressed > 0 {
-        PdfText::Compressed { streams: compressed }
+        PdfText::Unreadable { streams: compressed }
     } else {
         PdfText::NoText
     }
+}
+
+/// The dictionary belonging to the `stream` keyword at `at`.
+///
+/// **Found by balancing `>>` against `<<` backwards, not by taking the last `<<`.** A stream
+/// dictionary very often contains a nested one — `/DecodeParms << /Predictor 12 >>` is the
+/// common case, and it is precisely the one that decides whether the inflated bytes are text
+/// or predicted nonsense. The last `<<` before the keyword belongs to *that* inner
+/// dictionary, so the naive scan hands back a window with no `/Filter` in it and the stream
+/// is then read as though it were uncompressed.
+///
+/// A/B'd rather than reasoned about: with the naive version, a `/Predictor` fixture answers
+/// `NoText` — "this PDF has nothing in it" — where the truth is `Unreadable { streams: 1 }`.
+///
+/// An empty window for a stream with no dictionary at all, which is malformed but occurs.
+fn dictionary_before(bytes: &[u8], at: usize) -> &[u8] {
+    let mut depth = 0i32;
+    let mut cursor = at;
+    while cursor >= 2 {
+        let Some(pair) = bytes.get(cursor - 2..cursor) else { break };
+        if pair == b">>" {
+            depth += 1;
+            cursor -= 2;
+        } else if pair == b"<<" {
+            depth -= 1;
+            if depth <= 0 {
+                return bytes.get(cursor - 2..at).unwrap_or(&[]);
+            }
+            cursor -= 2;
+        } else {
+            cursor -= 1;
+        }
+    }
+    &[]
+}
+
+/// Whether a stream's dictionary says it holds something other than page content.
+///
+/// A substring test over the dictionary rather than a parse, which is enough because these
+/// markers do not occur in a content stream's own dictionary.
+fn is_not_content(dictionary: &[u8]) -> bool {
+    const NOT_CONTENT: [&[u8]; 6] =
+        [b"/ObjStm", b"/XRef", b"/Metadata", b"/Image", b"/FontFile", b"/Thumb"];
+    NOT_CONTENT.iter().any(|marker| find_bytes(dictionary, marker, 0).is_some())
+}
+
+/// Inflates a `FlateDecode`d stream, bounded by [`MAX_INFLATED_BYTES`].
+///
+/// Zlib first, then raw deflate. Both, because the specification says zlib and a
+/// well-known population of real producers emits a raw deflate stream with no two-byte
+/// header — a reader that only tries zlib reports those files as unreadable, which is
+/// indistinguishable from the compression not being supported at all.
+///
+/// `None` for a stream that is neither: a damaged file, or one whose `/Length` was wrong and
+/// took the body with it. Counted and named rather than treated as empty.
+fn inflate(data: &[u8]) -> Option<Vec<u8>> {
+    fn bounded<R: Read>(reader: R) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        // `take` before `read_to_end`, so a deflate bomb stops at the bound rather than
+        // after it. Reading first and checking afterwards is not a bound.
+        let mut reader = reader.take(MAX_INFLATED_BYTES as u64);
+        match reader.read_to_end(&mut out) {
+            // A truncated stream still yields the bytes that did inflate, and a page of text
+            // that ends early is worth more than nothing at all.
+            Ok(_) => Some(out),
+            Err(_) if !out.is_empty() => Some(out),
+            Err(_) => None,
+        }
+    }
+
+    bounded(flate2::read::ZlibDecoder::new(data))
+        .filter(|out| !out.is_empty())
+        .or_else(|| bounded(flate2::read::DeflateDecoder::new(data)))
+        .filter(|out| !out.is_empty())
 }
 
 /// Pulls the shown text out of one uncompressed content stream.
@@ -845,53 +992,392 @@ fn win_ansi(byte: u8) -> char {
 // Word processor documents
 // ---------------------------------------------------------------------------------------
 
-/// `.docx` and friends, which is one shell-out or one clear refusal.
+/// A `.docx`, `.pptx` or `.xlsx`: a ZIP of XML, read in-process on every platform.
 ///
-/// A `.docx` is a ZIP holding `word/document.xml`, and this crate has neither a ZIP reader
-/// nor a decompressor — the workspace's `zip` crate is not a dependency here and cannot be
-/// made one from inside this module. `textutil` ships with macOS and reads all four of these
-/// formats, so on the platform Velm ships on first this is a complete implementation; on
-/// Windows it is a named refusal until either `zip` is added to this crate or a converter is
-/// found. Both are recorded rather than papered over.
-fn docx(source: &str, label: &str, path: &Path, options: &Options) -> Ingested {
+/// `textutil` is the fallback rather than the implementation, which is the reversal that
+/// matters — it is macOS-only, so having it be the implementation meant Word documents
+/// working on the primary target and nowhere else. It is still tried for a file this cannot
+/// open, because a `.docx` that is really an old `.doc` with the wrong extension is a thing
+/// that happens and `textutil` reads it.
+fn office(source: &str, label: &str, path: &Path, kind: Kind, options: &Options) -> Ingested {
+    let read = match kind {
+        Kind::Docx => docx_text(path),
+        Kind::Pptx => pptx_text(path),
+        Kind::Xlsx => xlsx_text(path),
+        _ => None,
+    };
+
+    match read {
+        Some(text) if !text.trim().is_empty() => {
+            let chars = text.chars().count();
+            Ingested::new(source, kind, label, text, Outcome::Extracted { chars })
+        }
+        // It opened and there was nothing in it. Saying so beats offering a converter that
+        // will also find nothing.
+        Some(_) => Ingested::new(
+            source,
+            kind,
+            label,
+            String::new(),
+            Outcome::Unsupported {
+                message: format!("{label} opened, and there is no text in it."),
+            },
+        ),
+        None => legacy_document(source, label, path, options),
+    }
+}
+
+/// `.doc`, `.rtf`, `.odt`, `.pages` — and anything an Office reader could not open.
+///
+/// The one family left that needs an external converter. `textutil` reads all of them and
+/// ships with macOS; elsewhere this is a named refusal, and the message says what to do
+/// rather than what is missing.
+fn legacy_document(source: &str, label: &str, path: &Path, options: &Options) -> Ingested {
     if options.tools.textutil {
-        match run_tool("textutil", &["-convert", "txt", "-stdout"], path, false) {
+        return match run_tool("textutil", &["-convert", "txt", "-stdout"], path, false) {
             Ok(raw) => {
                 let text = normalise_text(&raw);
                 let chars = text.chars().count();
-                return Ingested::new(
-                    source,
-                    Kind::Docx,
-                    label,
-                    text,
-                    Outcome::Extracted { chars },
-                );
+                Ingested::new(source, Kind::LegacyDoc, label, text, Outcome::Extracted { chars })
             }
-            Err(error) => {
-                return Ingested::failed(
-                    source,
-                    Kind::Docx,
-                    label,
-                    format!("`textutil` could not read {label}: {error}"),
-                );
-            }
-        }
+            Err(error) => Ingested::failed(
+                source,
+                Kind::LegacyDoc,
+                label,
+                format!("`textutil` could not read {label}: {error}"),
+            ),
+        };
     }
 
     Ingested::new(
         source,
-        Kind::Docx,
+        Kind::LegacyDoc,
         label,
         String::new(),
         Outcome::NeedsTool {
             tool: "textutil",
             message: format!(
-                "{label} is a word processor document, and Velm has no reader for one built \
-                 in. On macOS `textutil` does this and ships with the system; elsewhere, save \
-                 the document as `.txt` or `.md` and attach that."
+                "Velm has no reader for {label}'s format. On macOS `textutil` does this and \
+                 ships with the system; elsewhere, save it as `.docx`, `.txt` or `.md` — all \
+                 three of those Velm reads by itself."
             ),
         },
     )
+}
+
+/// Word: one part, one line per paragraph.
+///
+/// Headers, footers, footnotes, endnotes and comments live in *other* parts and are
+/// deliberately not read — they are page furniture, and folding a running header into the
+/// prose once per page is worse than leaving it out.
+fn docx_text(path: &Path) -> Option<String> {
+    let parts = office_parts(path, &|name| name == "word/document.xml")?;
+    let (_, xml) = parts.into_iter().next()?;
+    Some(normalise_text(&office_xml_text(
+        &xml,
+        &XmlText { words: "w:t", breaks: &["w:p"], newline: &["w:br", "w:cr"], tab: &["w:tab"] },
+    )))
+}
+
+/// PowerPoint: one part per slide, **in slide order**.
+///
+/// The order is the reason this is not two lines. A ZIP lists its entries in whatever order
+/// they were written, and the names sort lexically — so `slide10.xml` lands between
+/// `slide1.xml` and `slide2.xml`, and a twelve-slide deck reaches the agent scrambled. Sorted
+/// by the trailing number instead.
+fn pptx_text(path: &Path) -> Option<String> {
+    let mut parts = office_parts(path, &|name| {
+        name.starts_with("ppt/slides/slide") && name.ends_with(".xml")
+    })?;
+    parts.sort_by_key(|(name, _)| slide_number(name).unwrap_or(u32::MAX));
+
+    let mut out = String::new();
+    for (index, (_, xml)) in parts.iter().enumerate() {
+        let text = normalise_text(&office_xml_text(
+            xml,
+            &XmlText { words: "a:t", breaks: &["a:p"], newline: &["a:br"], tab: &[] },
+        ));
+        if text.is_empty() {
+            continue;
+        }
+        // Numbered, because a deck read as continuous prose loses the one piece of structure
+        // it has. The number is the slide's position in the deck, not its file name.
+        out.push_str(&format!("Slide {}\n{text}\n\n", index + 1));
+    }
+    Some(out.trim().to_owned())
+}
+
+/// The number in `ppt/slides/slide12.xml`.
+fn slide_number(name: &str) -> Option<u32> {
+    name.rsplit_once("slide")?.1.split('.').next()?.parse().ok()
+}
+
+/// Excel: every sheet, as tab-separated rows.
+///
+/// **Shared strings are the whole job.** A cell holding text does not hold the text: it holds
+/// `t="s"` and an index into `xl/sharedStrings.xml`, so a reader that takes `<v>` at face
+/// value produces a spreadsheet of integers where the words were. That is the failure this
+/// resolves, and it is why `.xlsx` was worth doing rather than declaring.
+///
+/// **Declared limits**: a cell shows its stored value, so a date is the serial number Excel
+/// stores (`45000`) rather than a date, and a currency is a bare number — number *formats*
+/// are in `xl/styles.xml` and are not applied. A formula contributes its last cached result,
+/// which is right, except in a workbook saved without one, where it contributes nothing.
+fn xlsx_text(path: &Path) -> Option<String> {
+    let parts = office_parts(path, &|name| {
+        name == "xl/sharedStrings.xml"
+            || (name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml"))
+    })?;
+
+    let shared = parts
+        .iter()
+        .find(|(name, _)| name == "xl/sharedStrings.xml")
+        .map(|(_, xml)| shared_strings(xml))
+        .unwrap_or_default();
+
+    let mut sheets: Vec<&(String, String)> =
+        parts.iter().filter(|(name, _)| name != "xl/sharedStrings.xml").collect();
+    // Same lexical-order trap as the slides, and the same fix.
+    sheets.sort_by_key(|(name, _)| slide_number(name.trim_end_matches(".xml")).unwrap_or(u32::MAX));
+
+    let mut out = String::new();
+    for (_, xml) in sheets {
+        for row in sheet_rows(xml, &shared) {
+            out.push_str(&row);
+            out.push('\n');
+        }
+    }
+    Some(out.trim().to_owned())
+}
+
+/// `xl/sharedStrings.xml` as a lookup table: one entry per `<si>`.
+///
+/// An `<si>` can hold several `<t>` runs when Excel has split a string by formatting, and
+/// they are concatenated — taking only the first yields *"Torque"* where the cell says
+/// *"Torque figures"*.
+fn shared_strings(xml: &str) -> Vec<String> {
+    let chars: Vec<char> = xml.chars().collect();
+    let mut table = Vec::new();
+    let mut current = String::new();
+    let mut capture = false;
+    let mut phonetic = false;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if chars[index] != '<' {
+            if capture && !phonetic {
+                current.push(chars[index]);
+            }
+            index += 1;
+            continue;
+        }
+        let closing = chars.get(index + 1) == Some(&'/');
+        let name = xml_tag_name(&chars, index);
+        let after = skip_tag(&chars, index);
+        match (closing, name.as_str()) {
+            (false, "si") => current.clear(),
+            (true, "si") => table.push(decode_entities(current.trim())),
+            // `<rPh>` is the furigana Excel stores beside a Japanese string. It contains a
+            // `<t>` of its own, and including it doubles every such cell.
+            (false, "rPh") => phonetic = true,
+            (true, "rPh") => phonetic = false,
+            (false, "t") => capture = true,
+            (true, "t") => capture = false,
+            _ => {}
+        }
+        index = after;
+    }
+    table
+}
+
+/// One worksheet's rows, tab-separated, blank rows dropped.
+fn sheet_rows(xml: &str, shared: &[String]) -> Vec<String> {
+    let chars: Vec<char> = xml.chars().collect();
+    let mut rows = Vec::new();
+    let mut cells: Vec<String> = Vec::new();
+    let mut cell = String::new();
+    let mut value = String::new();
+    let mut cell_type = String::new();
+    let mut capture = false;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if chars[index] != '<' {
+            if capture {
+                value.push(chars[index]);
+            }
+            index += 1;
+            continue;
+        }
+        let closing = chars.get(index + 1) == Some(&'/');
+        let name = xml_tag_name(&chars, index);
+        let after = skip_tag(&chars, index);
+        let tag: String = chars.get(index..after).map(|s| s.iter().collect()).unwrap_or_default();
+
+        match (closing, name.as_str()) {
+            (false, "c") => {
+                cell.clear();
+                cell_type = xml_attr(&tag, "t").unwrap_or_default();
+            }
+            (false, "v" | "t") => {
+                capture = true;
+                value.clear();
+            }
+            (true, "v") => {
+                capture = false;
+                // `t="s"` is an *index*, not a value. This is the line that turns a
+                // spreadsheet of integers back into the words the user typed.
+                cell = if cell_type == "s" {
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|at| shared.get(at))
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    decode_entities(value.trim())
+                };
+            }
+            (true, "t") => {
+                // An inline string: the text is here rather than in the shared table, and it
+                // may arrive in several runs.
+                capture = false;
+                cell.push_str(&decode_entities(value.trim()));
+            }
+            (true, "c") => cells.push(std::mem::take(&mut cell)),
+            (true, "row") => {
+                if cells.iter().any(|cell| !cell.is_empty()) {
+                    rows.push(cells.join("\t"));
+                }
+                cells.clear();
+            }
+            _ => {}
+        }
+        index = after;
+    }
+    rows
+}
+
+/// Which elements of an Office XML part carry words, and which end a line.
+struct XmlText<'a> {
+    /// The element whose character data is the text: `w:t` in Word, `a:t` in PowerPoint.
+    words: &'a str,
+    /// End tags that finish a line — the paragraph element.
+    breaks: &'a [&'a str],
+    /// Empty elements that insert a line break.
+    newline: &'a [&'a str],
+    /// Empty elements that insert a tab.
+    tab: &'a [&'a str],
+}
+
+/// Text out of an Office XML part, respecting paragraph boundaries.
+///
+/// **Only the character data of `words` is taken**, rather than every text node with the tags
+/// stripped. Office XML is full of elements whose content is not prose, and a generic strip
+/// puts document settings and revision ids into the middle of a sentence. Paragraph
+/// boundaries are the other half: without them a report is one run-on line, and an agent
+/// given one paragraph of forty thousand characters has been given a worse document than the
+/// one on disk.
+fn office_xml_text(xml: &str, spec: &XmlText<'_>) -> String {
+    let chars: Vec<char> = xml.chars().collect();
+    let mut out = String::new();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if chars[index] != '<' {
+            if depth > 0 {
+                out.push(chars[index]);
+            }
+            index += 1;
+            continue;
+        }
+        let closing = chars.get(index + 1) == Some(&'/');
+        let name = xml_tag_name(&chars, index);
+        let after = skip_tag(&chars, index);
+        // `<w:t/>` is legal and empty; counting it as an opening leaves the capture on for
+        // the rest of the document.
+        let empty = after.checked_sub(2).and_then(|at| chars.get(at)) == Some(&'/');
+
+        if name == spec.words {
+            if closing {
+                depth = depth.saturating_sub(1);
+            } else if !empty {
+                depth += 1;
+            }
+        } else if (closing && spec.breaks.contains(&name.as_str()))
+            || (!closing && spec.newline.contains(&name.as_str()))
+        {
+            // A paragraph *ending*, or a break element *starting*: both finish a line.
+            out.push('\n');
+        } else if !closing && spec.tab.contains(&name.as_str()) {
+            out.push('\t');
+        }
+        index = after;
+    }
+    decode_entities(&out)
+}
+
+/// An XML tag's name: case preserved and the namespace kept, unlike [`tag_name`].
+///
+/// Both matter. XML is case-sensitive, and the prefix *is* part of the name here — `w:t` and
+/// `a:t` are what tell a Word run from a PowerPoint one.
+fn xml_tag_name(chars: &[char], at: usize) -> String {
+    let mut index = at + 1;
+    if chars.get(index) == Some(&'/') {
+        index += 1;
+    }
+    let mut name = String::new();
+    while let Some(ch) = chars.get(index) {
+        if ch.is_ascii_alphanumeric() || *ch == ':' || *ch == '-' || *ch == '_' || *ch == '.' {
+            name.push(*ch);
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    name
+}
+
+/// One attribute out of a raw tag.
+///
+/// Matched with a leading space so an attribute whose name merely *ends* with the one being
+/// asked for cannot answer — `<row ht="15">` must not satisfy a request for `t`.
+fn xml_attr(tag: &str, name: &str) -> Option<String> {
+    let key = format!(" {name}=\"");
+    let at = tag.find(&key)?;
+    let rest = tag.get(at + key.len()..)?;
+    let end = rest.find('"')?;
+    rest.get(..end).map(str::to_owned)
+}
+
+/// Opens an Office file and reads every part the caller wants.
+///
+/// The one function in this module that touches the `zip` crate, so the archive is opened
+/// once and the API surface stays to three calls. `None` means it is not a readable ZIP at
+/// all — which is what sends [`office`] to the converter fallback.
+///
+/// Names are collected before any part is read because listing borrows the archive and
+/// reading takes it mutably; there is no way to do both at once, and the alternative is
+/// opening the file once per part.
+fn office_parts(path: &Path, wanted: &dyn Fn(&str) -> bool) -> Option<Vec<(String, String)>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let names: Vec<String> =
+        archive.file_names().filter(|name| wanted(name)).map(str::to_owned).collect();
+
+    let mut parts = Vec::new();
+    for name in names {
+        let Ok(entry) = archive.by_name(&name) else { continue };
+        let mut bytes = Vec::new();
+        // Bounded: the compressed size on disk says nothing about the uncompressed size, and
+        // a ZIP bomb is a hundred kilobytes that inflates without end.
+        if entry.take(MAX_PART_BYTES as u64).read_to_end(&mut bytes).is_ok() {
+            parts.push((name, String::from_utf8_lossy(&bytes).into_owned()));
+        }
+    }
+    Some(parts)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1465,17 +1951,100 @@ fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     haystack.get(from..)?.windows(needle.len()).position(|window| window == needle).map(|at| at + from)
 }
 
-fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.len() > haystack.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).rposition(|window| window == needle)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Builds a ZIP with **stored** (uncompressed) entries, by hand.
+    ///
+    /// Deliberately not the `zip` crate's writer. Two reasons, and the second is the one that
+    /// matters: a fixture built by the same library that reads it cannot fail in the way a
+    /// real Office file would, and the writer's option types have been renamed across `zip`
+    /// releases — a fixture is not worth coupling the test to that. Stored entries also mean
+    /// the file is readable by `unzip` and by Python's `zipfile`, which is how this generator
+    /// was checked against something that is not itself.
+    fn zip_of(entries: &[(&str, &str)]) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut table = [0u32; 256];
+            for (n, slot) in table.iter_mut().enumerate() {
+                let mut c = n as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+                *slot = c;
+            }
+            let mut crc = 0xFFFF_FFFFu32;
+            for byte in data {
+                crc = table[((crc ^ u32::from(*byte)) & 0xFF) as usize] ^ (crc >> 8);
+            }
+            crc ^ 0xFFFF_FFFF
+        }
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut directory: Vec<u8> = Vec::new();
+        for (name, body) in entries {
+            let offset = out.len() as u32;
+            let data = body.as_bytes();
+            let crc = crc32(data);
+            let size = data.len() as u32;
+            let name_len = name.len() as u16;
+
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+            out.extend_from_slice(&0u16.to_le_bytes()); // time
+            out.extend_from_slice(&0u16.to_le_bytes()); // date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&name_len.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+
+            directory.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            directory.extend_from_slice(&20u16.to_le_bytes()); // made by
+            directory.extend_from_slice(&20u16.to_le_bytes()); // needed
+            directory.extend_from_slice(&0u16.to_le_bytes()); // flags
+            directory.extend_from_slice(&0u16.to_le_bytes()); // method
+            directory.extend_from_slice(&0u16.to_le_bytes()); // time
+            directory.extend_from_slice(&0u16.to_le_bytes()); // date
+            directory.extend_from_slice(&crc.to_le_bytes());
+            directory.extend_from_slice(&size.to_le_bytes());
+            directory.extend_from_slice(&size.to_le_bytes());
+            directory.extend_from_slice(&name_len.to_le_bytes());
+            directory.extend_from_slice(&0u16.to_le_bytes()); // extra
+            directory.extend_from_slice(&0u16.to_le_bytes()); // comment
+            directory.extend_from_slice(&0u16.to_le_bytes()); // disk
+            directory.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+            directory.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+            directory.extend_from_slice(&offset.to_le_bytes());
+            directory.extend_from_slice(name.as_bytes());
+        }
+
+        let cd_offset = out.len() as u32;
+        let cd_size = directory.len() as u32;
+        let count = entries.len() as u16;
+        out.extend_from_slice(&directory);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk with the directory
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        out
+    }
+
+    /// Writes a fixture archive and hands back its path.
+    fn office_file(dir: &Path, name: &str, entries: &[(&str, &str)]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, zip_of(entries)).unwrap();
+        path
+    }
 
     fn offline() -> Options {
         // `Tools::none` is what makes the degraded messages testable: with a real probe these
@@ -1488,6 +2057,14 @@ mod tests {
         assert_eq!(classify("notes.md"), Kind::Text);
         assert_eq!(classify("/a/b/SPEC.PDF"), Kind::Pdf, "the extension match must fold case");
         assert_eq!(classify("report.docx"), Kind::Docx);
+        assert_eq!(classify("deck.pptx"), Kind::Pptx);
+        assert_eq!(classify("book.xlsx"), Kind::Xlsx);
+        assert_eq!(classify("macros.xlsm"), Kind::Xlsx, "a macro-enabled file is the same ZIP");
+        // The split that decides whether an external converter is needed at all.
+        assert_eq!(classify("old.doc"), Kind::LegacyDoc);
+        assert_eq!(classify("notes.rtf"), Kind::LegacyDoc);
+        assert_eq!(Kind::Pptx.tag(), "pptx");
+        assert_eq!(Kind::LegacyDoc.tag(), "document");
         assert_eq!(classify("memo.m4a"), Kind::Audio);
         assert_eq!(classify("clip.mov"), Kind::Video);
         assert_eq!(classify("photo.heic"), Kind::Image);
@@ -1656,29 +2233,92 @@ mod tests {
         assert_eq!(pdf_string_to_text(&[0xE9]), "é", "Latin-1 must survive outside the high block");
     }
 
-    /// The common case, and the one this module has to be honest about: a compressed PDF
-    /// cannot be read here, and the answer names the tool that would.
+    /// **The test for the `flate2` dependency.** Producers have emitted compressed content
+    /// streams by default for twenty years, so this is not an edge case — it is what a PDF
+    /// is. Before the decompressor this exact file answered *"install pdftotext"*.
+    ///
+    /// The fixture is compressed with `flate2`'s own encoder, which is circular for zlib and
+    /// not for anything being tested here: what is under test is finding the stream, reading
+    /// its dictionary, inflating it and tokenising the result.
     #[test]
-    fn a_compressed_pdf_names_the_tool_it_needs_instead_of_returning_nothing() {
-        let pdf = b"%PDF-1.5\n1 0 obj\n<< /Length 20 /Filter /FlateDecode >>\nstream\n\
-                    \x78\x9c\x01\x02\x03\x04\nendstream\nendobj\n";
-        assert_eq!(pdf_text(pdf), PdfText::Compressed { streams: 1 });
+    fn a_flate_compressed_pdf_is_read_now_that_there_is_a_decompressor() {
+        use std::io::Write as _;
 
+        let content = b"BT /F1 12 Tf 72 720 Td (Torque figures.) Tj 0 -14 Td (Second line) Tj ET";
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(content).unwrap();
+        let squeezed = encoder.finish().unwrap();
+
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n1 0 obj\n<< /Length ");
+        pdf.extend_from_slice(squeezed.len().to_string().as_bytes());
+        pdf.extend_from_slice(b" /Filter /FlateDecode >>\nstream\n");
+        pdf.extend_from_slice(&squeezed);
+        pdf.extend_from_slice(b"\nendstream\nendobj\ntrailer\n%%EOF\n");
+
+        assert_eq!(
+            pdf_text(&pdf),
+            PdfText::Text("Torque figures.\nSecond line".into()),
+            "a FlateDecode stream was not inflated"
+        );
+
+        // And end to end, with no external tool available at all — which is the whole point
+        // of the dependency: this now works on a machine with no poppler and on Windows.
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("spec.pdf");
-        std::fs::write(&path, pdf).unwrap();
-
+        std::fs::write(&path, &pdf).unwrap();
         let ingested = ingest_with(path.to_str().unwrap(), &offline());
-        assert!(!ingested.outcome.is_text());
+        assert!(ingested.outcome.is_text(), "{:?}", ingested.outcome);
+        assert!(ingested.text.contains("Torque figures."), "{:?}", ingested.text);
+    }
+
+    /// What is left after the decompressor: LZW, a `/Predictor`, and a stream too damaged to
+    /// inflate. All three are counted and named rather than being read as empty — the failure
+    /// that would otherwise look exactly like a PDF with nothing in it.
+    #[test]
+    fn a_stream_that_still_cannot_be_read_is_counted_and_named() {
+        let lzw = b"%PDF-1.2\n1 0 obj\n<< /Length 6 /Filter /LZWDecode >>\nstream\n\
+                    \x80\x0b\x60\x50\x22\x0c\nendstream\nendobj\n";
+        assert_eq!(pdf_text(lzw), PdfText::Unreadable { streams: 1 });
+
+        // Inflating this would succeed and produce predicted bytes, which are not text.
+        // Emitting them would be worse than saying nothing.
+        let predicted = b"%PDF-1.5\n1 0 obj\n<< /Length 9 /Filter /FlateDecode \
+                          /DecodeParms << /Predictor 12 /Columns 4 >> >>\nstream\n\
+                          \x78\x9c\x03\x00\x00\x00\x00\x01\nendstream\nendobj\n";
+        assert_eq!(pdf_text(predicted), PdfText::Unreadable { streams: 1 });
+
+        let damaged = b"%PDF-1.5\n1 0 obj\n<< /Length 8 /Filter /FlateDecode >>\nstream\n\
+                        not deflate at all\nendstream\nendobj\n";
+        assert_eq!(pdf_text(damaged), PdfText::Unreadable { streams: 1 });
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("old.pdf");
+        std::fs::write(&path, lzw).unwrap();
+        let ingested = ingest_with(path.to_str().unwrap(), &offline());
         assert!(ingested.text.is_empty(), "a refusal must not pretend to have text");
         match &ingested.outcome {
             Outcome::NeedsTool { tool, message } => {
                 assert_eq!(*tool, "pdftotext");
-                assert!(message.contains("pdftotext"), "{message}");
                 assert!(message.contains("poppler"), "the message must say how to get it: {message}");
             }
-            other => panic!("a compressed PDF did not name the tool: {other:?}"),
+            other => panic!("an unreadable stream did not name the tool: {other:?}"),
         }
+    }
+
+    /// A font and an image are streams too, and inflating them costs real time for a result
+    /// that is always empty. Neither may contribute text, and — the assertion that matters —
+    /// neither may be counted as *unreadable*, or every ordinary PDF would report a failure.
+    #[test]
+    fn a_font_or_an_image_stream_is_neither_read_nor_counted_against_the_file() {
+        let pdf = b"%PDF-1.5\n\
+                    1 0 obj\n<< /Type /XObject /Subtype /Image /Filter /DCTDecode >>\nstream\n\
+                    \xff\xd8\xff\xe0 jpeg bytes\nendstream\nendobj\n\
+                    2 0 obj\n<< /Type /ObjStm /Filter /FlateDecode >>\nstream\n\
+                    not really deflate\nendstream\nendobj\n\
+                    3 0 obj\n<< /Length 40 >>\nstream\nBT (Real content) Tj ET\nendstream\nendobj\n";
+        assert_eq!(pdf_text(pdf), PdfText::Text("Real content".into()));
     }
 
     #[test]
@@ -1687,43 +2327,175 @@ mod tests {
         assert_eq!(pdf_text(b"%PDF-1.4\n<< >>\nstream\n0 0 m 10 10 l S\nendstream\n"), PdfText::NoText);
     }
 
-    /// Without `textutil` this is a refusal, and the refusal has to be actionable. Driven
-    /// through `Tools::none` rather than through whatever the test machine happens to have.
+    /// **The test for the `zip` dependency**, and it runs with `Tools::none` on purpose:
+    /// that is the assertion that a Word document no longer needs `textutil`, which is what
+    /// makes `.docx` work on Windows. Before this, exactly this file answered *"install
+    /// textutil"* on any machine that is not a Mac.
     #[test]
-    fn a_word_document_without_a_converter_says_what_to_do() {
+    fn a_word_document_is_read_with_no_converter_anywhere() {
+        let temp = tempfile::tempdir().unwrap();
+        let document = "<?xml version=\"1.0\"?><w:document><w:body>\
+             <w:p><w:r><w:t>Torque figures for the swap.</w:t></w:r></w:p>\
+             <w:p><w:r><w:t>Second </w:t></w:r><w:r><w:t>paragraph &amp; more.</w:t></w:r></w:p>\
+             <w:sectPr><w:pgSz w:w=\"11906\"/></w:sectPr></w:body></w:document>";
+        let path = office_file(
+            temp.path(),
+            "report.docx",
+            &[("[Content_Types].xml", "<Types/>"), ("word/document.xml", document)],
+        );
+
+        let ingested = ingest_with(path.to_str().unwrap(), &offline());
+        assert!(ingested.outcome.is_text(), "{:?}", ingested.outcome);
+        assert_eq!(ingested.source.kind, "docx");
+        // Paragraphs on their own lines, runs joined within one, entities decoded — and
+        // nothing from `<w:sectPr>`, which a generic tag-strip would have dragged in.
+        assert_eq!(
+            ingested.text,
+            "Torque figures for the swap.\nSecond paragraph & more.",
+            "{:?}",
+            ingested.text
+        );
+    }
+
+    /// A deck of twelve slides is the case that breaks a naive reader: ZIP entries sort
+    /// lexically, so `slide10` lands between `slide1` and `slide2` and the agent is handed
+    /// the deck out of order. The fixture is deliberately written in the wrong order too.
+    #[test]
+    fn a_slide_deck_is_read_in_slide_order_not_in_name_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let slide = |text: &str| {
+            format!(
+                "<p:sld><p:cSld><p:spTree><p:sp><p:txBody>\
+                 <a:p><a:r><a:t>{text}</a:t></a:r></a:p>\
+                 </p:txBody></p:sp></p:spTree></p:cSld></p:sld>"
+            )
+        };
+        let (one, two, ten) = (slide("First"), slide("Second"), slide("Tenth"));
+        let path = office_file(
+            temp.path(),
+            "deck.pptx",
+            &[
+                ("ppt/slides/slide10.xml", ten.as_str()),
+                ("ppt/slides/slide1.xml", one.as_str()),
+                ("ppt/slides/slide2.xml", two.as_str()),
+            ],
+        );
+
+        let ingested = ingest_with(path.to_str().unwrap(), &offline());
+        assert_eq!(ingested.source.kind, "pptx");
+        let first = ingested.text.find("First").expect("slide 1 missing");
+        let second = ingested.text.find("Second").expect("slide 2 missing");
+        let tenth = ingested.text.find("Tenth").expect("slide 10 missing");
+        assert!(first < second && second < tenth, "the deck came out unordered: {:?}", ingested.text);
+        assert!(ingested.text.contains("Slide 1"), "slides are not labelled: {:?}", ingested.text);
+    }
+
+    /// The reason `.xlsx` was worth doing rather than declaring: a text cell holds an *index*
+    /// into the shared-string table, so a reader that takes `<v>` at face value hands the
+    /// agent a grid of integers. This asserts the words, and asserts the integers are gone.
+    #[test]
+    fn a_spreadsheet_resolves_its_shared_strings_rather_than_emitting_indices() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = "<sst><si><t>Part</t></si><si><t>Torque</t></si>\
+                      <si><t>Rear </t><t>bush</t></si></sst>";
+        let sheet = "<worksheet><sheetData>\
+             <row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c><c r=\"B1\" t=\"s\"><v>1</v></c></row>\
+             <row r=\"2\"><c r=\"A2\" t=\"s\"><v>2</v></c><c r=\"B2\"><v>210</v></c></row>\
+             <row r=\"3\"></row>\
+             </sheetData></worksheet>";
+        let path = office_file(
+            temp.path(),
+            "book.xlsx",
+            &[("xl/sharedStrings.xml", shared), ("xl/worksheets/sheet1.xml", sheet)],
+        );
+
+        let ingested = ingest_with(path.to_str().unwrap(), &offline());
+        assert_eq!(ingested.source.kind, "xlsx");
+        assert_eq!(
+            ingested.text,
+            "Part\tTorque\nRear bush\t210",
+            "shared strings were not resolved: {:?}",
+            ingested.text
+        );
+        // The empty row contributed nothing rather than a blank line.
+        assert_eq!(ingested.text.lines().count(), 2);
+    }
+
+    /// A file that is not a readable ZIP falls through to the converter — a `.doc` renamed
+    /// to `.docx` is a real thing — and with no converter the message says what to do.
+    #[test]
+    fn an_unopenable_office_file_falls_back_and_then_says_what_to_do() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("report.docx");
-        std::fs::write(&path, b"PK\x03\x04 not really").unwrap();
+        std::fs::write(&path, b"\xd0\xcf\x11\xe0 an old OLE compound file").unwrap();
 
         let ingested = ingest_with(path.to_str().unwrap(), &offline());
         match &ingested.outcome {
             Outcome::NeedsTool { tool, message } => {
                 assert_eq!(*tool, "textutil");
-                assert!(message.contains("textutil"), "{message}");
-                assert!(message.contains(".txt"), "the message must offer a way out: {message}");
+                assert!(message.contains(".docx"), "the message must offer a way out: {message}");
             }
-            other => panic!("a docx with no converter did not name one: {other:?}"),
+            other => panic!("an unreadable office file did not name a converter: {other:?}"),
         }
     }
 
-    /// The shell-out, end to end, on a machine that has the converter — skipped elsewhere,
-    /// exactly as the git tests in [`crate::worktree`] are. Without it `run_tool` is the one
-    /// function in this module with no coverage at all, and it *is* the whole implementation
-    /// of `.docx` on the platform Velm ships on first.
-    ///
-    /// The fixture is built with the same tool that reads it, which is the only way to get a
-    /// genuine `.docx` into a test without committing a binary blob to the repository.
+    /// The pure halves, on literals — where the parsing actually lives.
     #[test]
-    fn a_word_document_is_read_when_the_converter_is_installed() {
+    fn the_office_xml_readers_respect_structure_rather_than_stripping_tags() {
+        // Only `w:t` character data is words. A generic strip takes `Arial` and `Heading1`
+        // out of the run properties and puts them in the middle of the sentence.
+        let word = "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>\
+                    <w:r><w:rPr><w:rFonts w:ascii=\"Arial\"/></w:rPr><w:t>Title</w:t></w:r></w:p>\
+                    <w:p><w:r><w:t>A</w:t><w:tab/><w:t>B</w:t><w:br/><w:t>C</w:t></w:r></w:p>";
+        let spec =
+            XmlText { words: "w:t", breaks: &["w:p"], newline: &["w:br", "w:cr"], tab: &["w:tab"] };
+        let text = normalise_text(&office_xml_text(word, &spec));
+        assert_eq!(text, "Title\nA B\nC", "{text:?}");
+        assert!(!text.contains("Arial") && !text.contains("Heading1"));
+
+        // A self-closing `<w:t/>` must not leave the capture switched on for the rest of the
+        // document, which is how one empty run swallows a whole file's markup.
+        let empty = "<w:p><w:r><w:t/></w:r></w:p><w:p><w:pStyle w:val=\"X\"/><w:r><w:t>Kept</w:t></w:r></w:p>";
+        assert_eq!(normalise_text(&office_xml_text(empty, &spec)), "Kept");
+
+        // Shared strings: several runs in one `<si>` are one string, and furigana is not.
+        let table = shared_strings(
+            "<sst><si><t>Rear </t><t>bush</t></si>\
+             <si><t>\u{6771}\u{4eac}</t><rPh><t>trash</t></rPh></si></sst>",
+        );
+        assert_eq!(table, vec!["Rear bush".to_owned(), "\u{6771}\u{4eac}".to_owned()]);
+
+        // An inline string lives in the cell rather than the table.
+        let inline = "<sheetData><row><c t=\"inlineStr\"><is><t>Inline</t></is></c>\
+                      <c><v>42</v></c></row></sheetData>";
+        assert_eq!(sheet_rows(inline, &[]), vec!["Inline\t42".to_owned()]);
+
+        // `<row ht="15">` must not answer a request for the `t` attribute.
+        assert_eq!(xml_attr("<c r=\"A1\" t=\"s\">", "t").as_deref(), Some("s"));
+        assert_eq!(xml_attr("<row ht=\"15\">", "t"), None);
+        assert_eq!(slide_number("ppt/slides/slide12.xml"), Some(12));
+        assert_eq!(slide_number("ppt/slides/notes.xml"), None);
+    }
+
+    /// The shell-out, end to end, on a machine that has the converter — skipped elsewhere,
+    /// exactly as the git tests in [`crate::worktree`] are. `run_tool` has no other coverage,
+    /// and it is the whole implementation of the formats that are not ZIP-of-XML.
+    ///
+    /// Deliberately an `.rtf` rather than a `.docx`: `.docx` no longer goes anywhere near
+    /// `textutil`, so pointing this at one would test the ZIP reader twice and the converter
+    /// not at all. The fixture is built with the same tool that reads it, which is the only
+    /// way to get a genuine `.rtf` into a test without committing a binary blob.
+    #[test]
+    fn a_legacy_document_is_read_when_the_converter_is_installed() {
         if !Tools::probe().textutil {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("src.txt");
-        let document = temp.path().join("report.docx");
+        let document = temp.path().join("notes.rtf");
         std::fs::write(&source, "Torque figures for the swap.\nSecond line.\n").unwrap();
         let made = Command::new("textutil")
-            .args(["-convert", "docx", "-output"])
+            .args(["-convert", "rtf", "-output"])
             .arg(&document)
             .arg(&source)
             .status()
@@ -1732,7 +2504,7 @@ mod tests {
 
         let ingested = ingest_with(document.to_str().unwrap(), &Options::default());
         assert!(ingested.outcome.is_text(), "{:?}", ingested.outcome);
-        assert_eq!(ingested.source.kind, "docx");
+        assert_eq!(ingested.source.kind, "document");
         assert!(
             ingested.text.contains("Torque figures for the swap."),
             "the converter's output did not reach the agent: {:?}",

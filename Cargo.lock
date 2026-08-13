@@ -4327,12 +4327,14 @@ name = "vellum-agent"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "portable-pty",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
  "ureq",
+ "zip",
 ]
 
 [[package]]

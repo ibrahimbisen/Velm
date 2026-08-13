@@ -158,10 +158,22 @@ pub(crate) type Blobs = Arc<Mutex<Vec<PendingBlob>>>;
 /// The placeholder is deliberately **not** a hash: hashing here would duplicate the blob
 /// store's own addressing in a crate that must not depend on it, and would be wrong the
 /// moment the store changes algorithm.
+///
+/// ⚠ **The counter is process-wide, not per queue.** Numbering from the queue's length reads
+/// correctly and is wrong: `take_pending_blobs` drains it, so the next turn starts at
+/// `pending:0` again — and an app that keeps its placeholder→hash map across frames would
+/// resolve this turn's picture to the last one's. A test that only checks two blobs in one
+/// queue cannot see it.
 pub(crate) fn park_blob(blobs: &Blobs, mime: &str, bytes: Vec<u8>) -> String {
-    let mut queue = blobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let id = format!("pending:{}", queue.len());
-    queue.push(PendingBlob { id: id.clone(), mime: mime.to_owned(), bytes });
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = format!(
+        "pending:{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    blobs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(PendingBlob { id: id.clone(), mime: mime.to_owned(), bytes });
     id
 }
 
@@ -377,9 +389,20 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with("pending:"), "{first}");
 
-        let queue = blobs.lock().unwrap();
-        assert_eq!(queue.len(), 2);
-        assert_eq!(queue[0].bytes, vec![1, 2, 3]);
-        assert_eq!(queue[1].mime, "image/png");
+        {
+            let queue = blobs.lock().unwrap();
+            assert_eq!(queue.len(), 2);
+            assert_eq!(queue[0].bytes, vec![1, 2, 3]);
+            assert_eq!(queue[1].mime, "image/png");
+        }
+
+        // **Across a drain**, which is the case a per-queue counter gets wrong: the queue is
+        // emptied every frame, so numbering from its length starts again at zero and this
+        // turn's picture resolves to the last one's.
+        let drained = std::mem::take(&mut *blobs.lock().unwrap());
+        assert_eq!(drained.len(), 2);
+        let after = park_blob(&blobs, "image/png", vec![9]);
+        assert_ne!(after, first, "a placeholder was reused after the queue was drained");
+        assert_ne!(after, second);
     }
 }

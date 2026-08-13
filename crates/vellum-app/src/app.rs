@@ -127,6 +127,13 @@ pub(crate) struct ActiveState {
     pub(crate) glass: GlassRenderer,
     /// egui's triangles on the GPU.
     pub(crate) chrome: ChromePass,
+    /// What the painter is told about the agents on this board, rebuilt once per frame by
+    /// `crate::agent_runtime`.
+    ///
+    /// Owned here rather than borrowed per frame for the reason `list` is: a steady-state
+    /// frame must allocate nothing, and on a board with no agent nodes this stays empty and
+    /// costs one `is_empty` — see [`crate::agent_view::AgentViews`].
+    pub(crate) agents: crate::agent_view::AgentViews,
     /// Per-frame scratch, owned so a steady-state frame allocates nothing.
     pub(crate) list: DrawList,
     hud_quads: Vec<QuadInstance>,
@@ -515,6 +522,7 @@ impl Vellum {
         crate::flight::prune(&data_directory);
 
         let mut state = ActiveState {
+            agents: crate::agent_view::AgentViews::new(),
             occluded: false,
             recorder,
             window,
@@ -1456,6 +1464,7 @@ impl ActiveState {
         let (projection, selection, assets) = self.editor.frame_parts();
         let selection = if previewed.is_empty() { selection } else { previewed.as_slice() };
         let context = DrawContext {
+            agents: &self.agents,
             camera: &camera,
             projection,
             theme,

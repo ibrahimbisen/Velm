@@ -148,8 +148,19 @@ the user has already drawn between two agents.
 ~/Library/Application Support/Vellum/agents/<board-key>/<item-id>.jsonl
 ```
 
-`<board-key>` is the BLAKE3 hash of the board file's canonical path, so a transcript follows
-its board and two boards never collide.
+`<board-key>` is a hash of the board file's canonical path, so a transcript follows its board
+and two boards never collide.
+
+**FNV-1a, not BLAKE3** — an earlier draft of this document said BLAKE3 and the code is right
+to disagree. This key names a cache directory: it is not a content address, nothing verifies
+it, and an attacker who could choose a colliding board path already has the filesystem. Using
+BLAKE3 would mean `vellum-agent` taking a dependency purely to name a folder, and this crate's
+whole discipline is that it depends on nothing in the workspace.
+
+The filename within it is the item id, put through a sanitiser that makes `..` **unwritable
+rather than checked for** — the escape is refused by construction, and two different ids can
+never sanitise to the same file, which would silently overwrite one agent's transcript with
+another's.
 
 - **Append-only JSONL of `TranscriptEvent`.** Cheap to append, cheap to tail, survives a crash
   mid-write (a torn last line is dropped on read).
