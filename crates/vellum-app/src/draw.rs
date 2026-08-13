@@ -227,11 +227,107 @@ pub struct DrawContext<'a> {
     /// writes nothing to the document until the button comes up, so without it the
     /// drag is invisible and the card appears to jump on release.
     pub card_drop: Option<[(f64, f64); 4]>,
+    /// The region a selected orchestrator owns, or the one being swept for it right now.
+    ///
+    /// `docs/07-agent-canvas.md` §9: *"the region is drawn as a labelled tint while the
+    /// orchestrator is selected"*. Resolved by the app — see
+    /// [`crate::actions::ActiveState::territory_preview`] — for `guides`' reason: which
+    /// node's region it is, and whether a gesture is redrawing it, are questions about the
+    /// selection and about `Input`, neither of which the painter is allowed to read.
+    pub territory: Option<TerritoryTint>,
     /// Where the minimap goes, in physical pixels — `[x, y, width, height]`. `None`
     /// hides it. Supplied by the caller rather than derived here because it has to
     /// clear the floating chrome, and only the caller knows where that is.
     pub minimap: Option<[f32; 4]>,
 }
+
+/// An orchestrator's region, ready to paint.
+///
+/// Owned rather than borrowed, like [`Placing`]: it is rebuilt each frame from a selection
+/// and a live gesture, and the `label` is a `String` composed from the node's own text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerritoryTint {
+    /// Centre and extent in **world** units — `[x, y, width, height]`, the shape
+    /// [`vellum_agent::Territory`] and `vellum_doc::Placement` both are, so nothing has to
+    /// convert between a corner and a centre on the way here. That conversion is exactly
+    /// where an off-by-half-a-box error lives.
+    pub region: [f64; 4],
+    /// Whose region it is, as the node is named on the board.
+    pub label: String,
+    /// The node itself. Only used as the text cache's key, so a label is shaped once and
+    /// retired with the item — see [`crate::text::TextCache::retain`].
+    pub scene: SceneId,
+    /// The projection generation the label was composed against, so a renamed node reshapes
+    /// and a panning board does not.
+    pub generation: u64,
+    /// Whether this is the rectangle under the pointer rather than the stored region.
+    ///
+    /// Drawn a little more strongly, because during the one gesture where it matters most
+    /// which rectangle is which, the answer must not be "they look the same".
+    pub pending: bool,
+}
+
+impl TerritoryTint {
+    /// The region as two screen corners, in physical pixels, top-left first.
+    ///
+    /// One function, asked by both the paint and the label's placement, for the rule
+    /// `card_layout` and `draw::kanban_runs` already exist to enforce: a second copy of a
+    /// rectangle's arithmetic is a label that sits where the tint is not.
+    fn screen_rect(&self, camera: &Camera) -> ((f32, f32), (f32, f32)) {
+        let [x, y, width, height] = self.region;
+        let a = camera.world_to_screen(WorldPoint::new(x - width / 2.0, y - height / 2.0));
+        let b = camera.world_to_screen(WorldPoint::new(x + width / 2.0, y + height / 2.0));
+        (
+            (a.x.min(b.x) as f32, a.y.min(b.y) as f32),
+            (a.x.max(b.x) as f32, a.y.max(b.y) as f32),
+        )
+    }
+}
+
+/// The territory label, laid out and placed. Screen pixels throughout.
+struct TerritoryLabel {
+    key: BlockKey,
+    /// The text block's top-left, which is what `PlacedGlyph::physical` adds its offsets to.
+    origin: (f32, f32),
+    /// The plate behind it — `[x, y, width, height]`.
+    plate: [f32; 4],
+}
+
+/// The slot a territory's label is cached under, on the node that owns the region.
+///
+/// **The top of the space, and it is safe by construction rather than by luck.** Every other
+/// slot comes from `0..Painter::slots_of(..)`, which is exclusive and whose own arithmetic
+/// saturates at `u16::MAX` — so the largest slot any item can ever use is `u16::MAX - 1`.
+/// Keying on the node's own `SceneId` is what makes the label retire with the node:
+/// `TextCache::retain` drops every entry whose item has left the board, and a synthetic id
+/// would be a layout that leaked for the life of the process.
+const TERRITORY_LABEL_SLOT: u16 = u16::MAX;
+
+/// The label's size in **device** pixels — see [`Painter::territory_label`] for why this is
+/// not a world size.
+const TERRITORY_LABEL_SIZE: f32 = 12.0;
+/// Air around the label's words, in device pixels.
+const TERRITORY_LABEL_PAD: f32 = 6.0;
+/// How far the plate sits inside the region's corner, in device pixels.
+const TERRITORY_LABEL_INSET: f32 = 8.0;
+/// The plate's corner radius. A hair rounder than a hairline, so it reads as a chip.
+const TERRITORY_LABEL_RADIUS: f32 = 4.0;
+
+/// How much of the accent a stored region washes the board with.
+///
+/// A **wash**, not a tint you could mistake for a fill: a territory routinely covers most of
+/// the board, and anything strong enough to read as an object at that size would recolour
+/// the whole canvas. Read against the near-white `paper` this design settled on, the edge is
+/// what says where the region is and the wash only says which side of it you are on.
+const TERRITORY_FILL_ALPHA: f32 = 0.05;
+/// The same, while the rectangle is being swept. Stronger, because the gesture is the one
+/// moment the fill *is* the feedback.
+const TERRITORY_FILL_ALPHA_LIVE: f32 = 0.10;
+/// The dashed edge, against a board of stickies. Above a guide's 0.45 because a territory is
+/// a boundary rather than a hint, and well under a selection ring's 1.0 because it is not
+/// an object's outline — see `push_territory`.
+const TERRITORY_EDGE_ALPHA: f32 = 0.60;
+const TERRITORY_EDGE_ALPHA_LIVE: f32 = 0.90;
 
 /// Where the caret is, what is selected, and the string both index into.
 ///
@@ -740,6 +836,15 @@ impl Painter {
         // slots up rather than requesting them.
         self.prepare_text(device, queue, renderer.atlas_mut(), ctx, &mut stats);
 
+        // The orchestrator's region, **behind everything** — `docs/07-agent-canvas.md` §9.
+        // After the grid and before the items: a territory is a wash *on* the board's
+        // surface rather than part of it, and a tint under the grid would put dots on top of
+        // the one thing that says which part of the board an agent owns.
+        //
+        // After `prepare_text`, because the label goes through the same atlas every other
+        // glyph does and `push_layout` looks slots up rather than requesting them.
+        self.push_territory(list, ctx, renderer.atlas(), screen);
+
         // Pass two: geometry and glyphs, strictly in paint order.
         for index in 0..self.order.len() {
             let (_, id) = self.order[index];
@@ -835,12 +940,215 @@ impl Painter {
             }
         }
 
+        // The territory label. **Not an item**, so it is not in `self.order` and cannot be
+        // reached by the loop above — and the region can be on screen while the node that
+        // owns it is culled, which is precisely when a label saying whose region this is
+        // earns its place. Rasterised at scale 1.0 for the reason
+        // [`Painter::territory_label`] gives.
+        if let Some(label) = self.territory_label(ctx) {
+            let missing = self.text.layout_of(label.key).is_some_and(|layout| {
+                layout.glyphs().any(|glyph| {
+                    let key = glyph.physical(label.origin, 1.0).key;
+                    atlas.slot(key).is_none() && !atlas.is_blank(key)
+                })
+            });
+            if missing {
+                self.text.rasterise_into(label.key, label.origin, 1.0, &mut self.glyphs);
+            }
+        }
+
         if !self.glyphs.is_empty()
             && let Err(error) = atlas.prepare(device, queue, &self.glyphs)
         {
             // Not fatal: the frame draws with whatever is resident, which is text
             // with holes in it rather than no frame at all.
             log::warn!("glyph atlas: {error}");
+        }
+    }
+
+    /// Lays out the territory's label and works out where on screen it goes.
+    ///
+    /// # Why this is not an item's block
+    ///
+    /// [`Painter::block`] positions text from `projected.rect()` and an [`Anchor`], which is
+    /// the right machinery for words that belong *inside* a box. A territory's label belongs
+    /// to a rectangle that is not an item, is very often larger than the screen, and has to
+    /// stay the same size at every zoom — none of which `block` can express. Teaching it a
+    /// case with no `Projected` behind it would put a special arm in the one function every
+    /// kind on the board goes through.
+    ///
+    /// # Laid out in **device** pixels, and pushed at scale 1.0
+    ///
+    /// Everything else here is shaped in world units and multiplied by the zoom at push
+    /// time, which is right for text that is part of the board. This is chrome: it must be
+    /// the same 12 px at a fitted 4% and at 8×, the way a guide's dash cadence and the
+    /// selection ring's weight already are. Shaping at the device size and pushing with
+    /// `scale = 1.0` is how that is spelled — the alternative, dividing a world size by the
+    /// zoom, reshapes the label on every frame of a zoom gesture and fills the atlas.
+    ///
+    /// # The label is clamped into the region *and* into the viewport
+    ///
+    /// A region is usually bigger than the window and its top-left corner is usually off
+    /// screen, so a label pinned to that corner is a label nobody ever sees — which is the
+    /// whole of what it was for. It slides along the region's own edges to stay in view, and
+    /// never leaves the region, so it cannot come to sit over a neighbouring orchestrator's.
+    fn territory_label(&mut self, ctx: &DrawContext<'_>) -> Option<TerritoryLabel> {
+        let tint = ctx.territory.as_ref()?;
+        if tint.label.trim().is_empty() {
+            return None;
+        }
+        let key = BlockKey::new(tint.scene, TERRITORY_LABEL_SLOT);
+        let style = vellum_doc::Style {
+            font_size: Some(f64::from(TERRITORY_LABEL_SIZE)),
+            ..vellum_doc::Style::default()
+        };
+        // The node's own projection generation, which is exactly what moves when its role
+        // label changes and exactly what does *not* move while the board is panned or a
+        // rectangle is being swept. The `pending` flag deliberately does not enter here: the
+        // words are the same either way, and folding it in would reshape the label twice per
+        // gesture to produce the identical layout.
+        let words = tint.label.clone();
+        let (layout, _) = self.text.layout(key, tint.generation, &style, None, || {
+            vellum_text::StyledText::plain(words)
+        });
+        let extent = (layout.extent.width, layout.extent.height);
+
+        let (min, max) = tint.screen_rect(ctx.camera);
+        let viewport = ctx.camera.viewport();
+        let plate = (
+            extent.0 + TERRITORY_LABEL_PAD * 2.0,
+            extent.1 + TERRITORY_LABEL_PAD,
+        );
+        // Inside the region's corner, then slid to stay on screen — but never past the
+        // region's far edge, so a label that cannot fit inside its own region sits at the
+        // corner rather than floating somewhere it does not describe.
+        let slide = |near: f32, far: f32, size: f32, limit: f32| {
+            let inset = near + TERRITORY_LABEL_INSET;
+            inset.max(0.0).min((far - size - TERRITORY_LABEL_INSET).max(inset)).min(
+                (limit - size).max(0.0),
+            )
+        };
+        let x = slide(min.0, max.0, plate.0, viewport.width as f32);
+        let y = slide(min.1, max.1, plate.1, viewport.height as f32);
+
+        Some(TerritoryLabel {
+            key,
+            // The glyphs sit inside the plate, and `Layout`'s own origin is the block's
+            // top-left, which is why the pad is added rather than subtracted.
+            origin: (x + TERRITORY_LABEL_PAD, y + TERRITORY_LABEL_PAD / 2.0),
+            plate: [x, y, plate.0, plate.1],
+        })
+    }
+
+    /// The orchestrator's region: a wash, a dashed edge and a label saying whose it is.
+    ///
+    /// **Screen view throughout, and that is the decision.** A region is a rectangle in
+    /// world units and the fill could as easily be pushed in the board view — but the edge
+    /// and the label cannot: a world-unit dash is a solid line when zoomed out and three
+    /// dashes across the window when zoomed in (`push_dashed`, and `push_grid` before it),
+    /// and a world-sized label is illegible at a fitted 4% and a banner at 8×. Drawing all
+    /// three in one view means one batch and one arithmetic, rather than a fill that agrees
+    /// with an edge only when nothing has been rounded.
+    ///
+    /// A region is axis-aligned and never rotated, so converting its two corners to screen
+    /// is exact — the conversion that would *not* be is the one this deliberately avoids by
+    /// carrying a centre and an extent all the way from `vellum_agent::Territory`.
+    ///
+    /// **Dashed rather than solid**, for feedback 25a's reason applied to a second kind of
+    /// chrome: a solid accent hairline is what a selection ring and a shape's border are, so
+    /// an edge drawn that way reads as belonging to an object. Nothing else on this canvas
+    /// is dashed except a connector that was asked to be, and a territory is the one thing
+    /// on the board that is not an object at all.
+    fn push_territory(
+        &mut self,
+        list: &mut DrawList,
+        ctx: &DrawContext<'_>,
+        atlas: &GlyphAtlas,
+        screen: u32,
+    ) {
+        let Some(tint) = ctx.territory.as_ref() else { return };
+        let (min, max) = tint.screen_rect(ctx.camera);
+        let viewport = ctx.camera.viewport();
+        let (view_w, view_h) = (viewport.width as f32, viewport.height as f32);
+
+        // Entirely off screen: nothing to draw, and — the part that matters — nothing to
+        // *dash*, since an edge a long way outside the window would otherwise emit a run of
+        // quads nobody can see. The same clip `push_dashed` applies along its own axis,
+        // applied here across both.
+        if max.0 <= 0.0 || max.1 <= 0.0 || min.0 >= view_w || min.1 >= view_h {
+            return;
+        }
+
+        list.use_view(screen);
+        let theme = ctx.theme;
+        let (fill_alpha, edge_alpha) = if tint.pending {
+            (TERRITORY_FILL_ALPHA_LIVE, TERRITORY_EDGE_ALPHA_LIVE)
+        } else {
+            (TERRITORY_FILL_ALPHA, TERRITORY_EDGE_ALPHA)
+        };
+
+        // The wash, clipped to the window. A region is routinely hundreds of screens wide
+        // and a quad that big is a quad the rasteriser has to clip anyway; doing it here
+        // keeps the numbers finite, which is what stops a zoomed-in board handing the GPU
+        // coordinates it cannot represent.
+        let clipped = [
+            min.0.max(0.0),
+            min.1.max(0.0),
+            (max.0.min(view_w) - min.0.max(0.0)).max(0.0),
+            (max.1.min(view_h) - min.1.max(0.0)).max(0.0),
+        ];
+        if clipped[2] > 0.0 && clipped[3] > 0.0 {
+            list.push_quad(QuadInstance::solid(
+                [clipped[0], clipped[1]],
+                [clipped[2], clipped[3]],
+                theme.accent.with_alpha(fill_alpha),
+            ));
+        }
+
+        // The four edges, each only when it is actually in the window. A hairline, and a
+        // hair over one pixel so it survives the rounding either way — the guides' rule.
+        let colour = theme.accent.with_alpha(edge_alpha);
+        let weight = HAIRLINE.max(1.0);
+        for (across, axis) in [
+            (min.0, crate::snap::Axis::Vertical),
+            (max.0, crate::snap::Axis::Vertical),
+            (min.1, crate::snap::Axis::Horizontal),
+            (max.1, crate::snap::Axis::Horizontal),
+        ] {
+            let limit = if axis == crate::snap::Axis::Vertical { view_w } else { view_h };
+            if across < 0.0 || across > limit {
+                continue;
+            }
+            let (a, b) = match axis {
+                crate::snap::Axis::Vertical => (
+                    ScreenPoint::new(f64::from(across), f64::from(min.1)),
+                    ScreenPoint::new(f64::from(across), f64::from(max.1)),
+                ),
+                crate::snap::Axis::Horizontal => (
+                    ScreenPoint::new(f64::from(min.0), f64::from(across)),
+                    ScreenPoint::new(f64::from(max.0), f64::from(across)),
+                ),
+            };
+            push_dashed(list, ctx, axis, a, b, colour, weight);
+        }
+
+        // The label. A pale plate with an accent hairline rather than accent-on-accent:
+        // charcoal on the teal is 5.3:1 and white on it is 3.2:1, so a filled accent plate
+        // would have to carry `on_accent` — which this canvas palette does not have, and
+        // inventing one here would be a fifth copy of a colour three files already share.
+        let Some(label) = self.territory_label(ctx) else { return };
+        list.use_view(screen);
+        list.push_quad(
+            QuadInstance::solid(
+                [label.plate[0], label.plate[1]],
+                [label.plate[2], label.plate[3]],
+                theme.surface,
+            )
+            .with_corner_radius(TERRITORY_LABEL_RADIUS)
+            .with_border(colour, weight),
+        );
+        if let Some(layout) = self.text.layout_of(label.key) {
+            list.push_layout(atlas, layout, [label.origin.0, label.origin.1], 1.0, theme.text);
         }
     }
 
@@ -7087,6 +7395,7 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
+            territory: None,
             minimap: None,
         }
     }
@@ -8421,6 +8730,7 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
+            territory: None,
             minimap: None,
         };
         push_stroke(&mut list, &ctx, board);
@@ -8456,6 +8766,7 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
+            territory: None,
             minimap: None,
         };
         push_stroke(&mut list, &ctx, board);
@@ -8497,6 +8808,7 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
+            territory: None,
             minimap: None,
         };
         push_stroke(&mut list, &ctx, board);
@@ -8534,6 +8846,7 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
+            territory: None,
             minimap: None,
         };
         push_marquee(&mut list, &ctx, screen);
@@ -8581,6 +8894,7 @@ mod tests {
                 card_drop: None,
                 pattern: Pattern::Plain,
                 grid_color: None,
+                territory: None,
                 minimap: None,
             };
             push_placing(&mut list, &ctx, board);
@@ -8679,6 +8993,7 @@ mod tests {
                 card_drop: None,
                 pattern: Pattern::Plain,
                 grid_color: None,
+                territory: None,
                 minimap: None,
             },
             screen,
@@ -8725,6 +9040,7 @@ mod tests {
                     card_drop: None,
                     pattern: Pattern::Plain,
                     grid_color: None,
+                    territory: None,
                     minimap: None,
                 },
                 board,
@@ -8768,6 +9084,7 @@ mod tests {
                 card_drop: None,
                 pattern: Pattern::Plain,
                 grid_color: None,
+                territory: None,
                 minimap: None,
             };
             push_handles(&mut list, &ctx, board);
@@ -8821,6 +9138,7 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
+            territory: None,
             minimap: None,
         };
         push_handles(&mut list, &ctx, board);
@@ -8865,6 +9183,7 @@ mod tests {
                 card_drop: None,
                 pattern: Pattern::Plain,
                 grid_color: None,
+                territory: None,
                 minimap: None,
             },
             board,

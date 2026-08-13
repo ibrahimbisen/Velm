@@ -130,16 +130,23 @@ pub struct AgentFacts<'a> {
     ///
     /// Without this a row prints `42@7` at somebody, which tells them nothing.
     pub label_of: &'a dyn Fn(&str) -> Option<String>,
-    /// Whether a note's file exists, and whether it is in conflict.
+    /// Whether a note's file exists, and whether a conflict file sits beside it.
     ///
     /// Both are questions about the filesystem rather than about the token, which is why they
-    /// are asked through a closure at all. ⚠ **The second is answered `false` unconditionally
-    /// today**, and the caller in `app.rs` says why: a conflict file is written by
-    /// `NoteStore::save`, nothing in this application calls `save` yet, so no note on any
-    /// board can be in conflict. That makes the constant *correct* rather than a stand-in —
-    /// but it is correct for a reason outside this type, which is the shape of the
-    /// `locked: false` trap. It has to be answered for real the day a note's body becomes
-    /// editable on the canvas.
+    /// are asked through a closure at all, and **both must be asked**. The honest answer to
+    /// the pair is `vellum_agent::NoteStore::state_of`, which resolves the stored path the way
+    /// every other reader of one does and looks for `<slug>.velm-conflict.md` beside it; the
+    /// closure in `app.rs` is where it is given, and this comment is the contract rather than
+    /// a report of what that closure currently contains.
+    ///
+    /// ⚠ **The second half used to be a literal `false`**, defended by an argument that was
+    /// true when it was written — `NoteStore::save` is the only thing that *writes* a conflict
+    /// file and nothing calls `save` — and that was never the whole question. A conflict file
+    /// is a file: an agent's own `note_write` can put one there, and one can survive from a
+    /// session or a tool that is long gone. So the constant was answering *"nothing in this
+    /// process has made one"* to a question that asks *"is there one"*, which is the
+    /// `locked: false` trap exactly — a stand-in kept correct by a fact in another crate,
+    /// where the change that falsifies it breaks no test here.
     pub note_state: &'a dyn Fn(&str) -> (bool, bool),
 }
 

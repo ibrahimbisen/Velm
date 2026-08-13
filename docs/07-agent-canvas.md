@@ -277,6 +277,13 @@ Three layers, each inheriting from the one above unless it overrides:
 - An unrecognised value for a structured setting **falls through to the layer above**, not to
   a default. That matters most for the permission posture: a permission granted by a typo is
   the one failure this cascade cannot be allowed to have.
+- **All three layers are writable.** `RuleFile::to_markdown` is the exact inverse of
+  `RuleFile::parse` — unknown front-matter keys included, since the parser keeps them
+  precisely so that a save does not drop them — and `RuleFile::save` writes atomically,
+  creates the file and its directories when there is none (the common case: a global rule set
+  starts by being written), and **refuses** rather than overwriting a file that changed since
+  the editor was opened. Velm writes the project layer to `.velm/rules.md` and never to
+  somebody else's `AGENTS.md`/`CLAUDE.md`/`.cursorrules`, which it only ever reads.
 - `rules::resolve(global, project, agent)` returns a `ResolvedRules` that records, per field,
   **which layer supplied it**. The inspector shows *inherited* versus *set here* from that
   record rather than by re-deriving it, so the display cannot disagree with what the agent got.
@@ -327,6 +334,17 @@ Most agents need no key at all — that is what §5a is for. A key is required o
   explicit and confirmed; an agent's worktree is never force-removed with uncommitted changes.
 - **Territory**: an orchestrator holds a world-space rectangle. It may only spawn inside it,
   and the region is drawn as a labelled tint while the orchestrator is selected.
+  - **The gesture is armed, then swept** — the verb is asked for (`ActiveState::arm_territory`)
+    and the *next* drag on the board answers it. Deliberately not a bare drag: a drag on empty
+    board is a marquee, which is the gesture that gets used constantly, and stealing it
+    whenever a manager happened to be selected would take marquee selection away from every
+    board with an orchestrator on it — silently, since the two look identical until the button
+    comes up. Escape abandons, and abandoning leaves the previous region in force; a *click*
+    abandons too, because there is no defensible default region a tap could have meant.
+  - The tint is drawn in the **screen** view — fill, dashed edge and label together. A
+    world-unit dash is a solid line when zoomed out and three dashes across the window when
+    zoomed in, and a world-sized label is illegible at a fitted 4%; drawing all three in one
+    view is also what keeps the fill and the edge from disagreeing by a rounding.
 - **Spawn cap**: a hard integer. `orchestrator.rs` refuses the spawn that would exceed it and
   reports the refusal into the transcript, so the orchestrator can adapt rather than silently
   failing. Cap and territory are both enforced in Velm, never in the prompt — a limit that

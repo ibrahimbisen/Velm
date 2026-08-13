@@ -36,6 +36,32 @@
 //! target, so an agent reading mid-write never sees half a file. It is a primitive and it is
 //! called once per save — *when* to save is a question about a caret leaving a node, which
 //! is `vellum-app`'s to answer.
+//!
+//! # ⚠ Who calls what today, and what [`NoteStore::save`] is waiting for
+//!
+//! Stated because the gap is invisible from inside this module and reads as a bug from
+//! outside it. **Velm is read-only against a note's body.** These are the three live paths:
+//!
+//! - [`NoteStore::create`] — the canvas, when the user makes a note node. Writes once.
+//! - [`NoteStore::reload`] — the canvas, on a low-frequency poll of the notes on screen.
+//!   §8's *external edits win on a clean node*, and it is the only thing that reads a body.
+//! - An agent's `note_write` over IPC, which goes to [`write_atomically`] **directly** and
+//!   deliberately: an agent writing a note is a server-side operation with nobody holding an
+//!   unsaved buffer, so last-write-wins with an atomic rename is the whole of what it needs,
+//!   and `append` is offered exactly so two agents do not have to read-modify-write.
+//!
+//! So [`NoteStore::save`] — and with it [`Save::Conflict`] and the `<slug>.velm-conflict.md`
+//! rule — **has no caller in the application.** It is not dead code and it is not aspirational:
+//! it is §8's contracted behaviour for the one path that does not exist yet, a caret in a
+//! note's *body*. There is none because `ItemKind::AgentNote` answers `text()` with its
+//! **title**, so the on-canvas editor reaches the heading and nothing else. The day that
+//! caret lands, saving is `save` and there is nothing to design.
+//!
+//! Two consequences worth knowing rather than rediscovering. Nothing can lose a note today,
+//! because nothing writes one from a buffer. And a conflict file can still *exist* — an agent
+//! may write one under that name, or one may survive from another tool — which is why
+//! [`NoteStore::conflict_at`] asks the filesystem rather than assuming that no caller means
+//! no conflict.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::io::Write as _;
@@ -301,6 +327,39 @@ impl NoteStore {
         let path = self.absolute(note)?;
         std::fs::read_to_string(&path)
             .map_err(|error| AgentError::file(path.display().to_string(), &error))
+    }
+
+    /// The conflict file beside a note, if one is there.
+    ///
+    /// `<slug>.velm-conflict.md`, asked of the filesystem rather than remembered: a conflict
+    /// is a *file*, it outlives the session that produced it, and the node that reports it
+    /// has to keep reporting it after a restart — which nothing in memory could do.
+    ///
+    /// # Only the canonical name is checked, and that bound is deliberate
+    ///
+    /// [`free_conflict_path`] appends `-2` only when the canonical file already exists, so a
+    /// numbered conflict implies a canonical one and this cannot miss a live conflict. The one
+    /// state it does not see is a user who deleted `plan.velm-conflict.md` by hand and kept
+    /// `plan-2.velm-conflict.md`, which is somebody tidying up half way. The alternative is a
+    /// prefix scan of the directory, and that is worse than the gap it closes: a note the user
+    /// genuinely called *Plan 2* has a file called `plan-2.md`, and a scan cannot tell its
+    /// conflict from this one's second.
+    pub fn conflict_at(&self, stored: &str) -> Option<PathBuf> {
+        let path = self.resolve_stored(stored).ok()?;
+        let conflict = conflict_path(&path);
+        conflict.exists().then_some(conflict)
+    }
+
+    /// The two filesystem facts a note node reports about itself: whether its file is there,
+    /// and whether a conflict file sits beside it.
+    ///
+    /// Answered here rather than by the caller joining paths for itself, because "where does
+    /// this stored path resolve to" is [`NoteStore::resolve_stored`]'s question and a second
+    /// answer to it is how a note that exists comes to report that it does not — the store's
+    /// base is only sometimes what a path is relative to.
+    pub fn state_of(&self, stored: &str) -> (bool, bool) {
+        let on_disk = self.resolve_stored(stored).is_ok_and(|path| path.exists());
+        (on_disk, self.conflict_at(stored).is_some())
     }
 
     /// Whether the file changed since the model last saw it.
@@ -776,11 +835,22 @@ fn compare(note: &NoteModel, path: &Path) -> Freshness {
     }
 }
 
+/// `<stem>.velm-conflict.md` beside `path` — the name a conflicted save writes first.
+///
+/// Split out so the spelling exists once: [`free_conflict_path`] writes it and
+/// [`NoteStore::conflict_at`] reads it, and a reader that spelled the suffix for itself would
+/// be a node that stops reporting conflicts the day the constant changes.
+fn conflict_path(path: &Path) -> PathBuf {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("note");
+    dir.join(format!("{stem}.{CONFLICT_SUFFIX}"))
+}
+
 /// `<stem>.velm-conflict.md`, and `-2` if that is taken.
 fn free_conflict_path(path: &Path) -> PathBuf {
     let dir = path.parent().unwrap_or(Path::new("."));
     let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("note");
-    let mut candidate = dir.join(format!("{stem}.{CONFLICT_SUFFIX}"));
+    let mut candidate = conflict_path(path);
     let mut n = 2u32;
     while candidate.exists() {
         candidate = dir.join(format!("{stem}-{n}.{CONFLICT_SUFFIX}"));
@@ -974,6 +1044,60 @@ mod tests {
         let second = again.conflict().expect("the second conflict was not reported").to_path_buf();
         assert_ne!(second, kept, "the second conflict overwrote the first");
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), "typed on the canvas");
+    }
+
+    /// The two facts a note node reports about itself, asked of the filesystem.
+    ///
+    /// The second used to be a literal `false` in `vellum-app`'s inspector, defended by *"only
+    /// `save` writes a conflict file and nothing calls `save`"*. That is a statement about
+    /// this process, and the question is about the disk: an agent's own `note_write` can put a
+    /// file under that name, and one can survive from a session that is long gone. So the
+    /// second half is driven here by a file written **by something other than `save`**, which
+    /// is precisely the case the old reasoning could not see.
+    ///
+    /// A/B: it fails against a `conflict_at` that remembers rather than looks, and against the
+    /// constant it replaces.
+    #[test]
+    fn a_note_reports_whether_it_is_on_disk_and_whether_a_conflict_sits_beside_it() {
+        let (_dir, store) = store();
+        let note = store.create("Plan", NoteScope::Shared, "the original", Requester::User).unwrap();
+
+        assert_eq!(store.state_of(&note.path), (true, false), "a fresh note reported a conflict");
+        assert_eq!(store.conflict_at(&note.path), None);
+
+        // Not through `save`: this is a file somebody else left there.
+        let beside = store.absolute(&note).unwrap().with_extension(CONFLICT_SUFFIX);
+        std::fs::write(&beside, "the other side").unwrap();
+
+        assert_eq!(store.state_of(&note.path), (true, true), "the conflict file was not seen");
+        assert_eq!(store.conflict_at(&note.path).as_deref(), Some(beside.as_path()));
+
+        // And a note whose file has been deleted underneath the board is neither.
+        std::fs::remove_file(store.absolute(&note).unwrap()).unwrap();
+        std::fs::remove_file(&beside).unwrap();
+        assert_eq!(store.state_of(&note.path), (false, false));
+
+        // A path that escapes the store is refused rather than answered about, which is why
+        // this goes through `resolve_stored` rather than joining onto the base.
+        assert_eq!(store.state_of("../../../.ssh/id_rsa"), (false, false));
+        assert_eq!(store.state_of(""), (false, false), "an empty path addressed the directory");
+    }
+
+    /// A conflict written by `save` is the same file `conflict_at` looks for. Two spellings of
+    /// one name is a node that stops reporting conflicts and nothing that says why.
+    #[test]
+    fn the_conflict_a_save_writes_is_the_one_the_node_looks_for() {
+        let (_dir, store) = store();
+        let mut note =
+            store.create("Plan", NoteScope::Shared, "the original", Requester::User).unwrap();
+        let path = store.absolute(&note).unwrap();
+        std::fs::write(&path, "written by an agent, at some length").unwrap();
+
+        let saved = store.save(&mut note, "typed on the canvas", Requester::User).unwrap();
+        let kept = saved.conflict().expect("no conflict was reported").to_path_buf();
+
+        assert_eq!(store.conflict_at(&note.path).as_deref(), Some(kept.as_path()));
+        assert_eq!(store.state_of(&note.path), (true, true));
     }
 
     /// An ordinary save is a save: no conflict when nobody else touched the file.

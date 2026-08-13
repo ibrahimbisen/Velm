@@ -354,6 +354,47 @@ pub(crate) struct Drag {
     lock_aspect: bool,
 }
 
+/// The two inherited rule layers as they were when the rules editor went up.
+///
+/// The freshness check in [`ActiveState::save_rule_layer`] needs *what the user was shown*,
+/// and a rules file is a hand-editable file that another tool may also write — so re-reading
+/// it at save time would compare the file against itself and never fire. Taken once, when
+/// the dialog is raised.
+///
+/// Both layers, not only the one being edited, because the editor names both files and the
+/// user may save either from one sitting. `RuleFile::default()` stands for *there is no such
+/// file*, which is the same thing [`vellum_agent::RuleFile::read`] answers for an absent one.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RulesSnapshot {
+    pub(crate) global: vellum_agent::RuleFile,
+    pub(crate) project: vellum_agent::RuleFile,
+}
+
+impl RulesSnapshot {
+    /// The layer's file. `None` for the two layers that are **not** files — an agent's own
+    /// rules live in its token, and `Default` is not a layer at all — which is the same
+    /// answer [`ActiveState::rule_layer_path`] gives for them, so the two cannot disagree
+    /// about which layers this module is for.
+    pub(crate) fn layer(&self, layer: vellum_agent::Layer) -> Option<&vellum_agent::RuleFile> {
+        match layer {
+            vellum_agent::Layer::Global => Some(&self.global),
+            vellum_agent::Layer::Project => Some(&self.project),
+            vellum_agent::Layer::Agent | vellum_agent::Layer::Default => None,
+        }
+    }
+
+    fn layer_mut(
+        &mut self,
+        layer: vellum_agent::Layer,
+    ) -> Option<&mut vellum_agent::RuleFile> {
+        match layer {
+            vellum_agent::Layer::Global => Some(&mut self.global),
+            vellum_agent::Layer::Project => Some(&mut self.project),
+            vellum_agent::Layer::Agent | vellum_agent::Layer::Default => None,
+        }
+    }
+}
+
 /// A kanban card in flight.
 ///
 /// Its own type rather than a [`DragMode`], because a card drag changes **no
@@ -1656,7 +1697,7 @@ impl ActiveState {
                 crate::agent_runtime::DocumentWork::ReadConfig { node } => {
                     match self.agent_doc(&node).and_then(|doc| self.agent_model(doc)) {
                         Some((model, _)) => reply.config(model),
-                        None => reply.refuse("that node is not an agent on the board in front"),
+                        None => reply.refuse(self.unreachable_node(&node)),
                     }
                 }
                 crate::agent_runtime::DocumentWork::WriteConfig { node, model } => {
@@ -1665,7 +1706,7 @@ impl ActiveState {
                             self.write_agent_model(doc, &model);
                             reply.done();
                         }
-                        None => reply.refuse("that node is not an agent on the board in front"),
+                        None => reply.refuse(self.unreachable_node(&node)),
                     }
                 }
             }
@@ -1679,6 +1720,23 @@ impl ActiveState {
     /// limit comes to be enforced in one place and not the other. This supplies the two
     /// things that crate deliberately does not know: how big a node is, and where its
     /// siblings actually are.
+    /// Why a node could not be reached, told apart so the message is true.
+    ///
+    /// **Parked and gone are different refusals**, and saying the second when the first is the
+    /// case is how an agent is told its own configuration does not exist. `run_due_agents`
+    /// already makes this comparison to *defer* a fired schedule; a `DocumentWork` cannot
+    /// defer — an agent process is blocked on the reply, bounded by `REPLY_TIMEOUT` — so the
+    /// refusal is right and only the wording was wrong.
+    fn unreachable_node(&self, node: &crate::agent_runtime::NodeKey) -> &'static str {
+        let parked =
+            self.agent_board.as_ref().map(|stamp| &stamp.key) != Some(&node.board);
+        if parked {
+            "that agent's board is open behind another tab; bring it forward and ask again"
+        } else {
+            "that node is not an agent on the board in front"
+        }
+    }
+
     fn spawn_agent(
         &mut self,
         parent: &crate::agent_runtime::NodeKey,
@@ -2438,9 +2496,15 @@ impl ActiveState {
     /// and a file tree rooted at a `target/` directory is forty thousand entries — the whole
     /// canvas rests on frame cost following what is visible rather than what exists.
     ///
-    /// A tree is read here rather than cached because a directory changes underneath us and
-    /// a cached listing is one that is wrong the moment anything moves. It is bounded twice:
-    /// by the viewport, and by `filetree::MAX_ROWS` inside the walk.
+    /// A tree's listing is **cached in the runtime**, refreshed on a low-frequency poll and
+    /// immediately whenever the model or the root changes — so opening a folder is instant
+    /// and a board simply holding a tree does not walk the filesystem sixty times a second.
+    /// It is still bounded twice: by the viewport, and by `filetree::MAX_ROWS` inside the walk.
+    ///
+    /// This paragraph used to say the opposite — that a tree is read here *rather than*
+    /// cached, because a cached listing is wrong the moment anything moves. That reasoning is
+    /// right about staleness and wrong about the remedy: the answer to a listing that can go
+    /// stale is to re-read it on a poll, not to re-read it on every frame.
     /// ⚠ **Through the R-tree, and matching by reference.** This ran once a frame and used to
     /// walk the *whole* projection linearly, cloning `projected.item.kind` for every visible
     /// item to find the two kinds it wants — so a board with one note on it deep-copied every
@@ -2453,6 +2517,10 @@ impl ActiveState {
         visible: vellum_scene::WorldRect,
     ) {
         let project = self.editor.path().and_then(|path| path.parent()).map(Path::to_path_buf);
+        // One clock read for the whole pass. The tree cache decides from it whether a listing
+        // is due to be re-read; asking per node would be a syscall per visible tree per frame
+        // to answer a question that cannot change within one frame.
+        let now = crate::agent_runtime::unix_now();
         // Only what the two arms below actually need leaves the borrow: a scene id, a doc id
         // and — for a tree — its *decoded* model, which is a handful of short strings. The
         // collect is still needed, because the loop takes `&mut self`.
@@ -2501,11 +2569,9 @@ impl ActiveState {
                         project.as_ref().map(|base| base.join(&tree.root))
                     };
                     let Some(root) = root else { continue };
-                    match vellum_agent::filetree::visible(&root, &tree, tree.show_ignored) {
-                        Ok(view) => self.agents.set_tree(scene, view),
-                        Err(error) => {
-                            log::debug!("agents: reading {} failed ({error})", root.display());
-                        }
+                    let key = crate::agent_runtime::NodeKey::new(board, doc.to_string());
+                    if let Some(view) = self.agent_runtime.tree_view(&key, &root, &tree, now) {
+                        self.agents.set_tree(scene, view);
                     }
                 }
                 // What the pool says about *this* page, which configuration cannot answer: a
@@ -3087,6 +3153,9 @@ impl ActiveState {
                 }
             }
             Command::EditAgentRules => self.edit_agent_rules(),
+            // Arms the sweep; the next drag on bare board sets the region. Escape and a click
+            // both abandon it and keep whatever the orchestrator already owned.
+            Command::SetTerritory => self.arm_territory(),
             Command::EditAgentSchedule => self.edit_agent_schedule(),
             Command::ToggleBrowserNodes => {
                 let on = !self.shell.library.browser_nodes();
@@ -3386,6 +3455,8 @@ impl ActiveState {
             "agent-prompt" => self.demo_agent_prompt(),
             "agent-controls" => self.demo_agent_controls(),
             "agent-launch" => self.demo_agent_launch(),
+            "territory" => self.demo_territory(),
+            "rule-layers" => self.demo_rule_layers(),
             // Not a fixture, but the same "do it on the first frame so an unattended
             // run can check it" need — an export is a menu row and nothing else can
             // reach one.
@@ -3398,7 +3469,8 @@ impl ActiveState {
                  (shapes, empty, table, chart, mindmap, kanban, card-drag, typing, caret, connector, placing, snapping, \
                   object-eraser, group-handles, locked-arrange, widget-edit, links, copy-paste, context-menu, \
                   edit-then-delete, frame-marquee, grid-snap, agent, agent-transcript, agent-message, \
-                  agent-prompt, agent-controls, agent-launch, export-svg, export-pdf, export-png, present)"
+                  agent-prompt, agent-controls, agent-launch, territory, rule-layers, \
+                  export-svg, export-pdf, export-png, present)"
             ),
         }
     }
@@ -4240,6 +4312,296 @@ impl ActiveState {
             (_, _, false, _) => self.gap("a frame that was already selected would not drag"),
             (.., false) => self.gap(&format!(
                 "the frame moved {travel:.1} and the items on it moved {carried:?}"
+            )),
+        }
+    }
+
+    /// Sweeping an orchestrator's territory, and seeing it — `docs/07-agent-canvas.md` §9.
+    ///
+    /// # Why a fixture and not a unit test
+    ///
+    /// The whole gesture is a live state. `ActiveState` owns a window and a GPU so no unit
+    /// test can build one; `--screenshot` photographs a window nobody is touching, so it can
+    /// see the *stored* tint and never the sweep; and a test that called `commit_territory`
+    /// directly would enter below the thing being tested — the arm, `input::Tool::Place`,
+    /// the release, and the `Intent::Place` interception — and would pass with every one of
+    /// them removed. That is this repository's oldest lesson, and the reason `--demo
+    /// frame-marquee` exists in the same shape.
+    ///
+    /// # Both halves, because either alone is satisfiable by a broken build
+    ///
+    /// A build that **stored** the region and drew nothing, and one that **drew** a tint and
+    /// stored nothing, each pass half of this. So the sweep is judged on the document *and*
+    /// on `territory_preview`, and the mid-drag frame is judged on `pending` being true
+    /// while the board has gained **no item** — a sweep that had quietly created something
+    /// looks identical in the PNG and is a worse bug.
+    ///
+    /// Then the two ways it must *not* write, both of which lose a region the user set on
+    /// purpose: **Escape** mid-sweep, and a **click** instead of a drag.
+    fn demo_territory(&mut self) {
+        use winit::event::{ElementState, MouseButton};
+
+        self.choose_tool(Tool::Agent);
+        let centre = self.camera.world_to_screen(WorldPoint::new(0.0, 0.0));
+        self.act_on(Intent::Place { at: centre, to: centre });
+        // A freshly placed node leaves a caret on its role — feedback 27's rule.
+        self.settle();
+
+        let Some(scene) = self.editor.selection().first().copied() else {
+            self.gap("placing an agent selected nothing");
+            return;
+        };
+        let Some(doc) = self.editor.projection().get(scene).map(|p| p.doc_id) else {
+            self.gap("the placed agent is not in the projection");
+            return;
+        };
+        // A worker owns no region, so it is promoted first — and given a **known** starting
+        // one, which is what lets the two refusals below be judged on the region surviving
+        // rather than on it merely being absent.
+        let was = vellum_agent::Territory::new(0.0, 0.0, 120.0, 90.0);
+        self.update_agent(doc, |config| {
+            config.role_kind = vellum_agent::RoleKind::Orchestrator;
+            config.territory = Some(was);
+        });
+        self.fit_board();
+        // `Editor::select` takes **document** ids, not scene ids. Both are integers, which is
+        // exactly why the mistake compiles nowhere and reads fine everywhere.
+        self.editor.select([doc]);
+        self.shell.invalidate_selection();
+
+        let region_now = |state: &Self| -> Option<vellum_agent::Territory> {
+            let item = state.editor.board().item(doc).ok()?;
+            let ItemKind::Agent { model, .. } = &item.kind else { return None };
+            crate::agent::decode(model).territory
+        };
+        let items_now = |state: &Self| state.editor.board().item_ids().len();
+
+        // Screen points taken from the **viewport**, not from world coordinates chosen in
+        // advance: the sweep has to be on screen for `--screenshot` to be worth taking, and
+        // the camera's fit depends on the node's default size, which is a module's business
+        // and not this fixture's.
+        let viewport = self.camera.viewport();
+        let at = |fx: f64, fy: f64| {
+            ScreenPoint::new(viewport.width * fx, viewport.height * fy)
+        };
+        let (press, release) = (at(0.15, 0.18), at(0.85, 0.82));
+        let expected = {
+            let (a, b) = (self.camera.screen_to_world(press), self.camera.screen_to_world(release));
+            ((b.x - a.x).abs(), (b.y - a.y).abs())
+        };
+
+        // Real winit events, through the same three the pointer produces for a frame.
+        let sweep = |state: &mut Self, from: ScreenPoint, to: ScreenPoint, finish: bool| {
+            state.input.cursor_moved(&mut state.camera, from);
+            let down = state.input.mouse_input(
+                &mut state.camera,
+                MouseButton::Left,
+                ElementState::Pressed,
+            );
+            state.act_on(down);
+            let moved = state.input.cursor_moved(&mut state.camera, to);
+            state.act_on(moved);
+            if finish {
+                let up = state.input.mouse_input(
+                    &mut state.camera,
+                    MouseButton::Left,
+                    ElementState::Released,
+                );
+                state.act_on(up);
+            }
+        };
+
+        // --- 1. arm, sweep, release ------------------------------------------------------
+        let before = items_now(self);
+        self.arm_territory();
+        let armed = self.territory_arm == Some(doc);
+        sweep(self, press, release, false);
+        // Mid-drag: the tint must be the *live* rectangle, and nothing may exist yet.
+        let previewing = self.territory_preview().is_some_and(|tint| tint.pending);
+        let made_nothing = items_now(self) == before;
+        let up = self.input.mouse_input(
+            &mut self.camera,
+            MouseButton::Left,
+            ElementState::Released,
+        );
+        self.act_on(up);
+
+        let stored = region_now(self);
+        let written = stored.is_some_and(|region| {
+            (region.width - expected.0).abs() < 0.5 && (region.height - expected.1).abs() < 0.5
+        });
+        // The other half: with the node selected, the painter is handed that same rectangle.
+        let drawn = self.territory_preview().is_some_and(|tint| {
+            stored.is_some_and(|region| {
+                (tint.region[2] - region.width).abs() < 1e-6 && !tint.pending
+            })
+        });
+
+        // --- 2. Escape mid-sweep leaves the region alone ---------------------------------
+        self.arm_territory();
+        sweep(self, at(0.4, 0.4), at(0.45, 0.45), false);
+        self.cancel_drag();
+        let kept_after_escape = region_now(self) == stored && self.territory_arm.is_none();
+
+        // --- 3. a click is not a region --------------------------------------------------
+        self.arm_territory();
+        let tap = at(0.5, 0.5);
+        sweep(self, tap, tap, true);
+        let kept_after_click = region_now(self) == stored;
+
+        // Leave the stored tint on screen, which is the one thing no assertion here sees.
+        // `Editor::select` takes **document** ids, not scene ids. Both are integers, which is
+        // exactly why the mistake compiles nowhere and reads fine everywhere.
+        self.editor.select([doc]);
+        self.shell.invalidate_selection();
+
+        match (armed, written && drawn, previewing && made_nothing, kept_after_escape && kept_after_click) {
+            (true, true, true, true) => self.ok(format!(
+                "swept a {:.0} x {:.0} territory, drew it, and kept it through an Escape \
+                 and a click",
+                expected.0, expected.1
+            )),
+            (false, ..) => self.gap("the territory sweep could not be armed on an orchestrator"),
+            (_, false, ..) => self.gap(&format!(
+                "the sweep asked for {:.0} x {:.0}; the document holds {stored:?} and the \
+                 painter was handed {}",
+                expected.0,
+                expected.1,
+                if drawn { "it" } else { "nothing that matches" }
+            )),
+            (_, _, false, _) => self.gap(&format!(
+                "mid-drag the preview was live: {previewing}, and the board still held only \
+                 what it started with: {made_nothing}"
+            )),
+            (.., false) => self.gap(&format!(
+                "an abandoned sweep changed the region — after Escape {kept_after_escape}, \
+                 after a click {kept_after_click}"
+            )),
+        }
+    }
+
+    /// Writing an inherited rule layer, through the app's own path rather than the crate's.
+    ///
+    /// # Why a fixture and not a unit test
+    ///
+    /// `vellum_agent::rules`' own tests prove the composer, the round trip and the freshness
+    /// check against paths a test hands it. None of that says whether the **app** can find
+    /// the file: the global layer's path comes from `AgentRuntime::data_dir`, the project's
+    /// from *the selected agent's own working directory*, and the freshness baseline from a
+    /// snapshot only `edit_agent_rules` takes. Those three hops are the ones that were
+    /// missing entirely — a three-layer cascade whose top two layers nothing could write —
+    /// and each of them is a `None` away from Save doing nothing at all.
+    ///
+    /// It enters at [`Self::run`] for the editor and at [`Self::save_rule_layer`] for the
+    /// save, which is exactly the pair a dialog's Save button will join once
+    /// `DialogEvent::RulesSet` carries its layer.
+    ///
+    /// # Nothing here goes near the user's data directory
+    ///
+    /// The project layer is written into a scratch directory this fixture makes, and the
+    /// global layer's path is **named and not written** — a demo that created
+    /// `<data-dir>/rules/global.md` would be a fixture editing the user's own configuration,
+    /// which is the shape of mistake `--board /tmp/x.vellum` has already been burned by. The
+    /// global half is therefore checked as *the path is derived and the file was not
+    /// touched*, which is the honest half of it.
+    ///
+    /// Three assertions, because each is satisfiable alone by a broken build: the file has
+    /// to be **created**, its content has to survive the round trip, and a hand-edit
+    /// underneath the editor has to be **refused** rather than overwritten.
+    fn demo_rule_layers(&mut self) {
+        use vellum_agent::{AgentRules, Layer, RuleFile};
+
+        // Counter, not a clock: `cargo test` runs binaries in parallel and a scratch path
+        // derived from the time in seconds is a collision waiting for a parallel runner —
+        // measured, in this very crate's sidecar tests.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let project = std::env::temp_dir().join(format!(
+            "velm-demo-rules-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if let Err(error) = std::fs::create_dir_all(&project) {
+            self.gap(&format!("the fixture could not make a scratch project: {error}"));
+            return;
+        }
+
+        self.choose_tool(Tool::Agent);
+        let from = self.camera.world_to_screen(WorldPoint::new(0.0, 0.0));
+        self.act_on(Intent::Place { at: from, to: from });
+        // A freshly placed agent leaves a caret on its role — feedback 27's rule, and the
+        // reason this would otherwise raise the undo-group toast on the first command.
+        self.settle();
+
+        let Some(scene) = self.editor.selection().first().copied() else {
+            self.gap("placing an agent selected nothing");
+            return;
+        };
+        let Some(doc) = self.editor.projection().get(scene).map(|p| p.doc_id) else {
+            self.gap("the placed agent is not in the projection");
+            return;
+        };
+        // The project layer is looked up from the node's working directory, not the board's
+        // folder — the same place `agent_launch_spec` loads it from.
+        let dir = project.display().to_string();
+        self.update_agent(doc, |config| config.working_dir = Some(dir));
+
+        // The real editor, so the freshness snapshot is taken the way a user's Save would
+        // find it. The dialog stays up, which is what `--screenshot` wants anyway.
+        self.run(Command::EditAgentRules);
+        let global_path = self.rule_layer_path(Layer::Global);
+        let global_existed = global_path.as_deref().is_some_and(std::path::Path::exists);
+
+        let written = AgentRules {
+            text: "---\ntone: blunt\nlanguage: English\n---\n\nProject house style.\n".to_owned(),
+            ..AgentRules::default()
+        };
+        self.save_rule_layer(Layer::Project, &written);
+
+        let target = vellum_agent::rules::project_rules_target(&project);
+        let created = target.is_file();
+        let back = RuleFile::read(&target);
+        let survived = back.front.tone.as_deref() == Some("blunt")
+            && back.front.language.as_deref() == Some("English")
+            && back.body == "Project house style.";
+
+        // Somebody else's editor, mid-dialog. The save that follows must refuse.
+        let hand_written = "---\ntone: warm\n---\n\nEdited by hand.\n";
+        if let Err(error) = std::fs::write(&target, hand_written) {
+            self.gap(&format!("the fixture could not simulate a hand edit: {error}"));
+            return;
+        }
+        let second = AgentRules { text: "---\ntone: formal\n---\n".to_owned(), ..written };
+        self.save_rule_layer(Layer::Project, &second);
+        let refused =
+            std::fs::read_to_string(&target).is_ok_and(|text| text == hand_written);
+
+        // The global layer: named, and not brought into existence by a fixture.
+        let global_named = global_path
+            .as_deref()
+            .and_then(std::path::Path::to_str)
+            .is_some_and(|path| path.ends_with("rules/global.md"));
+        let global_untouched =
+            global_existed == global_path.as_deref().is_some_and(std::path::Path::exists);
+
+        let _ = std::fs::remove_dir_all(&project);
+
+        match (created && survived, refused, global_named && global_untouched) {
+            (true, true, true) => self.ok(format!(
+                "wrote a project rule layer to {}, read it back whole, and refused to \
+                 overwrite a hand edit",
+                target.display()
+            )),
+            (false, ..) => self.gap(&format!(
+                "the project layer was not written whole: created {created}, survived \
+                 {survived}, at {}",
+                target.display()
+            )),
+            (_, false, _) => {
+                self.gap("a save clobbered a file that had changed underneath the editor");
+            }
+            (.., false) => self.gap(&format!(
+                "the global layer's path is {global_path:?}, and existed {global_existed} \
+                 before this ran"
             )),
         }
     }
@@ -5800,6 +6162,10 @@ impl ActiveState {
         // Escape and a tab switch, arrived at from a third direction; `finish_erase` returns
         // early when nothing is being erased, so this costs nothing the rest of the time.
         self.finish_erase();
+        // A territory sweep is armed on the *input* tool, so picking a real tool would leave
+        // the arm set and turn the next sticky placement into a region. Cleared without
+        // restoring anything, because the line below sets the input tool anyway.
+        self.territory_arm = None;
         self.shell.set_tool(tool);
         self.input.set_tool(match tool {
             Tool::Hand => crate::input::Tool::Hand,
@@ -5861,6 +6227,14 @@ impl ActiveState {
                 self.shell.invalidate_selection();
             }
             Intent::PlaceSample { at } => {
+                // A territory sweep borrows `input::Tool::Place` while the palette's tool is
+                // whatever the user left armed, so the two arms below would otherwise be
+                // asked about a pen or an eraser that is not in this gesture at all. Guarded
+                // by the arm rather than by the tool, which is the state that actually says
+                // what the button is doing.
+                if self.territory_arm.is_some() {
+                    return;
+                }
                 // The eraser is in the same gesture bucket as the pen and has always
                 // received this stream; it simply threw every sample away.
                 if matches!(self.shell.tool(), Tool::Eraser) {
@@ -5896,7 +6270,15 @@ impl ActiveState {
             Intent::Place { at, to } => {
                 let from = self.camera.screen_to_world(at);
                 let to = self.camera.screen_to_world(to);
-                self.place(from, to);
+                // An armed territory sweep owns the release. `place` would otherwise be
+                // asked to create whatever the palette's tool makes — which, with Select
+                // armed, is nothing at all, so the region would simply have been swept and
+                // thrown away.
+                if self.territory_arm.is_some() {
+                    self.commit_territory(from, to);
+                } else {
+                    self.place(from, to);
+                }
             }
         }
     }
@@ -7874,6 +8256,216 @@ impl ActiveState {
         self.end_prompting();
     }
 
+    // ----- an orchestrator's territory ---------------------------------------
+    //
+    // `docs/07-agent-canvas.md` §9: *"an orchestrator holds a world-space rectangle. It may
+    // only spawn inside it, and the region is drawn as a labelled tint while the
+    // orchestrator is selected."* The enforcement has always been there —
+    // `vellum_agent::orchestrator::may_spawn` against `Territory::contains_box` — and what
+    // was missing was both ways the user meets it: a gesture that *sets* the rectangle and
+    // paint that *shows* it. Until this, the only value it ever held was the one
+    // `crate::agent::default_territory` derives at creation.
+
+    /// How small a sweep is a click rather than a region, in world units per axis.
+    ///
+    /// [`DRAG_TO_SIZE`]'s job for a create tool, and the same number carries a different
+    /// rule here: a create tool answers a click with its *default size*, and there is no
+    /// defensible default region for "the part of the board this orchestrator owns" that a
+    /// user meant by tapping once. So a click **abandons** instead, and the previous region
+    /// stands — the one outcome that cannot lose something the user set on purpose.
+    const TERRITORY_MIN_SWEEP: f64 = 8.0;
+
+    /// Arms the next sweep to set the selected orchestrator's region.
+    ///
+    /// # Why the verb is asked for first
+    ///
+    /// This is feedback 29's trade, made deliberately the other way. A press on a frame
+    /// stopped picking the frame up because sweeping a marquee over a backdrop is the
+    /// gesture that gets used constantly; a bare drag that redrew a territory whenever a
+    /// manager happened to be selected would take that same gesture away from every board
+    /// with an orchestrator on it — and it would do it *silently*, since the drag looks
+    /// identical either way until the button comes up. So the region is asked for, and the
+    /// **next** sweep answers.
+    ///
+    /// The pointer is put into [`crate::input::Tool::Place`] rather than into a mode of its
+    /// own, which is what makes the preview and the commit one decision: the press, the
+    /// samples and the release are the same three events a frame's placement produces, they
+    /// are already tested, and `Input::placement` already reports the live rectangle.
+    /// `Shell`'s tool is left alone, so the palette does not lie about what is armed and the
+    /// tool comes back by itself when the gesture ends.
+    ///
+    /// Refuses, with a reason, for a selection that is not exactly one managing agent. That
+    /// is the chrome's gate as well, so reaching it means the two disagreed — worth a
+    /// sentence rather than silence, because *"the menu row did nothing"* is the report this
+    /// house does not ship.
+    pub(crate) fn arm_territory(&mut self) {
+        // A caret or an eraser sweep holds an undo group open, and the commit at the end of
+        // this gesture opens its own — trap 11's third route, closed here rather than
+        // discovered later.
+        self.settle();
+
+        let one = (self.editor.selection().len() == 1)
+            .then(|| self.editor.selection().first().copied())
+            .flatten();
+        let Some(scene) = one else {
+            self.gap("select one orchestrator first, then draw its region");
+            return;
+        };
+        // Read the node out in one borrow and hand back owned values: everything below
+        // needs `&mut self` for a toast, and the projection borrow would still be live.
+        let node = self.editor.projection().get(scene).and_then(|projected| {
+            let ItemKind::Agent { model, label } = &projected.item.kind else { return None };
+            let config = crate::agent::decode(model);
+            Some((projected.doc_id, config.role_kind, node_name(label, config.role_kind)))
+        });
+        let Some((doc, role_kind, name)) = node else {
+            self.gap("only an orchestrator or a meta agent owns a region of the board");
+            return;
+        };
+        if !role_kind.may_spawn() {
+            self.gap(&format!(
+                "{name} is a worker, and a worker has nowhere to spawn into. Make it an \
+                 orchestrator first."
+            ));
+            return;
+        }
+
+        self.territory_arm = Some(doc);
+        self.input.set_tool(crate::input::Tool::Place);
+        self.shell.toast(Toast::info(format!(
+            "Drag a rectangle on the board to give {name} its region. Escape leaves the one \
+             it has."
+        )));
+    }
+
+    /// Forgets an armed territory sweep and puts the pointer back on the palette's tool.
+    ///
+    /// Answers whether there was one, so [`Self::cancel_drag`] can tell whether Escape has
+    /// been spent — the same contract `Input::cancel_gesture` has, for the same reason: the
+    /// Escape ladder must not consume two rungs at once.
+    ///
+    /// **The stored region is untouched.** Abandoning is what a user does when they realise
+    /// they aimed wrong, and the region they already had is the thing they would least like
+    /// to lose in that moment.
+    pub(crate) fn disarm_territory(&mut self) -> bool {
+        if self.territory_arm.take().is_none() {
+            return false;
+        }
+        // `choose_tool` rather than `input.set_tool`, so the input tool is derived from the
+        // palette by the one function that owns that mapping — a second copy here would be
+        // the drift `draw::kanban_runs` is `pub(crate)` to prevent.
+        let tool = self.shell.tool();
+        self.choose_tool(tool);
+        true
+    }
+
+    /// Writes the swept rectangle onto the armed orchestrator.
+    ///
+    /// Three decisions:
+    ///
+    /// - **A click abandons rather than clearing.** See [`Self::TERRITORY_MIN_SWEEP`].
+    /// - **The write goes to the id the arm remembered**, not to whatever is selected now.
+    ///   `apply_agent_edit` reads the selection, which is right for a panel control and
+    ///   wrong for a gesture that began several hundred milliseconds ago; storing the
+    ///   `ItemId` is also what makes the sweep survive a reprojection.
+    /// - **A region too small to hold one node is written and *reported*.** Refusing it
+    ///   would be Velm second-guessing an instruction, and `orchestrator::capacity` would
+    ///   then refuse every spawn with *"room for 0 agents"* — a refusal at the far end of a
+    ///   run rather than at the gesture that caused it.
+    fn commit_territory(&mut self, from: WorldPoint, to: WorldPoint) {
+        let Some(doc) = self.territory_arm.take() else { return };
+        let tool = self.shell.tool();
+        self.choose_tool(tool);
+
+        let (width, height) = ((to.x - from.x).abs(), (to.y - from.y).abs());
+        if width < Self::TERRITORY_MIN_SWEEP || height < Self::TERRITORY_MIN_SWEEP {
+            self.gap("that was a click, not a region — the orchestrator kept the one it had");
+            return;
+        }
+        let region = vellum_agent::Territory::new(
+            (from.x + to.x) / 2.0,
+            (from.y + to.y) / 2.0,
+            width,
+            height,
+        );
+        self.update_agent(doc, |config| config.territory = Some(region));
+
+        // What the region is actually worth, in the orchestrator's own terms: how many
+        // sub-agents of the default size fit in it. Asked of `vellum_agent` rather than
+        // re-derived, because that is the arithmetic the spawn will be judged by.
+        let (node_w, node_h) = crate::agent::DEFAULT_SIZE;
+        let room = vellum_agent::orchestrator::capacity(&region, node_w, node_h);
+        if room == 0 {
+            self.gap(&format!(
+                "that region is {width:.0} × {height:.0}, which is too small for a single \
+                 agent — every spawn into it will be refused until it is redrawn"
+            ));
+        } else {
+            self.ok(format!("Region set: {width:.0} × {height:.0}, room for {room} agents"));
+        }
+    }
+
+    /// The tint the painter draws for a selected orchestrator's region.
+    ///
+    /// Resolved here rather than in the painter, for `guides`' and `card_drop`'s reason: the
+    /// question *"which node's region, and is one being drawn right now"* is about the
+    /// selection and a gesture, and `draw.rs` is given the answer rather than the state it
+    /// would have to re-derive to reach one.
+    ///
+    /// The **live sweep wins over the stored region**, and only one is ever drawn. Showing
+    /// both would put two rectangles on the board during the one gesture where it matters
+    /// most which is which; the stored one comes straight back if Escape is pressed.
+    ///
+    /// # What this costs on a board with no agents on it
+    ///
+    /// One `selection().first()` and one `projection().get`. The `ItemKind::Agent` match is
+    /// **before** `crate::agent::decode`, deliberately: this runs once per frame, `decode`
+    /// parses JSON, and putting it above the match would put a parse behind every frame of
+    /// every board — which is exactly the idle cost `docs/07-agent-canvas.md` §0 forbids.
+    /// A token is only parsed while exactly one agent node is selected.
+    pub(crate) fn territory_preview(&self) -> Option<crate::draw::TerritoryTint> {
+        let scene = self.editor.selection().first().copied()?;
+        if self.editor.selection().len() != 1 {
+            return None;
+        }
+        let projected = self.editor.projection().get(scene)?;
+        let ItemKind::Agent { model, label } = &projected.item.kind else { return None };
+        let config = crate::agent::decode(model);
+        if !config.role_kind.may_spawn() {
+            return None;
+        }
+
+        // Mid-sweep, and it is *this* node being redrawn: the rectangle under the pointer.
+        // `Input::placement` is the same pair a frame's preview reads, so the tint and the
+        // committed region come from one source and cannot be a rectangle apart.
+        let sweeping = (self.territory_arm == Some(projected.doc_id))
+            .then(|| self.input.placement())
+            .flatten()
+            .map(|(press, now)| {
+                let (a, b) =
+                    (self.camera.screen_to_world(press), self.camera.screen_to_world(now));
+                vellum_agent::Territory::new(
+                    (a.x + b.x) / 2.0,
+                    (a.y + b.y) / 2.0,
+                    (b.x - a.x).abs(),
+                    (b.y - a.y).abs(),
+                )
+            });
+        let pending = sweeping.is_some();
+        let region = sweeping.or(config.territory)?;
+        if region.is_empty() {
+            return None;
+        }
+
+        Some(crate::draw::TerritoryTint {
+            region: [region.x, region.y, region.width, region.height],
+            label: node_name(label, config.role_kind),
+            scene,
+            generation: projected.generation,
+            pending,
+        })
+    }
+
     /// Writes a schedule onto one agent node, or clears it.
     fn set_agent_schedule(&mut self, doc: DocId, schedule: Option<vellum_agent::Schedule>) {
         self.update_agent(doc, |config| config.schedule = schedule);
@@ -7895,6 +8487,124 @@ impl ActiveState {
         probe.rules = rules.clone();
         rules.overrides = self.resolve_rules(&probe).override_names();
         self.update_agent(doc, |config| config.rules = rules);
+    }
+
+    /// Where one of the two **inherited** rule layers is written.
+    ///
+    /// [`vellum_agent::rules::project_rules_path`] answers *which file this project already
+    /// uses* and is the wrong question for a save: it is `None` until one exists, and three
+    /// of the four spellings it finds belong to other tools. `project_rules_target` names the
+    /// one Velm writes.
+    ///
+    /// The project root is the **selected agent's own working directory**, matching
+    /// [`Self::rule_files`] and `agent_launch_spec`. Reading it from the board's folder
+    /// instead is how the editor comes to write a layer the agent never loads.
+    ///
+    /// `None` for `Layer::Agent` and `Layer::Default`: neither is a file. The node's own
+    /// layer is in its token and goes through [`Self::set_agent_rules`].
+    pub(crate) fn rule_layer_path(
+        &self,
+        layer: vellum_agent::Layer,
+    ) -> Option<std::path::PathBuf> {
+        match layer {
+            vellum_agent::Layer::Global => {
+                Some(vellum_agent::rules::global_rules_path(self.agent_runtime.data_dir()))
+            }
+            vellum_agent::Layer::Project => {
+                let project = self
+                    .selected_agent()
+                    .and_then(|doc| self.agent_model(doc))
+                    .and_then(|(config, _)| config.working_dir.clone())
+                    .map(std::path::PathBuf::from)?;
+                Some(vellum_agent::rules::project_rules_target(&project))
+            }
+            vellum_agent::Layer::Agent | vellum_agent::Layer::Default => None,
+        }
+    }
+
+    /// Writes the global or the project rule layer to disk.
+    ///
+    /// # Why this is not `set_agent_rules` with a path
+    ///
+    /// The two inherited layers are **files**, not document tokens: they are shared with
+    /// every board and with whatever else the user edits them in, they are outside Loro
+    /// entirely, and they have no undo. So this takes the file path, the freshness check and
+    /// the toast, and touches no board — which is also what makes it safe under RULE ZERO:
+    /// nothing here can reach a `.vellum`.
+    ///
+    /// `AgentRules` is the shape the editor produces for all three layers, and only its
+    /// `text` means anything here. `ignore_inherited` is a property of *a node*, and
+    /// `overrides` is a cache of what resolution decided for one — a global file has no
+    /// layer above it to ignore and nothing to be a cache of.
+    ///
+    /// # The freshness check is against what the dialog was opened on
+    ///
+    /// Re-read from disk, so a file somebody edited by hand while the dialog was up is
+    /// reported rather than overwritten — [`vellum_agent::RuleFile::save`] carries the
+    /// reasoning. A conflict is a **toast and no write**: the user's text is still in the
+    /// editor, which is the difference between this and a note's conflict file.
+    pub(crate) fn save_rule_layer(
+        &mut self,
+        layer: vellum_agent::Layer,
+        rules: &vellum_agent::AgentRules,
+    ) {
+        let Some(path) = self.rule_layer_path(layer) else {
+            // Reachable only for a project layer with no working directory — an agent that
+            // has never been pointed at a folder. Named, because "Save did nothing" is the
+            // report this house does not ship.
+            self.gap(
+                "there is nowhere to put project rules until this agent has a working \
+                 directory — set one in the properties panel first",
+            );
+            return;
+        };
+        // What the editor was opened on — the snapshot `edit_agent_rules` took, *not* a
+        // fresh read. Reading the file again here would compare it against itself and the
+        // check could never fire, which is the mistake this comment exists to stop the next
+        // reader making. `None` only when nothing opened a dialog, in which case there is no
+        // "what I was shown" to defend and an empty layer is the honest baseline: it means a
+        // file that already exists is reported as a conflict rather than replaced.
+        let seen = self
+            .rules_opened_on
+            .as_ref()
+            .and_then(|snapshot| snapshot.layer(layer))
+            .cloned()
+            .unwrap_or_default();
+        let composed = vellum_agent::RuleFile::parse(&rules.text);
+
+        let outcome = composed.save(&path, &seen);
+        // The snapshot moves forward with the file, so a second Save in the same session
+        // measures itself against what this one wrote rather than against what was there
+        // before it. The dialog closes on Save today, which makes this defensive — and it
+        // is the line that would otherwise turn a re-opened editor into a false conflict.
+        if matches!(&outcome, Ok(saved) if saved.is_saved())
+            && let Some(snapshot) = self.rules_opened_on.as_mut()
+            && let Some(slot) = snapshot.layer_mut(layer)
+        {
+            *slot = composed;
+        }
+
+        match outcome {
+            Ok(vellum_agent::Saved::Created) => {
+                self.ok(format!("Created {}", path.display()));
+            }
+            Ok(vellum_agent::Saved::Written | vellum_agent::Saved::Unchanged) => {
+                self.ok(format!("Saved {}", path.display()));
+            }
+            // A refusal, not a failure: the file on disk is intact and the user's own text
+            // is still in the editor in front of them. That is why this does not take
+            // `notes.rs`' treatment and write a `.velm-conflict.md` beside it — there is
+            // nothing here that would be lost, and littering a project with conflict files
+            // for a settings save is the worse trade.
+            Ok(vellum_agent::Saved::Conflict { .. }) => self.gap(&format!(
+                "{} changed since this editor was opened, so nothing was written. Look at \
+                 the file, then open these rules again.",
+                path.display()
+            )),
+            Err(error) => {
+                self.failed("saving those rules", &anyhow::anyhow!("{error}"));
+            }
+        }
     }
 
     /// Reads one agent node's token, hands it to `change`, and writes it back as one undo
@@ -7946,6 +8656,19 @@ impl ActiveState {
         // nowhere has no project. A layer nobody can find is a layer nobody edits, which is
         // what made the top two of a three-layer cascade read-only.
         let files = self.rule_files();
+        // What the two files said at the moment the editor went up. Taken **here** and not
+        // at save time: a rules file is meant to be hand-edited, so comparing it against
+        // itself a millisecond before writing would make the freshness check unable to fire.
+        self.rules_opened_on = Some(RulesSnapshot {
+            global: self
+                .rule_layer_path(vellum_agent::Layer::Global)
+                .as_deref()
+                .map_or_else(vellum_agent::RuleFile::default, vellum_agent::RuleFile::read),
+            project: self
+                .rule_layer_path(vellum_agent::Layer::Project)
+                .as_deref()
+                .map_or_else(vellum_agent::RuleFile::default, vellum_agent::RuleFile::read),
+        });
         self.shell.ask(
             move |id| vellum_ui::Dialog::rules(id, title, &own, resolved, files),
             crate::shell::Ask::AgentRules(doc),
@@ -8509,11 +9232,17 @@ impl ActiveState {
         // otherwise, and it still reports what the sweep took.
         let erasing = self.erasing;
         self.finish_erase();
+        // An armed territory sweep is the same shape again, and this is the *only* thing
+        // that ends one without a release: Escape, a tab switch and quitting all arrive
+        // here. Left armed, the pointer would still be in `Tool::Place` and the next click
+        // anywhere on the board would try to redraw a region. Nothing is written, so the
+        // orchestrator keeps the territory it had — see `disarm_territory`.
+        let arming = self.disarm_territory();
         // A card drag writes nothing until the button comes up, so abandoning it is just
         // forgetting it — there is no preview placement to put back.
         let carrying = self.card_drag.take().is_some();
         let Some(drag) = self.drag.take() else {
-            return cancelled || drawing || carrying || erasing;
+            return cancelled || drawing || carrying || erasing || arming;
         };
         for (scene, _, original) in &drag.items {
             self.editor.preview_placement(*scene, *original);
@@ -11216,6 +11945,7 @@ impl ActiveState {
                 card_drop: None,
                 pattern,
                 grid_color,
+                territory: None,
                 minimap: None,
             };
             let (device, queue, renderer) = self.surface.parts();
@@ -11486,6 +12216,18 @@ fn shortcut_reference() -> Vec<ReferenceSection> {
                 ),
                 ("Fold or unfold a mind-map branch".to_owned(), "Alt + Return".to_owned()),
                 ("Move a kanban card".to_owned(), "Drag it to another column".to_owned()),
+                // The territory sweep. In the sheet because it is the *only* thing that
+                // announces it: the gesture is armed first and then drawn, and there is
+                // nothing on the canvas that says either half. It is deliberately not a
+                // bare drag — see `ActiveState::arm_territory` — so without this row a
+                // three-line panel readout would be the whole of its discoverability.
+                (
+                    "Draw an orchestrator's region".to_owned(),
+                    format!(
+                        "{} then drag; Escape keeps the old one",
+                        if is_mac { "Shift + Cmd + T" } else { "Shift + Ctrl + T" }
+                    ),
+                ),
             ],
         },
         ReferenceSection {

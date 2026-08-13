@@ -283,6 +283,89 @@ impl FrontMatter {
         }
         front
     }
+
+    /// The inside of the `---` block, as [`Self::parse`] would read it back.
+    ///
+    /// # The round trip is the contract, not a nicety
+    ///
+    /// `parse(write(x)) == x` for every value `parse` can produce, and
+    /// `writing_a_layer_and_reading_it_back_is_the_same_layer` pins it. A rules file is
+    /// hand-written and may also be read by another tool, so a save that reformatted what
+    /// somebody typed into a shape their next `git diff` does not recognise would be a
+    /// worse outcome than not offering to save at all.
+    ///
+    /// Two ordering rules make a file this has touched read the same way twice: the four
+    /// named settings in [`Field::ALL`]'s order, then the unknown keys in the `BTreeMap`'s.
+    ///
+    /// **The unknown keys are written, not dropped.** They are the whole reason a file
+    /// written for a later build survives this one, and dropping them here would make the
+    /// editor a downgrade — the parser keeps them precisely so that a save does not.
+    ///
+    /// **An empty value is skipped**, because [`Self::parse`] skips one: `tone: ""` reads
+    /// back as *not set*, so writing it would make the round trip fail on a value nobody
+    /// can produce by hand anyway.
+    ///
+    /// **Empty, not blank.** `parse` tests `value.is_empty()` *after* unquoting, so
+    /// `tone: "  "` is a setting whose value is two spaces — absurd, and a value the round
+    /// trip has to carry all the same. Skipping on `trim().is_empty()` here would be the
+    /// writer disagreeing with the parser about what a setting is, which is the one thing
+    /// this pair may not do.
+    pub fn to_block(&self) -> String {
+        let mut out = String::new();
+        let mut line = |key: &str, value: &str| {
+            if value.is_empty() {
+                return;
+            }
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(&write_value(value));
+            out.push('\n');
+        };
+        if let Some(tone) = &self.tone {
+            line(Field::Tone.key(), tone);
+        }
+        if let Some(output) = &self.output {
+            line(Field::Output.key(), output);
+        }
+        if let Some(language) = &self.language {
+            line(Field::Language.key(), language);
+        }
+        if let Some(permissions) = self.permissions {
+            line(Field::Permissions.key(), permissions.tag());
+        }
+        // After the named four, so a `permissions:` this build could not read — which
+        // `parse` files under `extra` beside a posture it *could* — lands on the later line
+        // and is refused again on the way back in, leaving both halves exactly where they
+        // were. `an_unreadable_permission_survives_a_round_trip` measures that.
+        for (key, value) in &self.extra {
+            line(key, value);
+        }
+        out
+    }
+}
+
+/// A front-matter value, quoted only when a bare one would not read back the same.
+///
+/// [`FrontMatter::parse`] trims the value and then strips **one** matching pair of quotes,
+/// so three shapes need protecting and nothing else does: a value with leading or trailing
+/// space, a value that is itself quoted (`"formal"` written bare comes back as `formal`),
+/// and a value carrying a newline, which would close the block early and turn the rest of
+/// the file into body.
+///
+/// Wrapping in `"` is always safe, including for a value that already begins and ends with
+/// one: `unquote` strips a single pair, so `""x""` comes back as `"x"`. Quoting
+/// unconditionally was the alternative and is worse — it would put quotation marks around
+/// every setting in a file a person reads and edits, to defend against a case that occurs
+/// approximately never.
+fn write_value(value: &str) -> String {
+    // A newline cannot survive as itself; the block is line-based. Flattened rather than
+    // refused, because the caller is a text field and a refusal here would lose the edit.
+    let flat: String = value
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let quoted = flat != flat.trim() || unquote(&flat) != flat;
+    if quoted { format!("\"{flat}\"") } else { flat }
 }
 
 /// One layer's file: what it set, what it said, and whether it could be read at all.
@@ -333,6 +416,142 @@ impl RuleFile {
     pub fn is_empty(&self) -> bool {
         self.body.is_empty() && self.front.is_empty()
     }
+
+    /// The whole document, front matter and body, exactly as [`Self::parse`] would read it
+    /// back. The inverse of `parse`, and it has to be precisely that — see
+    /// [`FrontMatter::to_block`].
+    ///
+    /// Three things are load-bearing:
+    ///
+    /// - **The `---` is the very first line.** [`split_front_matter`] answers *no front
+    ///   matter* the moment the first non-empty line is anything else, so a leading blank
+    ///   line would silently turn every setting into prose.
+    /// - **An empty front matter is omitted** — a layer that sets nothing is a plain
+    ///   markdown file, which is what somebody who opened it in an editor would write.
+    /// - **Except when the body itself opens with `---`.** That is the one case where
+    ///   omitting the block would corrupt rather than merely reformat: the body's own
+    ///   horizontal rule would be re-read as an opening fence and everything down to the
+    ///   next rule would be swallowed as settings. An empty block in front of it costs two
+    ///   lines and makes the shape unambiguous.
+    ///
+    /// `path` and `error` are **not** written. They describe this process's relationship
+    /// with a file, not the layer's content, which is why the round-trip test compares
+    /// content rather than the whole value.
+    pub fn to_markdown(&self) -> String {
+        let body = self.body.trim();
+        let block = self.front.to_block();
+
+        if block.is_empty() {
+            return if body.starts_with("---") {
+                format!("---\n---\n\n{body}\n")
+            } else if body.is_empty() {
+                String::new()
+            } else {
+                format!("{body}\n")
+            };
+        }
+
+        let mut out = String::from("---\n");
+        out.push_str(&block);
+        out.push_str("---\n");
+        if !body.is_empty() {
+            out.push('\n');
+            out.push_str(body);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Whether two layers say the same thing, ignoring where they were read from.
+    ///
+    /// Content, not bytes. Two files that differ only in the order of their front matter or
+    /// in a trailing newline *are* the same layer, and calling that a conflict would refuse
+    /// a save because somebody's editor added a final newline.
+    pub fn says_the_same_as(&self, other: &Self) -> bool {
+        self.front == other.front && self.body == other.body
+    }
+
+    /// Write this layer to disk, refusing to overwrite an edit made underneath it.
+    ///
+    /// # Creating the file is the ordinary case
+    ///
+    /// `<data-dir>/rules/global.md` does not exist until somebody writes a global rule set,
+    /// and the row that offers to is exactly the row a user reaches for to *start* one. So
+    /// an absent file is [`Saved::Created`] and not an error, the parent directories are
+    /// made, and `seen` is [`RuleFile::default`] for that case — an absent layer and an
+    /// empty one are the same layer, which is the rule [`Self::read`] already follows.
+    ///
+    /// # `seen` is what the editor was opened on
+    ///
+    /// A rules file is *meant* to be edited by hand and by other tools, so between opening
+    /// the editor and pressing Save the file may have moved. This re-reads it and compares
+    /// against the layer the caller started from; a difference answers [`Saved::Conflict`]
+    /// and **writes nothing**. Blind overwriting is what a modal editor over a shared file
+    /// does wrong, and the user still has their text — it is in the editor in front of them.
+    ///
+    /// That is deliberately *not* [`crate::notes`]'s treatment, which keeps both sides in a
+    /// `.velm-conflict.md` beside the file. A note's canvas node has already been replaced
+    /// by the time the conflict is discovered, so the buffer would be lost if it were not
+    /// written somewhere; a rules dialog can simply stay open. Littering a project with
+    /// conflict files for a settings save would be a worse trade.
+    ///
+    /// The write itself is [`crate::notes::write_atomically`] — a temp file in the same
+    /// directory, `sync_all`, then a rename — so a reader sees the old text or the new one
+    /// and never a prefix of either.
+    pub fn save(&self, path: &Path, seen: &Self) -> crate::Result<Saved> {
+        let on_disk = match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            // Not a conflict and not a create: a file that exists and cannot be read is a
+            // file whose content is unknown, and writing over it would be exactly the
+            // clobber this function exists to refuse.
+            Err(error) => return Err(crate::AgentError::file(path.display().to_string(), &error)),
+        };
+
+        let current = on_disk.as_deref().map_or_else(Self::default, Self::parse);
+        if !current.says_the_same_as(seen) {
+            return Ok(Saved::Conflict { on_disk: Box::new(current) });
+        }
+        if on_disk.is_some() && current.says_the_same_as(self) {
+            return Ok(Saved::Unchanged);
+        }
+
+        crate::notes::write_atomically(path, &self.to_markdown())?;
+        Ok(if on_disk.is_some() { Saved::Written } else { Saved::Created })
+    }
+}
+
+/// What [`RuleFile::save`] did.
+///
+/// Four answers rather than a `bool`, because the caller says something different about
+/// each: *created* names a file that did not exist a moment ago and is worth showing,
+/// *written* is the quiet case, *unchanged* must not claim a save that did not happen, and
+/// *conflict* is the one where nothing was written and the user has to decide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Saved {
+    /// The file did not exist and now does, parent directories and all.
+    Created,
+    /// An existing file was replaced.
+    Written,
+    /// The file already said exactly this. Nothing was written.
+    Unchanged,
+    /// Somebody else changed the file since it was read. **Nothing was written**, and the
+    /// layer that is actually on disk comes back so the caller can offer it.
+    ///
+    /// Boxed because it is much the largest variant and the common answers are unit-sized;
+    /// a `Result<Saved>` returned per keystroke-free save should not be a `String`-sized
+    /// value in every arm.
+    Conflict { on_disk: Box<RuleFile> },
+}
+
+impl Saved {
+    /// Whether the file on disk now holds what was asked for.
+    ///
+    /// [`Self::Unchanged`] counts: nothing was written because nothing needed to be. Only a
+    /// conflict leaves the user's text unsaved.
+    pub const fn is_saved(&self) -> bool {
+        matches!(self, Self::Created | Self::Written | Self::Unchanged)
+    }
 }
 
 /// Where the global layer lives under the app's data directory.
@@ -375,6 +594,26 @@ pub fn project_rules_path(project: &Path) -> Option<PathBuf> {
         .iter()
         .map(|name| project.join(name))
         .find(|candidate| candidate.is_file())
+}
+
+/// Where a project layer is **written**, which is not always where one is read from.
+///
+/// [`project_rules_path`] answers *which of four files this project actually uses*, and
+/// three of the four belong to other tools. Velm writes exactly one of them —
+/// `.velm/rules.md`, the first entry in [`PROJECT_RULE_FILES`] — so a project that has an
+/// `AGENTS.md` gets a `.velm/rules.md` that then **shadows** it, which is the documented
+/// precedence and the only outcome a user could predict.
+///
+/// Writing back into a `CLAUDE.md` was the alternative and is the wrong one twice over: that
+/// file is usually somebody else's, under version control, and much larger than the four
+/// settings this editor knows about — a save composed from a parsed front matter and body
+/// would rewrite a document the editor only partly understands.
+pub fn project_rules_target(project: &Path) -> PathBuf {
+    let mut path = project.to_path_buf();
+    for part in PROJECT_RULE_FILES[0].split('/') {
+        path.push(part);
+    }
+    path
 }
 
 /// The project layer, or an empty one when the project has no rules file at all.
@@ -1223,5 +1462,160 @@ mod tests {
         assert_eq!(parsed.front.tone.as_deref(), Some("formal"));
         assert_eq!(parsed.front.output.as_deref(), Some("concise"));
         assert_eq!(parsed.front.language.as_deref(), Some("don't fuss"));
+    }
+
+    // ----- writing a layer back ------------------------------------------------------
+
+    /// The writer's whole contract: `parse(write(x)) == x`.
+    ///
+    /// Seven shapes in one table, each of which broke a draft of [`FrontMatter::to_block`]:
+    /// the four named settings, an **unknown key** (kept by the parser, so a writer that
+    /// dropped it would silently downgrade a file written for a later build), a body with no
+    /// front matter at all, a body that opens with `---`, and a value that is itself quoted.
+    ///
+    /// The comparison is content — front matter and body — not the whole [`RuleFile`]:
+    /// `path` and `error` describe this process's relationship with a file rather than the
+    /// layer, and neither is written.
+    ///
+    /// **A/B**: dropping `front.extra` from the writer fails the fourth case with
+    /// `left: {}` against `right: {"reviewers": "two"}`.
+    #[test]
+    fn writing_a_layer_and_reading_it_back_is_the_same_layer() {
+        for text in [
+            "",
+            "Just prose, no settings at all.",
+            "---\ntone: formal\noutput: concise\nlanguage: English\npermissions: reads\n---\n",
+            "---\ntone: blunt\nreviewers: two\n---\n\nHouse style.\n",
+            "---\nlanguage: Türkçe\n---\n\n# Heading\n\nWith a body.\n",
+            // A body whose first line is a horizontal rule. Written with no front matter it
+            // would be re-read as an opening fence, and everything to the next rule would
+            // become settings — the one way this function can corrupt rather than reformat.
+            "---\n---\n\n---\n\nA document that opens with a rule.\n",
+            // The value is `"formal"`, quotation marks and all: `unquote` strips one pair,
+            // so writing it bare would lose them.
+            "---\ntone: \"\"formal\"\"\n---\n",
+            // Two spaces. `parse` tests emptiness *after* unquoting, so this is a setting;
+            // a writer that trimmed, or that skipped on `trim().is_empty()`, loses it.
+            "---\ntone: \"  \"\n---\n",
+        ] {
+            let parsed = RuleFile::parse(text);
+            let written = parsed.to_markdown();
+            let back = RuleFile::parse(&written);
+            assert_eq!(back.front, parsed.front, "front matter changed by\n{written}");
+            assert_eq!(back.body, parsed.body, "body changed by\n{written}");
+        }
+    }
+
+    /// A `permissions:` value this build cannot read is filed under `extra` beside a posture
+    /// it *can*, and the writer has to put them back in an order that reproduces both.
+    ///
+    /// The named four are written first and the unknown keys after, so the unreadable value
+    /// lands on the later line and is refused again on the way in — leaving the posture from
+    /// the earlier line standing. Reversing the two blocks loses the posture.
+    #[test]
+    fn an_unreadable_permission_survives_a_round_trip() {
+        let parsed = file("---\npermissions: sometimes\npermissions: ask\n---\n");
+        assert_eq!(parsed.front.permissions, Some(Permissions::Ask));
+        assert_eq!(parsed.front.extra.get("permissions").map(String::as_str), Some("sometimes"));
+
+        let back = RuleFile::parse(&parsed.to_markdown());
+        assert_eq!(back.front, parsed.front, "{}", parsed.to_markdown());
+    }
+
+    /// The common case is creating a file that was never there — that is the whole point of
+    /// the row that offers to write a global rule set.
+    #[test]
+    fn saving_a_layer_that_has_no_file_yet_creates_it_directories_and_all() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two levels that do not exist, which is exactly `<data-dir>/rules/global.md` on a
+        // machine that has never had one.
+        let path = global_rules_path(dir.path());
+        assert!(!path.exists());
+
+        let layer = file("---\ntone: warm\n---\n\nBe brief.\n");
+        assert_eq!(layer.save(&path, &RuleFile::default()).unwrap(), Saved::Created);
+
+        assert!(path.is_file(), "the file was not created");
+        let read_back = RuleFile::read(&path);
+        assert!(read_back.says_the_same_as(&layer), "{:?}", read_back);
+        assert_eq!(read_back.path.as_deref(), Some(path.as_path()));
+    }
+
+    /// Saving the same text twice must not claim a second write, and must not report a
+    /// conflict against itself.
+    #[test]
+    fn saving_what_the_file_already_says_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("global.md");
+        let layer = file("---\ntone: warm\n---\n");
+        assert_eq!(layer.save(&path, &RuleFile::default()).unwrap(), Saved::Created);
+        assert_eq!(layer.save(&path, &layer).unwrap(), Saved::Unchanged);
+    }
+
+    /// Somebody edited the file in their own editor while the dialog was open. Nothing may
+    /// be written, and the caller has to be handed what is actually there.
+    ///
+    /// **A/B**: with the freshness check removed this reports `Written` and the hand-edited
+    /// `tone: blunt` is gone.
+    #[test]
+    fn a_file_that_changed_underneath_the_editor_is_not_clobbered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rules.md");
+        let opened_on = file("---\ntone: warm\n---\n");
+        opened_on.save(&path, &RuleFile::default()).unwrap();
+
+        // The user's other editor, mid-dialog.
+        std::fs::write(&path, "---\ntone: blunt\n---\n\nHand written.\n").unwrap();
+
+        let edited = file("---\ntone: formal\n---\n");
+        match edited.save(&path, &opened_on).unwrap() {
+            Saved::Conflict { on_disk } => {
+                assert_eq!(on_disk.front.tone.as_deref(), Some("blunt"));
+                assert_eq!(on_disk.body, "Hand written.");
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "---\ntone: blunt\n---\n\nHand written.\n",
+            "the hand-written file was overwritten"
+        );
+    }
+
+    /// A reformat is not a conflict. The same four settings in a different order, or with a
+    /// trailing newline somebody's editor added, *is* the layer the dialog was opened on —
+    /// refusing there would make Save fail for no reason a user could see.
+    #[test]
+    fn a_reformat_underneath_the_editor_is_not_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rules.md");
+        let opened_on = file("---\ntone: warm\noutput: concise\n---\n\nBody.\n");
+        opened_on.save(&path, &RuleFile::default()).unwrap();
+        std::fs::write(&path, "---\noutput:   concise\ntone: warm\n---\n\nBody.\n\n\n").unwrap();
+
+        let edited = file("---\ntone: blunt\n---\n");
+        assert_eq!(edited.save(&path, &opened_on).unwrap(), Saved::Written);
+        assert_eq!(RuleFile::read(&path).front.tone.as_deref(), Some("blunt"));
+    }
+
+    /// Velm writes one of the four project spellings and reads any of them. A project with
+    /// somebody else's `CLAUDE.md` must not have that file rewritten by this editor.
+    #[test]
+    fn a_project_layer_is_written_to_velm_s_own_file_and_never_to_someone_else_s() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "Somebody else's instructions.\n").unwrap();
+        assert_eq!(project_rules_path(dir.path()), Some(dir.path().join("CLAUDE.md")));
+
+        let target = project_rules_target(dir.path());
+        assert_eq!(target, dir.path().join(".velm").join("rules.md"));
+        file("---\ntone: blunt\n---\n").save(&target, &RuleFile::default()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(),
+            "Somebody else's instructions.\n",
+            "the project's own file was rewritten"
+        );
+        // And it now shadows it, which is `PROJECT_RULE_FILES`' documented precedence.
+        assert_eq!(project_rules_path(dir.path()), Some(target));
     }
 }

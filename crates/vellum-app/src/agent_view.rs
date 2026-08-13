@@ -133,7 +133,14 @@ pub struct AgentViews {
     notes: HashMap<SceneId, String>,
     /// Each visible file-tree node's rows, likewise. Reading a directory is not something a
     /// frame may do either.
-    trees: HashMap<SceneId, vellum_agent::filetree::View>,
+    ///
+    /// **Shared, not copied**, for the reason [`AgentView::events`] is: this set is cleared and
+    /// refilled every frame, and a `View` is up to `filetree::MAX_ROWS` — 4,000 — rows of owned
+    /// strings. Handing the painter its own copy of one would be a deep clone of a whole
+    /// directory listing per tree per frame on a board that is not doing anything, which is
+    /// exactly the idle cost the rest of this layer is built to avoid. The runtime holds the
+    /// same `Arc` in its own cache, so a frame that changes nothing bumps a refcount.
+    trees: HashMap<SceneId, Arc<vellum_agent::filetree::View>>,
     /// Whether browser nodes are permitted at all, from Preferences.
     ///
     /// Carried here rather than read from the library by the painter because the painter has
@@ -255,11 +262,18 @@ impl AgentViews {
     }
 
     /// One visible file tree's rows.
+    ///
+    /// The `Arc` is deliberately not in this signature: the painter borrows the rows for the
+    /// frame and has no reason to keep them, so every reader stays exactly as it was when the
+    /// sharing was introduced.
     pub fn tree(&self, id: SceneId) -> Option<&vellum_agent::filetree::View> {
-        self.trees.get(&id)
+        self.trees.get(&id).map(|view| &**view)
     }
 
-    pub fn set_tree(&mut self, id: SceneId, view: vellum_agent::filetree::View) {
+    /// Hand over one tree's rows. Takes the `Arc` the runtime's cache holds — see
+    /// [`AgentViews::trees`] — so this costs a refcount rather than a directory's worth of
+    /// strings.
+    pub fn set_tree(&mut self, id: SceneId, view: Arc<vellum_agent::filetree::View>) {
         self.trees.insert(id, view);
     }
 

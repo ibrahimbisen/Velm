@@ -92,11 +92,25 @@
 //!
 //! What a parked board's agents can and cannot do, stated exactly because "keep running" is
 //! easy to over-read: their **processes** run, their transcripts append, their schedules stay
-//! armed and fire. What waits is anything that needs the *document* — a schedule that fires
-//! on a parked board is held by [`AgentRuntime::defer_due`] and runs when that board is next
-//! in front, because `crate::actions` only ever holds one board. Closing the tab rather than
-//! parking it is different again: [`AgentRuntime::forget_board`] stops that board's agents,
-//! since nothing is left that could stop them by hand.
+//! armed and fire. What waits is anything that needs the *document*, and there are two
+//! different answers to that, deliberately:
+//!
+//! - **A schedule that fires waits.** [`AgentRuntime::defer_due`] holds it and it runs when
+//!   that board is next in front. Nobody is blocked on it — a fire has no caller — so waiting
+//!   costs nothing but time.
+//! - **`read_config`, `write_config` and `spawn` are refused rather than deferred**, and the
+//!   refusal has to distinguish *parked* from *gone* — `crate::actions::serve_agent_jobs`
+//!   carries the wording, and this paragraph is the reason it must, not a claim about what it
+//!   says today. They arrive as [`DocumentWork`] carrying a **reply channel**
+//!   an agent process is blocked on, bounded by [`REPLY_TIMEOUT`] inside
+//!   `ipc::CLIENT_READ_TIMEOUT`. Deferring one until the user happens to switch tabs — which
+//!   may be hours, or never — does not serve it: it converts a refusal the agent can act on
+//!   into a timeout with a worse message. **A refusal is the honest answer here and the
+//!   deferral is the honest answer there, and the difference is whether anybody is waiting.**
+//!   `crate::actions::serve_agent_jobs` is where the three are worded.
+//!
+//! Closing the tab rather than parking it is different again: [`AgentRuntime::forget_board`]
+//! stops that board's agents, since nothing is left that could stop them by hand.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -150,6 +164,20 @@ const MAX_DEFERRED: usize = 64;
 /// per-frame `stat` for every note on screen is a syscall storm for an answer that changes
 /// when somebody saves in another editor.
 pub const NOTE_POLL_SECONDS: u64 = 2;
+
+/// How often a *visible* file-tree node's directory is walked again.
+///
+/// [`NOTE_POLL_SECONDS`]' argument, applied to the other filesystem-backed node, and it is a
+/// far larger saving: a note is one `stat`, while a tree is a recursive `read_dir` plus an
+/// `Ignore::load` plus a `metadata()` per entry, bounded only by `filetree::MAX_ROWS` — four
+/// thousand rows. That ran **every frame** for every tree on screen.
+///
+/// The same two seconds as a note, and for the same reason: it is far below the rate at which
+/// a person notices a directory has changed and far above the frame rate. What it must *not*
+/// delay is the user's own act — see [`AgentRuntime::tree_view`], where a changed model or a
+/// changed root re-reads immediately, so opening a folder is instant and only somebody else's
+/// change waits.
+pub const TREE_POLL_SECONDS: u64 = 2;
 
 /// How long the window must have been unfocused before coming back raises a digest.
 ///
@@ -455,6 +483,25 @@ struct BoardWiring {
     links: Vec<(String, String, LinkDirection)>,
 }
 
+/// One file tree's rows, and the question they are the answer to.
+///
+/// The root and the model are kept beside the rows rather than being assumed unchanged,
+/// because they are exactly what an *expand* moves — see [`AgentRuntime::tree_view`], where
+/// a difference in either re-reads at once instead of waiting for the poll.
+struct TreeRead {
+    /// The directory that was walked, already resolved against the board's project.
+    root: PathBuf,
+    /// The model it was walked for: which directories were open, and whether ignored files
+    /// were shown.
+    model: vellum_agent::FileTreeModel,
+    /// When the walk happened, for the poll gate. Stamped on a failed read too, so a tree
+    /// pointed at a directory that is gone retries at the poll rate rather than every frame.
+    read_at: Timestamp,
+    /// `None` when the walk failed. Kept as a *cached failure* rather than as an absent
+    /// entry for exactly that reason.
+    view: Option<Arc<vellum_agent::filetree::View>>,
+}
+
 // ---------------------------------------------------------------------------------------
 // The runtime
 // ---------------------------------------------------------------------------------------
@@ -520,6 +567,16 @@ pub struct AgentRuntime {
     /// falls back to "anything newer than the epoch", which is the direction
     /// `agent_trigger_holds` already chooses deliberately: a wasted turn beats a schedule
     /// that silently never fires.
+    ///
+    /// The same cost applies to the **second** half, and it is worth stating separately
+    /// because a reader looking for `Trigger::LastRunFailed` will land here: a failure is
+    /// remembered for the session and not across a restart, so a retry trigger armed
+    /// yesterday sees `false` until something fails again today. That is the same safe
+    /// direction — the trigger declines rather than firing on a failure nobody can still see
+    /// the transcript of — and it is what closing it would cost: a write to the board file on
+    /// a timer, which is the undo-stack defect this field exists to have fixed.
+    ///
+    /// Who writes the flag: [`AgentRuntime::complete`] names all three exits.
     schedule_runs: HashMap<NodeKey, (Option<Timestamp>, bool)>,
     /// What to do when the turn a schedule started ends. See [`AgentRuntime::complete`].
     completions: HashMap<NodeKey, vellum_agent::Completion>,
@@ -564,6 +621,18 @@ pub struct AgentRuntime {
     /// than a syscall per note per frame.
     note_checked: HashMap<NodeKey, Timestamp>,
 
+    /// Each visible file-tree node's rows, as last read from disk.
+    ///
+    /// ⚠ **This cache is a fix, not a convenience.** The rows used to be walked from the
+    /// filesystem *every frame* — a recursive `read_dir`, an `Ignore::load` per directory and
+    /// a `metadata()` per entry, bounded only by `filetree::MAX_ROWS` — for every tree on
+    /// screen. It is `poll_agent_notes`' problem twenty lines away, solved there and not here,
+    /// and the reason it was not is worth stating because it is what makes the fix belong in
+    /// this file: `crate::agent_view::AgentViews` is **cleared every frame**, so gating the
+    /// *walk* alone would have blanked the tree on every frame that did not re-read it. The
+    /// answer has to be cached where it survives the clear, which is here.
+    trees: HashMap<NodeKey, TreeRead>,
+
     /// When the window last lost focus, for the away-mode digest.
     away_since: Option<Timestamp>,
 }
@@ -602,6 +671,7 @@ impl AgentRuntime {
             note_text: HashMap::new(),
             note_models: HashMap::new(),
             note_checked: HashMap::new(),
+            trees: HashMap::new(),
             away_since: None,
         }
     }
@@ -758,6 +828,26 @@ impl AgentRuntime {
         key: &NodeKey,
         spec: vellum_agent::LaunchSpec,
     ) -> vellum_agent::Result<()> {
+        // ⚠ **The third exit of a scheduled run, wrapped rather than repeated.** `launch` has
+        // four failure points and every one of them is a run that was expected and will never
+        // produce a `TurnEnded` — a missing binary, a provider with no command, a probe that
+        // refused, a transport that would not start. Answering them at the one place they all
+        // pass through is what stops this becoming feedback 35's *fix applied at N−1 of N
+        // sites*: adding a fifth `return Err` above cannot escape it.
+        let launched = self.launch(key, spec);
+        if launched.is_err() {
+            self.fail_expected_run(key);
+        }
+        launched
+    }
+
+    /// The body of [`AgentRuntime::start`]. Split out so the failure bookkeeping cannot be
+    /// bypassed by a new early return.
+    fn launch(
+        &mut self,
+        key: &NodeKey,
+        spec: vellum_agent::LaunchSpec,
+    ) -> vellum_agent::Result<()> {
         if self.sessions.contains_key(key) {
             return Ok(());
         }
@@ -785,11 +875,29 @@ impl AgentRuntime {
     }
 
     /// Ask a running agent something. Queues behind the turn in flight; see `session.rs`.
+    ///
+    /// A refused prompt is the third exit again, from the other side: `run_due_agents` starts
+    /// the agent and *then* asks it the schedule's question, so a start that succeeded and a
+    /// prompt that was refused is a scheduled run that will never produce a turn. See
+    /// [`AgentRuntime::complete`] for the three.
+    ///
+    /// ⚠ **One edge, named rather than closed.** A node can be asked something by the user
+    /// while a scheduled turn is still in flight, and `Session::prompt` refuses on a full
+    /// queue — so a *user's* prompt being refused would mark the scheduled run failed and drop
+    /// its completion, though that run may yet succeed. Which prompt was refused is not
+    /// visible from here, and threading the answer through would mean a second `prompt` on
+    /// every caller for a case that needs a full queue and two overlapping turns to reach. The
+    /// consequence is one wasted retry, not a lost run, and the adjacent quirk it rides on —
+    /// a completion being consumed by whichever turn ends first — is older than this function.
     pub fn prompt(&mut self, key: &NodeKey, text: &str) -> vellum_agent::Result<()> {
-        match self.sessions.get_mut(key) {
+        let asked = match self.sessions.get_mut(key) {
             Some(live) => live.session.prompt(text),
             None => Err(AgentError::Refused("that agent is not running".into())),
+        };
+        if asked.is_err() {
+            self.fail_expected_run(key);
         }
+        asked
     }
 
     /// Stop the turn in flight. Harmless when there is none.
@@ -924,7 +1032,9 @@ impl AgentRuntime {
     fn drain_sessions(&mut self, now: Timestamp, now_ms: u64) {
         let mut arrivals: Vec<(NodeKey, TranscriptEvent)> = Vec::new();
         let mut finished: Vec<NodeKey> = Vec::new();
-        let mut turns_ended: Vec<NodeKey> = Vec::new();
+        // The **outcome** travels with the key, because a scheduled run's success or failure
+        // is only stated here — see [`AgentRuntime::complete`].
+        let mut turns_ended: Vec<(NodeKey, vellum_agent::TurnOutcome)> = Vec::new();
 
         {
             let Self { sessions, blobs, blob_names, failed_blobs, .. } = self;
@@ -948,9 +1058,9 @@ impl AgentRuntime {
                     // A turn ending is where a borrowed hop count stops applying: anything
                     // this agent sends after it is something it decided to do, which is hop
                     // zero by `bus.rs`'s definition.
-                    if matches!(event, TranscriptEvent::TurnEnded { .. }) {
+                    if let TranscriptEvent::TurnEnded { outcome, .. } = &event {
                         live.hops = 0;
-                        turns_ended.push(key.clone());
+                        turns_ended.push((key.clone(), outcome.clone()));
                     }
                     arrivals.push((key.clone(), event));
                 }
@@ -965,12 +1075,23 @@ impl AgentRuntime {
         }
         // **After** the events are recorded, because a completion reads the turn's own last
         // words out of the ring — applying it first would report the turn before it.
-        for key in turns_ended {
-            self.complete(&key, now, now_ms);
+        for (key, outcome) in turns_ended {
+            self.complete(&key, now, now_ms, &outcome);
         }
         // A child that exited is released, so its process is reaped and the server can come
         // down with the last one. The transcript stays: it is the record of what it did.
         for key in finished {
+            // ⚠ **The second of a scheduled run's three exits.** A transport that dies without
+            // emitting `TurnEnded` — the child was killed, the process crashed, the stream
+            // dropped mid-answer — never reaches `complete`, so the run's outcome would go
+            // unrecorded and `Trigger::LastRunFailed` would never see the worst failure there
+            // is. It runs *after* the loop above, so a one-shot agent that ends its turn and
+            // exits in the same drain is already accounted for and this finds nothing.
+            //
+            // Deliberately **not** in `release`: that is also the path for the user pressing
+            // stop and for closing a board, and marking those failed would make a retry
+            // trigger re-run exactly what somebody asked to stop.
+            self.fail_expected_run(&key);
             self.release(&key);
         }
     }
@@ -1170,9 +1291,90 @@ impl AgentRuntime {
         std::mem::take(&mut self.reports)
     }
 
+    /// Whether a turn that ended this way counts as a run that **failed**, for
+    /// [`vellum_agent::Trigger::LastRunFailed`].
+    ///
+    /// `Cancelled` deliberately does not. The user pressing stop is the one outcome a *retry*
+    /// must never fire on: an agent that is re-run every evening because somebody stopped it
+    /// once is the opposite of what "only if the last run failed" offers.
+    ///
+    /// `Exhausted` does. It is a run that did not finish its work, which is what the trigger
+    /// is about — and the alternative reading, *"it will only exhaust itself again"*, is a
+    /// guess about the next run rather than a fact about this one.
+    const fn counts_as_failure(outcome: &vellum_agent::TurnOutcome) -> bool {
+        matches!(
+            outcome,
+            vellum_agent::TurnOutcome::Failed { .. } | vellum_agent::TurnOutcome::Exhausted { .. }
+        )
+    }
+
+    /// Record how the run a schedule started came out, for the trigger that asks about it.
+    ///
+    /// ⚠ **Gated on a completion being expected, and that gate is the whole of the
+    /// correctness.** `expect_completion` is inserted by `run_due_agents` and by nothing else,
+    /// so its presence *is* the statement "this turn was started by the scheduler". Without
+    /// the gate, a turn the user typed by hand would decide whether the next scheduled run
+    /// happens, which is a retry firing on something that was never a scheduled run.
+    ///
+    /// Only the flag moves; `last_run` is the fire time and was recorded when the schedule
+    /// fired. And only an *existing* entry is touched: a node with no recorded fire never had
+    /// a scheduled run to have failed.
+    fn note_run_outcome(&mut self, key: &NodeKey, failed: bool) {
+        if let Some((_, last_failed)) = self.schedule_runs.get_mut(key) {
+            *last_failed = failed;
+        }
+    }
+
+    /// A scheduled run that will never reach [`AgentRuntime::complete`]: mark it failed and
+    /// stop expecting its completion.
+    ///
+    /// **Clearing the expectation matters as much as the flag.** A `Completion` left behind by
+    /// a run that never happened would be applied to whatever turn the node ran *next* — so a
+    /// prompt the user typed by hand would be reported, or handed off to another agent, as
+    /// though it were the six-o'clock job.
+    ///
+    /// Idempotent, and reached from two places for that reason: a spawn that failed and a
+    /// transport that died. Doing nothing when no run was expected is the common case.
+    fn fail_expected_run(&mut self, key: &NodeKey) {
+        if self.completions.remove(key).is_some() {
+            self.note_run_outcome(key, true);
+        }
+    }
+
     /// Apply the completion action for a turn that has just ended.
-    fn complete(&mut self, key: &NodeKey, now: Timestamp, now_ms: u64) {
+    ///
+    /// # The three ways a scheduled run ends, and where each is answered
+    ///
+    /// `Schedule::last_failed` was **never set to `true` anywhere in the workspace** until
+    /// this function was given the outcome, so `Trigger::LastRunFailed` was a condition that
+    /// could not hold: a user who chose *"only if the last run failed"* got an agent that
+    /// never ran again. Setting it in one place would have been the same defect one exit
+    /// later, so all three are named here and each is fixed at its own site:
+    ///
+    /// 1. **The turn ended** — here, from `TurnEnded`'s own [`vellum_agent::TurnOutcome`].
+    /// 2. **The transport died without ending the turn** — `drain_sessions`' `finished` loop,
+    ///    through [`AgentRuntime::fail_expected_run`].
+    /// 3. **The agent never started** — [`AgentRuntime::start`] and [`AgentRuntime::prompt`],
+    ///    through the same function. This is the one a fix written only for (1) misses, and it
+    ///    is the failure most worth retrying: a missing binary or a refused credential.
+    ///
+    /// ⚠ **The flag is remembered for the session, not across a restart**, because
+    /// [`AgentRuntime::schedule_runs`] deliberately is — see that field for why it is not in
+    /// the document. So a retry trigger armed before a restart sees `false` until something
+    /// fails again in this session. That direction is the safe one and is the same choice
+    /// `agent_trigger_holds` makes for `FilesChanged`: a run that does not happen is worse
+    /// than one that does.
+    fn complete(
+        &mut self,
+        key: &NodeKey,
+        now: Timestamp,
+        now_ms: u64,
+        outcome: &vellum_agent::TurnOutcome,
+    ) {
         let Some(completion) = self.completions.remove(key) else { return };
+        // Before the actions below, and unconditionally: `Completion::Nothing` is still a
+        // scheduled run whose outcome the next trigger asks about.
+        self.note_run_outcome(key, Self::counts_as_failure(outcome));
         // The turn's own last words, which is what both actions are about. Taken from the
         // ring rather than accumulated separately: the ring is already the record.
         let said = self
@@ -1447,6 +1649,73 @@ impl AgentRuntime {
         true
     }
 
+    // ----- file trees ---------------------------------------------------------------
+
+    /// One visible file tree's rows, walked from disk at most every [`TREE_POLL_SECONDS`].
+    ///
+    /// # Why this is cached and the note poll is merely gated
+    ///
+    /// `poll_agent_notes` can gate its `stat` and leave the last text where the painter reads
+    /// it, because [`AgentRuntime::note_text`] survives between frames. A tree's rows were
+    /// handed straight to `AgentViews`, which is **cleared every frame** — so gating the walk
+    /// alone would have drawn an empty tree on every frame that did not re-read it. The rows
+    /// have to be cached on this side of the seam, and that is the whole of why this function
+    /// exists rather than a `tree_due` twin of [`AgentRuntime::note_due`].
+    ///
+    /// # An expand is instant; somebody else's change waits
+    ///
+    /// The poll is skipped outright when the **model** or the **root** differs from what was
+    /// read: disclosing a directory changes `FileTreeModel::expanded`, and a folder that took
+    /// up to two seconds to open would read as a control that does not work. Only a change
+    /// *underneath* the tree — a file another agent wrote — waits for the poll, which is the
+    /// half a person is not staring at. Comparing the whole model rather than tracking an
+    /// "expanded changed" flag is deliberate: `show_ignored` and the agent scope move it too,
+    /// and a flag is one more thing a future field can forget to set.
+    ///
+    /// # A failed read is cached as a failure
+    ///
+    /// A tree pointed at a directory that is gone answers `None` — the painter draws nothing,
+    /// exactly as it did when the walk failed inline — but the *attempt* is stamped, so a
+    /// broken root is retried at the poll rate rather than sixty times a second. Returning
+    /// early without recording would leave the one case that fails on every frame paying the
+    /// per-frame cost this function exists to remove.
+    ///
+    /// The `Arc` is the other half of the cost fix and is not cosmetic: a `View` is up to
+    /// `filetree::MAX_ROWS` rows of owned strings, so handing the painter a clone each frame
+    /// would replace a per-frame directory walk with a per-frame deep copy of its result.
+    pub fn tree_view(
+        &mut self,
+        key: &NodeKey,
+        root: &Path,
+        model: &vellum_agent::FileTreeModel,
+        now: Timestamp,
+    ) -> Option<Arc<vellum_agent::filetree::View>> {
+        let fresh = self.trees.get(key).is_some_and(|read| {
+            read.root == root
+                && &read.model == model
+                && now.saturating_sub(read.read_at) < TREE_POLL_SECONDS
+        });
+        if !fresh {
+            let view = match vellum_agent::filetree::visible(root, model, model.show_ignored) {
+                Ok(view) => Some(Arc::new(view)),
+                Err(error) => {
+                    log::debug!("agents: reading {} failed ({error})", root.display());
+                    None
+                }
+            };
+            self.trees.insert(
+                key.clone(),
+                TreeRead {
+                    root: root.to_path_buf(),
+                    model: model.clone(),
+                    read_at: now,
+                    view,
+                },
+            );
+        }
+        self.trees.get(key).and_then(|read| read.view.clone())
+    }
+
     // ----- views -------------------------------------------------------------------
 
     /// Fill in what the painter is told about this board's agents.
@@ -1686,6 +1955,15 @@ impl AgentRuntime {
         self.schedule_runs.retain(|key, _| &key.board != board);
         self.completions.retain(|key, _| &key.board != board);
         self.reports.retain(|(key, _)| &key.board != board);
+        // The four caches keyed by node. Nothing in them is state — every one is worth a
+        // re-read of a file or a directory to reconstruct, which is what reopening the board
+        // does — so a closed board must not go on paying for them. Three of these were
+        // already being left behind when this was written; they are cleared here now for the
+        // same reason the fourth is.
+        self.note_text.retain(|key, _| &key.board != board);
+        self.note_models.retain(|key, _| &key.board != board);
+        self.note_checked.retain(|key, _| &key.board != board);
+        self.trees.retain(|key, _| &key.board != board);
         self.schedules.remove(board);
         self.wiring.remove(board);
         self.stores.remove(board);
@@ -2678,5 +2956,260 @@ mod tests {
         // character straddling the boundary aborts the process (feedback 30).
         let long = format!("# {}", "夕".repeat(400));
         assert_eq!(heading_of(&long).map(|t| t.chars().count()), Some(80));
+    }
+
+    // ----- a scheduled run's outcome -------------------------------------------------
+
+    /// Everything a fired schedule leaves behind before its turn runs, so each test below
+    /// starts from the state `run_due_agents` actually produces.
+    fn a_scheduled_run(runtime: &mut AgentRuntime, key: &NodeKey, at: Timestamp) {
+        runtime.note_schedule_run(key, at, false);
+        runtime.expect_completion(key, vellum_agent::Completion::Nothing);
+    }
+
+    fn last_failed(runtime: &AgentRuntime, key: &NodeKey) -> bool {
+        let mut schedule = Schedule::default();
+        runtime.apply_schedule_history(key, &mut schedule);
+        schedule.last_failed
+    }
+
+    /// `Trigger::LastRunFailed` is *"only if the last run failed"*, and nothing in the
+    /// workspace ever said a run had — so choosing it produced an agent that never ran again.
+    /// This is the sentence that makes the condition reachable.
+    ///
+    /// A/B: with the outcome dropped on the way into `complete`, as it was, this fails with
+    /// the flag still `false`.
+    #[test]
+    fn a_scheduled_run_that_failed_is_what_the_retry_trigger_asks_about() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let key = NodeKey::new(&board(), "1@1");
+
+        a_scheduled_run(&mut runtime, &key, 1_000);
+        assert!(!last_failed(&runtime, &key), "a run that has not finished cannot have failed");
+
+        runtime.complete(
+            &key,
+            1_000,
+            1_000_000,
+            &vellum_agent::TurnOutcome::Failed { message: "claude: not found".into() },
+        );
+        assert!(last_failed(&runtime, &key), "a failed run did not arm the retry trigger");
+
+        // And the fire time is untouched: the flag says how it went, not when.
+        let mut schedule = Schedule::default();
+        runtime.apply_schedule_history(&key, &mut schedule);
+        assert_eq!(schedule.last_run, Some(1_000));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The user pressing stop is the one outcome a retry must not fire on, and an agent that
+    /// ran out of context is the one it should. Asserted together, because they are the two
+    /// halves of the same `matches!` and a fix that got one right would look complete.
+    #[test]
+    fn stopping_a_run_is_not_a_failure_and_exhausting_one_is() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let board = board();
+
+        let stopped = NodeKey::new(&board, "1@1");
+        a_scheduled_run(&mut runtime, &stopped, 1_000);
+        runtime.complete(&stopped, 1_000, 1_000_000, &vellum_agent::TurnOutcome::Cancelled);
+        assert!(
+            !last_failed(&runtime, &stopped),
+            "stopping an agent by hand armed a retry that would start it again"
+        );
+
+        let done = NodeKey::new(&board, "2@1");
+        a_scheduled_run(&mut runtime, &done, 1_000);
+        runtime.complete(&done, 1_000, 1_000_000, &vellum_agent::TurnOutcome::Completed);
+        assert!(!last_failed(&runtime, &done));
+
+        let spent = NodeKey::new(&board, "3@1");
+        a_scheduled_run(&mut runtime, &spent, 1_000);
+        runtime.complete(
+            &spent,
+            1_000,
+            1_000_000,
+            &vellum_agent::TurnOutcome::Exhausted { message: "out of context".into() },
+        );
+        assert!(last_failed(&runtime, &spent), "a run that stopped short reported success");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exit a fix written for `TurnEnded` alone misses, and the one most worth retrying:
+    /// the agent never started at all. `expect_completion` has already been recorded by the
+    /// time `start` is called, so a refused launch has to answer for the run.
+    ///
+    /// It also asserts the **expectation is cleared**, which is the half that is not about
+    /// this trigger: a `Completion` left behind by a run that never happened would be applied
+    /// to whatever the user typed next, so a hand-written prompt would be reported — or handed
+    /// to another agent — as though it were the six-o'clock job.
+    #[test]
+    fn a_scheduled_run_that_never_started_counts_as_a_failure_and_stops_expecting_a_result() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let key = NodeKey::new(&board(), "1@1");
+        a_scheduled_run(&mut runtime, &key, 1_000);
+
+        // A provider with no CLI to delegate to, asked to delegate to one: `start` refuses
+        // before it probes anything, which is the same shape as a missing binary and — unlike
+        // a bogus command — cannot depend on what is installed on the machine running the
+        // test. `LaunchSpec::default()` would be wrong here: it is Claude over the `claude`
+        // CLI, so on a developer's own machine it would really start an agent.
+        let spec = vellum_agent::LaunchSpec::new(
+            vellum_agent::ProviderChoice::new(vellum_agent::Provider::Kimi)
+                .with_transport(vellum_agent::Transport::Pty),
+        );
+        assert!(runtime.start(&key, spec).is_err(), "a provider with no command started one");
+
+        assert!(last_failed(&runtime, &key), "a launch that failed left the run looking fine");
+        assert!(
+            !runtime.completions.contains_key(&key),
+            "a run that never happened is still waiting to be reported"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate. A turn the user typed by hand is not a scheduled run, and must not decide
+    /// whether the next one happens — so a failure with no completion expected writes nothing.
+    #[test]
+    fn a_turn_the_user_asked_for_does_not_decide_the_next_scheduled_run() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let key = NodeKey::new(&board(), "1@1");
+
+        // A schedule ran and succeeded yesterday. Then the user typed something themselves,
+        // and it failed.
+        runtime.note_schedule_run(&key, 1_000, false);
+        runtime.complete(
+            &key,
+            2_000,
+            2_000_000,
+            &vellum_agent::TurnOutcome::Failed { message: "the user's own prompt".into() },
+        );
+        assert!(
+            !last_failed(&runtime, &key),
+            "a prompt the user typed armed the schedule's retry trigger"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- the file tree cache -------------------------------------------------------
+
+    /// The defect: every visible file tree was walked from disk **every frame** — a recursive
+    /// `read_dir` plus an `Ignore::load` plus a `metadata()` per entry, bounded only by
+    /// `filetree::MAX_ROWS`.
+    ///
+    /// Written as a question about *what changes underneath*, because that is the only way to
+    /// observe a walk that did not happen: a file created between two calls inside the poll
+    /// window must not appear, and must appear once the window is past. The `Arc::ptr_eq` is
+    /// the other half — a cached hit hands back the same allocation, so the painter is not
+    /// given a deep copy of four thousand rows either.
+    ///
+    /// A/B: against the unfixed code, which walked on every call, the second assertion fails
+    /// with `second.md` already listed.
+    #[test]
+    fn a_visible_file_tree_is_walked_on_a_poll_and_not_once_a_frame() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let key = NodeKey::new(&board(), "1@1");
+        let root = dir.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("first.md"), "one").unwrap();
+
+        let model = vellum_agent::FileTreeModel::default();
+        let first = runtime.tree_view(&key, &root, &model, 1_000).expect("the root would not read");
+        assert_eq!(first.rows.len(), 1, "the first walk missed the file that was there");
+
+        std::fs::write(root.join("second.md"), "two").unwrap();
+        let again = runtime.tree_view(&key, &root, &model, 1_001).expect("the cache went missing");
+        assert_eq!(again.rows.len(), 1, "the tree was walked again one frame later");
+        assert!(Arc::ptr_eq(&first, &again), "a cached hit still copied every row");
+
+        let later = runtime
+            .tree_view(&key, &root, &model, 1_000 + TREE_POLL_SECONDS)
+            .expect("the cache went missing");
+        assert_eq!(later.rows.len(), 2, "the poll never picked up a file somebody else wrote");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Opening a folder must not wait for the poll: a disclosure triangle that takes up to two
+    /// seconds to answer reads as a control that does not work. The model changing is what
+    /// says the *user* did something, so it re-reads at once.
+    #[test]
+    fn opening_a_folder_re_reads_the_tree_at_once_rather_than_waiting_for_the_poll() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let key = NodeKey::new(&board(), "1@1");
+        let root = dir.join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+
+        let closed = vellum_agent::FileTreeModel::default();
+        let before = runtime.tree_view(&key, &root, &closed, 1_000).expect("the root would not read");
+        assert_eq!(before.rows.len(), 1, "an unopened directory listed its children");
+
+        let opened = vellum_agent::FileTreeModel { expanded: vec!["src".into()], ..closed };
+        // The *same second*: only the model has changed, so only the model can have caused
+        // this to be read again.
+        let after = runtime.tree_view(&key, &root, &opened, 1_000).expect("the tree went missing");
+        assert_eq!(after.rows.len(), 2, "opening a folder did nothing until the poll came round");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A root that is gone draws nothing — as it did when the walk was inline — but the
+    /// *attempt* is remembered, or the one case that fails on every frame goes on paying the
+    /// per-frame cost this cache exists to remove.
+    #[test]
+    fn a_file_tree_pointed_at_nothing_is_not_retried_every_frame() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let key = NodeKey::new(&board(), "1@1");
+        let gone = dir.join("no such project");
+
+        let model = vellum_agent::FileTreeModel::default();
+        assert!(runtime.tree_view(&key, &gone, &model, 1_000).is_none());
+        assert!(
+            runtime.trees.contains_key(&key),
+            "a failed read left nothing behind, so it will be attempted again next frame"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Closing a tab must not leave the board's caches behind. Nothing in them is state —
+    /// every one is a re-read away — so a closed board going on holding a directory listing
+    /// is cost with no reader.
+    #[test]
+    fn closing_a_board_drops_everything_cached_for_it() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let mine = board();
+        let other = BoardKey::from_raw("00000000feedface");
+        let root = dir.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let model = vellum_agent::FileTreeModel::default();
+        let here = NodeKey::new(&mine, "1@1");
+        let elsewhere = NodeKey::new(&other, "1@1");
+        assert!(runtime.tree_view(&here, &root, &model, 1_000).is_some());
+        assert!(runtime.tree_view(&elsewhere, &root, &model, 1_000).is_some());
+        runtime.set_note_text(&here, "words".into());
+        assert!(runtime.note_due(&here, 1_000));
+
+        runtime.forget_board(&mine);
+
+        assert!(!runtime.trees.contains_key(&here), "a closed board kept its directory listing");
+        assert!(!runtime.note_text.contains_key(&here), "a closed board kept a note's contents");
+        assert!(!runtime.note_checked.contains_key(&here));
+        // The board behind the other tab is untouched — the whole reason every map here is
+        // keyed by board.
+        assert!(runtime.trees.contains_key(&elsewhere), "closing one board cleared another's");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

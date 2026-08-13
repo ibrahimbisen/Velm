@@ -330,6 +330,7 @@ impl Submenu {
                     Separator,
                     Item(C::EditAgentRules),
                     Item(C::EditAgentSchedule),
+                    Item(C::SetTerritory),
                 ]
             },
             Self::MoveToSpace
@@ -424,6 +425,9 @@ pub mod reason {
     pub const SYSTEM_OPAQUE: &str = "Turned off in the system's accessibility settings";
     pub const NO_AGENT: &str = "Select an agent node";
     pub const ONE_AGENT: &str = "Select one agent node";
+    /// A worker owns no region, so there is nothing for a sweep to set. Named rather than
+    /// hidden: a row that vanishes for two of the three roles reads as a missing feature.
+    pub const ONE_MANAGER: &str = "Select one orchestrator or meta agent";
     pub const AGENT_RUNNING: &str = "Already running";
     pub const NO_AGENT_RUNNING: &str = "Nothing selected is running";
     /// Why a hand-off target cannot be offered. Feature 10's rule, stated where the reader
@@ -565,6 +569,14 @@ pub enum Command {
     EditAgentRules,
     /// When it runs by itself, and what it does afterwards — feature 10.
     EditAgentSchedule,
+    /// Arm the territory sweep: the next drag on bare board sets the selected orchestrator's
+    /// region.
+    ///
+    /// A command rather than a bare drag, for feedback 29's reason: a drag on empty board is a
+    /// marquee, and taking it whenever a manager happened to be selected would remove marquee
+    /// selection from every board with an orchestrator on it — silently, and for the half of
+    /// the gesture that gets used constantly.
+    SetTerritory,
     // Preferences
     /// Whether a browser node may run a real web engine at all — feature 13.
     ///
@@ -645,6 +657,7 @@ impl Command {
         Self::ToggleAgentRaw,
         Self::EditAgentRules,
         Self::EditAgentSchedule,
+        Self::SetTerritory,
         Self::ToggleBrowserNodes,
         Self::ToggleWorktrees,
         Self::KeyboardShortcuts,
@@ -719,6 +732,7 @@ impl Command {
             Self::ToggleAgentRaw => "Raw output",
             Self::EditAgentRules => "Rules…",
             Self::EditAgentSchedule => "Schedule…",
+            Self::SetTerritory => "Set territory…",
             Self::ToggleBrowserNodes => "Browser nodes",
             Self::ToggleWorktrees => "Worktree isolation",
             Self::KeyboardShortcuts => "Keyboard shortcuts",
@@ -775,7 +789,8 @@ impl Command {
             | Self::StopAgent
             | Self::ToggleAgentRaw
             | Self::EditAgentRules
-            | Self::EditAgentSchedule => Menu::Edit,
+            | Self::EditAgentSchedule
+            | Self::SetTerritory => Menu::Edit,
             Self::ZoomIn
             | Self::ZoomOut
             | Self::ZoomToFit
@@ -850,7 +865,7 @@ impl Command {
             Self::Redo => Icon::Redo,
             Self::RunAgent => Icon::Play,
             Self::StopAgent => Icon::Stop,
-            Self::EditAgentRules | Self::EditAgentSchedule => Icon::Agent,
+            Self::EditAgentRules | Self::EditAgentSchedule | Self::SetTerritory => Icon::Agent,
             Self::ToggleBrowserNodes => Icon::Browser,
             _ => return None,
         })
@@ -1073,6 +1088,12 @@ impl Command {
                 gate(ctx.agents_selected == 1, reason::ONE_AGENT)
             }
 
+            // A territory belongs to a role that can spawn into it. Offering the sweep for a
+            // worker would let the user draw a rectangle that nothing would ever read.
+            Self::SetTerritory => {
+                gate(ctx.agents_selected == 1 && ctx.manager_selected, reason::ONE_MANAGER)
+            }
+
             Self::Group => gate(ctx.selected > 1, reason::NEEDS_TWO),
             Self::Ungroup => gate(ctx.any_group, reason::NO_GROUP),
 
@@ -1206,6 +1227,10 @@ pub struct CommandContext {
     /// and four stickies and the agent verbs still apply to the one — the same abstention
     /// rule `crate::selection::Field` applies to every other property.
     pub agents_selected: usize,
+    /// Whether the one selected agent is an orchestrator or the meta agent — a role that owns
+    /// a region. Its own field rather than a `RoleKind` because the only question anybody asks
+    /// of it is this one.
+    pub manager_selected: bool,
     pub any_agent_running: bool,
     /// True only when at least one agent is selected and every one of them is running,
     /// which is what makes *Run* refuse rather than start something twice.

@@ -57,7 +57,7 @@ pub use ipc::{IpcHandler, IpcServer};
 pub use notes::{Freshness, NoteStore, Requester, Save};
 pub use orchestrator::{AgentNode, NodeBox, Refusal};
 pub use provider::{Provider, ProviderChoice, Transport};
-pub use rules::{Layer, Permissions, ResolvedRules, RuleFile};
+pub use rules::{Layer, Permissions, ResolvedRules, RuleFile, Saved};
 pub use session::{Session, Status};
 pub use sidecar::{BoardKey, Record, Sidecar, Tail};
 pub use summary::{Activity, AgentDigest, Attention, Digest};

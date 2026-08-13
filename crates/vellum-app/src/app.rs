@@ -282,6 +282,30 @@ pub(crate) struct ActiveState {
     /// `hovered_badge` above is: the correction and the line have to come from one answer,
     /// or the guide points at a place the item did not go.
     pub(crate) guides: Vec<crate::snap::Guide>,
+    /// The two inherited rule layers exactly as they were on disk when the rules editor was
+    /// opened.
+    ///
+    /// A save has to be able to tell *"I am replacing what I was shown"* from *"somebody
+    /// has written this file since"*, and a rules file is meant to be edited by hand and by
+    /// other tools — so re-reading it at save time would compare the file against itself and
+    /// the check would never fire. Taken once, when the dialog goes up.
+    ///
+    /// One snapshot rather than a map: `Shell` shows one modal at a time, so a second rules
+    /// editor cannot be open behind the first.
+    pub(crate) rules_opened_on: Option<crate::actions::RulesSnapshot>,
+    /// The orchestrator whose territory the next sweep will set — `docs/07-agent-canvas.md`
+    /// §9's *"assigned a specific spatial region of the board by the user selecting an
+    /// area"*.
+    ///
+    /// **Armed rather than a bare drag**, which is feedback 29's trade made the other way
+    /// round: a press on a frame had to stop moving it because marquee selection over a
+    /// backdrop is the gesture that gets used constantly, and a bare drag that set a
+    /// territory whenever an orchestrator happened to be selected would take that same
+    /// gesture away again. So the verb is asked for first and the *next* sweep answers it.
+    ///
+    /// Holds the node's [`vellum_doc::ItemId`], not its `SceneId`: the sweep survives a
+    /// reprojection, and a scene id does not.
+    pub(crate) territory_arm: Option<vellum_doc::ItemId>,
     /// A kanban card in flight. Separate from `drag` because it changes no placement:
     /// a card's position is decided by the column it is in and its rank within it, so
     /// moving one rewrites the item's token and leaves its box alone.
@@ -624,6 +648,8 @@ impl Vellum {
             editing_touched: Instant::now(),
             hovered_badge: None,
             guides: Vec::new(),
+            rules_opened_on: None,
+            territory_arm: None,
             erased_from: None,
             pending_fit: self.options.zoom.is_none(),
             matches: Vec::new(),
@@ -1206,6 +1232,22 @@ impl ActiveState {
             Key::Named(NamedKey::ArrowUp) => self.nudge(0.0, -step),
             Key::Named(NamedKey::ArrowDown) => self.nudge(0.0, step),
             Key::Character("q" | "Q") if command => self.quit = true,
+            // **⇧⌘T — arm a territory sweep.** Here rather than in `vellum-ui`'s command
+            // table only because the crate that owns that table is not this one to edit;
+            // `ActiveState::arm_territory` is the whole verb and a `Command::SetTerritory`
+            // row is one line away from reaching it. Recorded honestly rather than
+            // rationalised: unlike the HUD, Escape and `⌘1`…`⌘9` above, this *is* a named
+            // action and belongs in the menu.
+            //
+            // **⇧ rather than ⌥.** On macOS the Option key composes the character before
+            // winit ever reports it — `⌥T` arrives as `†`, not as `t` — so an `ALT_CMD`
+            // binding matched here would simply never fire. `⌘T` is already New tab.
+            //
+            // Named in `shortcut_reference`, which is the only thing that announces it: the
+            // gesture is armed and *then* drawn, and nothing on the canvas says either half.
+            Key::Character("t" | "T") if command && modifiers.shift_key() => {
+                self.arm_territory();
+            }
             Key::Character(digit) if command && digit.len() == 1 => {
                 if let Some(index) = tab_for_digit(digit, self.shell.tab_count()) {
                     self.select_tab(index);
@@ -1727,18 +1769,21 @@ impl ActiveState {
         // the `locked: false` trap. **When a note's body becomes editable, this has to be
         // answered for real**, and by asking `vellum-agent` for the conflict path rather than
         // by spelling that suffix a second time here.
+        // Both halves are filesystem facts, and both are now asked of the filesystem.
+        //
+        // The conflict half used to be a literal `false`, defended on the grounds that only
+        // `NoteStore::save` writes a conflict file and nothing calls `save`. That was a
+        // statement about *this process* answering a question about *the disk* — an agent's
+        // own `note_write` resolves any path under the store, so a `.velm-conflict.md` is
+        // reachable today. It is the `locked: false` trap, in the file whose own header warns
+        // about it.
+        //
+        // `state_of` also resolves through the store rather than joining `base()` here, which
+        // is what every other reader does: a path that escapes the store is now refused
+        // rather than answered about.
         let note_state = |path: &str| -> (bool, bool) {
             let Some(board) = board.as_ref() else { return (false, false) };
-            // Resolved against the store's own base — a note path is stored relative to
-            // the project where there is one, and absolute otherwise, so joining it onto
-            // the wrong root is how a note that exists reports that it does not.
-            let on_disk = agent_runtime.note_store(board).is_some_and(|store| {
-                store.base().map_or_else(
-                    || std::path::Path::new(path).exists(),
-                    |base| base.join(path).exists(),
-                )
-            });
-            (on_disk, false)
+            agent_runtime.note_store(board).map_or((false, false), |store| store.state_of(path))
         };
 
         let facts = crate::inspect::AgentFacts {
@@ -1782,6 +1827,11 @@ impl ActiveState {
         // and it is the one place a create gesture's preview and its snapping are decided
         // together.
         let placing = self.placing_preview();
+        // The selected orchestrator's region, or the one being swept for it right now —
+        // `docs/07-agent-canvas.md` §9. `None` on every board with no agent on it, and on
+        // every selection that is not exactly one managing node, so this costs one
+        // `selection().first()` on an ordinary board.
+        let territory = self.territory_preview();
         // Cloned, **not** taken. A drag recomputes its guides only when the pointer moves,
         // so taking them would blank the lines on every frame a hand held still — which is
         // exactly when someone is looking at them. Four `Copy` structs at the very most.
@@ -1858,6 +1908,7 @@ impl ActiveState {
             card_drop,
             pattern,
             grid_color,
+            territory,
             minimap,
         };
         let (device, queue, renderer) = self.surface.parts();

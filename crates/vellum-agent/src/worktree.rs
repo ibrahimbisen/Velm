@@ -35,6 +35,15 @@
 //! work lives; deleting it on removal would turn "tidy up the directory" into "throw away
 //! the commits". Someone will eventually read `remove` and think the leftover branch is a
 //! bug — it is the feature, and this paragraph is why.
+//!
+//! # Who calls what
+//!
+//! [`create`] is called by `vellum-app`'s `ensure_worktree`, when an agent with the worktree
+//! switch on is started. **[`remove`] is reached only from a command the user chooses**, per
+//! `docs/07-agent-canvas.md` §9's *explicit and confirmed* — never from stopping an agent,
+//! never from closing a board and never from deleting a node, because all three of those
+//! would make an agent's uncommitted work disappear as a side effect of something else. The
+//! refusal in `remove` is the second line of defence and not the first.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -268,7 +277,21 @@ pub fn dirty(worktree: &Path) -> Result<Vec<String>> {
 ///
 /// The branch survives. That is where an agent's committed work is, and this function's job
 /// is to reclaim a directory, not to discard history.
+///
+/// # A directory the user already deleted by hand
+///
+/// Answered by [`prune`] rather than by an error, and the check has to come **before**
+/// [`dirty`]: `git status` in a directory that is not there fails with a message about
+/// changing directories, which this would then hand the user as though their worktree were
+/// somehow dirty. It is also the state that makes the next [`create`] refuse — git still has
+/// the registration — so a removal that could not clean up after a hand-deleted directory
+/// would leave the node permanently unable to make itself a new one. Nothing is deleted:
+/// `git worktree prune` only drops metadata for directories that have already vanished.
 pub fn remove(repo: &Path, worktree: &Path) -> Result<()> {
+    if !worktree.exists() {
+        return prune(repo);
+    }
+
     let outstanding = dirty(worktree)?;
     if !outstanding.is_empty() {
         return Err(AgentError::Refused(format!(
@@ -532,6 +555,38 @@ mod tests {
 
         let branches = run_git(&repo, &["branch", "--list", "velm/42-7"]);
         assert!(branches.contains("velm/42-7"), "removal deleted the agent's branch");
+    }
+
+    /// A user who empties the state directory by hand leaves git holding a registration for a
+    /// checkout that is not there. Removing it must be an ordinary success rather than an
+    /// error about `git status` being unable to change directory — and it must actually clear
+    /// the registration, or the node can never make itself a new worktree.
+    ///
+    /// The last assertion is the one that fails on the obvious fix: returning `Ok(())` early
+    /// without pruning satisfies every check about the removal and leaves `create` refusing
+    /// for ever.
+    #[test]
+    fn removing_a_worktree_whose_directory_is_already_gone_prunes_it() {
+        if !git_present() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repo_with_a_commit(temp.path());
+        let state = temp.path().join("state dir");
+        let worktree = create(&repo, &state, "42@7").unwrap();
+
+        fs::remove_dir_all(&worktree.path).unwrap();
+        assert!(
+            list(&repo).unwrap().iter().any(|wt| wt.branch.as_deref() == Some("velm/42-7")),
+            "git forgot the worktree on its own, so this test proves nothing"
+        );
+
+        remove(&repo, &worktree.path).expect("a worktree with no directory could not be removed");
+        assert!(
+            !list(&repo).unwrap().iter().any(|wt| wt.branch.as_deref() == Some("velm/42-7")),
+            "the stale registration survived, so a new worktree can never be made here"
+        );
+        create(&repo, &state, "42@7").expect("the node could not make itself a new worktree");
     }
 
     /// After a removal the branch is still there, so a second `create` must attach to it

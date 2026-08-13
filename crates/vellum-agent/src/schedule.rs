@@ -178,6 +178,17 @@ pub enum Trigger {
     /// Only if a note the agent can see changed since the last run.
     NoteChanged { path: String },
     /// Only if the previous run failed — a retry.
+    ///
+    /// Reads [`Schedule::last_failed`], which is written by whoever runs the turn. That is
+    /// this module's whole involvement: *what counts as a failure* is a question about a
+    /// transport and a process, so it is answered where those live. `vellum-app`'s
+    /// `AgentRuntime::complete` is that place, and its doc comment enumerates the three ways
+    /// a scheduled run can end without a turn ever finishing — all three of which have to
+    /// write the flag, or this condition is one that quietly cannot hold.
+    ///
+    /// ⚠ It was exactly that for as long as it existed: nothing in the workspace ever set
+    /// `last_failed` to `true`, so choosing this trigger produced an agent that never ran
+    /// again and said nothing about why.
     LastRunFailed,
 }
 
@@ -212,6 +223,9 @@ pub struct Schedule {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_run: Option<Timestamp>,
     /// Whether that last run failed, for [`Trigger::LastRunFailed`].
+    ///
+    /// Set by the runtime, never here — see [`Trigger::LastRunFailed`]. Written only when
+    /// `true`, so a schedule saved before this field existed round-trips byte for byte.
     #[serde(skip_serializing_if = "is_false")]
     pub last_failed: bool,
 }

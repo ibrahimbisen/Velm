@@ -156,9 +156,15 @@ impl ChromeState<'_> {
         // and four stickies, and the agent verbs still apply to the one.
         let agents = self.selection.iter().filter_map(|i| i.agent.as_ref());
         let running = agents.clone().filter(|a| a.running).count();
+        // Whether the one selected agent owns a region. Read from the role rather than from
+        // whether a territory happens to be set: a manager whose region the user cleared still
+        // owns one conceptually, and the sweep is how they draw the next.
+        let manager_selected =
+            agents.clone().next().is_some_and(|a| a.role_kind.may_spawn());
         let agents_selected = agents.count();
         CommandContext {
             agents_selected,
+            manager_selected: manager_selected && agents_selected == 1,
             any_agent_running: running > 0,
             all_agents_running: agents_selected > 0 && running == agents_selected,
             board_open: self.screen == Screen::Board,
