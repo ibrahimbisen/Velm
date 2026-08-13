@@ -699,19 +699,43 @@ impl AgentTransport for ClaudeCli {
 
         self.shared.cancelled.store(false, Ordering::Relaxed);
         *self.shared.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(turn);
-        self.shared.emit(TranscriptEvent::TurnStarted { turn, prompt: prompt.to_owned() });
 
         let shared = Arc::clone(&self.shared);
         let line = user_message(prompt);
-        std::thread::Builder::new()
+        let started = prompt.to_owned();
+        // ⚠ **`TurnStarted` is emitted by the thread, not here, and that ordering is the fix
+        // for a turn that could never end.** This is trap 11's shape at a different layer: a
+        // `?` on the unwind path of a paired begin/end. `TurnStarted` and `TurnEnded` are that
+        // pair, and `.spawn(…)?` sat *between* them — so a failed spawn returned `Err`, and
+        // `Session::dispatch` correctly cleared its own `current`, but the `TurnStarted` was
+        // already in the channel. The next `poll` absorbed it, set `Status::Running`, and no
+        // `TurnEnded` ever followed: every later prompt was refused with *"this agent is
+        // still working"* for the life of the session.
+        //
+        // Emitting it *inside* the closure is what makes the pairing structural rather than
+        // careful. Emitting it here after a successful spawn would still be racy — the thread
+        // can fail its write and emit `TurnEnded` first, which is the same unpaired sequence
+        // arriving by the other door. As the closure's first statement it cannot be.
+        //
+        // `shared.turn` is still set *before* the spawn, because the reader thread attributes
+        // the CLI's output by it and the write may be answered before this function returns.
+        // The spawn's `Err` arm is what puts that back.
+        let spawned = std::thread::Builder::new()
             .name("velm-claude-prompt".into())
             .spawn(move || {
+                shared.emit(TranscriptEvent::TurnStarted { turn, prompt: started });
                 if let Err(error) = shared.write_line(&line) {
                     shared.end_turn(TurnOutcome::Failed { message: error.to_string() });
                 }
-            })
-            .map_err(AgentError::Io)?;
-        Ok(())
+            });
+        match spawned {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                *self.shared.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    None;
+                Err(AgentError::Io(error))
+            }
+        }
     }
 
     /// Stops the turn in flight, without killing the child.

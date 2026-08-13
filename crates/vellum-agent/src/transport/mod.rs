@@ -241,6 +241,15 @@ pub trait AgentTransport: Send {
     /// transcript on disk is read back by and a transport is restarted more often than a
     /// node is. The transport emits `TurnStarted` and, eventually, exactly one `TurnEnded`
     /// carrying the same id.
+    ///
+    /// ⚠ **An `Err` means no `TurnStarted` was emitted.** The two events are a paired
+    /// begin/end and the caller cannot close a pair it never opened:
+    /// [`crate::session::Session`] clears its own optimistic state on the `Err`, but an event
+    /// already in the channel is absorbed on the next `poll`, sets `Status::Running`, and is
+    /// never followed by a `TurnEnded` — so every later prompt is refused for the life of the
+    /// session. This is trap 11's shape (a `?` on the unwind path of a paired begin/end), so
+    /// an implementation that spawns a worker must emit the start **from the worker**, where
+    /// the pairing is structural, rather than before a fallible spawn.
     fn send_prompt(&mut self, turn: TurnId, prompt: &str) -> Result<()>;
 
     /// Stops the turn in flight. A no-op when none is.

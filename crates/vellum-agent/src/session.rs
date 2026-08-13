@@ -664,6 +664,16 @@ mod tests {
     /// A prompt that cannot be sent must not leave the session stuck in `Running` with
     /// nothing coming — and the failure belongs in the **transcript**, not only in a status
     /// line, or the sidecar shows a question the agent simply never answered.
+    ///
+    /// ⚠ **The `TurnStarted` assertion below is the transport contract, not a detail.**
+    /// [`crate::transport::AgentTransport::send_prompt`] promises that an `Err` means no
+    /// `TurnStarted` was emitted, and [`Session::absorb`] is why: that event sets `current`
+    /// and `Status::Running` unconditionally, and nothing but a matching `TurnEnded` clears
+    /// them. A transport that emitted the start and *then* failed — which both the CLI and
+    /// the ACP transport did, with `.spawn(…)?` sitting between the two — leaves a session
+    /// that refuses every later prompt with *"this agent is still working"* for the life of
+    /// the process. `dispatch`'s own `Err` arm cannot undo it, because the event is already
+    /// in the channel by then.
     #[test]
     fn a_prompt_that_could_not_be_sent_fails_the_session_and_says_so_in_the_stream() {
         let (mut session, fake, _agent) = session();
@@ -675,6 +685,12 @@ mod tests {
         assert_eq!(session.current_turn(), None, "a failed send left a turn in flight");
 
         let drained = session.poll();
+        assert!(
+            !drained
+                .iter()
+                .any(|event| matches!(event, TranscriptEvent::TurnStarted { .. })),
+            "a refused prompt announced a turn that nothing will ever end: {drained:?}"
+        );
         assert!(
             matches!(drained.as_slice(), [TranscriptEvent::Error { .. }]),
             "the failure never reached the transcript: {drained:?}"

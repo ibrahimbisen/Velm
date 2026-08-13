@@ -652,14 +652,22 @@ impl AgentTransport for AcpTransport {
         }
         drop(self.turn.take());
         self.shared.cancelled.store(false, Ordering::Relaxed);
-        self.shared
-            .emit(TranscriptEvent::TurnStarted { turn, prompt: prompt.to_owned() });
 
         let shared = Arc::clone(&self.shared);
         let prompt = prompt.to_owned();
+        // ⚠ **`TurnStarted` is emitted by the thread, not here.** Trap 11's shape at a
+        // different layer: `TurnStarted`/`TurnEnded` is a paired begin/end and `.spawn(…)?`
+        // sat between them, so a failed spawn left a `TurnStarted` in the channel that
+        // nothing would ever close — the node reads `Status::Running` for good, with no turn
+        // behind it. Inside the closure the pair is structural: the same thread emits both,
+        // in order, or neither exists at all.
         let handle = std::thread::Builder::new()
             .name("velm-acp-turn".into())
             .spawn(move || {
+                shared.emit(TranscriptEvent::TurnStarted {
+                    turn,
+                    prompt: prompt.clone(),
+                });
                 let outcome = match run_turn(&shared, &prompt) {
                     Ok(outcome) => outcome,
                     Err(error) => TurnOutcome::Failed { message: error.to_string() },

@@ -62,6 +62,14 @@ pub const MAX_SCROLLBACK: usize = 2_000;
 /// limit. Broken rather than truncated, so nothing is lost.
 pub const MAX_LINE_CELLS: usize = 4_096;
 
+/// The most parameter and intermediate bytes one CSI sequence may accumulate.
+///
+/// The third part of the memory bound. A CSI sequence ends at its final byte (0x40–0x7E) and
+/// nothing guarantees a child sends one — `\x1b[` followed by an endless run of digits is a
+/// vector that grows for as long as the process runs. Real sequences are a handful of bytes;
+/// the longest anything here reads is `38;2;r;g;b`, so 256 is two orders of margin.
+pub const MAX_CSI_PARAMETER_BYTES: usize = 256;
+
 /// How much is read from the terminal at once.
 const READ_CHUNK: usize = 8 * 1024;
 
@@ -272,8 +280,17 @@ impl Ansi {
     fn csi(&mut self, byte: u8) {
         // Parameter bytes 0x30–0x3F and intermediates 0x20–0x2F accumulate; 0x40–0x7E ends
         // the sequence and says what it was.
+        //
+        // **Bounded**, for the same reason the line is: a sequence's final byte is whatever
+        // the child sends, and a child that never sends one — `\x1b[` followed by megabytes
+        // of digits — would otherwise grow this vector without limit. Past the cap the extra
+        // bytes are *dropped rather than ending the sequence*: a real CSI is a handful of
+        // bytes, so anything this long is not one, and treating byte 257 as the final byte
+        // would execute an arbitrary command chosen by the noise.
         if (0x20..0x40).contains(&byte) {
-            self.parameters.push(byte);
+            if self.parameters.len() < MAX_CSI_PARAMETER_BYTES {
+                self.parameters.push(byte);
+            }
             return;
         }
         self.state = State::Ground;
@@ -306,8 +323,33 @@ impl Ansi {
                 self.cells.clear();
                 self.column = 0;
             }
-            b'G' => self.column = parameters.first().copied().unwrap_or(1).saturating_sub(1),
-            b'C' => self.column += parameters.first().copied().unwrap_or(1).max(1),
+            // ⚠ **Both arms clamp to [`MAX_LINE_CELLS`], and that clamp is a memory bound
+            // rather than a fidelity choice.** The column comes off the wire as an arbitrary
+            // `usize`, and [`Ansi::put`] pads with spaces up to it *before* it checks the
+            // line cap — so `\x1b[1000000000Gx`, ten bytes from any child process, asks for
+            // a billion sixteen-byte cells and aborts the application. The cap is already the
+            // longest line this terminal will hold, so a column past it has nowhere to be.
+            //
+            // `MAX_LINE_CELLS - 1` rather than `MAX_LINE_CELLS`, because a column is an index:
+            // the last cell of a full line is at `MAX_LINE_CELLS - 1`, and clamping one higher
+            // would let `put` pad to the cap and then push one cell past it.
+            b'G' => {
+                self.column = parameters
+                    .first()
+                    .copied()
+                    .unwrap_or(1)
+                    .saturating_sub(1)
+                    .min(MAX_LINE_CELLS - 1);
+            }
+            // `saturating_add` before the clamp: the addition itself overflows on a parameter
+            // near `usize::MAX`, and a wrapped column is a *small* number, which looks like
+            // working output rather than like the bug it is.
+            b'C' => {
+                self.column = self
+                    .column
+                    .saturating_add(parameters.first().copied().unwrap_or(1).max(1))
+                    .min(MAX_LINE_CELLS - 1);
+            }
             b'D' => {
                 self.column =
                     self.column.saturating_sub(parameters.first().copied().unwrap_or(1).max(1));
@@ -812,6 +854,69 @@ mod tests {
             runaway.chars().count(),
             "the break lost characters"
         );
+    }
+
+    /// **Ten bytes must not be able to ask for 16GB.** `\x1b[1000000000G` sets the cursor
+    /// column from a number on the wire, and `put` pads with spaces up to that column
+    /// *before* it consults [`MAX_LINE_CELLS`] — so an unclamped column is a billion
+    /// sixteen-byte cells pushed one at a time, and `panic = "abort"` in the release profile
+    /// means there is no catching the allocation failure.
+    ///
+    /// The existing runaway-line test cannot see this: it only feeds characters the child
+    /// actually printed, and those go through `put` one per byte, where the cap does hold.
+    ///
+    /// A/B: with the `.min(MAX_LINE_CELLS - 1)` removed this does not fail, it hangs the test
+    /// binary and then dies — which is precisely the report.
+    #[test]
+    fn a_cursor_column_from_the_wire_cannot_grow_the_line_past_its_cap() {
+        let lines = feed(&[b"\x1b[1000000000Gx"]);
+        assert_eq!(lines.len(), 1, "the clamped column should still be one line: {lines:?}");
+        assert_eq!(
+            lines[0].chars().count(),
+            MAX_LINE_CELLS,
+            "the padded line was not bounded by the line cap"
+        );
+        assert!(lines[0].ends_with('x'), "the character that followed the move was lost");
+
+        // Cursor-forward is the same hole by addition, and it overflows before it clamps —
+        // `usize::MAX` here wraps to a *small* column, which reads as working output.
+        let lines = feed(&[b"a\x1b[18446744073709551615Cb"]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].chars().count(), MAX_LINE_CELLS);
+        assert!(lines[0].starts_with('a') && lines[0].ends_with('b'));
+
+        // Repeating the move must not accumulate either: each one lands at the same cap.
+        let lines = feed(&[b"\x1b[900000000G\x1b[900000000G\x1b[900000000Gz"]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].chars().count(), MAX_LINE_CELLS);
+    }
+
+    /// The third memory bound. A CSI sequence ends at its *final* byte and nothing makes a
+    /// child send one, so `\x1b[` followed by an endless run of digits grows the parameter
+    /// buffer for as long as the process lives.
+    ///
+    /// The assertion is about **both** halves: bounded, and still not treating an ordinary
+    /// byte as the sequence's terminator — dropping the overflow rather than ending the
+    /// sequence is what stops noise from executing a command it happens to spell.
+    #[test]
+    fn an_unterminated_escape_sequence_does_not_grow_without_limit() {
+        let mut terminal = Ansi::new();
+        terminal.feed(b"\x1b[");
+        for _ in 0..1000 {
+            terminal.feed(b"1;2;3;4;5;6;7;8;9;0");
+        }
+        assert_eq!(
+            terminal.parameters.len(),
+            MAX_CSI_PARAMETER_BYTES,
+            "the parameter buffer grew past its cap"
+        );
+        assert_eq!(terminal.state, State::Csi, "the sequence ended on a parameter byte");
+        assert_eq!(terminal.current().text, "", "parameter bytes reached the text");
+
+        // The sequence still ends where it is supposed to, and what follows is ordinary text.
+        terminal.feed(b"mafter");
+        assert_eq!(terminal.state, State::Ground);
+        assert_eq!(terminal.current().text, "after");
     }
 
     /// Tabs, backspace and the bell all reach the text if nothing handles them, and a bare
