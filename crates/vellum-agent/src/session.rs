@@ -254,11 +254,23 @@ impl Session {
 
     /// Takes the images the agent produced, for the caller to put in the blob store.
     ///
-    /// ⚠ **Drain this before [`Session::poll`] and substitute the real hashes before the
-    /// events are appended to the sidecar.** The transport parks the bytes before it sends
-    /// the event, so blobs-then-events is the order in which the map is always populated
-    /// when the `Image` event arrives — and a transcript written with a placeholder still in
-    /// it reads back, after a restart, as a picture that resolves to nothing.
+    /// **Drain this *after* [`Session::poll`], and substitute the real hashes before the
+    /// events are appended to the sidecar.**
+    ///
+    /// This comment used to say the opposite, and argued for it — blobs first, then events —
+    /// on the grounds that the map must be populated when the `Image` event arrives. The
+    /// reasoning inverted the ordering it depends on. The transport parks the bytes **before**
+    /// it sends the event, so:
+    ///
+    /// - Polling **first** and taking blobs **second** is sound: any event now in hand had its
+    ///   bytes parked before it was sent, so the take that follows is guaranteed to see them.
+    /// - Taking blobs **first** loses the race: a blob parked between the take and the poll is
+    ///   not in the map, its placeholder survives substitution, and `"blob":"pending:3"` is
+    ///   written into the JSONL — where it stays across restarts and draws a placeholder for
+    ///   ever. Exactly the failure the old comment claimed to prevent.
+    ///
+    /// The caller must also handle the blob store *failing*: an event whose bytes could not be
+    /// stored has to become an error rather than be recorded with its placeholder intact.
     pub fn take_pending_blobs(&mut self) -> Vec<PendingBlob> {
         self.transport.take_pending_blobs()
     }
