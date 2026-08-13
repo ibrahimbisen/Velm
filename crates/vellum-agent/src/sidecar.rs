@@ -78,8 +78,16 @@ const TAIL_WINDOW: u64 = 64 * 1024;
 /// asked.
 ///
 /// 8MB is roughly the last thirty thousand ordinary records. A read that stops here answers
-/// with `complete: false`, which is what that field already means and what every caller
-/// already reads.
+/// with `complete: false`, which is what that field already means.
+///
+/// ⚠ **What reads it, precisely, because "every caller does" was written here and is not
+/// true.** One production reader does: `AgentRuntime`'s node loader turns it into the node's
+/// `truncated` flag, which is what puts *"earlier output is not shown"* on the card. The other
+/// caller — the away-mode digest in `crate::summary`, which is the very question that made this
+/// ceiling necessary — takes `records` and **drops** `complete` on the floor. So a digest built
+/// from a read that stopped at the ceiling reports what it found without saying it stopped
+/// looking. That is a gap in the digest, not in this bound, and it is stated rather than
+/// implied to be covered.
 const MAX_TAIL_WINDOW: u64 = 8 * 1024 * 1024;
 
 /// The most records a time-based read will answer with.
@@ -379,7 +387,10 @@ impl Sidecar {
             //
             // Answering short is correct here rather than a compromise: `complete` is already
             // `false` whenever the window did not reach the start, which is exactly what it
-            // means, and every caller reads it.
+            // means. ⚠ Not *"and every caller reads it"*, which this comment used to say — the
+            // node loader does and the away-mode digest does not. [`MAX_TAIL_WINDOW`] has the
+            // detail; the correctness of stopping here does not depend on it, but anyone
+            // reasoning about what the user is told does.
             if enough(&tail.records) || start == 0 || window >= ceiling {
                 if tail.records.len() > cap {
                     tail.records.drain(..tail.records.len() - cap);
@@ -737,6 +748,7 @@ mod tests {
     /// Driven through the ceiling rather than the constant, so this is a few kilobytes of
     /// fixture instead of a transcript nobody has. The assertion is that the read **stops**
     /// and says it was short — answering `complete: false` is what that field already means.
+    /// (What *reads* that answer is a shorter list than it looks: see [`MAX_TAIL_WINDOW`].)
     #[test]
     fn a_cutoff_older_than_the_file_stops_at_the_window_ceiling() {
         let (_scratch, sidecar) = sidecar();

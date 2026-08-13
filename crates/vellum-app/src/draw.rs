@@ -4466,12 +4466,22 @@ pub(crate) struct OptionCard {
     pub(crate) chosen: bool,
 }
 
-/// Where the two answers to a permission request will go.
+/// The two answers to a permission request: where they are drawn, and where they are pressed.
 ///
-/// The row is measured here and answered by `ActiveState::press_in_transcript`, which reads
-/// these three rectangles rather than repeating the arithmetic. A permission that could be
-/// *drawn* and not *answered* would leave the agent blocked for ever behind a button, which is
-/// the inert control this codebase refuses to ship.
+/// **One pair of rectangles, read twice.** The painter fills them in the same statement that
+/// records them, and `ActiveState::press_in_transcript` resolves a click against this list
+/// rather than repeating the arithmetic — the `kanban_runs` rule, which here has been broken
+/// in both directions and the second one was worse:
+///
+/// - A permission *drawn* and not *answered* leaves the agent blocked for ever behind a
+///   button, which is the inert control this codebase refuses to ship. That is what the
+///   comment this replaces was about, and it is the failure that did **not** happen.
+/// - A permission *answered* and not *drawn* is what shipped: the row was reserved and the
+///   chips pushed with no plate and no words, so a blank strip across the body of the card
+///   allowed on the left half and denied on the right — and the press arm returns `true`, so
+///   the node could not even be selected by clicking there.
+///
+/// "Measured now, painted later" is not half a feature; it is a hot zone with nothing on it.
 #[derive(Debug, Clone)]
 pub(crate) struct PermissionChips {
     /// `RequestId`'s string, which is what an answer is sent back with.
@@ -4887,8 +4897,13 @@ fn transcript_entry(
             if !detail.trim().is_empty() {
                 body.paragraph(detail, SCAFFOLD_SCALE, Tone::Muted, 1);
             }
-            // The answers' row: measured now, painted with the handler. See
-            // [`PermissionChips`] for why a drawn button would be the wrong half to ship first.
+            // **The answers, drawn from the two rectangles the press path reads.** Not two
+            // sets of arithmetic that agree today: [`PermissionChips`] carries these very
+            // rects, so a button cannot come to be drawn where a press does not land — the
+            // `kanban_runs` rule, and the one this row broke in the other direction. It was
+            // shipped measured-but-unpainted, which made the reserved band a blank strip that
+            // *answered* a permission: the left half allowed and the right half denied, and
+            // the arm returns `true`, so the node could not even be selected there.
             let chip_w = ((body.width - pad) / 2.0).max(1.0);
             let allow = NodeRect::new(body.x, body.y + pad, chip_w, chip);
             let deny = NodeRect::new(body.x + chip_w + pad, body.y + pad, chip_w, chip);
@@ -4903,6 +4918,36 @@ fn transcript_entry(
                 NodeRect::new(x, 0.0, width, entry.height),
                 PlateTone::NeedsYou,
                 CARD_RADIUS,
+            );
+            // **After the wash, because plates are drawn in the order they are pushed.**
+            // `push_node_plate` walks `NodePaint::plates` in order, so a chip painted with the
+            // body would come out *under* the question's own tint. Runs are a separate pass and
+            // are always above both, which is why only the plates have to be ordered.
+            //
+            // Allow wears the accent border an *option card the user picked* wears and deny the
+            // plain card: nothing new is invented for two buttons, and the same plate vocabulary
+            // the rest of the node uses is what makes them read as pressable.
+            entry.paint.plate(allow, PlateTone::Chosen, CARD_RADIUS);
+            entry.paint.plate(deny, PlateTone::Card, CARD_RADIUS);
+            // The label's own box is inset so its single line sits in the middle of the chip
+            // rather than against its top edge — `NodePaint::text` lays a run out from the top
+            // of the box it is given, and a plate 1.4 lines tall with the word at the top reads
+            // as a mistake rather than as a button.
+            let label = font * NODE_LINE_HEIGHT;
+            let lift = ((chip - label) / 2.0).max(0.0);
+            entry.paint.text(
+                NodeRect::new(allow.x, allow.y + lift, allow.width, label),
+                "Allow",
+                font,
+                Tone::Accent,
+                Align::Center,
+            );
+            entry.paint.text(
+                NodeRect::new(deny.x, deny.y + lift, deny.width, label),
+                "Deny",
+                font,
+                Tone::Primary,
+                Align::Center,
             );
             entry.paint.shift(column.y);
             column.paint.absorb(entry.paint);
@@ -9927,13 +9972,93 @@ mod card_overflow_tests {
             paint.runs.iter().any(|run| run.text.contains("Waiting for your answer")),
             "a blocked agent did not say it was waiting"
         );
-        // The answers' row is measured even though nothing paints it yet — see
-        // `PermissionChips` for why that is the right half to ship first.
         let chips = paint.permissions();
         assert_eq!(chips.len(), 1);
         assert_eq!(chips[0].request, "r1");
         assert!(!chips[0].allow.is_empty() && !chips[0].deny.is_empty());
         assert!(chips[0].allow.x + chips[0].allow.width <= chips[0].deny.x + 0.001);
+    }
+
+    /// **A permission chip is drawn where it is pressed, and it is drawn at all.**
+    ///
+    /// The row shipped measured and unpainted: the rectangles went into `PermissionChips`, the
+    /// press path answered them, and nothing put a plate or a word in the band they reserved.
+    /// So the body of a blocked node carried a blank strip that allowed on its left half and
+    /// denied on its right — and because the arm returns `true`, a click there could not even
+    /// select the node.
+    ///
+    /// Both halves are asserted, because either alone passes on a build with the defect facing
+    /// the other way: the words prove something was painted, and comparing the plates against
+    /// the *press* rectangles proves it was painted where the click lands. Aiming at "two more
+    /// plates exist" would pass on chips drawn a hundred units below the button.
+    #[test]
+    fn a_permission_asks_with_two_buttons_drawn_where_the_press_path_reads_them() {
+        let events = vec![TranscriptEvent::PermissionRequest {
+            id: RequestId("r1".into()),
+            summary: "write to src/main.rs".into(),
+            detail: String::new(),
+        }];
+        let paint = agent_paint(&agent_view(events), &node_layout(), node_font());
+        let chips = paint.permissions().first().expect("no permission row was measured").clone();
+
+        let (allow, deny) = (chips.allow, chips.deny);
+        let word_in = |text: &str, x: f64, y: f64, width: f64, height: f64| {
+            paint.runs.iter().any(|run| {
+                run.text == text
+                    && run.rect.x >= x - 0.001
+                    && run.rect.x + run.rect.width <= x + width + 0.001
+                    && run.rect.y >= y - 0.001
+                    && run.rect.y + run.rect.height <= y + height + 0.001
+            })
+        };
+        assert!(
+            word_in("Allow", allow.x, allow.y, allow.width, allow.height),
+            "the allow chip drew no word inside itself"
+        );
+        assert!(
+            word_in("Deny", deny.x, deny.y, deny.width, deny.height),
+            "the deny chip drew no word inside itself"
+        );
+
+        // And a plate under each, at exactly the rectangle the press path answers.
+        let plate_at = |x: f64, y: f64, width: f64, height: f64| {
+            paint.plates.iter().any(|plate| {
+                (plate.rect.x - x).abs() < 0.001
+                    && (plate.rect.y - y).abs() < 0.001
+                    && (plate.rect.width - width).abs() < 0.001
+                    && (plate.rect.height - height).abs() < 0.001
+            })
+        };
+        assert!(
+            plate_at(allow.x, allow.y, allow.width, allow.height),
+            "the allow chip is a hot zone with nothing drawn on it"
+        );
+        assert!(
+            plate_at(deny.x, deny.y, deny.width, deny.height),
+            "the deny chip is a hot zone with nothing drawn on it"
+        );
+
+        // The question's own wash is **under** both, or a 10% tint lands over the buttons:
+        // `push_node_plate` walks the list in order.
+        let wash = paint
+            .plates
+            .iter()
+            .position(|plate| plate.tone == PlateTone::NeedsYou)
+            .expect("the question lost its wash");
+        // Matched on the whole rectangle, not on `x` alone: the prompt row's own well shares a
+        // left edge with the body, and finding *that* would make this assertion about a
+        // different plate entirely.
+        let first_chip = paint
+            .plates
+            .iter()
+            .position(|plate| {
+                (plate.rect.x - allow.x).abs() < 0.001
+                    && (plate.rect.y - allow.y).abs() < 0.001
+                    && (plate.rect.width - allow.width).abs() < 0.001
+                    && (plate.rect.height - allow.height).abs() < 0.001
+            })
+            .expect("the allow chip has no plate");
+        assert!(wash < first_chip, "the question's wash was drawn over its own buttons");
     }
 
     /// Scaffolding is muted and the answer is not, which is the whole difference between Raw

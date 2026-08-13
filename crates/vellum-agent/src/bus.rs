@@ -319,6 +319,24 @@ struct Flight {
 struct Inner {
     topology: Topology,
     queue: VecDeque<Delivery>,
+    /// Deliveries the bound has thrown away since anyone last asked.
+    ///
+    /// ⚠ **The bound is not the whole answer, and this is the half that was missing.** This
+    /// queue carries a [`TranscriptEvent::Message`], and that is not a line of scrollback — it
+    /// becomes the receiving agent's **next prompt**. So a drop is an instruction that was
+    /// accepted, acknowledged with `Ok(())`, and then quietly never delivered: the sending
+    /// agent believes it asked, the receiving agent never heard, and the board shows a
+    /// conversation with a hole in it that nothing names.
+    ///
+    /// Dropping is still right — the alternative is unbounded memory on an 8GB machine — but a
+    /// silent drop is not. Counted here, **per node**, and reported by [`Bus::take_dropped`],
+    /// which the app asks once per frame and turns into a line in that node's own transcript —
+    /// which is where the hole is, and the only place it can be seen.
+    ///
+    /// A map keyed by node rather than the dropped deliveries themselves, because holding
+    /// those until someone drains would be the unbounded queue again wearing another name.
+    /// One entry per node on the board is a bound the board already imposes.
+    dropped: HashMap<String, usize>,
     /// Every link with a live pulse on it. Empty on an idle board, which is what makes
     /// [`Bus::pulse`] a length check for the frame that matters — the one where nothing is
     /// happening.
@@ -381,6 +399,7 @@ impl Bus {
             inner: Mutex::new(Inner {
                 topology: Topology::new(),
                 queue: VecDeque::new(),
+                dropped: HashMap::new(),
                 flights: Vec::new(),
             }),
             max_hops,
@@ -521,6 +540,20 @@ impl Bus {
         self.lock().queue.len()
     }
 
+    /// How many deliveries the bound has thrown away since this was last asked, and resets it.
+    ///
+    /// **Asked once per frame, beside [`Bus::drain`].** A non-zero answer is not a statistic:
+    /// this queue carries the message that becomes an agent's next prompt, so it means an
+    /// instruction was accepted and never arrived. The app says so out loud rather than
+    /// leaving a conversation with a hole in it — a lost instruction that nothing reports is
+    /// indistinguishable from an agent that ignored one.
+    ///
+    /// Taken rather than read, so one report is one loss: a counter that only ever climbs
+    /// puts the same sentence on screen every frame for the rest of the session.
+    pub fn take_dropped(&self) -> Vec<(String, usize)> {
+        std::mem::take(&mut self.lock().dropped).into_iter().collect()
+    }
+
     /// Whether a message recently went from `from` to `to`.
     pub fn in_flight(&self, from: &str, to: &str, now_ms: u64) -> bool {
         self.lock()
@@ -583,7 +616,12 @@ impl Inner {
     /// them. See the constant for why the *oldest* is what goes.
     fn enqueue(&mut self, delivery: Delivery) {
         while self.queue.len() >= Bus::MAX_QUEUED {
-            self.queue.pop_front();
+            if let Some(lost) = self.queue.pop_front() {
+                // Counted against the node that lost it, not shrugged off. See
+                // `Inner::dropped`: what leaves here may be an instruction that `Bus::send`
+                // has already answered `Ok(())` for.
+                *self.dropped.entry(lost.node).or_insert(0) += 1;
+            }
         }
         self.queue.push_back(delivery);
     }
@@ -788,6 +826,42 @@ mod tests {
             "the newest delivery was dropped"
         );
         assert!(bus.pending() == 0, "drain left something behind");
+    }
+
+    /// ⚠ **A dropped delivery is a lost instruction, and it was reported as a delivered one.**
+    ///
+    /// The bound above is right and the silence around it was not: this queue does not carry
+    /// scrollback, it carries the [`TranscriptEvent::Message`] that becomes the receiving
+    /// agent's **next prompt**. `Bus::send` had already answered `Ok(())` for every entry the
+    /// cap then threw away — so an agent asked another to do something, was told the message
+    /// was sent, and the other agent was never given it. On the board that is indistinguishable
+    /// from an agent that was asked and ignored it.
+    ///
+    /// Counted **per node**, because the node that lost it is the only place a person can be
+    /// told: the app turns each entry into a line in that agent's own transcript.
+    #[test]
+    fn a_delivery_the_bound_threw_away_is_counted_against_the_node_that_lost_it() {
+        let bus = bus_with(pair());
+        assert!(bus.take_dropped().is_empty(), "an idle bus claimed to have dropped something");
+
+        for index in 0..Bus::MAX_QUEUED {
+            bus.send(Message::new("a", "b", format!("message {index}")), 0).unwrap();
+        }
+
+        let dropped = bus.take_dropped();
+        assert!(!dropped.is_empty(), "the queue threw away deliveries and said nothing");
+        let total: usize = dropped.iter().map(|(_, count)| count).sum();
+        // Two deliveries per message, one slot each: everything past the cap went.
+        assert_eq!(total, Bus::MAX_QUEUED, "the count does not match what was thrown away");
+        assert!(
+            dropped.iter().any(|(node, _)| node == "b"),
+            "the receiver lost its prompts and was not the node it was counted against: \
+             {dropped:?}"
+        );
+
+        // Taken, not read: one loss is one report, or the same sentence lands on the node
+        // every frame for the rest of the session.
+        assert!(bus.take_dropped().is_empty(), "the same loss was reported twice");
     }
 
     /// A hop-limit refusal is generated at the speed of the loop that provokes it, so a pair

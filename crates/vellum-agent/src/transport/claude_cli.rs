@@ -684,11 +684,10 @@ impl AgentTransport for ClaudeCli {
     /// it is the reader's, and a write that fails ends the turn from inside the closure so a
     /// prompt that never left cannot leave a turn open forever.
     fn send_prompt(&mut self, turn: TurnId, prompt: &str) -> Result<()> {
-        if self.shared.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
-            return Err(AgentError::Refused(
-                "this agent is still working — the prompt was not sent".into(),
-            ));
-        }
+        // Before the turn is claimed, and safe there: `ensure_started` answers `Ok` the moment
+        // a child exists, and a turn in flight means one does — so this can never start a
+        // process on top of a running turn, and a turn that ended because the process died has
+        // already been taken by `pump`.
         self.ensure_started()?;
         if !self.shared.alive.load(Ordering::Relaxed) {
             return Err(AgentError::Transport {
@@ -697,42 +696,63 @@ impl AgentTransport for ClaudeCli {
             });
         }
 
-        self.shared.cancelled.store(false, Ordering::Relaxed);
-        *self.shared.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(turn);
-
         let shared = Arc::clone(&self.shared);
         let line = user_message(prompt);
         let started = prompt.to_owned();
-        // ⚠ **`TurnStarted` is emitted by the thread, not here, and that ordering is the fix
-        // for a turn that could never end.** This is trap 11's shape at a different layer: a
-        // `?` on the unwind path of a paired begin/end. `TurnStarted` and `TurnEnded` are that
-        // pair, and `.spawn(…)?` sat *between* them — so a failed spawn returned `Err`, and
-        // `Session::dispatch` correctly cleared its own `current`, but the `TurnStarted` was
-        // already in the channel. The next `poll` absorbed it, set `Status::Running`, and no
-        // `TurnEnded` ever followed: every later prompt was refused with *"this agent is
-        // still working"* for the life of the session.
+
+        // ⚠ **The whole claim of a turn happens under one lock, and that is the fix.**
         //
-        // Emitting it *inside* the closure is what makes the pairing structural rather than
-        // careful. Emitting it here after a successful spawn would still be racy — the thread
-        // can fail its write and emit `TurnEnded` first, which is the same unpaired sequence
-        // arriving by the other door. As the closure's first statement it cannot be.
+        // `TurnStarted` and `TurnEnded` are a paired begin/end (trap 11's shape at a different
+        // layer), and this function has now had the pair broken in *both* directions:
         //
-        // `shared.turn` is still set *before* the spawn, because the reader thread attributes
-        // the CLI's output by it and the write may be answered before this function returns.
-        // The spawn's `Err` arm is what puts that back.
+        // - `.spawn(…)?` used to sit **between** them, so a failed spawn returned `Err` with a
+        //   `TurnStarted` already in the channel: `Session::dispatch` cleared its own `current`,
+        //   the next `poll` absorbed the event, set `Status::Running`, and no `TurnEnded` ever
+        //   followed. Every later prompt was refused for the life of the session.
+        // - Emitting it as the **closure's first statement** fixed that and opened a
+        //   `TurnEnded`-before-`TurnStarted` window instead: `shared.turn` was set before the
+        //   spawn, and `pump`'s EOF path and `shutdown` both call `end_turn`, which *takes* that
+        //   id and emits the end. Neither is in the closure, so a process that died in the
+        //   microseconds before the new thread ran emitted the end first — `Session::absorb`
+        //   consumed it, the late start set `Status::Running`, and nothing was left to close it.
+        //   The same permanent wedge, arriving by the other door.
+        //
+        // `end_turn` takes this very mutex before it can emit anything, so holding it across the
+        // claim, the spawn and the emit makes the order **structural**: no `TurnEnded` can be
+        // emitted for this id until `TurnStarted` is already in the channel, and a spawn that
+        // fails puts the id back having emitted nothing at all. The busy check is inside the
+        // guard for the same reason — a claim tested outside the lock it is written under is a
+        // second turn waiting to be started.
+        //
+        // The turn is claimed *before* the write rather than after, because the reader thread
+        // attributes the CLI's output by it and the child may answer before this returns.
+        let mut in_flight =
+            self.shared.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if in_flight.is_some() {
+            return Err(AgentError::Refused(
+                "this agent is still working — the prompt was not sent".into(),
+            ));
+        }
+        self.shared.cancelled.store(false, Ordering::Relaxed);
+        *in_flight = Some(turn);
+
+        // The prompt is written on a detached one-shot thread — see this function's own doc
+        // comment — and a write that fails ends the turn from inside it, which blocks on this
+        // guard until the emit below has happened.
         let spawned = std::thread::Builder::new()
             .name("velm-claude-prompt".into())
             .spawn(move || {
-                shared.emit(TranscriptEvent::TurnStarted { turn, prompt: started });
                 if let Err(error) = shared.write_line(&line) {
                     shared.end_turn(TurnOutcome::Failed { message: error.to_string() });
                 }
             });
         match spawned {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.shared.emit(TranscriptEvent::TurnStarted { turn, prompt: started });
+                Ok(())
+            }
             Err(error) => {
-                *self.shared.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    None;
+                *in_flight = None;
                 Err(AgentError::Io(error))
             }
         }
@@ -1282,6 +1302,58 @@ mod tests {
         let (shared, events) = detached();
         pump(Cursor::new(String::new()), &shared);
         assert!(events.try_recv().is_err());
+    }
+
+    /// **A turn cannot be ended while it is still being claimed**, and that is the whole of
+    /// `send_prompt`'s ordering guarantee.
+    ///
+    /// Moving `TurnStarted` into the prompt thread closed a `TurnStarted`-after-`Err` hole and
+    /// opened a `TurnEnded`-before-`TurnStarted` one: `shared.turn` was set before the spawn,
+    /// and both `pump`'s EOF path and `shutdown` call [`Shared::end_turn`] — neither of which
+    /// is in that closure. A process that died in the microseconds before the new thread ran
+    /// emitted the end first, `Session::absorb` consumed it, and the late start left
+    /// `Status::Running` with nothing able to close it.
+    ///
+    /// `send_prompt` now claims, spawns and emits under **one** guard on this mutex. What that
+    /// relies on is the property asserted here: `end_turn` takes the same mutex *before* it can
+    /// emit anything, so it waits rather than overtaking. A rewrite that took the id and then
+    /// emitted outside the lock would leave `send_prompt` looking correct and racing again —
+    /// this is the test that would go red.
+    ///
+    /// ⚠ **What is not driven here**: `send_prompt` itself, which needs a child process. Its
+    /// sequence is read against this property, not measured.
+    #[test]
+    fn a_turn_cannot_be_ended_while_it_is_still_being_claimed() {
+        let (shared, events) = detached();
+        let mut claim = shared.turn.lock().unwrap();
+        *claim = Some(TurnId(7));
+
+        // Exactly what `pump` does when the pipe closes, on its own thread, while the claim
+        // is held — the window the second version of this bug lived in.
+        let dying = Arc::clone(&shared);
+        let ender = std::thread::spawn(move || {
+            dying.end_turn(TurnOutcome::Failed { message: "the process ended".into() });
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            events.try_recv().is_err(),
+            "a turn was ended before the prompt that started it had said so"
+        );
+
+        shared.emit(TranscriptEvent::TurnStarted { turn: TurnId(7), prompt: "go".into() });
+        drop(claim);
+        ender.join().unwrap();
+
+        let order: Vec<TranscriptEvent> = events.iter().take(2).collect();
+        assert!(
+            matches!(order.first(), Some(TranscriptEvent::TurnStarted { .. })),
+            "the pair opened with something other than its start: {order:?}"
+        );
+        assert!(
+            matches!(order.get(1), Some(TranscriptEvent::TurnEnded { .. })),
+            "the pair never closed: {order:?}"
+        );
     }
 
     /// A `result` arriving with nothing in flight cannot invent a turn to end. It happens on

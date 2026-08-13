@@ -978,6 +978,29 @@ impl AgentRuntime {
     /// Route what the bus has for us: one transcript line per end, and the receiving
     /// session's next turn.
     fn drain_bus(&mut self, now: Timestamp, _now_ms: u64) {
+        // ⚠ **What the bus threw away, said out loud.** `Bus::MAX_QUEUED` is a memory bound and
+        // it drops the *oldest* delivery — but a delivery is not a line of scrollback, it is
+        // the prompt the receiving agent was about to be given, and `Bus::send` has already
+        // answered its caller `Ok(())` by the time this happens. Silently, that is an
+        // instruction accepted and never delivered: indistinguishable, on the board, from an
+        // agent that was asked and ignored it. Taken rather than read, so one loss is one
+        // sentence and not one per frame for the rest of the session.
+        for (node, lost) in self.bus.take_dropped() {
+            log::error!("the message bus dropped {lost} deliveries for {node}: it was full");
+            let Some(key) = NodeKey::from_wire(&node) else { continue };
+            let message = if lost == 1 {
+                "A message to this agent was dropped before it arrived: Velm's message bus was \
+                 full. Nothing was delivered for it — ask again if it mattered."
+                    .to_owned()
+            } else {
+                format!(
+                    "{lost} messages to this agent were dropped before they arrived: Velm's \
+                     message bus was full. Nothing was delivered for them — ask again if they \
+                     mattered."
+                )
+            };
+            self.record(&key, now, &TranscriptEvent::Error { message });
+        }
         for delivery in self.bus.drain() {
             let Some(key) = NodeKey::from_wire(&delivery.node) else {
                 continue;

@@ -1086,6 +1086,13 @@ impl ActiveState {
         // The eraser holds a group open across its dabs for the same reason, and quitting
         // mid-sweep is a way for it to end without the button ever coming up.
         self.finish_erase();
+        // And the prompt row, which is the third of them — quitting mid-sentence must keep
+        // what was typed. The draft lives in the runtime rather than in the session, so
+        // `end_prompting` is what moves it there; without this call an instruction half
+        // written when the window closed is simply gone on the next launch. (`settle` is the
+        // one function that closes all three and is private to `crate::actions`; the two
+        // above are its other halves.)
+        self.end_prompting();
         let path = self.editor.path().map(std::path::Path::to_path_buf);
         if let Some(path) = path.as_deref() {
             self.capture_thumbnail(path);

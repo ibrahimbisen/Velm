@@ -44,7 +44,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::ipc::{self, Answer, RuntimeFile};
-use crate::research::{Research, ResearchConfig, ResearchError, SearchEngine};
+use crate::research::{Research, ResearchConfig, ResearchError};
 
 // ---------------------------------------------------------------------------------------
 // The protocol's own strings
@@ -649,11 +649,14 @@ impl Default for Server {
 }
 
 impl Server {
-    /// The shipping configuration: research from the environment's search settings, Velm from
+    /// The shipping configuration: research from the environment, Velm from
     /// [`Endpoint::from_env`].
+    ///
+    /// `ResearchConfig::from_env` rather than the search field alone — it reads the host
+    /// policy's own switch too, which for as long as this line named one field was the reason
+    /// `allow_local_hosts` could not be turned on by anyone but a recompile.
     pub fn new() -> Self {
-        let config = ResearchConfig { search: SearchEngine::from_env(), ..ResearchConfig::default() };
-        Self::with(Research::new(config), Endpoint::from_env())
+        Self::with(Research::new(ResearchConfig::from_env()), Endpoint::from_env())
     }
 
     /// Both halves supplied. What the tests use, so a protocol assertion cannot depend on the

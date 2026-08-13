@@ -1001,7 +1001,8 @@ pub fn encode_base64(bytes: &[u8]) -> String {
 }
 
 /// The other direction, and it is **strict**. `None` for anything [`encode_base64`] would not
-/// have produced.
+/// have produced **from bytes worth carrying** — which is every string it produces except the
+/// one it makes from nothing.
 ///
 /// # Why strict, when lenient is friendlier
 ///
@@ -1025,9 +1026,16 @@ pub fn encode_base64(bytes: &[u8]) -> String {
 /// - **Non-canonical trailing bits.** `Zg==` and `Zh==` differ, and a decoder that discards
 ///   the tail says they are the same byte. Two spellings of one payload is how a
 ///   content-addressed store gets two hashes for one picture.
+/// - **The empty string**, which is the only refusal here that is not a malformed input. It is
+///   perfectly good base64 for zero bytes, and zero bytes is not a thing any of this
+///   function's three callers can use: all three are decoding **an image an agent posted**,
+///   straight into the blob store. Refusing `"a"` and accepting `""` left the *same* zero-byte
+///   blob reachable by the honest route, with two test files asserting it was correct. The
+///   check belongs here rather than at the callers precisely because there are three of them
+///   and a rule applied at two of three is how this defect got its second life.
 pub fn decode_base64(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
-    if !bytes.len().is_multiple_of(4) {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return None;
     }
 
@@ -1460,8 +1468,15 @@ mod tests {
     /// that agree with each other and with nothing else — including a wrong alphabet.
     #[test]
     fn base64_matches_rfc_4648_and_survives_a_round_trip() {
+        // RFC 4648's first vector is `("", "")` and it is **encode-only** here: the decoder
+        // refuses the empty string on purpose (see its own doc comment), because the only
+        // thing this pair carries is an image an agent posted and a zero-byte picture is the
+        // defect the `"a"` refusal exists to stop, arriving by the honest route. The encoder
+        // is still held to the vector.
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(decode_base64(""), None, "an empty payload was decoded as a zero-byte blob");
+
         let vectors = [
-            ("", ""),
             ("f", "Zg=="),
             ("fo", "Zm8="),
             ("foo", "Zm9v"),
@@ -1478,8 +1493,9 @@ mod tests {
             );
         }
 
-        // Every length through two full quantums, so no padding case is missed.
-        for length in 0..=32usize {
+        // Every length through two full quantums, so no padding case is missed. From **one**,
+        // because zero is the encode-only vector above.
+        for length in 1..=32usize {
             let bytes: Vec<u8> = (0..length).map(|i| (i * 7 + 3) as u8).collect();
             let text = encode_base64(&bytes);
             assert_eq!(text.len() % 4, 0, "padding is wrong at length {length}");

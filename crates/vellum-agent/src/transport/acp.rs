@@ -1026,9 +1026,13 @@ mod tests {
     fn base64_refuses_the_shapes_a_truncated_or_spliced_payload_takes() {
         assert_eq!(decode_base64("aGVsbG8=").unwrap(), b"hello");
         assert_eq!(decode_base64("YW55IGNhcm5hbCBwbGVhc3VyZQ==").unwrap(), b"any carnal pleasure");
-        assert_eq!(decode_base64("").unwrap(), b"");
 
         assert!(decode_base64("not base64!").is_none());
+        // ⚠ This line used to be `decode_base64("").unwrap() == b""`, one line below the one
+        // that refuses a zero-byte blob from `"a"` — the same defect, asserted as correct in
+        // the half nobody had looked at. Nothing here checks `is_empty()` before parking the
+        // bytes, so an empty `data` field went into the store as a picture.
+        assert!(decode_base64("").is_none(), "an empty payload is not a picture");
         assert!(decode_base64("a").is_none(), "one character decoded to a zero-byte blob");
         assert!(decode_base64("aGVsbG8").is_none(), "an unpadded length is a truncated payload");
         assert!(decode_base64("aGVs\nbG8=").is_none(), "whitespace inside the payload");

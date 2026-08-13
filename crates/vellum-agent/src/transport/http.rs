@@ -481,6 +481,16 @@ enum Piece {
     /// into "a complete stream is reported as truncated", which is the same defect facing the
     /// other way and every bit as much of a lie.
     TextThenStop(String, TurnOutcome),
+    /// The same frame for a **reasoning** delta, and it is not a hypothetical corner.
+    ///
+    /// `TextThenStop` was added for `content` and applied to `content` alone — one branch over,
+    /// `reasoning_content` went on returning a bare `Thought` and dropping the `finish_reason`
+    /// beside it. So a reasoning turn cut short by `length` or stopped by `content_filter` was
+    /// reported as complete, which is the defect that variant exists to prevent, surviving in
+    /// its sibling. The servers that send reasoning this way — Kimi and DeepSeek, named in
+    /// `parse_event`'s own comment — are exactly the ones that attach the stop reason to the
+    /// last chunk rather than sending a frame of its own.
+    ThoughtThenStop(String, TurnOutcome),
     /// The provider reported an error mid-stream.
     Failed(String),
     /// End of stream.
@@ -549,10 +559,16 @@ fn parse_event(wire: Wire, data: &str) -> Piece {
                     None => Piece::Text(text.to_owned()),
                 };
             }
+            // The same two shapes as `content` above, and they have to be read the same way:
+            // the stop reason rides on the last chunk, which for a reasoning turn is a
+            // reasoning chunk. Returning a bare `Thought` here dropped it.
             if let Some(text) = choice["delta"]["reasoning_content"].as_str()
                 && !text.is_empty()
             {
-                return Piece::Thought(text.to_owned());
+                return match stop {
+                    Some(outcome) => Piece::ThoughtThenStop(text.to_owned(), outcome),
+                    None => Piece::Thought(text.to_owned()),
+                };
             }
             match stop {
                 Some(outcome) => Piece::Stop(outcome),
@@ -768,18 +784,33 @@ impl AgentTransport for HttpTransport {
         drop(self.turn.take());
         self.cancel.store(false, Ordering::Relaxed);
 
-        let _ =
-            self.events.send(TranscriptEvent::TurnStarted { turn, prompt: prompt.to_owned() });
-        lock(&self.history).push(Message { role: "user", content: prompt.to_owned() });
-
         let config = Arc::clone(&self.config);
         let history = Arc::clone(&self.history);
         let model = Arc::clone(&self.model);
         let cancel = Arc::clone(&self.cancel);
         let events = self.events.clone();
+        let asked = prompt.to_owned();
+        // ⚠ **`TurnStarted` and the history entry are both the worker's, and neither may
+        // happen before the spawn.** `AgentTransport::send_prompt`'s contract is that an
+        // `Err` means no `TurnStarted` was emitted, and `.spawn(…)?` sat *below* the emit: a
+        // failed spawn returned `Err`, `Session::dispatch` correctly cleared its own state,
+        // and the `TurnStarted` was already in the channel. The next `poll` absorbed it, set
+        // `Status::Running`, and nothing ever emitted the `TurnEnded` that closes it — so
+        // every later prompt was refused with *"this agent is still answering"* for the life
+        // of the session. Trap 11's shape: a `?` on the unwind path of a paired begin/end.
+        //
+        // The other two transports moved this into their closures and this one did not. In
+        // here the pairing is structural — the same closure emits both events and nothing
+        // else in this transport emits either — rather than careful.
+        //
+        // The user's message goes in with it, because a prompt that was never sent must not
+        // be in the conversation the *next* one is built from. It is read only by `run_turn`,
+        // three lines below, so moving it changes nothing anyone else can observe.
         let handle = std::thread::Builder::new()
             .name("velm-agent-http".into())
             .spawn(move || {
+                let _ = events.send(TranscriptEvent::TurnStarted { turn, prompt: asked.clone() });
+                lock(&history).push(Message { role: "user", content: asked });
                 let outcome = run_turn(&config, &history, &model, &cancel, &events);
                 let _ = events.send(TranscriptEvent::TurnEnded { turn, outcome });
             })
@@ -1142,6 +1173,19 @@ fn consume_stream(
                 terminator = true;
                 outcome = reported;
             }
+            // The reasoning is delivered before the stop is recorded, exactly as the text arm
+            // below does it. `produced` counts it for the same reason `Thought` does: a
+            // provider that emits nothing but reasoning must still reach `MAX_ANSWER_BYTES`.
+            Piece::ThoughtThenStop(text, reported) => {
+                produced += text.len();
+                flush(events, &mut pending);
+                let sent = events.send(TranscriptEvent::Thought { text }).is_ok();
+                terminator = true;
+                outcome = reported;
+                if !sent {
+                    break;
+                }
+            }
             // The text is delivered *before* the stop is recorded, so the last words of an
             // answer reach the node even though the same frame ended the turn.
             Piece::TextThenStop(text, reported) => {
@@ -1406,6 +1450,29 @@ mod tests {
         // DeepSeek both — which is why this arm is not Anthropic-only.
         let thinking = r#"{"choices":[{"delta":{"reasoning_content":"hmm"}}]}"#;
         assert_eq!(parse_event(Wire::OpenAi, thinking), Piece::Thought("hmm".into()));
+
+        // ⚠ **With the stop reason attached, which is what the last chunk of a real stream
+        // carries.** The line above omits `finish_reason` — the field production supplies —
+        // so it passed on a build that read the reasoning and threw the stop away, and a
+        // reasoning turn cut off at the token cap was reported as a finished answer. The two
+        // servers named above are the ones that put it here rather than in a frame of its own.
+        let capped_thought =
+            r#"{"choices":[{"delta":{"reasoning_content":"hm"},"finish_reason":"length"}]}"#;
+        assert!(
+            matches!(
+                parse_event(Wire::OpenAi, capped_thought),
+                Piece::ThoughtThenStop(ref text, TurnOutcome::Exhausted { .. })
+                    if text.as_str() == "hm"
+            ),
+            "a capped reasoning chunk dropped its stop reason: {:?}",
+            parse_event(Wire::OpenAi, capped_thought)
+        );
+        let filtered =
+            r#"{"choices":[{"delta":{"reasoning_content":"hm"},"finish_reason":"content_filter"}]}"#;
+        assert!(
+            !matches!(parse_event(Wire::OpenAi, filtered), Piece::Thought(_)),
+            "a filtered reasoning chunk was reported as an ordinary thought"
+        );
 
         let ended = r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
         assert_eq!(parse_event(Wire::OpenAi, ended), Piece::Stop(TurnOutcome::Completed));

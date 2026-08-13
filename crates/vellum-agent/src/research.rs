@@ -82,10 +82,13 @@
 //!   goes and finds a public source. This is the same rule the rest of this module already
 //!   follows for a 403.
 //!
-//! **The opt-in, and why it is a config field rather than a special case.** A user pointing
-//! this at their own local model or their own SearXNG is a legitimate thing to want, so
-//! [`ResearchConfig::allow_local_hosts`] exists — **default off**, set by the user and never
-//! by a model. The distinction that matters throughout is *who chose the URL*: a **search
+//! **The opt-in, and how it is actually reached.** A user pointing this at their own local
+//! model or their own SearXNG is a legitimate thing to want, so
+//! [`ResearchConfig::allow_local_hosts`] exists — **default off**, and set by the user through
+//! [`ALLOW_LOCAL_HOSTS_ENV`], never by a model. ⚠ For a while it was set by *nobody*: the field
+//! was written in one place, `Default::default()`, as `false`, while the refusal's own message
+//! told the user to turn it on. An escape hatch that needs a recompile is not one, and a
+//! refusal that names it is then giving an instruction that cannot be followed. The distinction that matters throughout is *who chose the URL*: a **search
 //! endpoint is user configuration** and is exempt already ([`Research::search_at`]), because
 //! SearXNG on `localhost` is the ordinary way to run it and the user typed that address
 //! themselves. A URL a model produced is not.
@@ -225,6 +228,22 @@ pub const DEFAULT_SEARCH_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 /// refusal rather than a silent nothing.
 pub const SEARCH_ENDPOINT_ENV: &str = "VELM_SEARCH_ENDPOINT";
 
+/// The environment variable that lifts the host policy — [`ResearchConfig::allow_local_hosts`].
+///
+/// **It exists because the refusal advertises it.** [`ResearchError::BlockedHost`]'s message
+/// tells the user to turn `allow_local_hosts` on if the address really is their own server, and
+/// for as long as that field was written in exactly one place — `Default::default()`, as
+/// `false` — the only way to take that advice was to edit Rust and rebuild. An escape hatch
+/// nobody can reach is worse than none: it reads as a setting that has been looked for and not
+/// found.
+///
+/// Set to `1`, `true`, `yes` or `on`. Anything else, including unset, leaves the policy on.
+///
+/// **An environment variable rather than a menu**, matching [`SEARCH_ENDPOINT_ENV`]: both are
+/// switches a *user* sets deliberately for a whole session, and neither is a thing a model can
+/// reach — nothing on the canvas writes them, and this is read once when the tool is built.
+pub const ALLOW_LOCAL_HOSTS_ENV: &str = "VELM_ALLOW_LOCAL_HOSTS";
+
 /// The environment variable that says what shape the configured endpoint answers in.
 ///
 /// `json` (the default for a *configured* endpoint, because a user pointing Velm at their own
@@ -268,8 +287,8 @@ pub enum ResearchError {
     /// whatever address it was told not to reach.
     #[error(
         "{url} was not fetched: {host} is {reason}, and Velm's research tool reaches the \
-         public internet only. Use a public address, or ask the user to turn on \
-         `allow_local_hosts` if this really is their own server."
+         public internet only. Use a public address, or ask the user to set \
+         VELM_ALLOW_LOCAL_HOSTS=1 if this really is their own server."
     )]
     BlockedHost { url: String, host: String, reason: String },
 
@@ -337,9 +356,10 @@ impl Default for SearchEngine {
 impl SearchEngine {
     /// Reads [`SEARCH_ENDPOINT_ENV`] and [`SEARCH_FORMAT_ENV`].
     ///
-    /// The one place in this module that touches the environment, and it is read once when a
-    /// [`Research`] is built rather than per call, so a search cannot change destination
-    /// halfway through a session.
+    /// Read once when a [`Research`] is built rather than per call, so a search cannot change
+    /// destination halfway through a session. [`ResearchConfig::from_env`] reads the other one
+    /// ([`ALLOW_LOCAL_HOSTS_ENV`]) beside it; this used to be the only environment read in the
+    /// module, which is exactly why the host policy's own switch had no way of being set.
     pub fn from_env() -> Self {
         let endpoint = std::env::var(SEARCH_ENDPOINT_ENV).unwrap_or_default();
         let endpoint = endpoint.trim();
@@ -384,7 +404,11 @@ pub struct ResearchConfig {
 
     /// Whether the host policy is lifted. See the module header.
     ///
-    /// **Off in every constructor, and it is the user's switch rather than the model's.** A
+    /// **Off by default, and set by the user through [`ALLOW_LOCAL_HOSTS_ENV`] — which is the
+    /// part that used to be missing.** It was `false` in the only place that wrote it, so the
+    /// sentence below ("a policy the user cannot override on their own machine") described the
+    /// build rather than the thing it was arguing against. [`ResearchConfig::from_env`] is what
+    /// makes it reachable, and it is the constructor the running tool uses. A
     /// user pointing an agent at their own local model, their own wiki or their own SearXNG is
     /// a real thing to want, and refusing it outright would be a policy the user cannot
     /// override on their own machine. What it must never be is the *default*, because the URL
@@ -412,6 +436,42 @@ impl Default for ResearchConfig {
             search: SearchEngine::default(),
         }
     }
+}
+
+impl ResearchConfig {
+    /// The defaults, with the two things the **user** is allowed to change read from the
+    /// environment: where search goes, and whether the host policy is lifted.
+    ///
+    /// This is what the running tool is built from. The two fields are together here because
+    /// they are the same kind of thing — a decision the person at the keyboard makes for a
+    /// session — and because the alternative was what shipped: `allow_local_hosts` written in
+    /// one place, as `false`, while the refusal it guards told the user to turn it on.
+    pub fn from_env() -> Self {
+        Self {
+            search: SearchEngine::from_env(),
+            allow_local_hosts: env_flag(ALLOW_LOCAL_HOSTS_ENV),
+            ..Self::default()
+        }
+    }
+}
+
+/// One environment variable read as a switch.
+///
+/// Deliberately narrow: the four spellings someone actually types, and **everything else is
+/// off**. A flag that treats any non-empty value as `true` turns `VELM_ALLOW_LOCAL_HOSTS=no`
+/// into permission, and the value of this particular switch is that it is hard to turn on by
+/// accident.
+fn env_flag(name: &str) -> bool {
+    flag_is_on(std::env::var(name).ok().as_deref())
+}
+
+/// The reading half, split out so it can be asserted **without setting an environment
+/// variable**: a test binary runs its tests as threads in one process, so a test that writes
+/// the environment writes it for every other test running at that moment.
+fn flag_is_on(value: Option<&str>) -> bool {
+    let Some(value) = value else { return false };
+    let value = value.trim();
+    ["1", "true", "yes", "on"].iter().any(|form| value.eq_ignore_ascii_case(form))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2118,6 +2178,13 @@ impl Research {
     ///
     /// Every address is checked, not the first: a name that resolves to a public address and a
     /// private one is a name that reaches the private one whenever the resolver feels like it.
+    ///
+    /// ⚠ **Known and not fixed: the lookup is blocking and outside `config.timeout`.**
+    /// `to_socket_addrs` is the platform resolver and takes no deadline, so a host whose DNS
+    /// hangs blocks this call for however long the system resolver waits — per redirect hop,
+    /// since the policy is applied on each. `timeout` bounds the HTTP exchange below and has
+    /// never bounded this. Giving it one means resolving on a worker with a deadline, which is
+    /// a change to how every fetch is made rather than a line here.
     fn check_host(&self, url: &str, parts: &UrlParts) -> Result<(), ResearchError> {
         if self.config.allow_local_hosts {
             return Ok(());
@@ -3039,6 +3106,99 @@ mod policy_tests {
             matches!(crate_wide, crate::AgentError::Refused(_)),
             "a policy refusal arrived as something retryable: {crate_wide:?}"
         );
+    }
+
+    /// ⚠ **The gate is *called*, and that is what nothing checked.**
+    ///
+    /// Every assertion above is on `blocked_by_name`, `hostname_of` or `resolve_url` — pure
+    /// functions that know the policy perfectly and are not the policy. Delete the
+    /// `self.check_host(&target, &parts)?` line out of `fetch_at` and every one of them stays
+    /// green while a model-chosen `http://127.0.0.1:11434/…` is fetched. That is the shape
+    /// `opens_context_menu` and `import_to_new_board` both had in `CLAUDE.md`: written, tested,
+    /// and reached by nothing.
+    ///
+    /// **It needs no network.** A literal loopback address is refused by name, before the
+    /// resolver is consulted and long before a request is made — so this drives the real
+    /// entry point, `Research::fetch_at`, and asserts on the error it hands back.
+    #[test]
+    fn a_model_chosen_local_url_is_refused_by_the_fetch_itself_and_not_only_by_the_policy() {
+        let research = Research::new(ResearchConfig::default());
+        let refused = research
+            .fetch_at("http://127.0.0.1:11434/api/generate", Instant::now())
+            .expect_err("the fetch reached this machine");
+        assert!(
+            matches!(refused, ResearchError::BlockedHost { .. }),
+            "a local address was refused, but not by the host policy: {refused:?}"
+        );
+        // The advice in the message has to be an instruction somebody can follow, which for a
+        // while it was not: the switch it names was set in one place in the source, as `false`.
+        assert!(
+            refused.to_string().contains(ALLOW_LOCAL_HOSTS_ENV),
+            "the refusal advertises an escape hatch it does not name: {refused}"
+        );
+
+        // The metadata address by the same route — the one that hands out credentials.
+        assert!(matches!(
+            research.fetch_at("http://169.254.169.254/latest/meta-data/", Instant::now()),
+            Err(ResearchError::BlockedHost { .. })
+        ));
+
+        // And with the user's own switch on, the policy stands aside — the half that makes
+        // this a gate rather than a wall. It has to get *past* the gate to prove anything, so
+        // this one does attempt a connection: to port 1 on loopback, which nothing listens on,
+        // with a short timeout so a firewall that drops rather than refuses cannot stall the
+        // suite. Either way the answer is a **network** error, which is only reachable below
+        // the check that would otherwise have refused the host.
+        //
+        // ⚠ A scheme that is not http(s) would *not* have proved this: `split_url` refuses
+        // that one line above `check_host`, so the assertion would hold with the policy still
+        // in force — the vacuous shape this whole test exists to correct.
+        let allowed = Research::new(ResearchConfig {
+            allow_local_hosts: true,
+            respect_robots: false,
+            timeout: Duration::from_millis(250),
+            ..ResearchConfig::default()
+        });
+        let outcome = allowed.fetch_at("http://127.0.0.1:1/x", Instant::now());
+        assert!(
+            matches!(outcome, Err(ResearchError::Network { .. })),
+            "the user's own switch did not lift the host policy: {outcome:?}"
+        );
+    }
+
+    /// The switch the refusal advertises is one the user can actually throw.
+    ///
+    /// `allow_local_hosts` was written in exactly one place — `Default::default()`, as `false` —
+    /// so the only way to take the advice in [`ResearchError::BlockedHost`] was to edit this
+    /// file and rebuild. The assertion is on the **constructor the running tool uses**, since
+    /// that is where the field being unreachable actually bit.
+    #[test]
+    fn the_host_policy_can_be_lifted_by_the_user_without_recompiling_velm() {
+        // The reading, which is where a flag like this goes wrong: **anything** that is not one
+        // of the four spellings leaves the policy on, so `VELM_ALLOW_LOCAL_HOSTS=no` cannot
+        // read as permission — which is what a naive "set to anything" flag would do with it.
+        for value in ["1", "true", "TRUE", "yes", " on "] {
+            assert!(flag_is_on(Some(value)), "{value:?} should turn the switch on");
+        }
+        for value in ["0", "no", "off", "false", "", "please", "no thanks"] {
+            assert!(!flag_is_on(Some(value)), "{value:?} must not turn the switch on");
+        }
+        assert!(!flag_is_on(None), "unset must leave the host policy in force");
+
+        // Asserted without writing the environment: a test binary runs its tests as threads in
+        // one process, so `set_var` here is a write every other test can see.
+        //
+        // The wiring, then: whatever the environment currently says, `from_env` is what the
+        // field follows — where it used to follow nothing at all, because the only place it
+        // was ever written was `Default::default()`.
+        let from_env = ResearchConfig::from_env();
+        assert_eq!(
+            from_env.allow_local_hosts,
+            flag_is_on(std::env::var(ALLOW_LOCAL_HOSTS_ENV).ok().as_deref()),
+            "the constructor the running tool uses does not read {ALLOW_LOCAL_HOSTS_ENV}"
+        );
+        // And the default is unchanged: the switch is opt-in, whatever route it arrives by.
+        assert!(!ResearchConfig::default().allow_local_hosts);
     }
 
     /// **The robots exemption is an equality test, not a prefix.** `/robots.txt` is exempt

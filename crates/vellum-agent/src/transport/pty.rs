@@ -59,7 +59,13 @@ pub const MAX_SCROLLBACK: usize = 2_000;
 ///
 /// The second half of the memory bound: a process that writes megabytes with no newline —
 /// a `cat` of a minified bundle, a hung progress bar — would otherwise grow one line without
-/// limit. Broken rather than truncated, so nothing is lost.
+/// limit. The line is **broken rather than truncated**, so the characters are all still there;
+/// what is lost is only where the writer thought the line ended.
+///
+/// ⚠ **A break resets the column to zero**, which is the part any caller of [`Ansi::put`] in a
+/// loop has to account for: a loop whose stop was worked out from the column *before* the
+/// break never reaches it. That is not hypothetical — the tab arm of [`Ansi::ground`] diverged
+/// on it, and that is a hang rather than a wrong character.
 pub const MAX_LINE_CELLS: usize = 4_096;
 
 /// The most parameter and intermediate bytes one CSI sequence may accumulate.
@@ -250,10 +256,30 @@ impl Ansi {
             // in every CLI works, and treating it as a newline is what turns one of them
             // into a thousand lines of transcript.
             b'\r' => self.column = 0,
+            // ⚠ **The stop is recomputed against what `put` did, not against what it was
+            // asked to do.** [`Ansi::put`] breaks the line at [`MAX_LINE_CELLS`] and a break
+            // puts the column back to **zero** — so a target worked out before the break is
+            // never reached and `while self.column < next` runs for ever, pushing a full
+            // 4,096-cell line into `finished` every 4,096 turns. `feed` never returns: the
+            // node goes dead, memory grows without bound, and `MAX_SCROLLBACK` never gets a
+            // chance to prune because it is downstream of a call that does not come back.
+            //
+            // It is not a corner. `\x1b[4096G` clamps the column to `MAX_LINE_CELLS - 1`
+            // (see the `b'G'` arm), which is *inside* the window a tab diverges in — and
+            // 4,090 ordinary printed characters followed by a tab reaches it with no escape
+            // sequence at all.
+            //
+            // A column that did not advance is a line that wrapped, and a tab stop belongs to
+            // the line it was written on: stopping there ends the tab where the line ended,
+            // which is what a terminal does.
             b'\t' => {
                 let next = (self.column / 8 + 1) * 8;
                 while self.column < next {
+                    let before = self.column;
                     self.put(' ');
+                    if self.column <= before {
+                        break;
+                    }
                 }
             }
             0x08 => self.column = self.column.saturating_sub(1),
@@ -333,6 +359,13 @@ impl Ansi {
             // `MAX_LINE_CELLS - 1` rather than `MAX_LINE_CELLS`, because a column is an index:
             // the last cell of a full line is at `MAX_LINE_CELLS - 1`, and clamping one higher
             // would let `put` pad to the cap and then push one cell past it.
+            //
+            // ⚠ **What the clamp fixed and what it then made deterministic.** It does stop the
+            // billion-cell allocation. It also lands every oversized column on 4,095 — one
+            // cell short of a line break — so `\x1b[NG` for any N ≥ 4,089 followed by a **tab**
+            // put the tab arm of [`Ansi::ground`] into the divergent window every time, turning
+            // an abort into a hang. The tab arm is where that is answered; this is only where
+            // the input arrives, and it is recorded here because the two are one bug.
             b'G' => {
                 self.column = parameters
                     .first()
@@ -889,6 +922,48 @@ mod tests {
         let lines = feed(&[b"\x1b[900000000G\x1b[900000000G\x1b[900000000Gz"]);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].chars().count(), MAX_LINE_CELLS);
+    }
+
+    /// **A tab at the end of a full line must end, and the clamp above is what put it there.**
+    ///
+    /// The tab arm works its stop out once and then pads towards it, and `put` breaks the line
+    /// at [`MAX_LINE_CELLS`] — putting the column back to **zero**, below a stop it can now
+    /// never reach. `feed` then never returns: a full 4,096-cell line goes into `finished`
+    /// every 4,096 turns, for ever, and [`MAX_SCROLLBACK`] never prunes because it is
+    /// downstream of the call that does not come back.
+    ///
+    /// The column clamp is what made it deterministic rather than lucky: `MAX_LINE_CELLS - 1`
+    /// is *inside* the divergent window, so **every** `\x1b[NG` with N ≥ 4,089 followed by a
+    /// tab lands in it. The second case needs no escape sequence at all.
+    ///
+    /// The existing clamp test cannot see this and neither could the runaway-line one: both
+    /// feed a **printable** character after the move, which is the case that works — one `put`
+    /// with no loop around it.
+    ///
+    /// A/B, and it is the same shape as the clamp test above: against the unfixed arm this
+    /// does not fail, it hangs the test binary while its memory climbs.
+    #[test]
+    fn a_tab_at_the_end_of_a_full_line_stops_at_the_break_instead_of_looping_for_ever() {
+        // The column comes off the wire, is clamped to 4,095, and the tab's stop is 4,096.
+        let lines = feed(&[b"\x1b[4096G\t"]);
+        assert_eq!(lines.len(), 1, "the padded line was not broken exactly once: {}", lines.len());
+        assert_eq!(
+            lines[0].chars().count(),
+            MAX_LINE_CELLS,
+            "the tab padded past the line cap"
+        );
+
+        // Reachable with no escape sequence: 4,090 printed characters put the column six
+        // short of the break, and the next tab stop is past it.
+        let mut typed = "x".repeat(MAX_LINE_CELLS - 6);
+        typed.push('\t');
+        let lines = feed(&[typed.as_bytes()]);
+        assert_eq!(lines.len(), 1, "a tab after 4,090 characters did not end the line once");
+        assert_eq!(lines[0].chars().count(), MAX_LINE_CELLS);
+        assert!(lines[0].starts_with("xxxx"), "the characters before the tab were lost");
+
+        // And the ordinary case is unchanged: a tab still advances to the next multiple of 8.
+        assert_eq!(feed(&[b"a\tb"]), vec![format!("a{}b", " ".repeat(7))]);
     }
 
     /// The third memory bound. A CSI sequence ends at its *final* byte and nothing makes a

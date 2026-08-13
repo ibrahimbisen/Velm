@@ -623,6 +623,27 @@ impl ActiveState {
             self.agent_runtime.forget_board(&board);
             log::debug!("released {}", parked.path().display());
         }
+
+        // ⚠ **And the board on screen, which is the one the user actually closed.**
+        // `Session::retain` only ever answers *parked* boards, and the board behind the tab
+        // you just clicked the × on is the **hot** one — so `⌘W`, Board ▸ Close board and the
+        // × on the active tab all reached the loop above and none of them was ever in it. The
+        // consequence is the one the comment above describes, uncorrected: the schedule stays,
+        // fires, `agent_doc` answers `None` because that board is not in front, `defer_due`
+        // re-queues it — and it can never come forward again, because its tab is gone. `due`
+        // is one of the conditions `dormant()` tests, so the whole agent layer stops going
+        // quiet for the life of the process.
+        //
+        // Read from the editor rather than from what was swapped out, because this runs
+        // *before* the swap: `follow_tab_strip` calls it first and then decides what comes
+        // forward. A board with no path is the blank library editor and has no agents.
+        if let Some(path) = self.editor.path()
+            && !live.contains(&Shell::tab_key(path))
+        {
+            let board = vellum_agent::BoardKey::for_board(path);
+            self.agent_runtime.forget_board(&board);
+            log::debug!("released the board on screen: {}", path.display());
+        }
     }
 
     /// Shows the board library — the home tab.
@@ -631,6 +652,13 @@ impl ActiveState {
     /// what makes going to the library and back instant. It is released only when the
     /// user closed its tab and home is what came forward.
     fn show_the_library(&mut self) {
+        // The same three gestures the tab swap has to close, for the same reason: going home
+        // is a way for a caret, an eraser sweep or a prompt row to end without a release. The
+        // library screen draws none of them, so a prompt session left open here holds the
+        // keyboard against a board that is not on screen — and it must be settled **before**
+        // the editor below is swapped for a blank one, or the draft is filed against the wrong
+        // board. `settle` is idempotent, so this costs nothing when nothing is open.
+        self.settle();
         self.shell.set_screen(Screen::Library);
         let Some(path) = self.editor.path().map(Path::to_path_buf) else { return };
         if let Err(error) = self.editor.flush() {
@@ -1608,6 +1636,16 @@ impl ActiveState {
     /// Serve the requests that need the document.
     ///
     /// ⚠ Only reachable from [`Self::poll_agents`] **after** its `busy_with_a_group` guard.
+    ///
+    /// ⚠ **Known gap, named rather than papered over: a parked board's agents cannot reach
+    /// their own configuration.** [`Self::agent_doc`] answers `None` for two different things —
+    /// "that is not an agent node" and "that board is not the one in front" — and all three
+    /// arms below treat the second as the first. `run_due_agents` learned to tell them apart
+    /// and *defers* rather than refusing; these did not, so an agent behind another tab is told
+    /// its own node does not exist. The refusals below say **"the board in front"** rather than
+    /// "any open board", which is at least true; closing it properly means reading (and, for
+    /// `WriteConfig`, writing) a document `crate::session` holds parked, which is a larger
+    /// change than a wording fix and is not smuggled in here.
     fn serve_agent_jobs(&mut self) {
         for pending in self.agent_runtime.take_document_jobs() {
             let crate::agent_runtime::Pending { work, reply } = pending;
@@ -1618,7 +1656,7 @@ impl ActiveState {
                 crate::agent_runtime::DocumentWork::ReadConfig { node } => {
                     match self.agent_doc(&node).and_then(|doc| self.agent_model(doc)) {
                         Some((model, _)) => reply.config(model),
-                        None => reply.refuse("that node is not an agent on any open board"),
+                        None => reply.refuse("that node is not an agent on the board in front"),
                     }
                 }
                 crate::agent_runtime::DocumentWork::WriteConfig { node, model } => {
@@ -1627,7 +1665,7 @@ impl ActiveState {
                             self.write_agent_model(doc, &model);
                             reply.done();
                         }
-                        None => reply.refuse("that node is not an agent on any open board"),
+                        None => reply.refuse("that node is not an agent on the board in front"),
                     }
                 }
             }
@@ -10244,8 +10282,24 @@ impl ActiveState {
         // group stays open on a board nothing is editing and the next edit joins it. The
         // eraser's sweep holds a group open exactly the same way and was not covered:
         // switching tabs mid-sweep parked the board with it open, and it stayed open.
-        self.commit_editing();
-        self.finish_erase();
+        //
+        // ⚠ **`settle`, not the two of them by hand — a prompt row is the third.** This was
+        // written as `commit_editing` + `finish_erase`, and it was extended once without the
+        // prompt row being noticed, which is exactly why the list belongs in one function
+        // rather than at each of its call sites. A tab switch is not a board mutation, so
+        // `run`'s own `settle` is never reached on this path, and a prompt session left open
+        // across the swap does three separate wrongs: `type_prompt_key` is asked **first** and
+        // consumes every keystroke while `prompting.is_some()` — with no check that the board
+        // it belongs to is still in front — so the keyboard goes dead on the new board with
+        // nothing drawn to say why; `end_prompting` then files board A's item id as a draft
+        // under board B's key; and Enter runs an agent on a board nobody is looking at.
+        //
+        // **Above the `mem::replace`**, and that is load-bearing: `end_prompting` writes the
+        // draft through `set_agent_draft`, which resolves the node against whichever board is
+        // hot. After the swap it would be the wrong one. This is feedback 27's rule stated for
+        // a third gesture — give every way one can end without a release a call to the thing
+        // that closes it.
+        self.settle();
         // **A native view belongs to the window, not to the board.** Nothing about parking a
         // board removes a `WKWebView` from the window it is a child of, so a page left running
         // stays composited over whatever board comes forward — showing the parked board's site

@@ -105,15 +105,18 @@ pub const MAX_PART_BYTES: usize = 32 * 1024 * 1024;
 /// The most **every** part of one Office file may come to, added together.
 ///
 /// ⚠ A per-part cap is not a cap on a document, and a `.pptx` or a `.xlsx` is *made* of parts:
-/// [`office_parts`] collects every matching entry into one `Vec` before a caller sees any of
-/// them, so a workbook of a hundred sheets was a hundred × [`MAX_PART_BYTES`] — 3.2GB — held
-/// at once, from an archive that is a few hundred kilobytes on disk. That is the classic ZIP
-/// bomb with the per-entry check passing on every entry.
+/// [`office_parts_within`] collects every matching entry into one `Vec` before a caller sees
+/// any of them, so a workbook of a hundred sheets was a hundred × [`MAX_PART_BYTES`] — 3.2GB —
+/// held at once, from an archive that is a few hundred kilobytes on disk. That is the classic
+/// ZIP bomb with the per-entry check passing on every entry.
 ///
 /// A whole Office document worth reading is a few megabytes of XML; 64MB is a document nobody
-/// is going to read to the end of. Parts past the cap are **dropped rather than truncated**,
-/// because a half-read XML part parses as a shorter document rather than as a broken one, and
-/// a silently shorter spreadsheet is worse than an absent sheet.
+/// is going to read to the end of. A part that does not fit in what is left is **dropped whole
+/// rather than truncated**, because a half-read XML part parses as a shorter document rather
+/// than as a broken one — and the parts *behind* it are still read, which is not a detail:
+/// Excel writes its string table last, and dropping the rest of the archive with the first
+/// oversized sheet took every word in the workbook with it. Either way the caller is told, and
+/// [`office`] turns that into [`Outcome::Partial`] rather than a complete read.
 pub const MAX_PARTS_BYTES: usize = 64 * 1024 * 1024;
 
 /// The most text one PDF will yield, across **every** content stream in it.
@@ -1077,17 +1080,52 @@ fn win_ansi(byte: u8) -> char {
 /// open, because a `.docx` that is really an old `.doc` with the wrong extension is a thing
 /// that happens and `textutil` reads it.
 fn office(source: &str, label: &str, path: &Path, kind: Kind, options: &Options) -> Ingested {
+    office_within(source, label, path, kind, options, MAX_PART_BYTES, MAX_PARTS_BYTES)
+}
+
+/// [`office`] with both budgets supplied, for the same reason [`office_parts_within`] takes
+/// them: what a file *past* the budget reports is the thing worth testing, and a fixture that
+/// really is 64MB is not a test this machine should be asked to run sixty-five times over.
+fn office_within(
+    source: &str,
+    label: &str,
+    path: &Path,
+    kind: Kind,
+    options: &Options,
+    per_part: usize,
+    total: usize,
+) -> Ingested {
     let read = match kind {
-        Kind::Docx => docx_text(path),
-        Kind::Pptx => pptx_text(path),
-        Kind::Xlsx => xlsx_text(path),
+        Kind::Docx => docx_text(path, per_part, total),
+        Kind::Pptx => pptx_text(path, per_part, total),
+        Kind::Xlsx => xlsx_text(path, per_part, total),
         _ => None,
     };
 
     match read {
-        Some(text) if !text.trim().is_empty() => {
+        Some((text, dropped)) if !text.trim().is_empty() => {
             let chars = text.chars().count();
-            Ingested::new(source, kind, label, text, Outcome::Extracted { chars })
+            // ⚠ **A budget that left something behind is a `Partial`, never an `Extracted`.**
+            // The reader's own caps are the only thing that can leave a hole here, and the hole
+            // does not look like one: an `.xlsx` whose sheets spent the aggregate budget loses
+            // `xl/sharedStrings.xml`, which is written last — so every text cell resolves to
+            // the empty string and a workbook of words arrives as a grid of numbers, under
+            // *"Read n characters"*. `Outcome::Partial` exists precisely so the node can say
+            // which of the two it got, and its own doc comment is about this: a message that
+            // covers all the reasons covers none of them.
+            let outcome = if dropped {
+                Outcome::Partial {
+                    chars,
+                    message: format!(
+                        "{label} is larger than one attachment holds. {chars} characters were \
+                         read and some of the file was left out, so words that are in it may \
+                         be missing here."
+                    ),
+                }
+            } else {
+                Outcome::Extracted { chars }
+            };
+            Ingested::new(source, kind, label, text, outcome)
         }
         // It opened and there was nothing in it. Saying so beats offering a converter that
         // will also find nothing.
@@ -1147,13 +1185,21 @@ fn legacy_document(source: &str, label: &str, path: &Path, options: &Options) ->
 /// Headers, footers, footnotes, endnotes and comments live in *other* parts and are
 /// deliberately not read — they are page furniture, and folding a running header into the
 /// prose once per page is worse than leaving it out.
-fn docx_text(path: &Path) -> Option<String> {
-    let parts = office_parts(path, &|name| name == "word/document.xml")?;
+///
+/// The `bool` is whether the archive gave up everything it was asked for — see [`OfficeParts`].
+/// All three readers carry it, not only the workbook one: a truncated `document.xml` is a
+/// document missing its last pages, and the node must not call that a complete read.
+fn docx_text(path: &Path, per_part: usize, total: usize) -> Option<(String, bool)> {
+    let (parts, dropped) =
+        office_parts_within(path, &|name| name == "word/document.xml", per_part, total)?;
     let (_, xml) = parts.into_iter().next()?;
-    Some(normalise_text(&office_xml_text(
-        &xml,
-        &XmlText { words: "w:t", breaks: &["w:p"], newline: &["w:br", "w:cr"], tab: &["w:tab"] },
-    )))
+    Some((
+        normalise_text(&office_xml_text(
+            &xml,
+            &XmlText { words: "w:t", breaks: &["w:p"], newline: &["w:br", "w:cr"], tab: &["w:tab"] },
+        )),
+        dropped,
+    ))
 }
 
 /// PowerPoint: one part per slide, **in slide order**.
@@ -1162,10 +1208,13 @@ fn docx_text(path: &Path) -> Option<String> {
 /// they were written, and the names sort lexically — so `slide10.xml` lands between
 /// `slide1.xml` and `slide2.xml`, and a twelve-slide deck reaches the agent scrambled. Sorted
 /// by the trailing number instead.
-fn pptx_text(path: &Path) -> Option<String> {
-    let mut parts = office_parts(path, &|name| {
-        name.starts_with("ppt/slides/slide") && name.ends_with(".xml")
-    })?;
+fn pptx_text(path: &Path, per_part: usize, total: usize) -> Option<(String, bool)> {
+    let (mut parts, dropped) = office_parts_within(
+        path,
+        &|name| name.starts_with("ppt/slides/slide") && name.ends_with(".xml"),
+        per_part,
+        total,
+    )?;
     parts.sort_by_key(|(name, _)| slide_number(name).unwrap_or(u32::MAX));
 
     let mut out = String::new();
@@ -1181,7 +1230,7 @@ fn pptx_text(path: &Path) -> Option<String> {
         // it has. The number is the slide's position in the deck, not its file name.
         out.push_str(&format!("Slide {}\n{text}\n\n", index + 1));
     }
-    Some(out.trim().to_owned())
+    Some((out.trim().to_owned(), dropped))
 }
 
 /// The number in `ppt/slides/slide12.xml`.
@@ -1200,11 +1249,16 @@ fn slide_number(name: &str) -> Option<u32> {
 /// stores (`45000`) rather than a date, and a currency is a bare number — number *formats*
 /// are in `xl/styles.xml` and are not applied. A formula contributes its last cached result,
 /// which is right, except in a workbook saved without one, where it contributes nothing.
-fn xlsx_text(path: &Path) -> Option<String> {
-    let parts = office_parts(path, &|name| {
-        name == "xl/sharedStrings.xml"
-            || (name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml"))
-    })?;
+fn xlsx_text(path: &Path, per_part: usize, total: usize) -> Option<(String, bool)> {
+    let (parts, dropped) = office_parts_within(
+        path,
+        &|name| {
+            name == "xl/sharedStrings.xml"
+                || (name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml"))
+        },
+        per_part,
+        total,
+    )?;
 
     let shared = parts
         .iter()
@@ -1224,7 +1278,7 @@ fn xlsx_text(path: &Path) -> Option<String> {
             out.push('\n');
         }
     }
-    Some(out.trim().to_owned())
+    Some((out.trim().to_owned(), dropped))
 }
 
 /// `xl/sharedStrings.xml` as a lookup table: one entry per `<si>`.
@@ -1429,7 +1483,18 @@ fn xml_attr(tag: &str, name: &str) -> Option<String> {
     rest.get(..end).map(str::to_owned)
 }
 
-/// Opens an Office file and reads every part the caller wants.
+/// What came out of an archive, and **whether it is all of it**.
+///
+/// The flag is the whole reason this is not a bare `Vec`. A budget that quietly leaves parts
+/// behind while the caller reports [`Outcome::Extracted`] is a lie about the file, and in the
+/// shape that bites hardest it is not even a partial read: Excel writes `xl/sharedStrings.xml`
+/// **after** the worksheets, and every text cell in the workbook is an *index* into it — so a
+/// budget spent on sheets loses the string table and every one of those cells resolves to the
+/// empty string. The words are gone, the row count is right, and the outcome said *"Read n
+/// characters"*. Anything left out has to reach the caller.
+type OfficeParts = (Vec<(String, String)>, bool);
+
+/// Opens an Office file and reads every part the caller wants, within both budgets.
 ///
 /// The one function in this module that touches the `zip` crate, so the archive is opened
 /// once and the API surface stays to three calls. `None` means it is not a readable ZIP at
@@ -1438,18 +1503,16 @@ fn xml_attr(tag: &str, name: &str) -> Option<String> {
 /// Names are collected before any part is read because listing borrows the archive and
 /// reading takes it mutably; there is no way to do both at once, and the alternative is
 /// opening the file once per part.
-fn office_parts(path: &Path, wanted: &dyn Fn(&str) -> bool) -> Option<Vec<(String, String)>> {
-    office_parts_within(path, wanted, MAX_PART_BYTES, MAX_PARTS_BYTES)
-}
-
-/// [`office_parts`] with both budgets supplied, so the aggregate bound is an offline test over
-/// an archive built in memory rather than one that needs a gigabyte of fixture.
+///
+/// The budgets are parameters rather than the constants directly, so the aggregate bound is an
+/// offline test over an archive built in memory rather than one that needs a gigabyte of
+/// fixture. [`office`] supplies [`MAX_PART_BYTES`] and [`MAX_PARTS_BYTES`].
 fn office_parts_within(
     path: &Path,
     wanted: &dyn Fn(&str) -> bool,
     per_part: usize,
     total: usize,
-) -> Option<Vec<(String, String)>> {
+) -> Option<OfficeParts> {
     let file = std::fs::File::open(path).ok()?;
     let mut archive = zip::ZipArchive::new(file).ok()?;
     let names: Vec<String> =
@@ -1457,32 +1520,60 @@ fn office_parts_within(
 
     let mut parts = Vec::new();
     let mut collected = 0usize;
+    let mut dropped = false;
     for name in names {
-        // ⚠ **The aggregate bound, and it is the one that was missing.** The per-part cap
-        // below passes on every entry of a ZIP bomb — that is what makes it a bomb — while
-        // this function holds *all* of them at once for the caller: a hundred sheets at
-        // `MAX_PART_BYTES` each is 3.2GB out of an archive of a few hundred kilobytes.
+        // ⚠ **The aggregate bound.** The per-part cap below passes on every entry of a ZIP
+        // bomb — that is what makes it a bomb — while this function holds *all* of them at
+        // once for the caller: a hundred sheets at `MAX_PART_BYTES` each is 3.2GB out of an
+        // archive of a few hundred kilobytes.
         //
-        // Remaining parts are **dropped, not truncated**: half an XML part parses as a
-        // shorter document rather than as a broken one, and a spreadsheet silently missing
-        // its last thousand rows is worse than one visibly missing a sheet.
-        if collected >= total {
+        // Nothing is left before the budget is actually spent, and that is the correction:
+        // this used to `break` on the first entry that would cross the line, which threw away
+        // **everything behind it**. Excel writes `xl/sharedStrings.xml` after the worksheets,
+        // so a workbook whose sheets reach the cap lost the string table — and with it every
+        // text cell in the file, since a text cell holds an index into it and not the words.
+        // A `continue` reads the small parts behind a big one; a `break` cannot.
+        let room = total.saturating_sub(collected);
+        if room == 0 {
+            dropped = true;
             break;
         }
-        let Ok(entry) = archive.by_name(&name) else { continue };
+        let Ok(entry) = archive.by_name(&name) else {
+            // A wanted part the archive would not hand over is missing words too.
+            dropped = true;
+            continue;
+        };
         let mut bytes = Vec::new();
         // Bounded: the compressed size on disk says nothing about the uncompressed size, and
         // a ZIP bomb is a hundred kilobytes that inflates without end. `take` before
         // `read_to_end`, so the cap is applied instead of the allocation rather than after it.
-        if entry.take(per_part as u64).read_to_end(&mut bytes).is_ok() {
-            if collected + bytes.len() > total {
-                break;
-            }
-            collected += bytes.len();
-            parts.push((name, String::from_utf8_lossy(&bytes).into_owned()));
+        //
+        // The ceiling is the *smaller* of the two budgets and one byte over it, which does
+        // two things: it tells an entry that exactly fills the remaining room from one that
+        // overruns it, and it stops a bomb being inflated past what could ever be kept.
+        // `saturating_add`, because a caller is free to pass `usize::MAX` as a budget — the
+        // aggregate test does — and `+ 1` on that is an overflow panic in a debug build.
+        let ceiling = per_part.min(room);
+        if entry.take((ceiling as u64).saturating_add(1)).read_to_end(&mut bytes).is_err() {
+            dropped = true;
+            continue;
         }
+        if bytes.len() > per_part {
+            // Past the **per-part** cap: truncated, and reported. Half an XML part parses as a
+            // shorter document rather than as a broken one, so most of a huge `document.xml`
+            // beats none of it — but the caller is told, because "most" is not "all".
+            bytes.truncate(per_part);
+            dropped = true;
+        } else if bytes.len() > room {
+            // Within the per-part cap and too big for what is left of the **aggregate** one:
+            // dropped whole, and the parts behind it are still read.
+            dropped = true;
+            continue;
+        }
+        collected += bytes.len();
+        parts.push((name, String::from_utf8_lossy(&bytes).into_owned()));
     }
-    Some(parts)
+    Some((parts, dropped))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2747,18 +2838,36 @@ mod tests {
             "%PDF-1.4\n<< >>\nstream\nBT <FEFF{}> Tj ET\nendstream\n",
             "4E2D".repeat(50)
         );
-        // 100 is not a multiple of three, so the cut lands inside a character.
-        let PdfText::Text(text) = pdf_text_within(cjk.as_bytes(), 100) else { panic!("no text") };
-        assert!(text.len() <= 100, "{} bytes", text.len());
+        // ⚠ **The budget has to be chosen so the cut lands *inside* a character, and the old
+        // one did not.** `pdf_text_within` keeps a byte back for the separator, so the index
+        // handed to `prefix_within` is `budget - 1`: at a budget of 100 that is 99, which is
+        // 33 × 3 — an exact boundary on a three-byte character, where the walk has nothing to
+        // do and a naive `&text[..room]` would have passed just as well. 101 makes the index
+        // 100, which is one byte into the thirty-fourth character, so the walk is the only
+        // thing standing between this and an abort.
+        let PdfText::Text(text) = pdf_text_within(cjk.as_bytes(), 101) else { panic!("no text") };
+        assert!(text.len() <= 101, "{} bytes", text.len());
         assert!(text.chars().all(|ch| ch == '\u{4e2d}'), "{text:?}");
         assert!(!text.is_empty(), "the boundary walk emptied the string instead of cutting it");
+        // Cut **back** to the boundary rather than at the budget: 33 whole characters, 99
+        // bytes. A cut at 100 is not representable as a `&str` at all.
+        assert_eq!(text.len(), 99, "the cut did not land on a character boundary");
+        assert_eq!(text.chars().count(), 33);
     }
 
     /// The same shape one layer down: `MAX_PART_BYTES` bounds one ZIP entry, and a `.pptx` or
-    /// a `.xlsx` is *made* of entries — `office_parts` collects every matching one into a
+    /// a `.xlsx` is *made* of entries — `office_parts_within` collects every matching one into a
     /// `Vec` before a caller sees any of them, so 100 sheets × 32MB ≈ 3.2GB out of an archive
     /// of a few hundred kilobytes. The per-entry cap passes on every entry, which is what
     /// makes it a bomb rather than a big file.
+    ///
+    /// ⚠ **The fixture is deliberately not twenty interchangeable payloads any more.** It was,
+    /// and that is why it could not see the defect underneath the one it was written for: with
+    /// every part the same size and the same worth, "the budget stopped after four" is
+    /// indistinguishable from "the budget threw away the one part the file needed". A real
+    /// `.xlsx` is not made of interchangeable parts — `xl/sharedStrings.xml` is written **last**
+    /// and every text cell is an index into it — so the last small entry is named, is different,
+    /// and is asserted for.
     #[test]
     fn every_part_of_an_office_file_is_bounded_in_total_and_not_only_per_part() {
         use std::io::Write as _;
@@ -2772,28 +2881,131 @@ mod tests {
             writer.start_file(format!("xl/worksheets/sheet{sheet}.xml"), options).unwrap();
             writer.write_all(&payload).unwrap();
         }
+        // Where Excel puts it: after the sheets, and small.
+        writer.start_file("xl/sharedStrings.xml", options).unwrap();
+        writer.write_all(&[b's'; 100]).unwrap();
         writer.finish().unwrap();
 
-        let wanted = |name: &str| name.starts_with("xl/worksheets/sheet");
+        let wanted = |name: &str| name.starts_with("xl/");
 
-        // Unbounded in aggregate: every entry passes a generous per-part cap, and 20 of them
+        // Unbounded in aggregate: every entry passes a generous per-part cap, and 21 of them
         // arrive at once. This is the arithmetic the bomb relies on.
-        let whole = office_parts_within(&path, &wanted, 1_000_000, usize::MAX).unwrap();
-        assert_eq!(whole.len(), 20);
+        let (whole, dropped) = office_parts_within(&path, &wanted, 1_000_000, usize::MAX).unwrap();
+        assert_eq!(whole.len(), 21);
         let total: usize = whole.iter().map(|(_, text)| text.len()).sum();
-        assert_eq!(total, 20_000);
+        assert_eq!(total, 20_100);
+        assert!(!dropped, "a whole read reported that it had left something out");
 
         // With a total budget, the per-part cap is untouched and the *sum* is what stops.
         // The part that would cross the line is dropped whole rather than truncated: half an
         // XML part parses as a shorter document rather than as a broken one.
-        let capped = office_parts_within(&path, &wanted, 1_000_000, 4_500).unwrap();
+        let (capped, dropped) = office_parts_within(&path, &wanted, 1_000_000, 4_500).unwrap();
         let total: usize = capped.iter().map(|(_, text)| text.len()).sum();
         assert!(total <= 4_500, "the aggregate budget was not honoured: {total} bytes");
         assert!(!capped.is_empty(), "the budget refused everything rather than bounding it");
-        assert!(capped.len() < 20, "nothing was left out, so nothing was bounded");
+        assert!(capped.len() < 21, "nothing was left out, so nothing was bounded");
         assert!(
-            capped.iter().all(|(_, text)| text.len() == 1_000),
+            capped.iter().all(|(_, text)| text.len() == 1_000 || text.len() == 100),
             "a part was truncated where it should have been dropped"
+        );
+        assert!(dropped, "parts were left out and the caller was not told");
+
+        // ⚠ **And the string table behind them was still read.** This is the half a fixture of
+        // interchangeable parts cannot assert: the budget is spent by the fourth sheet, and a
+        // `break` there — which is what this used to do — takes every entry *behind* it,
+        // including the one that holds the workbook's actual words. Every `t="s"` cell then
+        // resolves to the empty string while the read still reports a number of characters.
+        assert!(
+            capped.iter().any(|(name, _)| name == "xl/sharedStrings.xml"),
+            "the budget stopped at the first oversized part and lost the string table: {:?}",
+            capped.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>()
+        );
+
+        // A per-part cap **truncates** and reports, where the aggregate one drops whole. Both
+        // are honest; they are not the same answer, and the flag does not care which happened.
+        let (short, dropped) = office_parts_within(&path, &wanted, 400, usize::MAX).unwrap();
+        assert!(dropped, "a truncated part was reported as a complete read");
+        assert!(
+            short.iter().any(|(_, text)| text.len() == 400),
+            "the per-part cap dropped a part it should have truncated"
+        );
+        assert_eq!(short.len(), 21, "the per-part cap lost a part instead of shortening it");
+    }
+
+    /// **A file the budget bit into is `Partial`, not `Extracted`.** The outcome is what the
+    /// node shows and what a later reader believes; *"Read n characters"* over a workbook whose
+    /// string table was left behind is a complete read of a file that arrived without its
+    /// words. `Outcome::Partial` exists for exactly this and was not being reached.
+    /// Through the budgets rather than through a 64MB fixture, which is `office_parts_within`'s
+    /// own argument one layer up: what a file *past* the cap reports is the thing being tested,
+    /// and the number the cap happens to hold is not.
+    #[test]
+    fn an_office_file_bigger_than_the_budget_says_it_was_only_partly_read() {
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let options = zip::write::SimpleFileOptions::default();
+        let sheet = |rows: &str| {
+            format!("<worksheet><sheetData>{rows}</sheetData></worksheet>")
+        };
+        let row = |value: &str| {
+            format!("<row><c t=\"s\"><v>{value}</v></c></row>")
+        };
+
+        // A workbook in the shape that loses its words: two fat sheets whose cells are
+        // *indices*, and the string table they index — written last, as Excel writes it.
+        let path = temp.path().join("book.xlsx");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let rows: String = (0..200).map(|_| row("0")).collect();
+        let body = sheet(&rows);
+        let table = "<sst><si><t>torque</t></si></sst>";
+        for number in 1..=2 {
+            writer.start_file(format!("xl/worksheets/sheet{number}.xml"), options).unwrap();
+            writer.write_all(body.as_bytes()).unwrap();
+        }
+        writer.start_file("xl/sharedStrings.xml", options).unwrap();
+        writer.write_all(table.as_bytes()).unwrap();
+        writer.finish().unwrap();
+
+        // Room for one sheet and the table, and not for the second sheet — derived from the
+        // fixture rather than written as a number, so editing a row above cannot quietly turn
+        // this into a test of something else.
+        let budget = body.len() + table.len() + 1;
+        let read = office_within(
+            "book.xlsx",
+            "book.xlsx",
+            &path,
+            Kind::Xlsx,
+            &Options::default(),
+            1_000_000,
+            budget,
+        );
+        assert!(
+            matches!(read.outcome, Outcome::Partial { .. }),
+            "a workbook the reader could not finish reported {:?}",
+            read.outcome
+        );
+        assert!(
+            read.text.contains("torque"),
+            "the string table was skipped, so every text cell came back empty: {:?}",
+            read.text
+        );
+
+        // And a file that fits is still a plain `Extracted` — a `Partial` on everything is the
+        // same lie facing the other way, and it would make the distinction worthless.
+        let read = office_within(
+            "book.xlsx",
+            "book.xlsx",
+            &path,
+            Kind::Xlsx,
+            &Options::default(),
+            MAX_PART_BYTES,
+            MAX_PARTS_BYTES,
+        );
+        assert!(
+            matches!(read.outcome, Outcome::Extracted { .. }),
+            "a workbook that fitted reported {:?}",
+            read.outcome
         );
     }
 

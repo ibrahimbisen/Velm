@@ -238,6 +238,13 @@ pub(crate) fn park_blob(blobs: &Blobs, mime: &str, bytes: Vec<u8>) -> String {
 /// Anthropic's `source.data`/`source.media_type` are both single unwrapped tokens — and each
 /// of those shapes is what a *truncated or spliced* payload looks like, which is exactly the
 /// thing worth refusing on the way into a blob store.
+///
+/// ⚠ **And the empty string, which unifying the three did not catch.** `""` is legitimate
+/// base64 for zero bytes, so it kept decoding to the very `vec![]` the `"a"` refusal exists to
+/// stop — and both remaining test files asserted that was correct, two lines from the
+/// assertion that says the opposite. It is refused at the decoder rather than at the three
+/// callers, because none of them checks `is_empty()` and a rule applied at two of three sites
+/// is the shape of the defect rather than the fix for it.
 pub(crate) use crate::ipc::decode_base64;
 
 /// One running agent, whatever kind of process is behind it.
@@ -447,11 +454,16 @@ mod tests {
     fn base64_decodes_a_picture_and_refuses_what_is_not_one() {
         assert_eq!(decode_base64("aGk=").as_deref(), Some(&b"hi"[..]));
         assert_eq!(decode_base64("aGVsbG8gd29ybGQ=").as_deref(), Some(&b"hello world"[..]));
-        assert_eq!(decode_base64(""), Some(Vec::new()));
         assert_eq!(decode_base64("not base64!"), None);
 
         // The near misses — the shape a *mistake* takes, rather than the shape rubbish takes.
         assert_eq!(decode_base64("a"), None, "one character decoded to a zero-byte blob");
+        // ⚠ **And the same blob by the honest route.** This line used to read
+        // `assert_eq!(decode_base64(""), Some(Vec::new()))`, two lines above the one that
+        // refuses a zero-byte blob from `"a"` — so half of the defect was fixed and the other
+        // half was *asserted to be correct*. No caller of this function checks `is_empty()`:
+        // all three decode an image an agent posted and hand the bytes to the blob store.
+        assert_eq!(decode_base64(""), None, "an empty payload is not a picture");
         assert_eq!(decode_base64("aGVsbG8"), None, "an unpadded length is a truncated payload");
         assert_eq!(decode_base64("aGVs\nbG8="), None, "whitespace inside the payload");
         assert_eq!(decode_base64("aGk=aGk="), None, "two payloads spliced together");

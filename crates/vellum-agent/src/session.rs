@@ -686,6 +686,15 @@ mod tests {
     /// that refuses every later prompt with *"this agent is still working"* for the life of
     /// the process. `dispatch`'s own `Err` arm cannot undo it, because the event is already
     /// in the channel by then.
+    ///
+    /// ⚠ **What this cannot see, and it is where the bug actually was.** The transport here is
+    /// a *fake* whose `send_prompt` returns an error without emitting anything, so this pins
+    /// [`Session`]'s half of the contract — that a refused prompt leaves no turn in flight —
+    /// and says nothing about whether the three real transports keep their half. `HttpTransport`
+    /// emitted the start before its fallible spawn for as long as this test has been green, and
+    /// no test can drive that failure: `std::thread::Builder::spawn` fails when the OS is out
+    /// of threads, which is not a state a test may put the machine into. Those are read, not
+    /// measured — see the comment on each transport's `send_prompt`.
     #[test]
     fn a_prompt_that_could_not_be_sent_fails_the_session_and_says_so_in_the_stream() {
         let (mut session, fake, _agent) = session();
