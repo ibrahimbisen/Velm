@@ -5689,6 +5689,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "velmd"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "serde",
+ "serde_json",
+ "vellum-doc",
+ "vellum-store",
+]
+
+[[package]]
 name = "version-compare"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

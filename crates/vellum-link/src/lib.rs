@@ -34,10 +34,12 @@
 //! page in the browser the user already has. `ItemKind::Embed` still stores the provider's
 //! iframe markup, so nothing is lost if that decision is ever revisited.
 
+#[cfg(feature = "net")]
 pub mod fetch;
 pub mod meta;
 pub mod provider;
 
+#[cfg(feature = "net")]
 pub use fetch::{FetchOptions, LinkError, fetch, fetch_with, get_bytes};
 pub use meta::{LinkMeta, decode_entities, parse, parse_oembed};
 pub use provider::{favicon_url, host_of, plays_video, provider_for};

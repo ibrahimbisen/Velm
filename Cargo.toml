@@ -155,13 +155,13 @@ cosmic-text = "0.14"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Local crates.
-vellum-agent = { path = "crates/vellum-agent" }
+vellum-agent = { path = "crates/vellum-agent", default-features = false }
 vellum-chart = { path = "crates/vellum-chart" }
 vellum-connect = { path = "crates/vellum-connect" }
 vellum-doc = { path = "crates/vellum-doc" }
 vellum-export = { path = "crates/vellum-export" }
 vellum-flow = { path = "crates/vellum-flow" }
-vellum-link = { path = "crates/vellum-link" }
+vellum-link = { path = "crates/vellum-link", default-features = false }
 vellum-import = { path = "crates/vellum-import" }
 vellum-ink = { path = "crates/vellum-ink" }
 vellum-mindmap = { path = "crates/vellum-mindmap" }

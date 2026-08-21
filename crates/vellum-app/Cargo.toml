@@ -62,7 +62,7 @@ vellum-ui.workspace = true
 # `crate::agent`, `crate::note`, `crate::filetree` and `crate::browser` supply the
 # token encoding and the measurement it deliberately does not do — the same split
 # `vellum-flow` and `vellum-mindmap` already have.
-vellum-agent.workspace = true
+vellum-agent = { workspace = true, features = ["native"] }
 # Chart geometry: scales, nice-number ticks, marks, legends. `crate::chart`
 # supplies the shaping and the tessellation it does not do.
 vellum-chart.workspace = true
@@ -75,7 +75,7 @@ vellum-doc.workspace = true
 vellum-flow.workspace = true
 vellum-import.workspace = true
 # Names a pasted link's site from its host, with no network.
-vellum-link.workspace = true
+vellum-link = { workspace = true, features = ["net"] }
 vellum-ink.workspace = true
 # The tidy-tree layout, collapse and reparent. `crate::mindmap` supplies the label
 # measurement it deliberately does not do.

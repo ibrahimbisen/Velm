@@ -17,6 +17,12 @@ vellum-doc.workspace = true
 # thread and no socket attached: `vellum-agent`'s own header is explicit that the crate
 # costs nothing until a node exists. So this stays a crate that builds and tests on a
 # machine with no graphics stack.
+# `default-features = false` drops the socket/subprocess half. This crate is built from
+# `vellum-agent`'s *types* only -- Provider, DisplayMode, ChatTheme, RoleKind, Layer,
+# Schedule, Territory, rules::resolve, notes::slug, voice::Preference -- and the chrome has
+# to draw on wasm32, where `ureq` (-> rustls -> ring) has no build script that runs and a
+# PTY cannot exist. Cargo unifies features across the graph, so a native build still gets
+# the full crate the moment `vellum-app` asks for it; nothing about the desktop app changes.
 vellum-agent.workspace = true
 # The shape flyout draws real silhouettes from the catalogue, so adding a shape to
 # `vellum-shapes` adds it to the picker with no change here.

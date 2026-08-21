@@ -12,4 +12,17 @@ description = "Vellum's link cards: what a URL is called, and the OpenGraph/oEmb
 log = { workspace = true }
 thiserror = { workspace = true }
 tl = { workspace = true }
-ureq = { workspace = true }
+ureq = { workspace = true, optional = true }
+
+[features]
+# `fetch` is the only thing in this crate that opens a socket, and it is the only
+# thing that cannot exist in a browser: a wasm build reaches the network through
+# the host page's own `fetch`, and `ureq` drags in rustls -> ring, whose build
+# script does not run for wasm32 at all.
+#
+# On by default so every native caller is unchanged. `vellum-web` turns it off.
+# `provider` and `meta` -- naming a site from its host, parsing OpenGraph -- are
+# pure string work and stay available either way, which is what lets a card draw
+# before any request finishes.
+default = ["net"]
+net = ["dep:ureq"]

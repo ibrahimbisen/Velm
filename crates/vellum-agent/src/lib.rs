@@ -30,22 +30,43 @@
 
 pub mod bus;
 pub mod filetree;
+#[cfg(feature = "native")]
 pub mod ingest;
+#[cfg(feature = "native")]
 pub mod ipc;
+#[cfg(feature = "native")]
 pub mod mcp;
 pub mod model;
 pub mod notes;
 pub mod orchestrator;
 pub mod provider;
+#[cfg(feature = "native")]
 pub mod research;
 pub mod rules;
 pub mod schedule;
+#[cfg(feature = "native")]
 pub mod session;
 pub mod sidecar;
 pub mod summary;
 pub mod transcript;
+#[cfg(feature = "native")]
 pub mod transport;
+mod voice_pure;
+
+#[cfg(feature = "native")]
 pub mod voice;
+
+/// The vocabulary half of [`voice`], under the same public path.
+///
+/// A build without `native` has no microphone, no local binary to probe and no HTTP client,
+/// so the capture and transcription code cannot compile — but `vellum-ui` is built from
+/// `voice::Preference` and `voice::NOT_BUILT_IN` and must draw on every target. Re-exporting
+/// them here means `vellum_agent::voice::Preference` resolves on both, and no caller needs a
+/// `cfg` of its own.
+#[cfg(not(feature = "native"))]
+pub mod voice {
+    pub use crate::voice_pure::{NOT_BUILT_IN, Preference};
+}
 pub mod worktree;
 
 pub use model::{
@@ -53,15 +74,18 @@ pub use model::{
     NoteModel, NoteScope, RoleKind, Territory,
 };
 pub use bus::{Bus, Delivery, LinkDirection, LinkPulse, Message, Topology};
+#[cfg(feature = "native")]
 pub use ipc::{IpcHandler, IpcServer};
 pub use notes::{Freshness, NoteStore, Requester, Save};
 pub use orchestrator::{AgentNode, NodeBox, Refusal};
 pub use provider::{Provider, ProviderChoice, Transport};
 pub use rules::{Layer, Permissions, ResolvedRules, RuleFile, Saved};
+#[cfg(feature = "native")]
 pub use session::{Session, Status};
 pub use sidecar::{BoardKey, Record, Sidecar, Tail};
 pub use summary::{Activity, AgentDigest, Attention, Digest};
 pub use schedule::{Completion, Recurrence, Schedule, Timestamp, Trigger};
+#[cfg(feature = "native")]
 pub use transport::{AgentTransport, LaunchSpec, PendingBlob};
 pub use transcript::{
     AgentRef, Choice, RequestId, ToolCallId, TranscriptEvent, TurnId, TurnOutcome,

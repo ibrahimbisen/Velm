@@ -1,0 +1,25 @@
+[package]
+name = "velmd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Velm's board server: holds boards and serves them to a browser."
+
+[[bin]]
+name = "velmd"
+path = "src/main.rs"
+
+# Deliberately depends *down* on the document and storage layers only.
+#
+# It must never depend on `vellum-app`: that would drag winit, wgpu and egui onto a headless
+# server, and the whole point of this crate is that it runs on a box with no display. The two
+# things it could have borrowed from there -- `data_directory()` and the `Library` filing
+# model -- are reimplemented instead, because the server's paths differ anyway and copying
+# ~200 lines is cheaper than making a GUI crate a server dependency.
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+vellum-doc.workspace = true
+vellum-store.workspace = true

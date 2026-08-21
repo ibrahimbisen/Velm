@@ -22,7 +22,7 @@ log.workspace = true
 # nothing sits between a decoded payload and a board the user can save.
 vellum-doc.workspace = true
 # Names a link's site from its host, so an imported card reads as a card offline.
-vellum-link.workspace = true
+vellum-link = { workspace = true, features = ["net"] }
 vellum-store.workspace = true
 
 [dev-dependencies]

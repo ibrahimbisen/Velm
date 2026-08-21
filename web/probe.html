@@ -1,0 +1,319 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Velm WebGPU probe</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    margin: 0; padding: 24px 20px 64px;
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    background: #F2F2F2; color: #23282C;
+    -webkit-text-size-adjust: 100%;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: #6B7379; margin: 0 0 20px; font-size: 13px; }
+  .card {
+    background: #fff; border: 1px solid #E5EAED; border-radius: 10px;
+    padding: 14px 16px; margin: 0 0 10px; max-width: 760px;
+  }
+  .row { display: flex; gap: 10px; align-items: baseline; padding: 5px 0; }
+  .row + .row { border-top: 1px solid #F0F3F5; }
+  .badge {
+    flex: 0 0 auto; width: 62px; text-align: center; border-radius: 5px;
+    font-size: 11px; font-weight: 700; letter-spacing: .04em; padding: 3px 0;
+  }
+  .pass { background: #D6F2EC; color: #00614F; }
+  .fail { background: #FBDDDD; color: #8C1D1D; }
+  .warn { background: #FDEFD4; color: #7A5200; }
+  .skip { background: #ECEFF1; color: #6B7379; }
+  .name { flex: 1 1 auto; }
+  .val  { flex: 0 0 auto; color: #4A5257; font-variant-numeric: tabular-nums;
+          font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+          text-align: right; max-width: 46%; overflow-wrap: anywhere; }
+  .note { color: #6B7379; font-size: 12.5px; margin: 3px 0 0 72px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .07em;
+       color: #6B7379; margin: 22px 0 8px; }
+  #summary { font-size: 16px; font-weight: 600; padding: 14px 16px; border-radius: 10px;
+             max-width: 760px; margin-bottom: 18px; }
+  #summary.ok   { background: #D6F2EC; color: #00614F; }
+  #summary.bad  { background: #FBDDDD; color: #8C1D1D; }
+  #summary.busy { background: #ECEFF1; color: #4A5257; }
+  pre#verdict { background: #23282C; color: #E5EAED; padding: 14px 16px; border-radius: 10px;
+                max-width: 760px; overflow-x: auto; font-size: 12px; line-height: 1.5; }
+  canvas { border: 1px solid #E5EAED; border-radius: 6px; image-rendering: pixelated; }
+</style>
+
+<h1>Velm WebGPU probe</h1>
+<p class="sub">Stage 0. Decides whether Velm can run in this browser before any Rust is
+written. Open this page on every target: Chrome, Brave, and Safari on the iPad.</p>
+
+<div id="summary" class="busy">Running…</div>
+<div id="out"></div>
+
+<h2>Copy this back</h2>
+<pre id="verdict">collecting…</pre>
+
+<script>
+const out = document.getElementById('out');
+const lines = [];
+let hardFail = 0, softFail = 0;
+let card = null;
+
+function section(title) {
+  const h = document.createElement('h2'); h.textContent = title; out.appendChild(h);
+  card = document.createElement('div'); card.className = 'card'; out.appendChild(card);
+  lines.push('', '## ' + title);
+}
+function row(state, name, value, note) {
+  const r = document.createElement('div'); r.className = 'row';
+  const b = document.createElement('span'); b.className = 'badge ' + state;
+  b.textContent = state.toUpperCase();
+  const n = document.createElement('span'); n.className = 'name'; n.textContent = name;
+  const v = document.createElement('span'); v.className = 'val'; v.textContent = value ?? '';
+  r.append(b, n, v); card.appendChild(r);
+  if (note) { const p = document.createElement('div'); p.className = 'note'; p.textContent = note; card.appendChild(p); }
+  lines.push(state.toUpperCase().padEnd(5) + ' | ' + name + (value ? ' = ' + value : '') + (note ? '\n        ' + note : ''));
+  if (state === 'fail') hardFail++;
+  if (state === 'warn') softFail++;
+  document.getElementById('verdict').textContent = lines.join('\n');
+}
+
+// KILL CRITERION 5 in the plan: the vertex-stage storage buffer.
+// vellum-render/src/mesh.rs:270 binds a read-only storage buffer with
+// ShaderStages::VERTEX, consumed by shaders/mesh.wgsl:15 and shape.wgsl:33.
+// Core WebGPU allows 8 of these. WebGL2 allows 0. WebGPU *compatibility mode*
+// defaults to 0. If this fails, ink, connectors and stroked shape outlines all
+// need re-plumbing onto uniform buffers, and the project estimate roughly doubles.
+const VERTEX_STORAGE_WGSL = `
+struct Xform { offset: vec2f, scale: vec2f };
+@group(0) @binding(0) var<storage, read> transforms: array<Xform>;
+
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-0.8, -0.8), vec2f(0.8, -0.8), vec2f(0.0, 0.8));
+  let x = transforms[0];
+  return vec4f(p[vi] * x.scale + x.offset, 0.0, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4f { return vec4f(0.0, 0.64, 0.55, 1.0); }
+`;
+
+async function main() {
+  section('Environment');
+  row('skip', 'User agent', '', navigator.userAgent);
+  const secure = window.isSecureContext;
+  row(secure ? 'pass' : 'fail', 'Secure context', String(secure),
+      secure ? null : 'navigator.gpu is [SecureContext]-gated. Serve this over https:// or from localhost, or WebGPU is absent no matter what the hardware can do.');
+
+  section('WebGPU availability');
+  if (!('gpu' in navigator)) {
+    row('fail', 'navigator.gpu', 'absent',
+        'KILL CRITERION 1. This browser cannot run Velm. On iPad this means iPadOS below 26.');
+    return finish();
+  }
+  row('pass', 'navigator.gpu', 'present');
+
+  const fmt = navigator.gpu.getPreferredCanvasFormat();
+  row('pass', 'Preferred canvas format', fmt,
+      'vellum-app/src/surface.rs:432 prefers a non-sRGB format; both allowed values are non-sRGB.');
+
+  let adapter;
+  try { adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }); }
+  catch (e) { row('fail', 'requestAdapter threw', String(e)); return finish(); }
+  if (!adapter) {
+    row('fail', 'requestAdapter', 'null', 'KILL CRITERION 1. No adapter — Velm cannot render here.');
+    return finish();
+  }
+  row('pass', 'Adapter acquired', 'yes');
+
+  const info = adapter.info ?? {};
+  const infoStr = [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(' / ') || '(blank)';
+  row('skip', 'Adapter info', infoStr,
+      'Brave 1.93 deliberately blanks these for fingerprinting. Blank here is expected and is not a fault.');
+
+  section('Limits Velm actually depends on');
+  const L = adapter.limits;
+  const need = (name, want, why) => {
+    const got = L[name];
+    if (got === undefined) { row('warn', name, 'unreported', 'Limit not exposed by this browser. ' + (why || '')); return; }
+    row(got >= want ? 'pass' : 'fail', name, got + ' (need ≥ ' + want + ')', got >= want ? why : 'KILL CRITERION. ' + why);
+  };
+  need('maxTextureDimension2D', 2048, 'vellum-render caps textures at 2048 (texture.rs:117).');
+  need('maxStorageBuffersInVertexStage', 1,
+       'THE ONE THAT MATTERS. mesh.rs:270 binds a storage buffer to the vertex stage. 0 here means compatibility mode or WebGL-class hardware, and mesh.wgsl + shape.wgsl must be rewritten onto uniform buffers.');
+  need('maxStorageBuffersPerShaderStage', 1, 'Same binding, older spelling.');
+  need('maxBufferSize', 134217728, 'Board geometry buffers.');
+  need('maxUniformBufferBindingSize', 65536, 'Per-view uniforms (view.rs).');
+  row('skip', 'minUniformBufferOffsetAlignment', String(L.minUniformBufferOffsetAlignment),
+      'Read at runtime by view.rs:116, so any value is fine.');
+
+  let device;
+  try { device = await adapter.requestDevice(); }
+  catch (e) { row('fail', 'requestDevice threw', String(e)); return finish(); }
+  row('pass', 'Device acquired (default limits, no features)', 'yes',
+      'surface.rs:101 requests Limits::default() and zero Features. That is what this proves.');
+
+  const errors = [];
+  device.addEventListener('uncapturederror', e => errors.push(String(e.error)));
+
+  section('Canvas configuration');
+  const canvas = document.createElement('canvas');
+  canvas.width = 64; canvas.height = 64;
+  const ctx = canvas.getContext('webgpu');
+  if (!ctx) { row('fail', 'canvas.getContext("webgpu")', 'null'); return finish(); }
+  try {
+    ctx.configure({ device, format: fmt, alphaMode: 'opaque' });
+    row('pass', 'Configure with preferred format', fmt);
+  } catch (e) { row('fail', 'Configure with preferred format', String(e)); }
+  try {
+    ctx.configure({ device, format: 'bgra8unorm', alphaMode: 'opaque' });
+    row('pass', 'Configure as bgra8unorm', 'ok', 'surface.rs prefers this exact format.');
+  } catch (e) { row('warn', 'Configure as bgra8unorm', String(e), 'Falls back to rgba8unorm; not fatal.'); }
+
+  section('4x MSAA with storeOp discard + resolve');
+  // Velm's board pass: BOARD_SAMPLES = 4, StoreOp::Discard on the multisampled
+  // attachment, resolving into the canvas texture (surface.rs:355-379).
+  let msaaOk = false;
+  try {
+    const ms = device.createTexture({
+      size: [64, 64], sampleCount: 4, format: 'rgba8unorm',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    const resolve = device.createTexture({
+      size: [64, 64], format: 'rgba8unorm',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginRenderPass({
+      colorAttachments: [{
+        view: ms.createView(), resolveTarget: resolve.createView(),
+        clearValue: { r: 0, g: 0.64, b: 0.55, a: 1 },
+        loadOp: 'clear', storeOp: 'discard',
+      }],
+    });
+    pass.end();
+    const rb = device.createBuffer({ size: 256 * 64, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyTextureToBuffer({ texture: resolve }, { buffer: rb, bytesPerRow: 256 }, [64, 64]);
+    device.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const px = new Uint8Array(rb.getMappedRange()).slice(0, 4);
+    rb.unmap();
+    msaaOk = px[1] > 120 && px[2] > 100;
+    row(msaaOk ? 'pass' : 'fail', '4x MSAA resolves', 'rgba(' + px.join(',') + ')',
+        msaaOk ? 'The board pass shape works: multisample, discard, resolve.'
+               : 'KILL CRITERION. The resolve produced nothing. Velm draws its whole board this way.');
+  } catch (e) {
+    row('fail', '4x MSAA resolve', String(e), 'KILL CRITERION.');
+  }
+
+  section('Storage buffer in the VERTEX stage');
+  try {
+    const mod = device.createShaderModule({ code: VERTEX_STORAGE_WGSL });
+    const ci = await mod.getCompilationInfo();
+    const errs = ci.messages.filter(m => m.type === 'error');
+    if (errs.length) {
+      row('fail', 'Shader compiles', errs.map(m => m.message).join(' | '), 'KILL CRITERION 2.');
+    } else {
+      row('pass', 'Shader compiles', 'ok');
+      const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(buf, 0, new Float32Array([0, 0, 1, 1]));
+      const bgl = device.createBindGroupLayout({
+        entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } }],
+      });
+      const pipe = device.createRenderPipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+        vertex: { module: mod, entryPoint: 'vs' },
+        fragment: { module: mod, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      row('pass', 'Pipeline with vertex-stage storage buffer', 'created');
+
+      const tex = device.createTexture({
+        size: [64, 64], format: 'rgba8unorm',
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      });
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: tex.createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                             loadOp: 'clear', storeOp: 'store' }],
+      });
+      pass.setPipeline(pipe);
+      pass.setBindGroup(0, device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: buf } }] }));
+      pass.draw(3);
+      pass.end();
+      const rb = device.createBuffer({ size: 256 * 64, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      enc.copyTextureToBuffer({ texture: tex }, { buffer: rb, bytesPerRow: 256 }, [64, 64]);
+      device.queue.submit([enc.finish()]);
+      await rb.mapAsync(GPUMapMode.READ);
+      const data = new Uint8Array(rb.getMappedRange());
+      // Centre of the 64x64 target sits inside the triangle.
+      const c = (32 * 256) + (32 * 4);
+      const hit = data[c + 1] > 120;
+      const px = [data[c], data[c+1], data[c+2], data[c+3]];
+      rb.unmap();
+      row(hit ? 'pass' : 'fail', 'Triangle actually drawn from it', 'centre = rgba(' + px.join(',') + ')',
+          hit ? 'This is the single most important result on the page. Velm renders ink, connectors and stroked outlines this way.'
+              : 'KILL CRITERION 2. The pipeline was created but drew nothing.');
+    }
+  } catch (e) {
+    row('fail', 'Vertex-stage storage buffer', String(e),
+        'KILL CRITERION 2. mesh.rs:270 and both shaders need rewriting onto uniform buffers; the estimate roughly doubles.');
+  }
+
+  section('Image decode path');
+  // Stage 5 replaces the `image` crate (which does not run on wasm at all) with
+  // createImageBitmap. ICO matters specifically: CLAUDE.md feedback 27 records a
+  // favicon that fetched fine and could not be decoded because the ico feature
+  // was off, and it failed silently for the whole session.
+  try {
+    const c = document.createElement('canvas'); c.width = c.height = 16;
+    const g = c.getContext('2d'); g.fillStyle = '#00A38C'; g.fillRect(0, 0, 16, 16);
+    const png = await new Promise(r => c.toBlob(r, 'image/png'));
+    const pngBytes = new Uint8Array(await png.arrayBuffer());
+    const bmp = await createImageBitmap(png);
+    row(bmp.width === 16 ? 'pass' : 'fail', 'createImageBitmap (PNG)', bmp.width + 'x' + bmp.height);
+
+    // Wrap that PNG in a real ICO container (Vista+ allows a PNG payload).
+    const ico = new Uint8Array(6 + 16 + pngBytes.length);
+    const dv = new DataView(ico.buffer);
+    dv.setUint16(0, 0, true); dv.setUint16(2, 1, true); dv.setUint16(4, 1, true);
+    ico[6] = 16; ico[7] = 16; ico[8] = 0; ico[9] = 0;
+    dv.setUint16(10, 1, true); dv.setUint16(12, 32, true);
+    dv.setUint32(14, pngBytes.length, true); dv.setUint32(18, 22, true);
+    ico.set(pngBytes, 22);
+    try {
+      const ib = await createImageBitmap(new Blob([ico], { type: 'image/x-icon' }));
+      row('pass', 'createImageBitmap (ICO)', ib.width + 'x' + ib.height,
+          'Favicons on link cards decode natively.');
+    } catch (e) {
+      row('warn', 'createImageBitmap (ICO)', 'unsupported',
+          'Not fatal: fall back to an <img> element + canvas draw, which does handle ICO. Note it in Stage 5.');
+    }
+    const off = ('OffscreenCanvas' in window);
+    row(off ? 'pass' : 'warn', 'OffscreenCanvas', String(off),
+        off ? 'Stage 5 reads pixels back through this.' : 'Fall back to a hidden 2D canvas.');
+  } catch (e) {
+    row('fail', 'Image decode probe', String(e));
+  }
+
+  section('Device health');
+  await new Promise(r => setTimeout(r, 120));
+  row(errors.length ? 'fail' : 'pass', 'Uncaptured device errors', String(errors.length),
+      errors.length ? errors.join(' | ') : 'No validation errors raised during any test above.');
+
+  finish();
+}
+
+function finish() {
+  const s = document.getElementById('summary');
+  if (hardFail === 0 && softFail === 0) {
+    s.className = 'ok'; s.textContent = 'GO — every check passed. Velm can render in this browser.';
+  } else if (hardFail === 0) {
+    s.className = 'ok'; s.textContent = 'GO with ' + softFail + ' note(s). Nothing blocking; read the WARN rows.';
+  } else {
+    s.className = 'bad'; s.textContent = 'STOP — ' + hardFail + ' blocking failure(s). Read the FAIL rows before writing any Rust.';
+  }
+  lines.push('', '=== ' + s.textContent + ' ===');
+  document.getElementById('verdict').textContent = lines.join('\n');
+}
+
+main().catch(e => { row('fail', 'Probe crashed', String(e)); finish(); });
+</script>

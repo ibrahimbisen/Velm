@@ -71,8 +71,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::voice_pure::{NOT_BUILT_IN, Preference};
+
 use crate::model::AgentModel;
 use crate::provider::Provider;
+#[cfg(feature = "native")]
 use crate::transport::http::Credentials;
 use crate::{AgentError, Result};
 
@@ -102,20 +105,6 @@ pub const MAX_UTTERANCE_SECONDS: u64 = 120;
 /// quiet room and a muted microphone are indistinguishable from here, and refusing to send
 /// a genuinely whispered sentence would be worse than a transcriber answering nothing.
 pub const SILENCE_PEAK: i16 = 32;
-
-/// What the fallback capture says when the feature was not built in.
-///
-/// Actionable rather than merely true: it names the feature, because the person most likely
-/// to read it is building Velm themselves.
-///
-/// ⚠ It names the **feature**, not a command line, and that is deliberate. The exact
-/// invocation depends on how `vellum-app` passes the flag through and on how `build.py`
-/// invokes cargo — neither of which this crate can see — so a command quoted here would be a
-/// remedy that is wrong the first time somebody renames the passthrough. Feedback 18 is the
-/// worked example of a named-but-wrong remedy costing more than no remedy at all.
-pub const NOT_BUILT_IN: &str = "voice capture is not built into this copy of Velm — it needs \
-     a build with the `voice` feature turned on; everything else about this node works \
-     without it";
 
 /// Where a transcription setting is actually changed today.
 ///
@@ -884,40 +873,6 @@ pub enum VoiceEvent {
 // Half 2 — transcription
 // =======================================================================================
 
-/// Which transcriber to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Preference {
-    /// Local when it is installed, hosted otherwise. **The default**, and the local half of
-    /// it is not a tie-break — see this module's note on why.
-    #[default]
-    Auto,
-    /// Local only. A refusal when the binary is missing, rather than a quiet upload.
-    Local,
-    /// Hosted only. For a user who has no local model and has said so.
-    Hosted,
-}
-
-impl Preference {
-    pub const ALL: [Self; 3] = [Self::Auto, Self::Local, Self::Hosted];
-
-    pub const fn tag(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Local => "local",
-            Self::Hosted => "hosted",
-        }
-    }
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "Prefer on this machine",
-            Self::Local => "Only on this machine",
-            Self::Hosted => "Only the API",
-        }
-    }
-}
-
 /// Which of the two answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -990,6 +945,7 @@ impl Speech {
     /// Probes `PATH` through [`crate::transport::probe_command`] — which looks for the file
     /// rather than running it, for the reason `ingest::Tools` records: a probe that executes
     /// a binary is a probe that can hang.
+    #[cfg(feature = "native")]
     pub fn detect_local(&self) -> Option<String> {
         if let Some(command) = self.command.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
             return crate::transport::probe_command(command).ok().map(|_| command.to_owned());
@@ -1442,6 +1398,7 @@ pub struct HostedTranscriber {
     key: Option<String>,
 }
 
+#[cfg(feature = "native")]
 impl Transcribe for HostedTranscriber {
     fn transcribe(&self, utterance: &Utterance) -> Result<String> {
         let wav = utterance.wav();
