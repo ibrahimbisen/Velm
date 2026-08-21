@@ -70,10 +70,19 @@ pub fn verify(data: &Path, manifest_path: &Path) -> anyhow::Result<()> {
 /// failure halfway through cost nothing.
 pub fn import(from: &Path, data: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(from.is_dir(), "{} is not a directory", from.display());
-    anyhow::ensure!(
-        from != data,
-        "--from and --data are the same directory; import copies between two places"
-    );
+    // Canonicalised, because a lexical compare is satisfied by a trailing slash, a symlink
+    // or `~/x` against `/Users/me/x` -- and "these are two different places" is the whole
+    // premise of a copy. `--data` may not exist yet, so only `--from` is required to resolve.
+    let from_real = std::fs::canonicalize(from)
+        .map_err(|e| anyhow::anyhow!("cannot resolve {}: {e}", from.display()))?;
+    if let Ok(data_real) = std::fs::canonicalize(data) {
+        anyhow::ensure!(
+            from_real != data_real,
+            "--from and --data resolve to the same directory ({}); import copies between two \
+             places",
+            from_real.display()
+        );
+    }
     std::fs::create_dir_all(data)?;
 
     let entries = manifest::walk(from)?;
@@ -92,6 +101,21 @@ pub fn import(from: &Path, data: &Path) -> anyhow::Result<()> {
         {
             skipped += 1;
             continue;
+        }
+        // ⚠ `std::fs::copy` TRUNCATES an existing target. RULE ZERO is about content, not
+        // about which syscall removes it: importing a stale copy over a live data directory
+        // would replace a newer board with an older one, silently, and that is the same loss
+        // as an unlink. The hash check above only clears files that are already identical, so
+        // anything reaching here with different content is refused by name.
+        if target.exists() {
+            anyhow::bail!(
+                "{} already exists here and differs from the incoming copy.\n  \
+                 Refusing to overwrite it -- that would replace a board with a different \
+                 version of itself and there is no undo.\n  \
+                 If the incoming copy is genuinely the one you want, move the existing file \
+                 aside yourself first.",
+                target.display()
+            );
         }
         std::fs::copy(&source, &target)
             .map_err(|e| anyhow::anyhow!("copying {}: {e}", entry.path))?;
@@ -143,6 +167,20 @@ fn check_boards(data: &Path) -> anyhow::Result<()> {
     }
     println!("\n{} board(s) opened and readable", rows.len());
 
+    // ⚠ The failures are reported BEFORE the zero-board check below, and the order is the
+    // whole point. If every board fails to open, `rows` is empty and `unreadable` is full --
+    // and a guard on `rows` alone would fire first, print "no boards were found, check your
+    // --from path", and swallow the only lines that say *why*. That is a true-sounding
+    // message that is false on both counts, in the one situation where the user most needs
+    // the real reason.
+    if !unreadable.is_empty() {
+        println!("\n{} board(s) could NOT be read:", unreadable.len());
+        for line in &unreadable {
+            println!("  {line}");
+        }
+        anyhow::bail!("some boards did not load — stop and ask before going further");
+    }
+
     // ⚠ Zero boards is reported as a failure, not as a quiet success.
     //
     // An import that found nothing prints "0 mismatches" and every other reassuring number,
@@ -151,20 +189,12 @@ fn check_boards(data: &Path) -> anyhow::Result<()> {
     // a sweep that never crossed an edge would otherwise report zero blinks and look like
     // evidence. A migration is the worst possible place to learn that lesson twice.
     anyhow::ensure!(
-        !rows.is_empty(),
+        !found.is_empty(),
         "no boards were found in {} -- nothing was imported. \
          Check that --from pointed at a Velm data directory (the one holding boards/ and \
-         blobs/), and that the copy in step 8 actually carried the .vellum files across",
+         blobs/), and that the copy actually carried the .vellum files across",
         boards_dir.display()
     );
-
-    if !unreadable.is_empty() {
-        println!("\n{} board(s) could NOT be read:", unreadable.len());
-        for line in &unreadable {
-            println!("  {line}");
-        }
-        anyhow::bail!("some boards did not load — stop and ask before going further");
-    }
     Ok(())
 }
 
@@ -192,4 +222,67 @@ fn inspect(path: &Path) -> anyhow::Result<(String, usize)> {
     let title = board.title();
     let items = board.items()?.len();
     Ok((title, items))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    fn scratch(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("velmd-mig-{name}-{n}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn importing_over_a_board_that_differs_is_refused_rather_than_overwritten() {
+        // `std::fs::copy` truncates. RULE ZERO is about content, not about which syscall
+        // takes it away: importing a stale copy over a live data directory would replace a
+        // newer board with an older one, silently, and no `rm` would appear anywhere.
+        //
+        // A/B: with the `target.exists()` guard removed this test fails with `after ==
+        // "older"`, which is the data loss stated as an assertion.
+        let root = scratch("overwrite");
+        let from = root.join("from");
+        let data = root.join("data");
+        std::fs::create_dir_all(from.join("boards")).unwrap();
+        std::fs::create_dir_all(data.join("boards")).unwrap();
+        std::fs::write(from.join("boards/b.vellum"), b"older").unwrap();
+        std::fs::write(data.join("boards/b.vellum"), b"newer, and irreplaceable").unwrap();
+
+        let result = super::import(&from, &data);
+
+        assert!(result.is_err(), "import overwrote an existing board instead of refusing");
+        let after = std::fs::read(data.join("boards/b.vellum")).unwrap();
+        assert_eq!(
+            after, b"newer, and irreplaceable",
+            "the board that was already there was modified"
+        );
+    }
+
+    #[test]
+    fn an_identical_file_is_skipped_rather_than_refused() {
+        // The guard must not make a re-run impossible. Identical content is the common case
+        // when somebody runs the import twice, and refusing there would teach them to reach
+        // for a flag that disables the protection entirely.
+        let root = scratch("idempotent");
+        let from = root.join("from");
+        let data = root.join("data");
+        std::fs::create_dir_all(from.join("boards")).unwrap();
+        std::fs::create_dir_all(data.join("boards")).unwrap();
+        std::fs::write(from.join("boards/b.vellum"), b"same").unwrap();
+        std::fs::write(data.join("boards/b.vellum"), b"same").unwrap();
+
+        // It fails on "no boards opened" -- `b.vellum` is not a real database -- but the
+        // copy stage must have got past the identical file rather than bailing on it.
+        let message = format!("{:#}", super::import(&from, &data).unwrap_err());
+        assert!(
+            !message.contains("Refusing to overwrite"),
+            "an identical file was refused instead of skipped: {message}"
+        );
+    }
 }

@@ -75,7 +75,6 @@ pub use crate::voice_pure::{NOT_BUILT_IN, Preference};
 
 use crate::model::AgentModel;
 use crate::provider::Provider;
-#[cfg(feature = "native")]
 use crate::transport::http::Credentials;
 use crate::{AgentError, Result};
 
@@ -945,7 +944,6 @@ impl Speech {
     /// Probes `PATH` through [`crate::transport::probe_command`] — which looks for the file
     /// rather than running it, for the reason `ingest::Tools` records: a probe that executes
     /// a binary is a probe that can hang.
-    #[cfg(feature = "native")]
     pub fn detect_local(&self) -> Option<String> {
         if let Some(command) = self.command.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
             return crate::transport::probe_command(command).ok().map(|_| command.to_owned());
@@ -1398,7 +1396,6 @@ pub struct HostedTranscriber {
     key: Option<String>,
 }
 
-#[cfg(feature = "native")]
 impl Transcribe for HostedTranscriber {
     fn transcribe(&self, utterance: &Utterance) -> Result<String> {
         let wav = utterance.wav();

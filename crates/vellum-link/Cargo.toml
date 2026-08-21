@@ -20,7 +20,8 @@ ureq = { workspace = true, optional = true }
 # the host page's own `fetch`, and `ureq` drags in rustls -> ring, whose build
 # script does not run for wasm32 at all.
 #
-# On by default so every native caller is unchanged. `vellum-web` turns it off.
+# On by default so every native caller is unchanged; a wasm build turns it off with
+# `--no-default-features`, which is the only thing that exercises the gate today.
 # `provider` and `meta` -- naming a site from its host, parsing OpenGraph -- are
 # pure string work and stay available either way, which is what lets a card draw
 # before any request finishes.

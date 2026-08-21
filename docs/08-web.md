@@ -142,7 +142,40 @@ needs a real hostname, a real certificate and CORS headers — at which point it
 
 `web/probe.html` measures all of this on the real device before any of it is relied on.
 
-## 6. Still unproven
+## 6. The probe, run
+
+`web/probe.html`, served over `http://localhost` (a secure context, so `navigator.gpu`
+exists), driven headless through Brave on this machine — **adapter `apple / metal-3`**:
+
+| Check | Result |
+|---|---|
+| `navigator.gpu` | present |
+| Adapter + device at `Limits::default()`, zero features | acquired |
+| `getPreferredCanvasFormat()` | `bgra8unorm`, and configurable |
+| `maxTextureDimension2D` | **16384** (needs 2048) |
+| **`maxStorageBuffersInVertexStage`** | **10** (needs ≥ 1) |
+| `maxBufferSize` | 4,294,967,292 |
+| 4× MSAA, `storeOp: "discard"`, resolve | `rgba(0,163,140,255)` |
+| **Triangle drawn from a vertex-stage storage buffer** | `rgba(0,163,140,255)` |
+| Uncaptured device errors | 0 |
+
+**Verdict: GO.** The one result that could have doubled the estimate — a vertex-stage storage
+buffer, which `mesh.wgsl:15` and `shape.wgsl:33` both need — is not merely permitted at 10
+but **draws real pixels**, the exact teal the fragment shader outputs.
+
+This is Apple's Metal driver, which is the same lineage the iPad runs. It is strong evidence
+and it is **not** the iPad. Run the page there before treating it as settled.
+
+⚠ **Three bugs in the probe itself, all one shape.** `mapAsync`, `toBlob` and
+`createImageBitmap` are each an `await` on a browser callback, and in a headless browser with
+no frame loop none of them resolve. The page sat on *"Running…"* forever — which on an iPad is
+indistinguishable from the blank-screen failure the probe exists to detect. Every such await
+is bounded now, and the page always reaches a verdict. Two further notes worth keeping:
+patching only the two that were observed to hang left `toBlob` to hang next (feedback 35's
+sibling rule, paid again), and a headless timeout is reported **WARN, not FAIL** — a probe
+that says STOP for a reason unrelated to the hardware is one nobody reads to the end.
+
+## 7. Still unproven
 
 Treat these as unknown rather than done:
 

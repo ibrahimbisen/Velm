@@ -6,7 +6,8 @@
 //! capture and transcription code in [`crate::voice`] cannot exist there; these two items
 //! can, and they are all the chrome ever needed.
 //!
-//! This is [`crate::voice::Unavailable`]'s own precedent applied one level up: **the
+//! This is `voice::Unavailable`'s own precedent applied one level up (not a link: under
+//! `not(feature = "native")` the `voice` module is the alias below and has no such item): **the
 //! capability is gated, the vocabulary is not.** The public path is unchanged either way —
 //! `vellum_agent::voice::Preference` resolves here on both targets — so no caller can tell
 //! which half it got, and nothing goes quiet: a build without the capability still has the

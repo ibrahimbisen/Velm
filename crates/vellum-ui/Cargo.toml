@@ -22,7 +22,11 @@ vellum-doc.workspace = true
 # Schedule, Territory, rules::resolve, notes::slug, voice::Preference -- and the chrome has
 # to draw on wasm32, where `ureq` (-> rustls -> ring) has no build script that runs and a
 # PTY cannot exist. Cargo unifies features across the graph, so a native build still gets
-# the full crate the moment `vellum-app` asks for it; nothing about the desktop app changes.
+# the full crate the moment `vellum-app` asks for it -- which is true of any invocation
+# that includes vellum-app (`--workspace`, `-p vellum-app`, make-app.sh) and NOT of
+# `cargo test -p vellum-ui` alone, which compiles the pure half. Nothing tests that
+# configuration, so a `vellum_agent::session::` call added here would pass CI and fail for
+# whoever builds this crate on its own.
 vellum-agent.workspace = true
 # The shape flyout draws real silhouettes from the catalogue, so adding a shape to
 # `vellum-shapes` adds it to the picker with no change here.

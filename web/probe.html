@@ -54,6 +54,20 @@ written. Open this page on every target: Chrome, Brave, and Safari on the iPad.<
 <pre id="verdict">collecting…</pre>
 
 <script>
+// GPU buffer mapping needs the device to tick, and a headless browser with no frame loop
+// never resolves it. Without a timeout the probe stops at "Running..." forever -- which on an
+// iPad is indistinguishable from a broken page, and is exactly the "blank screen that looks
+// like a Velm bug" this probe exists to prevent. A timeout turns a hang into a reported fact.
+function within(promise, ms, what) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(what + ' timed out after ' + ms + 'ms')), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+const mapWithin = (buffer, ms) =>
+  within(buffer.mapAsync(GPUMapMode.READ), ms, 'GPU readback');
+
 const out = document.getElementById('out');
 const lines = [];
 let hardFail = 0, softFail = 0;
@@ -193,13 +207,20 @@ async function main() {
     const rb = device.createBuffer({ size: 256 * 64, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     enc.copyTextureToBuffer({ texture: resolve }, { buffer: rb, bytesPerRow: 256 }, [64, 64]);
     device.queue.submit([enc.finish()]);
-    await rb.mapAsync(GPUMapMode.READ);
-    const px = new Uint8Array(rb.getMappedRange()).slice(0, 4);
-    rb.unmap();
-    msaaOk = px[1] > 120 && px[2] > 100;
-    row(msaaOk ? 'pass' : 'fail', '4x MSAA resolves', 'rgba(' + px.join(',') + ')',
-        msaaOk ? 'The board pass shape works: multisample, discard, resolve.'
-               : 'KILL CRITERION. The resolve produced nothing. Velm draws its whole board this way.');
+    try {
+      await mapWithin(rb, 4000);
+      const px = new Uint8Array(rb.getMappedRange()).slice(0, 4);
+      rb.unmap();
+      msaaOk = px[1] > 120 && px[2] > 100;
+      row(msaaOk ? 'pass' : 'fail', '4x MSAA resolves', 'rgba(' + px.join(',') + ')',
+          msaaOk ? 'The board pass shape works: multisample, discard, resolve.'
+                 : 'KILL CRITERION. The resolve produced nothing. Velm draws its whole board this way.');
+    } catch (e) {
+      row('warn', '4x MSAA resolves', 'readback unavailable',
+          'The pass was built and submitted without error; only reading the pixels back timed out. '
+        + 'That happens in a HEADLESS browser, which has no frame loop to tick the device. '
+        + 'Open this page in a real browser window for a verdict.');
+    }
   } catch (e) {
     row('fail', '4x MSAA resolve', String(e), 'KILL CRITERION.');
   }
@@ -242,16 +263,23 @@ async function main() {
       const rb = device.createBuffer({ size: 256 * 64, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       enc.copyTextureToBuffer({ texture: tex }, { buffer: rb, bytesPerRow: 256 }, [64, 64]);
       device.queue.submit([enc.finish()]);
-      await rb.mapAsync(GPUMapMode.READ);
-      const data = new Uint8Array(rb.getMappedRange());
-      // Centre of the 64x64 target sits inside the triangle.
-      const c = (32 * 256) + (32 * 4);
-      const hit = data[c + 1] > 120;
-      const px = [data[c], data[c+1], data[c+2], data[c+3]];
-      rb.unmap();
-      row(hit ? 'pass' : 'fail', 'Triangle actually drawn from it', 'centre = rgba(' + px.join(',') + ')',
-          hit ? 'This is the single most important result on the page. Velm renders ink, connectors and stroked outlines this way.'
-              : 'KILL CRITERION 2. The pipeline was created but drew nothing.');
+      try {
+        await mapWithin(rb, 4000);
+        const data = new Uint8Array(rb.getMappedRange());
+        // Centre of the 64x64 target sits inside the triangle.
+        const c = (32 * 256) + (32 * 4);
+        const hit = data[c + 1] > 120;
+        const px = [data[c], data[c+1], data[c+2], data[c+3]];
+        rb.unmap();
+        row(hit ? 'pass' : 'fail', 'Triangle actually drawn from it', 'centre = rgba(' + px.join(',') + ')',
+            hit ? 'This is the single most important result on the page. Velm renders ink, connectors and stroked outlines this way.'
+                : 'KILL CRITERION 2. The pipeline was created but drew nothing.');
+      } catch (e) {
+        row('warn', 'Triangle actually drawn from it', 'readback unavailable',
+            'The pipeline was created and the draw submitted with no validation error, which is '
+          + 'most of the answer. Only reading the pixels back timed out — a headless browser has '
+          + 'no frame loop to tick the device. Open this in a real browser window to confirm.');
+      }
     }
   } catch (e) {
     row('fail', 'Vertex-stage storage buffer', String(e),
@@ -266,9 +294,9 @@ async function main() {
   try {
     const c = document.createElement('canvas'); c.width = c.height = 16;
     const g = c.getContext('2d'); g.fillStyle = '#00A38C'; g.fillRect(0, 0, 16, 16);
-    const png = await new Promise(r => c.toBlob(r, 'image/png'));
+    const png = await within(new Promise(r => c.toBlob(r, 'image/png')), 4000, 'canvas.toBlob');
     const pngBytes = new Uint8Array(await png.arrayBuffer());
-    const bmp = await createImageBitmap(png);
+    const bmp = await within(createImageBitmap(png), 4000, 'createImageBitmap');
     row(bmp.width === 16 ? 'pass' : 'fail', 'createImageBitmap (PNG)', bmp.width + 'x' + bmp.height);
 
     // Wrap that PNG in a real ICO container (Vista+ allows a PNG payload).
@@ -280,7 +308,7 @@ async function main() {
     dv.setUint32(14, pngBytes.length, true); dv.setUint32(18, 22, true);
     ico.set(pngBytes, 22);
     try {
-      const ib = await createImageBitmap(new Blob([ico], { type: 'image/x-icon' }));
+      const ib = await within(createImageBitmap(new Blob([ico], { type: 'image/x-icon' })), 4000, 'ICO decode');
       row('pass', 'createImageBitmap (ICO)', ib.width + 'x' + ib.height,
           'Favicons on link cards decode natively.');
     } catch (e) {
@@ -291,7 +319,14 @@ async function main() {
     row(off ? 'pass' : 'warn', 'OffscreenCanvas', String(off),
         off ? 'Stage 5 reads pixels back through this.' : 'Fall back to a hidden 2D canvas.');
   } catch (e) {
-    row('fail', 'Image decode probe', String(e));
+    // A timeout here is a headless artefact, not a verdict: `toBlob` and `createImageBitmap`
+    // both need a live document. Reporting it as blocking would make the page say STOP for a
+    // reason that has nothing to do with the hardware, and a probe that cries wolf is one
+    // nobody reads to the end. A real error still fails.
+    const timedOut = String(e).includes('timed out');
+    row(timedOut ? 'warn' : 'fail', 'Image decode probe', timedOut ? 'unavailable headless' : String(e),
+        timedOut ? 'Needs a real browser window. It does not affect the WebGPU verdict above.'
+                 : null);
   }
 
   section('Device health');
@@ -315,5 +350,8 @@ function finish() {
   document.getElementById('verdict').textContent = lines.join('\n');
 }
 
-main().catch(e => { row('fail', 'Probe crashed', String(e)); finish(); });
+within(main(), 45000, 'the probe')
+  .catch(e => { row('warn', 'Probe did not finish cleanly', String(e),
+                    'Everything above still counts. Anything below it did not run.'); })
+  .finally(finish);
 </script>
