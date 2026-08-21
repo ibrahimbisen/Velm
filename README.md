@@ -9,7 +9,7 @@ boards that make a browser-based canvas crawl.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-00A38C)](#license)
 [![Platform](https://img.shields.io/badge/platform-macOS-1A1D1F)](#platform-support)
-[![Release](https://img.shields.io/badge/release-1.0.0-00A38C)](https://github.com/ibrahimbisen/Velm/releases)
+[![Release](https://img.shields.io/badge/release-1.1.0-00A38C)](https://github.com/ibrahimbisen/Velm/releases)
 
 </div>
 
@@ -146,7 +146,7 @@ Every one of these is a fixture you can produce yourself:
 
 ### Download it
 
-1. Get **`Velm-1.0.0-macos-arm64.dmg`** from [Releases](https://github.com/ibrahimbisen/Velm/releases).
+1. Get **`Velm-1.1.0-macos-arm64.dmg`** from [Releases](https://github.com/ibrahimbisen/Velm/releases).
 2. Open it and drag **Velm** into your Applications folder.
 3. **The first launch needs one extra step.** Velm is ad-hoc signed and **not
    notarized** — notarization needs a paid Apple Developer account. So macOS will refuse

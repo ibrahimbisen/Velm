@@ -5459,7 +5459,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-agent"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -5475,7 +5475,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-app"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5516,7 +5516,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-chart"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5524,7 +5524,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-connect"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "lyon",
  "serde",
@@ -5533,7 +5533,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-doc"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "loro",
  "thiserror 2.0.19",
@@ -5541,7 +5541,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-export"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64",
  "miniz_oxide",
@@ -5555,7 +5555,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-flow"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5564,7 +5564,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-import"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -5583,7 +5583,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-ink"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "lyon",
  "thiserror 2.0.19",
@@ -5591,7 +5591,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-link"
-version = "0.1.0"
+version = "1.1.0"
 dependencies = [
  "log",
  "thiserror 2.0.19",
@@ -5601,7 +5601,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-mindmap"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5610,7 +5610,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-render"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bytemuck",
  "log",
@@ -5626,21 +5626,21 @@ dependencies = [
 
 [[package]]
 name = "vellum-scene"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rstar",
 ]
 
 [[package]]
 name = "vellum-search"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "thiserror 2.0.19",
 ]
 
 [[package]]
 name = "vellum-shapes"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "lyon",
  "serde",
@@ -5650,7 +5650,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-store"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "blake3",
  "rusqlite",
@@ -5661,7 +5661,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-table"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5670,7 +5670,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-text"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "cosmic-text",
  "thiserror 2.0.19",
@@ -5679,7 +5679,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-ui"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "egui",
  "vellum-agent",

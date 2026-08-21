@@ -128,8 +128,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key>        <string>app.velm.Velm</string>
   <key>CFBundleIconFile</key>          <string>Velm</string>
   <key>CFBundlePackageType</key>       <string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0.0</string>
-  <key>CFBundleVersion</key>           <string>1.0.0</string>
+  <key>CFBundleShortVersionString</key><string>1.1.0</string>
+  <key>CFBundleVersion</key>           <string>1.1.0</string>
   <key>LSMinimumSystemVersion</key>    <string>11.0</string>
   <key>NSHighResolutionCapable</key>   <true/>
   <!-- The canvas is drawn by us at every zoom, so macOS must not scale the

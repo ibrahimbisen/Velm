@@ -1,6 +1,6 @@
 [package]
 name = "vellum-link"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Vellum's link cards: what a URL is called, and the OpenGraph/oEmbed metadata behind it. The parsing is pure and offline; the one fetching function is behind a feature-sized module so nothing else in the workspace gains a network dependency."
