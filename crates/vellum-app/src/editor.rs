@@ -363,7 +363,7 @@ impl Editor {
     /// discrete act, and a per-frame check would either rebuild a 596-item board
     /// sixty times a second or need a flag that some future mutator forgets to set.
     pub fn reproject(&mut self) {
-        let started = std::time::Instant::now();
+        let started = crate::time::Instant::now();
         if let Err(error) = self.projection.rebuild(&self.board) {
             log::error!("projecting the board: {error}");
         }
@@ -1216,7 +1216,7 @@ mod tests {
             WorldPoint::new(-1e6, -1e6),
             WorldPoint::new(1e6, 1e6),
         );
-        let started = std::time::Instant::now();
+        let started = crate::time::Instant::now();
         editor.marquee(everything, false);
         editor.marquee(everything, true);
         editor.marquee(everything, true);

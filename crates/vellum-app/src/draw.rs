@@ -45,7 +45,8 @@
 //!   grows the variant except the match arm that dispatches to it.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::time::Instant;
 
 use vellum_agent::{DisplayMode, Status, TranscriptEvent};
 // `vellum_agent::filetree::View` and `vellum_render::View` are both `View`, and this file

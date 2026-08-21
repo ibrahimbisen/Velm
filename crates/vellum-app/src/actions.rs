@@ -37,7 +37,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use crate::time::Instant;
 
 use vellum_import::rtb::ArchiveSet;
 use vellum_ink::Stroke;
@@ -5915,12 +5915,12 @@ impl ActiveState {
             // child without draining would deadlock until the shim's own two-second timeout —
             // and would then report the socket as broken when the only thing missing was the
             // frame.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = crate::time::Instant::now() + std::time::Duration::from_secs(5);
             let status = loop {
                 actions.poll_agents();
                 match child.try_wait() {
                     Ok(Some(status)) => break Some(status.success()),
-                    Ok(None) if std::time::Instant::now() < deadline => {
+                    Ok(None) if crate::time::Instant::now() < deadline => {
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                     Ok(None) => {

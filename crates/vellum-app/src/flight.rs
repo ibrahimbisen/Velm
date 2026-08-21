@@ -36,7 +36,7 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use crate::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// How many session files to keep. Enough to cover "it happened a few runs ago"
 /// without the directory becoming its own storage problem — each is a few KB.

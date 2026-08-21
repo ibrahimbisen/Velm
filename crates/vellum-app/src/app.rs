@@ -34,7 +34,8 @@
 //! changes twice a minute.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::time::Instant;
 
 use vellum_import::rtb::ArchiveSet;
 use vellum_render::{DrawList, GlassRenderer, QuadInstance, Rgba, View};

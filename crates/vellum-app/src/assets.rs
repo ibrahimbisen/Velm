@@ -22,7 +22,8 @@
 //!   the next few frames, which is what every map and every photo grid does.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::time::Instant;
 
 use vellum_render::{ImageSource, TextureId, TextureManager};
 use vellum_store::BlobStore;

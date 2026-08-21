@@ -57,7 +57,8 @@
 //!
 //! See [`InputConfig::drag_inertia`] and [`InputConfig::scroll_inertia`].
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::time::Instant;
 
 use vellum_scene::{Camera, ScreenPoint};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase};

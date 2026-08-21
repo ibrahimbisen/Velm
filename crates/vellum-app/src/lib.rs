@@ -76,6 +76,7 @@ pub mod snap;
 pub mod surface;
 pub mod table;
 pub mod text;
+pub mod time;
 pub mod theme;
 pub mod voice;
 pub mod words;

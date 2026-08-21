@@ -117,7 +117,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use crate::time::{SystemTime, UNIX_EPOCH};
 
 use vellum_agent::ipc::{IpcHandler, IpcServer, NoteEntry, RuntimeFile, SpawnRequest};
 use vellum_agent::sidecar::Appender;
