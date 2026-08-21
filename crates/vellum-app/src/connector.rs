@@ -139,6 +139,25 @@ pub fn free_anchor(own: &Placement, world: (f64, f64)) -> (f64, f64) {
     )
 }
 
+/// Where a connector's two ends actually are, in world space.
+///
+/// `(start, end)`, resolved through [`resolve_end`] exactly as [`route`] does — the same
+/// function, so a grip drawn here cannot sit somewhere the line does not begin. That is the
+/// `card_layout` rule: a second copy of a position is a click landing where the paint is not.
+///
+/// `None` for anything that is not a connector.
+pub fn endpoints(
+    item_kind: &ItemKind,
+    own: &Placement,
+    placement_of: impl Fn(ItemId) -> Option<Placement>,
+) -> Option<((f64, f64), (f64, f64))> {
+    let ItemKind::Connector { start, end, .. } = item_kind else { return None };
+    let target = |e: &ConnectorEnd| e.target.and_then(&placement_of);
+    let from = resolve_end(start, own, target(start).as_ref()).point;
+    let to = resolve_end(end, own, target(end).as_ref()).point;
+    Some(((from.x, from.y), (to.x, to.y)))
+}
+
 /// Everything needed to draw one connector.
 pub struct Routed {
     pub path: RoutedPath,

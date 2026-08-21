@@ -156,7 +156,7 @@ pub(crate) fn show(
                 more_row(ui, palette, state, active);
             });
             palette_rect = response.response.rect;
-            paint_glass_edge(ui.painter(), palette_rect, palette, Backing::Canvas);
+            paint_glass_edge(ui.painter(), palette_rect, palette, Backing::Canvas, f32::from(radius::LARGE));
         });
     register_glass(glass, palette, palette_rect);
     register_glass(glass, palette, history(ctx, palette, cmd_ctx, events, palette_rect));
@@ -240,7 +240,13 @@ fn history(
                     }
                 }
             });
-            paint_glass_edge(ui.painter(), inner.response.rect, palette, Backing::Canvas);
+            paint_glass_edge(
+                    ui.painter(),
+                    inner.response.rect,
+                    palette,
+                    Backing::Canvas,
+                    f32::from(radius::LARGE),
+                );
             inner.response.rect
         })
         .inner
@@ -248,15 +254,27 @@ fn history(
 
 /// Notes a floating surface for the renderer to blur the canvas behind.
 pub(crate) fn register_glass(glass: &mut Vec<GlassSurface>, palette: Palette, rect: Rect) {
+    register_glass_rounded(glass, palette, rect, f32::from(radius::LARGE));
+}
+
+/// [`register_glass`], for a surface whose frame does not use [`radius::LARGE`].
+///
+/// **The blurred region's corners must match the frame drawn over them.** This blur is what
+/// the glass is *made of*, so a region with tighter corners than its frame leaves a bright
+/// wedge of unblurred canvas at each one — visible precisely because the surface is
+/// translucent. The selection bar opened its corners to 10 and is the only caller that needs
+/// this; it was also the only one that would have shown the mistake.
+pub(crate) fn register_glass_rounded(
+    glass: &mut Vec<GlassSurface>,
+    palette: Palette,
+    rect: Rect,
+    corner_radius: f32,
+) {
     let Some(spec) = palette.glass(Backing::Canvas) else { return };
     if !rect.is_positive() {
         return;
     }
-    glass.push(GlassSurface {
-        rect,
-        corner_radius: f32::from(radius::LARGE),
-        opacity: spec.opacity,
-    });
+    glass.push(GlassSurface { rect, corner_radius, opacity: spec.opacity });
 }
 
 fn tool_row(
@@ -417,7 +435,13 @@ fn flyout_window(
                 Flyout::Agent => agent_picker(ui, palette, state, events),
                 Flyout::More => more_picker(ui, palette, state, active, events),
             });
-            paint_glass_edge(ui.painter(), inner.response.rect, palette, Backing::Canvas);
+            paint_glass_edge(
+                    ui.painter(),
+                    inner.response.rect,
+                    palette,
+                    Backing::Canvas,
+                    f32::from(radius::LARGE),
+                );
         })
         .response;
 

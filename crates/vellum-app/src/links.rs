@@ -19,10 +19,16 @@
 //!
 //! # What is fetched, and when
 //!
-//! Nothing automatically. `Library::link_previews` is **off** until the user turns it on,
-//! because a board that fetches on open tells a third party every link the user has saved.
-//! With it on, a fetch is requested when a link is pasted and when the user asks for one —
-//! never on a timer, and never twice for the same URL in a session ([`Fetcher::seen`]).
+//! ⚠ **`Library::link_previews` is ON unless the user turns it off** — `unwrap_or(true)`.
+//! This paragraph said the opposite for a long time after the default moved, which is worth
+//! recording rather than quietly correcting: it shipped *off* first, on the reasoning that a
+//! board fetching on open tells a third party every link the user has saved. The reasoning
+//! was sound and the outcome was wrong — a pasted link drew a grey box with nothing on
+//! screen to say why, and it was reported as broken. A privacy default that reads as a bug
+//! is not a privacy win. The switch is still in Preferences.
+//!
+//! A fetch is requested when a link is pasted and when the user asks for one — never on a
+//! timer, and never twice for the same URL in a session ([`Fetcher::seen`]).
 //!
 //! # Two requests, one card
 //!
@@ -143,7 +149,7 @@ impl Fetcher {
         // extra metadata fetch for a card whose mode changed, which is the fetch that has to
         // happen anyway to get the image.
         let key = format!("{item}\u{1}{}\u{1}{url}", u8::from(want_image));
-        if !self.seen.insert(key) {
+        if !self.seen.insert(key.clone()) {
             return false;
         }
         let sent = self
@@ -152,8 +158,30 @@ impl Fetcher {
             .is_ok();
         if sent {
             self.outstanding += 1;
+        } else {
+            // The workers are gone, so nothing is coming back for this key. Leaving it in
+            // `seen` would mark the card *asked for* when it never was, and since the set
+            // is the only thing preventing a repeat, that card could never be fetched again
+            // for the life of the process.
+            self.seen.remove(&key);
         }
         sent
+    }
+
+    /// Forgets every request made for one item, so it can be asked for again.
+    ///
+    /// `seen` exists to stop a card being fetched twice, and it is written when a request
+    /// goes *out* — which is right, because that is when a duplicate would be wasteful. The
+    /// hole is what happens when an answer comes back and then cannot be applied: the batch
+    /// is dropped, the set still says "asked", and the card sits blank until the app is
+    /// restarted with no way for the user to know why. `apply_link_fetches` calls this on
+    /// its failure path so the next frame simply asks again.
+    ///
+    /// Keyed by prefix because one item has several keys — metadata-only and with-image are
+    /// separate requests, deliberately (see [`Fetcher::request`]).
+    pub fn forget_item(&mut self, item: vellum_doc::ItemId) {
+        let prefix = format!("{item}\u{1}");
+        self.seen.retain(|key| !key.starts_with(&prefix));
     }
 
     /// Everything that has come back since the last call. Never blocks.

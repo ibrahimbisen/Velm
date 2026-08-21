@@ -43,6 +43,24 @@ impl AgentRef {
     }
 }
 
+/// How many choices an option set may carry.
+///
+/// ⚠ **This is a painting constraint, and it has to be enforced at the door.** The cards are
+/// drawn in a single row inside the node, so the painter shows this many and no more — and
+/// with the two doors bounding it differently (the MCP schema said "2 to 8", the IPC socket
+/// said nothing at all) an agent could offer eight and have half of them arrive as an
+/// unclickable *"and 4 more"* line. That is this repo's own rule broken from the inside:
+/// never present something the user cannot act on. Refusing the call instead tells the agent
+/// exactly what to do — offer four — while it still has the turn in hand to do it.
+///
+/// Lives here rather than in the painter because both doors are in this crate and neither can
+/// see `vellum-app`; `crate::draw::MAX_OPTION_CARDS` is defined as this value, so the row that
+/// is drawn and the row that is accepted cannot come apart.
+pub const MAX_CHOICES: usize = 4;
+
+/// The fewest that is still a choice. One option is an instruction.
+pub const MIN_CHOICES: usize = 2;
+
 /// One selectable option an agent offered.
 ///
 /// The pattern this exists for: *"here are three UI directions I built"* — a row of cards

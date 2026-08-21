@@ -426,23 +426,23 @@ was reachable, and the gap between the two was invisible to a green suite.
 |---|---|---|
 | 1 Live agent nodes | Palette ▸ Agent (or `A`), drag; Run on the node | Reachable |
 | 2 Raw / clean per node | The node's mode toggle; the bar; Edit ▸ Agent; Preferences for the default | Reachable |
-| 3 Agent-to-agent messaging | Connector between two agents; arrowhead sets direction | Delivery reachable; an agent *initiating* one needs the shim |
-| 4 Worktree isolation | Preferences ▸ Worktree isolation, then run a coding agent | Reachable — created at launch, recorded, used as cwd. Removal is deliberately manual |
-| 5 Custom role labels | Double-click the role, or the panel | Reachable, and folded into the system context |
-| 6 Meta agent | Palette ▸ Agent ▸ Meta | Placeable; its configure power runs over the shim |
-| 7 File tree nodes | More ▸ File tree | Reachable; per-agent scoping needs its editor |
-| 8 Note nodes | More ▸ Note | Reachable once a note is given a file |
-| 9 Orchestrator territory + cap | Palette ▸ Agent ▸ Orchestrator | Cap enforced; spawn runs over the shim; the territory drag is not built |
-| 10 Scheduled agents | Edit ▸ Agent ▸ Schedule… | Reachable, end to end |
-| 11 Hierarchical rules | Edit ▸ Agent ▸ Rules… | Agent layer editable; the two above are shown and revealable |
-| 12 Voice | Push-to-talk on the node | Needs `--features voice`; a default build says so |
+| 3 Agent-to-agent messaging | Connector between two agents; arrowheads (both ends, on the bar) set direction | **Reachable and measured end to end** — `--demo agent-ipc` |
+| 4 Worktree isolation | Preferences ▸ Worktree isolation, then place an agent; Edit ▸ Agent ▸ Remove worktree… | Reachable both ways: the project setting is inherited at placement and at spawn, and removal is a confirmed command that refuses a dirty checkout |
+| 5 Custom role labels | Double-click the role, or the panel | Reachable, folded into the system context, and never empty (`node_name`) |
+| 6 Meta agent | Palette ▸ Agent ▸ Meta | Placeable; **told in its system context** that it may configure others, over the shim or `velm_configure_agent` |
+| 7 File tree nodes | More ▸ File tree | Reachable, and the per-agent scope has a consumer: a tree scoped to an agent is named in that agent's system context as the part of the project it works in. Stated as a pointer, not enforced — Velm does not sandbox a coding agent's filesystem. The list scrolls |
+| 8 Note nodes | More ▸ Note; `note chain` from an agent | Reachable; private scope works (owner id), chaining is a real verb, and **the body is edited on the canvas** — `--demo note-edit` types into one and the `.md` on disk holds the result |
+| 9 Orchestrator territory + cap | Palette ▸ Agent ▸ Set territory…, then sweep | Reachable; the panel offers the sweep in both states |
+| 10 Scheduled agents | Edit ▸ Agent ▸ Schedule… | Reachable, end to end. Interval / daily / weekly / **a five-field cron expression**, refused at save rather than at six in the evening |
+| 11 Hierarchical rules | Edit ▸ Agent ▸ Rules…, then *Edit* beside an inherited layer | **All three layers writable**; the project row appears before its file exists and names the file a save would create |
+| 12 Voice | Select an agent, **hold `⌥D`**; Preferences ▸ Voice | **Reachable and measured** — `--demo agent-voice`. What is said becomes the node's prompt draft. The transcriber is chosen in the menu, model file included. Capture needs `--features voice`; a default build refuses by name |
 | 13 Browser nodes | More ▸ Browser + Preferences + Load | Card reachable; live pages need `--features browser` |
-| 14 Images and options | An agent emits them | Images reachable; option sets arrive over the shim |
-| 15 Away summaries | Leave the window, come back | Reachable, as a headline |
-| 16 Provider per node | The context bar, or the panel | Reachable; a local model needs its endpoint field |
+| 14 Images and options | An agent emits them | Reachable. Option sets bounded to what the row can draw at both doors; `velm_post_image` answers with the blob hash, so a choice's *image* can be filled in by an agent. A click is matched on the question as well as the answer |
+| 15 Away summaries | Leave the window, come back | Reachable; one that needs the user is an error-lifetime toast naming the agents, not a three-second success |
+| 16 Provider per node | The context bar, or the panel | Reachable, including a local model's **endpoint**; a stored key is used when the delegated CLI is absent |
 | 17 Bring-your-own-subscription | Provider ▸ Claude | **Reachable and measured** — no API key |
-| 18 File-type ingestion | Drop a file on an agent, or attach from the panel | Needs its producer wired |
-| 19 Web research | An agent calls the MCP tool | Runs over the shim and its MCP registration |
+| 18 File-type ingestion | Drop a file, *Attach a file…*, or *Attach a link…* | Reachable, and the **text reaches the agent** (blob-cached, bounded, truncation stated). **Audio and video are transcribed** when a whisper binary is installed — locally only, never uploaded; without one the file is attached by path and the node says so |
+| 19 Web research | An agent calls the MCP tool | Reachable on **every transport**. `claude`, ACP and PTY carry an MCP server; **HTTP agents call the same tools natively**, advertised on both wires and dispatched over the same loopback socket the shim uses |
 
 ### The chain six of these share
 
@@ -450,10 +450,62 @@ Messaging-initiation, the meta agent's configure, orchestrator spawn, option set
 note access and web research **all** terminate at `velm-agent-cli` / `velm-mcp`. That chain had
 three independent breaks, any one fatal: the binaries were not built or shipped; nothing put
 them on a launched agent's `PATH` or registered the MCP server; and the system context never
-mentioned they existed. All three are closed — but note what is still not proven: **a real
-agent process invoking the shim and Velm's handler answering has never been driven end to
-end.** Every layer is tested and one hop is not. That is trap 9's exact shape, and a
-*"messaging does nothing"* report should start there rather than in the bus.
+mentioned they existed.
+
+**All three are closed, and the joint itself is now measured.** This section used to end by
+admitting that *"a real agent process invoking the shim and Velm's handler answering has never
+been driven end to end"* — trap 9's exact shape, every layer tested and the joint not.
+`--demo agent-ipc` drives it: the real binary resolved through the same `transport::shim()` a
+launch uses, the two environment variables a launch sets, a real TCP connection to the
+`IpcServer` that production's `ensure_ipc` started, the real token check, the real handler, and
+the message read back out of the target's sidecar on disk. Measured:
+
+```
+agents: loopback server on port 59007
+a real velm-agent-cli process reached Velm over the loopback socket and its message
+landed in the target's transcript — done
+```
+
+The one substitution is named in the fixture: the session is an `Http` transport pointed at a
+port with nothing behind it, because that is the only transport whose `start` neither probes
+for a binary nor opens a connection — so the server comes up through the production path
+without `claude`, a subscription or any traffic. A/B'd by moving the shim aside, where it
+reports the gap and names the build command instead of passing quietly.
+
+### What is still open, stated rather than implied
+
+The rows above say *reachable* where a person can get to the thing. These are the places where
+they cannot, kept here so the next reader does not have to re-derive them:
+
+> ⚠ **Six entries were removed from this list on 2026-08-14 because they had become false**,
+> and that is the point §14 exists to make about itself. A file tree's scope, a scroll gesture,
+> `velm_post_image` answering with its hash, an option click resolved by question, `Recurrence::Cron`
+> and the PTY transport's MCP registration were all *implemented in the working tree while this
+> section went on describing them as gaps*. A ledger is a hypothesis with a date on it, including
+> this one. **Check the code before believing a row here — in either direction.**
+
+- **An orchestrator cannot spawn onto a parked board.** Config reads and writes reach a parked
+  board (`parked_agent_model`, `write_parked_agent_model`) and so does ingestion
+  (`attach_ingested_parked`); `spawn` still refuses, because placing a node needs a territory
+  and a camera on a board nobody is looking at. Refused by name, not silently.
+- **A user's drop ingests on the frame thread**, so a large PDF or a slow page costs frames.
+  Deliberate and narrow: the *agent*-initiated path (`Handler::ingest`) runs on the IPC worker,
+  and a drop is one file the user is standing there waiting for. The shape to grow into is
+  `crate::links`' worker pool; what stops it today is that a pool has to carry the target node
+  across the wait, during which the node can be deleted.
+- **A hosted transcriber has no menu rows.** Preferences ▸ Voice covers the local path
+  completely — which transcriber, and the model file it needs — because that is the private one
+  and the one that needs no key. A hosted one additionally needs a provider *and* a model name
+  Velm refuses to guess (`Speech::hosted_model` says why a pinned model id is wrong), so it is
+  set in the sidecar. `voice::WHERE_TO_CONFIGURE_HOSTED` is the one string that says so, split
+  from its sibling precisely so a hosted refusal never sends somebody to a menu that cannot
+  answer it.
+- **Media is transcribed locally or not at all.** `voice::transcribe_media` refuses a hosted
+  transcriber on purpose: uploading somebody's video because they dragged it onto a node is a
+  decision they did not make. With no whisper binary installed the file is attached by path and
+  the node says which of the two happened.
+- **Feature 12's capture and feature 13's engine need a non-default build** — `--features
+  voice` and `--features browser`. Both refuse by name otherwise, which is §0.3.
 
 ### The rule this section exists to enforce
 

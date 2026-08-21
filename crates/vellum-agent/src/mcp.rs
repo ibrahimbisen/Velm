@@ -179,6 +179,28 @@ impl Endpoint {
         Self { reach: resolve_from_env() }
     }
 
+    /// Resolves the same two variables out of a **supplied** environment.
+    ///
+    /// ⚠ This is what lets a transport running *inside Velm* use the board tools. `from_env`
+    /// reads `std::env`, which for an in-process transport is Velm's own environment and does
+    /// not carry `VELM_IPC` — those live on [`crate::LaunchSpec::env`], because they were
+    /// written to be handed to a **child process**. Without this constructor the whole board
+    /// surface is reachable only by agents Velm spawns, which is exactly why feature 19 could
+    /// not reach an HTTP agent: there is no child to put an environment on.
+    ///
+    /// Same resolution, same refusal wording, one implementation — so an HTTP agent and a
+    /// spawned `claude` cannot come to disagree about what "Velm is not reachable" means.
+    pub fn from_pairs(env: &[(String, String)]) -> Self {
+        Self {
+            reach: resolve_with(|name| {
+                env.iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+            }),
+        }
+    }
+
     /// An endpoint that is deliberately not there, carrying the reason.
     ///
     /// Public because the protocol tests need a server whose Velm half is known-absent
@@ -227,14 +249,23 @@ impl Endpoint {
 }
 
 fn resolve_from_env() -> Result<Reach, String> {
-    let agent = non_empty(AGENT_ID_ENV).ok_or_else(|| {
+    resolve_with(non_empty)
+}
+
+/// The resolution itself, over any lookup.
+///
+/// Split out so [`Endpoint::from_pairs`] and [`Endpoint::from_env`] are the *same* rules — the
+/// address forms, the token requirement, the runtime-file fallback and every refusal sentence.
+/// Two copies of this would be two ideas of what a reachable Velm is.
+fn resolve_with(look: impl Fn(&str) -> Option<String>) -> Result<Reach, String> {
+    let agent = look(AGENT_ID_ENV).ok_or_else(|| {
         format!(
             "{AGENT_ID_ENV} is not set, so this process cannot say which agent node it is \
              acting for. The velm_* tools are only available to a process Velm started from \
              an agent node on a board. The research_* tools work regardless."
         )
     })?;
-    let ipc = non_empty(IPC_ENV).ok_or_else(|| {
+    let ipc = look(IPC_ENV).ok_or_else(|| {
         format!(
             "{IPC_ENV} is not set, so this process was not launched by Velm and there is no \
              board to act on. The research_* tools work regardless."
@@ -242,7 +273,7 @@ fn resolve_from_env() -> Result<Reach, String> {
     })?;
 
     if let Some(address) = parse_address(&ipc) {
-        let token = non_empty(IPC_TOKEN_ENV).ok_or_else(|| {
+        let token = look(IPC_TOKEN_ENV).ok_or_else(|| {
             format!(
                 "{IPC_ENV} names an address ({ipc}) but {IPC_TOKEN_ENV} is not set, so there \
                  is no credential to send. Point {IPC_ENV} at Velm's runtime/ipc.json instead, \
@@ -284,15 +315,17 @@ fn parse_address(text: &str) -> Option<SocketAddr> {
 /// cannot be told about is not a tool. `research.search` is therefore `research_search`; the
 /// prefix still does the grouping the dot was there for, and [`ipc::Request::verb`] keeps the
 /// dotted spelling on the wire, where nothing constrains it.
-pub const TOOL_NAMES: [&str; 10] = [
+pub const TOOL_NAMES: [&str; 12] = [
     "research_search",
     "research_fetch",
     "velm_send_message",
     "velm_list_notes",
     "velm_read_note",
+    "velm_read_note_chain",
     "velm_write_note",
     "velm_post_image",
     "velm_post_options",
+    "velm_ingest_context",
     "velm_spawn_agent",
     "velm_configure_agent",
 ];
@@ -440,6 +473,69 @@ velm_list_notes to see what is actually there.",
             }
         }),
         json!({
+            "name": "velm_read_note_chain",
+            "description": "\
+Read a note **and everything it links to**, following the markdown links from note to note \
+and returning the whole trail in one call.\n\
+\n\
+Use this instead of reading notes one at a time when a note points at others: the board's \
+memory is written as a chain on purpose, and this is how you follow it without spending a \
+turn per hop or looping for ever on two notes that point at each other.\n\
+\n\
+Arguments: `path` is the note to start from, as velm_list_notes reports it. `depth` is how \
+many hops out to follow; leave it out for the default, and note that asking for more than \
+the default does not get you more.\n\
+\n\
+What it refuses: a starting note that is private to another agent. A note *reached* by a \
+link that you may not read is quietly left out of the trail rather than refusing the whole \
+call, and a link to a note nobody has written yet is not an error — it is simply not there.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The note to start from, as velm_list_notes reports it."
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many hops of links to follow. Optional."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "velm_ingest_context",
+            "description": "\
+Have Velm read a document, a page or a media file as context for you, and keep it.\n\
+\n\
+Use this for a source you will need again — a specification, an RFC, a long article. The \
+text is extracted, stored against your node, and put in front of you at the start of your \
+next session, so you do not have to re-read or re-fetch it. For a file you can simply open \
+and are done with, open it yourself; this is for context that should persist.\n\
+\n\
+Arguments: `source` is a path on disk or a URL. PDFs, Word documents, spreadsheets, plain \
+text, web pages and YouTube links are understood.\n\
+\n\
+What it refuses, or reports honestly: a file it cannot reach, a format needing a converter \
+this machine has not got, and audio or video — which are attached by path, because Velm \
+does not transcribe media. The answer says which of those happened; it is never a silent \
+success.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "A path on disk, or a URL."
+                    }
+                },
+                "required": ["source"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "velm_write_note",
             "description": "\
 Write to a note. Returns confirmation once it is on disk.\n\
@@ -506,24 +602,25 @@ this is how you ask a question and get a definite answer rather than a paragraph
 Use it whenever you would otherwise write 'would you like A, B or C?'. It is the one thing a \
 chat window cannot do: each card can carry a picture.\n\
 \n\
-Arguments: `prompt` is the question. `choices` is a list of 2 to 8 cards, each with a short \
+Arguments: `prompt` is the question. `choices` is a list of 2 to 4 cards, each with a short \
 `id` you will get back verbatim, a `title` that fits on a card, and optionally a `body` of a \
 sentence or two. `image` on a card is a content hash of a picture already in Velm's blob \
 store — leave it out unless you were given one.\n\
 \n\
 Returns once the options are on the board; the user's answer arrives as your next turn, not \
-as this tool's result.\n\
+as this tool's result. To put a picture on a card, post it with velm_post_image first and \
+pass the hash it answers with as that choice's `image`.\n\
 \n\
 What it refuses: fewer than two cards, because one option is not a choice, and more than \
-eight, because they are drawn in a row on the node and would not fit.",
+four, because they are drawn in one row on the node and a fifth could not be clicked.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "prompt": { "type": "string", "description": "The question being asked." },
                     "choices": {
                         "type": "array",
-                        "minItems": 2,
-                        "maxItems": 8,
+                        "minItems": crate::transcript::MIN_CHOICES,
+                        "maxItems": crate::transcript::MAX_CHOICES,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -814,16 +911,36 @@ impl Server {
             ));
         }
 
-        let outcome = match name {
-            "research_search" => self.research_search(&arguments),
-            "research_fetch" => self.research_fetch(&arguments),
-            _ => self.velm_tool(name, &arguments),
-        };
-
-        Ok(match outcome {
+        Ok(match self.run_tool(name, &arguments) {
             Ok(text) => content_frame(&text, false),
             Err(text) => content_frame(&text, true),
         })
+    }
+
+    /// Run one tool by name, for a caller that is **not** speaking JSON-RPC.
+    ///
+    /// The dispatch `call_tool` used to hold inline, lifted so that the two callers share it:
+    /// an MCP client over stdio, and `transport/http.rs`'s tool loop, which talks the
+    /// provider's own function-calling shape and never sees a JSON-RPC frame. One dispatch, so
+    /// an HTTP agent and an MCP agent cannot come to offer different tools or answer a refusal
+    /// differently — which is the drift this repository has paid for every time one behaviour
+    /// grew a second implementation.
+    ///
+    /// `Err` is a **tool failure**, not a protocol error: it is the refusal a model reads and
+    /// adapts to. The caller decides how to present it; see this type's `handle_line` for why
+    /// the two must not be conflated. The unknown-tool check stays in `call_tool`, because for
+    /// a function-calling wire an unknown name is answered as a tool result rather than as a
+    /// protocol failure.
+    pub fn run_tool(&self, name: &str, arguments: &Value) -> Result<String, String> {
+        match name {
+            "research_search" => self.research_search(arguments),
+            "research_fetch" => self.research_fetch(arguments),
+            _ if TOOL_NAMES.contains(&name) => self.velm_tool(name, arguments),
+            _ => Err(format!(
+                "no tool called `{name}`; this server offers {}",
+                TOOL_NAMES.join(", ")
+            )),
+        }
     }
 
     // -- the research half ---------------------------------------------------------------
@@ -883,10 +1000,20 @@ impl Server {
             },
             "velm_list_notes" => ipc::Request::NoteList,
             "velm_read_note" => ipc::Request::NoteRead { path: string_argument(arguments, "path")? },
+            "velm_read_note_chain" => ipc::Request::NoteChain {
+                path: string_argument(arguments, "path")?,
+                depth: arguments
+                    .get("depth")
+                    .and_then(Value::as_u64)
+                    .and_then(|depth| usize::try_from(depth).ok()),
+            },
             "velm_write_note" => ipc::Request::NoteWrite {
                 path: string_argument(arguments, "path")?,
                 text: string_argument(arguments, "text")?,
                 append: arguments.get("append").and_then(Value::as_bool).unwrap_or(false),
+            },
+            "velm_ingest_context" => ipc::Request::Ingest {
+                source: string_argument(arguments, "source")?,
             },
             "velm_post_image" => image_request(arguments)?,
             "velm_post_options" => ipc::Request::Options {
@@ -929,6 +1056,28 @@ impl Server {
                     }
                 }
                 out.push('\n');
+                Ok(out)
+            }
+            // The hash, said plainly, because the next call the model makes with it is
+            // `velm_post_options` — and a sentence it has to parse a hash out of is a sentence
+            // it will get wrong.
+            Answer::Stored { blob } => Ok(format!(
+                "Stored. Its image hash is {blob} — pass that as a choice's `image` in \
+                 velm_post_options to show it on a card."
+            )),
+            Answer::Chain { notes } => {
+                if notes.is_empty() {
+                    return Ok("That note is not there, or it is empty.".to_owned());
+                }
+                // Each note under its own heading, in the order the walk reached them —
+                // breadth first, so the note asked for comes first and its direct links
+                // before theirs. A model reading this needs to know where one note ends and
+                // the next begins, which is the whole reason this is not a concatenation.
+                let mut out =
+                    format!("{} note(s), following the links from the first:\n", notes.len());
+                for (path, text) in &notes {
+                    out.push_str(&format!("\n===== {path} =====\n{text}\n"));
+                }
                 Ok(out)
             }
             Answer::Spawned { agent } => Ok(format!(
@@ -998,12 +1147,17 @@ fn choices_from(arguments: &Value) -> Result<Vec<crate::transcript::Choice>, Str
     let Some(array) = arguments.get("choices").and_then(Value::as_array) else {
         return Err("`choices` is required and must be a list of cards".to_owned());
     };
-    if array.len() < 2 {
+    if array.len() < crate::transcript::MIN_CHOICES {
         return Err("`choices` needs at least two cards — one option is not a choice".to_owned());
     }
-    if array.len() > 8 {
-        return Err("`choices` takes at most eight cards; they are drawn in a row on the node"
-            .to_owned());
+    // The painter's row, not a number chosen here. A card past this one is drawn as a line of
+    // text saying it exists, which the user cannot click — see `transcript::MAX_CHOICES`.
+    if array.len() > crate::transcript::MAX_CHOICES {
+        return Err(format!(
+            "`choices` takes at most {} cards; they are drawn in one row on the node and a \
+             card past that could not be clicked",
+            crate::transcript::MAX_CHOICES
+        ));
     }
     array
         .iter()
@@ -1178,7 +1332,13 @@ mod tests {
         // The two halves of the surface are both present, and the Velm half matches the verbs
         // `ipc::Request` actually has — one enum, one surface.
         assert!(seen.contains(&"research_search") && seen.contains(&"research_fetch"));
-        assert_eq!(seen.iter().filter(|name| name.starts_with("velm_")).count(), 8);
+        // Counted against `TOOL_NAMES` rather than a literal, which is the assertion this was
+        // reaching for: the number is bookkeeping, and a tool added to the list and not to the
+        // payload — or the reverse — is the failure worth catching. A hardcoded 8 catches that
+        // too and also fails for the harmless reason that a tool was added correctly.
+        let velm_tools = TOOL_NAMES.iter().filter(|name| name.starts_with("velm_")).count();
+        assert_eq!(seen.iter().filter(|name| name.starts_with("velm_")).count(), velm_tools);
+        assert_eq!(seen.len(), TOOL_NAMES.len(), "tools/list and TOOL_NAMES disagree");
     }
 
     /// Every tool that refuses names *what it refuses*, because a boundary a model discovers
@@ -1255,16 +1415,33 @@ mod tests {
         assert!(matches!(inline, ipc::Request::Image { ref caption, .. } if caption.as_deref() == Some("a chart")));
     }
 
-    /// One option is not a choice, and nine do not fit on a node. Both bounded here as well as
-    /// in the schema, because the schema is advice to the model and this is what runs.
+    /// One option is not a choice, and more than the painter draws do not fit on a node. Both
+    /// bounded here as well as in the schema, because the schema is advice to the model and
+    /// this is what runs.
+    ///
+    /// ⚠ **The upper bound is the painter's row, not a number spelled here.** It used to be
+    /// eight, spelled in three places — this validator, the schema's `maxItems`, and the
+    /// tool's own description — while `draw::MAX_OPTION_CARDS` drew four and rendered the rest
+    /// as a line of text saying how many options the user could not click. The assertion is on
+    /// [`crate::transcript::MAX_CHOICES`] rather than on a literal so that moving the row's
+    /// capacity moves the refusal with it.
     #[test]
     fn option_cards_are_bounded_and_carry_their_ids() {
         let too_few = choices_from(&json!({ "choices": [{ "id": "a", "title": "A" }] }));
         assert!(too_few.unwrap_err().contains("at least two"));
 
+        let over = crate::transcript::MAX_CHOICES + 1;
         let many: Vec<Value> =
-            (0..9).map(|index| json!({ "id": index.to_string(), "title": "x" })).collect();
-        assert!(choices_from(&json!({ "choices": many })).unwrap_err().contains("eight"));
+            (0..over).map(|index| json!({ "id": index.to_string(), "title": "x" })).collect();
+        let refusal = choices_from(&json!({ "choices": many })).unwrap_err();
+        assert!(
+            refusal.contains(&crate::transcript::MAX_CHOICES.to_string()),
+            "the refusal did not say how many are allowed: {refusal}"
+        );
+        assert!(
+            refusal.contains("clicked"),
+            "the refusal did not say why, which is what makes it actionable: {refusal}"
+        );
 
         let good = choices_from(&json!({ "choices": [
             { "id": "warm", "title": "Warm", "body": "Coral and cream." },

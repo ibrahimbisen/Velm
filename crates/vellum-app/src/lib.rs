@@ -77,6 +77,7 @@ pub mod surface;
 pub mod table;
 pub mod text;
 pub mod theme;
+pub mod voice;
 pub mod words;
 
 pub use app::Vellum;

@@ -26,7 +26,12 @@ const HOUR: u64 = 60 * MINUTE;
 const DAY: u64 = 24 * HOUR;
 
 /// How often a scheduled agent runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// ⚠ **Not `Copy`, because [`Self::Cron`] carries a string.** Everything here takes `&self`
+/// as a result; that is the whole cost, and it buys the fourth shape `docs/07-agent-canvas.md`
+/// §10 has specified since it was written — *"interval / daily / weekly / cron expression"* —
+/// of which only the first three existed. A person who already knows cron should not have to
+/// translate *"weekdays at 07:30"* into a shape this enum happens to have.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "every")]
 pub enum Recurrence {
     /// Every `minutes` minutes from the moment it was armed.
@@ -41,6 +46,15 @@ pub enum Recurrence {
     Daily { seconds_after_midnight: u32, utc_offset: i32 },
     /// Once a week, on `weekday` (0 = Monday) at the same offset a daily job uses.
     Weekly { weekday: u8, seconds_after_midnight: u32, utc_offset: i32 },
+    /// A five-field cron expression — `minute hour day-of-month month day-of-week` — in the
+    /// user's own local time, which `utc_offset` converts.
+    ///
+    /// Deliberately the **classic five fields and no more**: no seconds column, no `@reboot`,
+    /// no step-with-range beyond `*/n`. A schedule that fires an AI agent does not need
+    /// second resolution, and every extension is another spelling a user has to guess right.
+    /// An expression this cannot parse is refused when the schedule is saved, not silently at
+    /// six in the evening — see [`Recurrence::parse_cron`].
+    Cron { expression: String, utc_offset: i32 },
 }
 
 impl Recurrence {
@@ -48,14 +62,17 @@ impl Recurrence {
     ///
     /// Strictly after, which is what stops a job that has just run from running again
     /// immediately: the scheduler asks for the next time *after the one it just served*.
-    pub fn next_after(self, after: Timestamp) -> Timestamp {
-        match self {
+    pub fn next_after(&self, after: Timestamp) -> Timestamp {
+        match *self {
             Self::Interval { minutes } => {
                 let step = u64::from(minutes.max(1)) * MINUTE;
                 after + step
             }
             Self::Daily { seconds_after_midnight, utc_offset } => {
                 next_daily(after, u64::from(seconds_after_midnight), utc_offset, DAY)
+            }
+            Self::Cron { ref expression, utc_offset } => {
+                next_cron(expression, after, utc_offset)
             }
             Self::Weekly { weekday, seconds_after_midnight, utc_offset } => {
                 let target = next_daily(
@@ -79,8 +96,13 @@ impl Recurrence {
         }
     }
 
-    pub fn label(self) -> String {
-        match self {
+    /// Whether an expression is one this understands, for the editor to refuse a save on.
+    pub fn parse_cron(expression: &str) -> Option<CronFields> {
+        CronFields::parse(expression)
+    }
+
+    pub fn label(&self) -> String {
+        match *self {
             Self::Interval { minutes } if minutes % 60 == 0 && minutes >= 60 => {
                 let hours = minutes / 60;
                 if hours == 1 { "Every hour".into() } else { format!("Every {hours} hours") }
@@ -94,7 +116,187 @@ impl Recurrence {
                 weekday_name(weekday),
                 clock(seconds_after_midnight)
             ),
+            Self::Cron { ref expression, .. } => format!("Cron: {expression}"),
         }
+    }
+}
+
+/// A parsed five-field cron expression.
+///
+/// Each field is the **set of values it matches**, expanded at parse time. A `Vec<bool>` per
+/// field rather than a matcher to evaluate per candidate: the search below tries at most a
+/// year of minutes, and asking "is this minute in the set" has to be a lookup rather than a
+/// re-parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronFields {
+    minute: Vec<bool>,
+    hour: Vec<bool>,
+    day_of_month: Vec<bool>,
+    month: Vec<bool>,
+    day_of_week: Vec<bool>,
+    /// Whether each **day** field was written as `*`.
+    ///
+    /// ⚠ Recorded at parse time rather than inferred from the set, and that distinction is a
+    /// bug this module already had: the sets are sized `high + 1` so a 1-based field like
+    /// day-of-month has a permanently-false index 0, which makes *"every value is set"* false
+    /// for `*` — so both day fields read as restricted, the OR rule below applied to every
+    /// expression, and `30 7 * * 1-5` fired on Saturday because `*` had "matched" the
+    /// day-of-month. Cron itself decides this from the field being a star, and so does this.
+    day_of_month_star: bool,
+    day_of_week_star: bool,
+}
+
+impl CronFields {
+    /// `minute hour day-of-month month day-of-week`, each `*`, `n`, `a,b`, `a-b` or `*/n`.
+    ///
+    /// `None` for anything else, which is what lets the editor refuse a save rather than
+    /// accept an expression that would never fire. Day-of-week takes 0 **or** 7 for Sunday,
+    /// because both spellings are in every crontab anybody has copied from.
+    pub fn parse(expression: &str) -> Option<Self> {
+        let fields: Vec<&str> = expression.split_whitespace().collect();
+        let [minute, hour, day_of_month, month, day_of_week] = fields.as_slice() else {
+            return None;
+        };
+        Some(Self {
+            day_of_month_star: day_of_month.trim() == "*",
+            day_of_week_star: day_of_week.trim() == "*",
+            minute: field(minute, 0, 59)?,
+            hour: field(hour, 0, 23)?,
+            day_of_month: field(day_of_month, 1, 31)?,
+            month: field(month, 1, 12)?,
+            day_of_week: {
+                let mut days = field(day_of_week, 0, 7)?;
+                // 7 and 0 are both Sunday. Folded here so the match below can index 0..=6.
+                if days.get(7).copied().unwrap_or(false) {
+                    days[0] = true;
+                }
+                days.truncate(7);
+                days
+            },
+        })
+    }
+
+    /// Whether a local civil time matches.
+    ///
+    /// ⚠ **Day-of-month and day-of-week are OR, not AND, when both are restricted.** That is
+    /// cron's own rule and it surprises everyone who has not been bitten by it — `0 0 1 * 1`
+    /// is *the first of the month **and** every Monday*, not *Mondays that fall on the first*.
+    /// Implementing the intuitive reading would make every expression copied from a crontab
+    /// fire on the wrong days.
+    fn matches(&self, civil: Civil) -> bool {
+        let dom_restricted = !self.day_of_month_star;
+        let dow_restricted = !self.day_of_week_star;
+        let dom = self.day_of_month.get(civil.day as usize).copied().unwrap_or(false);
+        let dow = self.day_of_week.get(civil.weekday as usize).copied().unwrap_or(false);
+        let day = match (dom_restricted, dow_restricted) {
+            (true, true) => dom || dow,
+            (true, false) => dom,
+            (false, true) => dow,
+            (false, false) => true,
+        };
+        day && self.minute.get(civil.minute as usize).copied().unwrap_or(false)
+            && self.hour.get(civil.hour as usize).copied().unwrap_or(false)
+            && self.month.get(civil.month as usize).copied().unwrap_or(false)
+    }
+}
+
+/// One field of an expression, expanded to the values it matches.
+fn field(text: &str, low: u32, high: u32) -> Option<Vec<bool>> {
+    let mut set = vec![false; high as usize + 1];
+    for part in text.split(',') {
+        let (range, step) = match part.split_once('/') {
+            Some((range, step)) => (range, step.parse::<u32>().ok().filter(|n| *n > 0)?),
+            None => (part, 1),
+        };
+        let (from, to) = if range == "*" {
+            (low, high)
+        } else if let Some((from, to)) = range.split_once('-') {
+            (from.parse().ok()?, to.parse().ok()?)
+        } else {
+            let one: u32 = range.parse().ok()?;
+            // `5/15` means "from 5, every 15" — the same shape `*/15` has.
+            if step > 1 { (one, high) } else { (one, one) }
+        };
+        if from < low || to > high || from > to {
+            return None;
+        }
+        let mut at = from;
+        while at <= to {
+            set[at as usize] = true;
+            at += step;
+        }
+    }
+    set.iter().any(|on| *on).then_some(set)
+}
+
+/// A civil date and time, in whatever frame the caller shifted into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Civil {
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    /// 0 = Sunday, matching cron rather than this module's Monday-first weekday.
+    weekday: u32,
+}
+
+/// The next minute strictly after `after` that the expression matches.
+///
+/// A minute-by-minute walk, capped at one year. Cron's own reference implementations do the
+/// same, for the same reason: the alternative is field arithmetic that has to be right about
+/// February, and a year of minutes is half a million lookups on a `Vec<bool>` — microseconds,
+/// once, when a schedule is armed. The cap is what stops `0 0 30 2 *` — the 30th of February —
+/// searching forever; it answers a year out, and the editor refuses to save an expression
+/// that never fires.
+fn next_cron(expression: &str, after: Timestamp, utc_offset: i32) -> Timestamp {
+    let Some(fields) = CronFields::parse(expression) else {
+        // Unparseable expressions are refused at the editor. Reaching here means a board file
+        // was hand-edited: answer far in the future rather than firing every minute.
+        return after.saturating_add(365 * DAY);
+    };
+    // Start at the next whole minute after `after`, so a job cannot fire twice in one minute.
+    let start = shift(after, utc_offset) / MINUTE * MINUTE + MINUTE;
+    for step in 0..MINUTES_IN_A_YEAR {
+        let local = start + step * MINUTE;
+        if fields.matches(civil_of(local)) {
+            return unshift(local, utc_offset);
+        }
+    }
+    after.saturating_add(365 * DAY)
+}
+
+const MINUTES_IN_A_YEAR: u64 = 366 * 24 * 60;
+
+/// Civil time from a local-frame Unix timestamp, by the days-from-epoch algorithm.
+///
+/// Written out rather than taken from a crate: this module's whole discipline is that it holds
+/// no timezone database and reads no clock, and `chrono` would bring both.
+fn civil_of(local: u64) -> Civil {
+    let days = (local / DAY) as i64;
+    let seconds = local % DAY;
+    // 1970-01-01 was a Thursday; cron counts Sunday as 0.
+    let weekday = ((days + 4).rem_euclid(7)) as u32;
+
+    // Howard Hinnant's civil_from_days, shifted to a March-based year so leap day lands last.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if month <= 2 { year + 1 } else { year };
+
+    Civil {
+        year,
+        month,
+        day,
+        hour: (seconds / HOUR) as u32,
+        minute: ((seconds % HOUR) / MINUTE) as u32,
+        weekday,
     }
 }
 
@@ -286,6 +488,128 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 1970-01-01T00:00:00Z is a Thursday, and every other date here is checked against a
+    /// calendar rather than against this module's own arithmetic.
+    #[test]
+    fn civil_time_is_right_about_leap_years_and_weekdays() {
+        // 2024-02-29T12:34:00Z — a leap day, which is the date this algorithm exists to get
+        // right and the one a naive month table gets wrong.
+        let leap = civil_of(1_709_210_040);
+        assert_eq!((leap.year, leap.month, leap.day), (2024, 2, 29));
+        assert_eq!((leap.hour, leap.minute), (12, 34));
+        assert_eq!(leap.weekday, 4, "2024-02-29 was a Thursday");
+
+        // 2026-01-01T00:00:00Z, a Thursday.
+        let new_year = civil_of(1_767_225_600);
+        assert_eq!((new_year.year, new_year.month, new_year.day), (2026, 1, 1));
+        assert_eq!(new_year.weekday, 4);
+    }
+
+    #[test]
+    fn a_cron_field_expands_every_form_it_accepts() {
+        let every = field("*", 0, 5).expect("a star");
+        assert!(every.iter().all(|on| *on));
+
+        let one = field("3", 0, 5).expect("a number");
+        assert_eq!(one.iter().filter(|on| **on).count(), 1);
+        assert!(one[3]);
+
+        let list = field("1,4", 0, 5).expect("a list");
+        assert!(list[1] && list[4] && !list[2]);
+
+        let range = field("2-4", 0, 5).expect("a range");
+        assert!(range[2] && range[3] && range[4] && !range[1]);
+
+        let step = field("*/2", 0, 5).expect("a step");
+        assert!(step[0] && step[2] && step[4] && !step[1]);
+
+        // Out of range, backwards, and nonsense are refused rather than clamped: an
+        // expression that means nothing must fail the editor's save, not fire at a time
+        // nobody asked for.
+        assert!(field("6", 0, 5).is_none());
+        assert!(field("4-2", 0, 5).is_none());
+        assert!(field("*/0", 0, 5).is_none());
+        assert!(field("many", 0, 5).is_none());
+    }
+
+    #[test]
+    fn an_expression_needs_exactly_five_fields() {
+        assert!(CronFields::parse("30 7 * * 1-5").is_some());
+        assert!(CronFields::parse("30 7 * *").is_none(), "four fields");
+        assert!(CronFields::parse("0 30 7 * * 1-5").is_none(), "a seconds column");
+        assert!(CronFields::parse("").is_none());
+        // Sunday is 0 or 7, because both are in every crontab anybody has copied.
+        let sunday_seven = CronFields::parse("0 0 * * 7").expect("7 is Sunday");
+        let sunday_zero = CronFields::parse("0 0 * * 0").expect("0 is Sunday");
+        assert_eq!(sunday_seven, sunday_zero);
+    }
+
+    /// The weekday walk, at a real date: 2026-01-01 is a Thursday, so *weekdays at 07:30*
+    /// fires that morning, then Friday, then skips to Monday.
+    #[test]
+    fn a_weekday_expression_skips_the_weekend() {
+        let midnight = 1_767_225_600; // 2026-01-01T00:00:00Z, a Thursday
+        let recurrence =
+            Recurrence::Cron { expression: "30 7 * * 1-5".to_owned(), utc_offset: 0 };
+
+        let thursday = recurrence.next_after(midnight);
+        assert_eq!(thursday, midnight + 7 * HOUR + 30 * MINUTE);
+
+        let friday = recurrence.next_after(thursday);
+        assert_eq!(friday, thursday + DAY);
+
+        // Saturday and Sunday are skipped: the next one is three days later, not one.
+        let monday = recurrence.next_after(friday);
+        assert_eq!(monday, friday + 3 * DAY, "the weekend was not skipped");
+    }
+
+    /// ⚠ Cron's own rule, and the one everybody gets wrong: with **both** day fields
+    /// restricted they are OR-ed, not AND-ed. `0 0 1 * 1` is the first of the month *and*
+    /// every Monday.
+    #[test]
+    fn the_two_day_fields_are_or_when_both_are_restricted() {
+        let fields = CronFields::parse("0 0 1 * 1").expect("an expression");
+        // 2026-01-01 is a Thursday and the first of the month: matches on day-of-month alone.
+        assert!(fields.matches(civil_of(1_767_225_600)));
+        // 2026-01-05 is a Monday and not the first: matches on day-of-week alone.
+        assert!(fields.matches(civil_of(1_767_225_600 + 4 * DAY)));
+        // 2026-01-02 is a Friday and not the first: matches neither.
+        assert!(!fields.matches(civil_of(1_767_225_600 + DAY)));
+    }
+
+    /// A schedule fires **strictly after** the moment it is asked about, or a job that has
+    /// just run at 07:30 would be armed for 07:30 again and run every minute of that minute.
+    #[test]
+    fn the_next_fire_is_strictly_after_the_one_it_just_served() {
+        let recurrence = Recurrence::Cron { expression: "* * * * *".to_owned(), utc_offset: 0 };
+        let now = 1_767_225_600;
+        let next = recurrence.next_after(now);
+        assert_eq!(next, now + MINUTE);
+        assert!(recurrence.next_after(next) > next);
+    }
+
+    /// An expression that can never match answers far in the future rather than searching
+    /// for ever. The 30th of February is the honest example.
+    #[test]
+    fn an_expression_that_never_matches_terminates() {
+        let never = Recurrence::Cron { expression: "0 0 30 2 *".to_owned(), utc_offset: 0 };
+        let now = 1_767_225_600;
+        assert!(never.next_after(now) >= now + 365 * DAY);
+    }
+
+    /// The offset is the user's, exactly as it is for a daily job: *07:30 in whose morning*
+    /// is the only question this module answers about time zones.
+    #[test]
+    fn a_cron_time_is_local_like_every_other_recurrence() {
+        let midnight = 1_767_225_600; // 2026-01-01T00:00:00Z
+        let utc = Recurrence::Cron { expression: "0 9 * * *".to_owned(), utc_offset: 0 };
+        // Two hours east: 09:00 local is 07:00 UTC.
+        let east = Recurrence::Cron { expression: "0 9 * * *".to_owned(), utc_offset: 2 * 3600 };
+        assert_eq!(utc.next_after(midnight), midnight + 9 * HOUR);
+        assert_eq!(east.next_after(midnight), midnight + 7 * HOUR);
+    }
+
 
     /// Every assertion here supplies its own "now". A module that read the clock itself
     /// could only be tested by waiting, which is why it does not.

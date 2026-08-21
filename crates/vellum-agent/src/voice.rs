@@ -117,6 +117,36 @@ pub const NOT_BUILT_IN: &str = "voice capture is not built into this copy of Vel
      a build with the `voice` feature turned on; everything else about this node works \
      without it";
 
+/// Where a transcription setting is actually changed today.
+///
+/// ⚠ **This exists because six refusals in this file used to say "Preferences ▸ Voice", and
+/// there is no such page.** Those strings became reachable the moment feature 12 was wired
+/// into the app, and the likeliest real path reaches one of them — a user with whisper on
+/// `PATH` and no model file named, which is what `Speech::default()` is. Sending somebody to
+/// look for a settings page that does not exist costs them their time before it costs them
+/// their trust, which is this repository's stated worst failure and the rule `docs/07` §14
+/// ends on.
+///
+/// Named once so the day a Voice page is built there is one string to change and no chance of
+/// four of the six being missed — which is feedback 35's sibling rule, applied before rather
+/// than after.
+pub const WHERE_TO_CONFIGURE: &str = "choose one in Preferences ▸ Voice";
+
+/// Where the **hosted** half is configured, which is not that menu.
+///
+/// ⚠ Split from [`WHERE_TO_CONFIGURE`] deliberately, and the split is the honesty. Preferences
+/// ▸ Voice covers the local path completely — which transcriber, and the model file it needs —
+/// because that is the private one and the one that needs no key. A hosted transcriber
+/// additionally needs a provider *and* a model name Velm refuses to guess
+/// ([`Speech::hosted_model`] says why a pinned model id is wrong), so it has no rows there and
+/// is set in the sidecar.
+///
+/// Pointing a hosted refusal at the menu would be this pair's own defect one page further in:
+/// somebody opens Preferences ▸ Voice looking for the API settings the sentence promised, and
+/// finds three rows and a file picker.
+pub const WHERE_TO_CONFIGURE_HOSTED: &str =
+    "set the `speech` key in library.json, beside your boards";
+
 /// The local transcribers probed for when none is configured.
 ///
 /// whisper.cpp's binary, under the two names it ships as. Deliberately short: a tool with a
@@ -376,6 +406,31 @@ pub trait VoiceCapture {
     /// Whether a device is open right now. Used to draw the node's recording state, so it
     /// must answer about the *device*, not about what the caller believes.
     fn is_recording(&self) -> bool;
+}
+
+/// ⚠ **Without this the module's own two halves cannot be joined.** [`microphone`] answers
+/// `Box<dyn VoiceCapture>` — it has to, because which capture a build has is a `cfg` decision
+/// — and [`PushToTalk::new`] takes a `C: VoiceCapture`. With no impl for the box, the only
+/// constructor in this file and the only consumer of one in this file do not fit together,
+/// and the whole press path is unreachable from any caller that did not pick a concrete
+/// capture at compile time. Which is every real caller: the app cannot, since the feature may
+/// be off.
+///
+/// Found by trying to write that caller. It is this repository's signature defect — code that
+/// compiles, passes its own tests, and has no way to be called — surviving inside a module
+/// whose tests all name a concrete type.
+impl VoiceCapture for Box<dyn VoiceCapture> {
+    fn start(&mut self) -> Result<()> {
+        (**self).start()
+    }
+
+    fn stop(&mut self) -> Result<Recording> {
+        (**self).stop()
+    }
+
+    fn is_recording(&self) -> bool {
+        (**self).is_recording()
+    }
 }
 
 /// The capture compiled into every build.
@@ -992,10 +1047,10 @@ impl Speech {
         // OpenAI path would 404 every request and read as a refused key.
         if matches!(provider, Provider::Claude | Provider::Gemini) {
             return Err(AgentError::Refused(format!(
-                "{} has no speech-to-text endpoint Velm can use — choose a transcription \
-                 provider under Preferences ▸ Voice, or install a whisper binary and let \
-                 Velm transcribe on this machine",
-                provider.label()
+                "{} has no speech-to-text endpoint Velm can use — install a whisper binary and \
+                 let Velm transcribe on this machine, or name a provider that transcribes ({}).",
+                provider.label(),
+                WHERE_TO_CONFIGURE_HOSTED
             )));
         }
 
@@ -1038,8 +1093,8 @@ impl Speech {
             if key.is_none() {
                 return Err(AgentError::Unauthorized {
                     provider: provider.label().to_owned(),
-                    message: "there is no API key for this provider — add one in Preferences, \
-                              or transcribe on this machine instead"
+                    message: "there is no API key for this provider — sign in to it on an \
+                              agent node, or transcribe on this machine instead"
                         .into(),
                 });
             }
@@ -1070,9 +1125,10 @@ pub fn choose_backend(
             } else {
                 Err(AgentError::Refused(format!(
                     "voice is set to transcribe only on this machine, and no whisper binary was \
-                     found — install one (its command is usually `{}`) and name its model file \
-                     under Preferences ▸ Voice, or allow the API instead",
-                    KNOWN_LOCAL_COMMANDS[0]
+                     found — install one (its command is usually `{}`) and name its model \
+                     file, or allow the API instead. {}",
+                    KNOWN_LOCAL_COMMANDS[0],
+                    WHERE_TO_CONFIGURE
                 )))
             }
         }
@@ -1080,11 +1136,10 @@ pub fn choose_backend(
             if hosted_configured {
                 Ok(Backend::Hosted)
             } else {
-                Err(AgentError::Refused(
-                    "voice is set to transcribe through an API, and none is configured — choose \
-                     a transcription provider and model under Preferences ▸ Voice"
-                        .into(),
-                ))
+                Err(AgentError::Refused(format!(
+                    "voice is set to transcribe through an API, and none is configured — name \
+                     a transcription provider and model ({WHERE_TO_CONFIGURE_HOSTED})"
+                )))
             }
         }
         // Local first. Not a tie-break: a microphone is the most private input in the
@@ -1093,10 +1148,12 @@ pub fn choose_backend(
         Preference::Auto if hosted_configured => Ok(Backend::Hosted),
         Preference::Auto => Err(AgentError::Refused(format!(
             "there is no way to turn speech into text yet — either install a whisper binary on \
-             this machine (its command is usually `{}`, and it needs a model file) or set a \
-             transcription provider and model under Preferences ▸ Voice. Nothing was recorded \
-             to anywhere in the meantime",
-            KNOWN_LOCAL_COMMANDS[0]
+             this machine (its command is usually `{}`, and it needs a model file: {}) or name \
+             a transcription provider and model ({}). Nothing was recorded to anywhere in the \
+             meantime",
+            KNOWN_LOCAL_COMMANDS[0],
+            WHERE_TO_CONFIGURE,
+            WHERE_TO_CONFIGURE_HOSTED
         ))),
     }
 }
@@ -1156,10 +1213,15 @@ pub struct LocalTranscriber {
     pub args: Vec<String>,
 }
 
-impl Transcribe for LocalTranscriber {
-    fn transcribe(&self, utterance: &Utterance) -> Result<String> {
-        let wav = TempWav::write(&utterance.wav())?;
-        let args = render_args(&self.args, self.model_file.as_deref(), &wav.path)?;
+impl LocalTranscriber {
+    /// Runs the tool over one audio file already on disk.
+    ///
+    /// Factored out of [`Transcribe::transcribe`] so that **a recording and a media file take
+    /// the same path** — feature 18's last step is this function with a `.m4a` instead of a
+    /// temporary `.wav`. A second copy of the argument rendering and the stderr handling would
+    /// be two ideas of what "the transcriber refused" means, and the two would drift.
+    pub fn run_on(&self, audio: &std::path::Path) -> Result<String> {
+        let args = render_args(&self.args, self.model_file.as_deref(), audio)?;
 
         let output = Command::new(&self.command).args(&args).output().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -1185,6 +1247,13 @@ impl Transcribe for LocalTranscriber {
 
         Ok(clean_transcript(&String::from_utf8_lossy(&output.stdout)))
     }
+}
+
+impl Transcribe for LocalTranscriber {
+    fn transcribe(&self, utterance: &Utterance) -> Result<String> {
+        let wav = TempWav::write(&utterance.wav())?;
+        self.run_on(&wav.path)
+    }
 
     fn backend(&self) -> Backend {
         Backend::Local
@@ -1193,6 +1262,45 @@ impl Transcribe for LocalTranscriber {
     fn label(&self) -> String {
         format!("`{}`, on this machine", self.command)
     }
+}
+
+/// Turn a media **file** into text — feature 18's missing last step.
+///
+/// `ingest` produces a [`crate::ingest::MediaHandoff`] and deliberately extracts nothing from
+/// audio or video; its own doc names the contract — *"whoever owns transcription reads this
+/// hand-off, produces the text"* — and until now nobody did, so a dropped recording reached
+/// the agent as a filename.
+///
+/// # Local only, and that is the design rather than a shortcut
+///
+/// A hosted transcriber would take the file whole and is **refused here**. Sending somebody's
+/// video to an API because they dragged it onto a node is a decision they did not make: a
+/// spoken prompt is a thing the user just said into a microphone knowing they were talking to
+/// an agent, and a file on their disk is not. The local path leaves nothing, so it needs no
+/// such consent — which is why this is the half that ships.
+///
+/// The refusal names the remedy, so a user with no whisper installed learns why the file was
+/// attached by name rather than discovering it by reading the agent's confused reply.
+pub fn transcribe_media(speech: &Speech, audio: &std::path::Path) -> Result<String> {
+    let Some(command) = speech.detect_local() else {
+        return Err(AgentError::Refused(format!(
+            "Velm transcribes media only with a transcriber on this machine, and none is \
+             installed — its command is usually `{}`. Install one and {WHERE_TO_CONFIGURE}; \
+             until then the agent is given the file's path rather than its words. An API is \
+             deliberately not used here: that would upload your file.",
+            KNOWN_LOCAL_COMMANDS[0]
+        )));
+    };
+    LocalTranscriber {
+        command,
+        model_file: speech.model_file.clone(),
+        args: if speech.args.is_empty() {
+            DEFAULT_LOCAL_ARGS.iter().map(|argument| (*argument).to_owned()).collect()
+        } else {
+            speech.args.clone()
+        },
+    }
+    .run_on(audio)
 }
 
 /// Substitutes `{model}` and `{audio}` into an argument template.
@@ -1216,9 +1324,11 @@ pub fn render_args(
             let model = model_file.map(str::trim).filter(|model| !model.is_empty()).ok_or_else(
                 || {
                     AgentError::Refused(
-                        "the local transcriber needs a model file — point Preferences ▸ Voice at \
-                         a whisper model (a `ggml-*.bin`), or transcribe through an API instead"
-                            .into(),
+                        format!(
+                            "the local transcriber needs a whisper model file (a \
+                             `ggml-*.bin`) — name one, or transcribe through an API instead. \
+                             {WHERE_TO_CONFIGURE}"
+                        ),
                     )
                 },
             )?;
@@ -1914,7 +2024,10 @@ mod tests {
             .expect_err("a transcriber appeared from nowhere");
         let message = error.to_string();
         assert!(message.contains("whisper"), "the local remedy was not named: {message}");
-        assert!(message.contains("Preferences"), "the hosted remedy was not named: {message}");
+        assert!(
+            message.contains("library.json"),
+            "the hosted remedy must name a place that exists: {message}"
+        );
         assert!(message.contains("Nothing was recorded to anywhere"), "{message}");
 
         let hosted_only = choose_backend(Preference::Hosted, true, false).unwrap_err();
@@ -2246,5 +2359,56 @@ mod tests {
             "the missing binary was not named: {error}"
         );
         assert!(matches!(error, AgentError::MissingCommand { .. }));
+    }
+
+    /// ⚠ **Feature 18's last step, run on a real file.** `transcribe_media` was wired into both
+    /// ingest paths and had never been executed against anything — the shape this repository
+    /// keeps finding, where every part is tested and the join is not.
+    ///
+    /// The "transcriber" is a shell script that echoes a line, which is exactly what
+    /// `LocalTranscriber` expects of one: a command that takes the rendered arguments and
+    /// prints text. So this drives the real `Speech::detect_local`, the real `render_args`, the
+    /// real process spawn and the real `clean_transcript`, with no whisper installed and no
+    /// network — and it asserts the **media file's own path** reached the command, which is the
+    /// one thing that distinguishes this from transcribing a recording.
+    #[test]
+    #[cfg(unix)]
+    fn a_media_file_is_transcribed_by_the_tool_on_this_machine() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let media = scratch.path().join("interview.m4a");
+        std::fs::write(&media, b"not really audio, and the script does not care").unwrap();
+
+        // Echoes the words, and the path it was handed, so the assertion can prove the file
+        // reached the tool rather than a temporary WAV built from nothing.
+        let tool = scratch.path().join("fake-whisper");
+        let mut script = std::fs::File::create(&tool).unwrap();
+        writeln!(script, "#!/bin/sh\necho \"heard: $*\"").unwrap();
+        drop(script);
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let speech = Speech {
+            command: Some(tool.display().to_string()),
+            model_file: Some("ggml-tiny.bin".into()),
+            ..Speech::default()
+        };
+
+        let text = transcribe_media(&speech, &media).expect("the script transcribes");
+        assert!(text.contains("heard:"), "the tool's output did not come back: {text:?}");
+        assert!(
+            text.contains("interview.m4a"),
+            "the media file's own path never reached the tool: {text:?}"
+        );
+
+        // And with nothing installed it refuses **by name**, rather than silently attaching
+        // the file with no words — which is the state the node's message describes.
+        let bare = Speech { command: Some("velm-no-such-transcriber".into()), ..Speech::default() };
+        let refused = transcribe_media(&bare, &media).expect_err("nothing is installed");
+        assert!(
+            refused.to_string().contains("this machine"),
+            "the refusal must name the remedy: {refused}"
+        );
     }
 }

@@ -158,6 +158,12 @@ pub struct Ansi {
     finished: Vec<Line>,
 }
 
+/// The flag Velm's MCP server is handed to a wrapped CLI with.
+///
+/// The same spelling `claude_cli` uses, and used here under the same probe: a terminal agent
+/// may be any binary the user named, and most of them have never heard of it.
+const MCP_CONFIG_FLAG: &str = "--mcp-config";
+
 impl Default for Ansi {
     fn default() -> Self {
         Self::new()
@@ -548,12 +554,30 @@ impl PtyTransport {
         let program = probe_command(command)?;
 
         let (columns, rows) = spec.terminal.unwrap_or(DEFAULT_SIZE);
+        let command_name = command.to_owned();
         let system = native_pty_system();
         let pair = system
             .openpty(PtySize { rows, cols: columns, pixel_width: 0, pixel_height: 0 })
             .map_err(|error| transport_error(&error))?;
 
         let mut builder = CommandBuilder::new(&program);
+        // ⚠ **Velm's own MCP server, on the same terms `claude_cli` registers it.** A PTY
+        // session is the Maestri mechanic — a real CLI agent in a real terminal on the board —
+        // and it was the one transport that registered nothing, so an agent running here had
+        // no research tools and reached the board only by shelling out to the shim on its
+        // `PATH`. The two guards are `claude_cli`'s and matter for the same reasons: no
+        // configuration is handed over naming a binary that is not beside us, and the flag is
+        // only passed to a program whose own `--help` admits to it, because an unknown option
+        // is a non-zero exit rather than an ignored argument.
+        let mut mcp_dropped = false;
+        if let Some(config) = spec.mcp_config() {
+            if super::claude_cli::supports_flag(&program, MCP_CONFIG_FLAG) {
+                builder.arg(MCP_CONFIG_FLAG);
+                builder.arg(config.to_string());
+            } else {
+                mcp_dropped = true;
+            }
+        }
         for argument in &spec.args {
             builder.arg(argument);
         }
@@ -565,6 +589,16 @@ impl PtyTransport {
         }
         if !spec.system_context.is_empty() {
             builder.env(CONTEXT_ENV, &spec.system_context);
+        }
+
+        if mcp_dropped {
+            let _ = events.send(TranscriptEvent::Error {
+                message: format!(
+                    "{command_name} did not accept `{MCP_CONFIG_FLAG}`, so Velm's tools are \
+                     not registered with it. The board verbs still work through the \
+                     `velm-agent-cli` command on its PATH; web research does not."
+                ),
+            });
         }
 
         let child = pair.slave.spawn_command(builder).map_err(|error| transport_error(&error))?;

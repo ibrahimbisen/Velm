@@ -122,7 +122,141 @@ impl DisplayMode {
             Self::Clean => Self::Raw,
         }
     }
+
+    /// What choosing this mode means, for the row that offers it.
+    ///
+    /// Beside the variant rather than in the menu that draws it: these rows are built from
+    /// `ALL` rather than from `vellum_ui`'s command table, so a third mode added here would
+    /// otherwise reach the interface with nothing explaining it. The crate holding the enum
+    /// is the one place that cannot be forgotten.
+    pub const fn note(self) -> &'static str {
+        match self {
+            Self::Raw => {
+                "Every tool call, shell command, file read and reasoning step, as it \
+                 happens. What you want while you are learning to trust an agent, or working \
+                 out why one did something."
+            }
+            Self::Clean => {
+                "Only what the agent finally answered. The default, because the noisy one \
+                 should be the one you ask for."
+            }
+        }
+    }
 }
+
+/// How one agent node's transcript is dressed.
+///
+/// *"there should be themes for chats that i can adjust like claude theme or chat gpt theme
+/// or kimi theme … and i should be able to set individual chats with individual themes."*
+///
+/// # Four presets and no colour picker
+///
+/// [`Command::note`](../../vellum_ui/enum.Command.html)'s reasoning for the accent applies
+/// here in a sharper form: each of these has been chosen so its ink clears 4.5:1 against its
+/// own paper, and an arbitrary pair cannot promise that. A transcript is the one surface in
+/// this application that is *only* text, so a theme that fails contrast does not look bad —
+/// it stops the feature working. The **picture** is where arbitrary choice belongs
+/// ([`AgentModel::chat_background`]), and it sits behind a scrim for exactly this reason.
+///
+/// # The colours are `[u8; 3]`, not a colour type
+///
+/// This crate depends on `serde` and `thiserror` and deliberately nothing in the workspace —
+/// see the crate docs. `vellum_app::theme` turns these into the canvas palette, which is the
+/// same shape `vellum_flow` and `vellum_mindmap` already use: the layout crate holds the
+/// data, the app holds the paint.
+///
+/// # They are drawn from the real products, not invented
+///
+/// Sampled from each vendor's own light interface. Two things are deliberately *not* copied:
+/// no logo, no typeface. A theme names a look you recognise; it does not pretend to be
+/// somebody else's application.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatTheme {
+    /// Velm's own: the board's paper, the board's ink, the accent you chose.
+    #[default]
+    Velm,
+    /// Warm cream paper, near-black ink, a rust accent.
+    Claude,
+    /// White paper, near-black ink, a green accent.
+    ChatGpt,
+    /// Cool near-white paper with an indigo accent.
+    Kimi,
+}
+
+impl ChatTheme {
+    pub const ALL: [Self; 4] = [Self::Velm, Self::Claude, Self::ChatGpt, Self::Kimi];
+
+    /// The stored spelling. **A string, not the variant's ordinal** — feedback 24's rule:
+    /// an enum serialised by position turns every user's *Kimi* into *ChatGpt* the day
+    /// somebody adds a fifth theme in the middle of the list.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Velm => "velm",
+            Self::Claude => "claude",
+            Self::ChatGpt => "chatgpt",
+            Self::Kimi => "kimi",
+        }
+    }
+
+    /// Reads a stored tag. An unknown one **degrades to the default** rather than failing
+    /// the parse — RULE ZERO's posture, and the reason a board written by a newer build
+    /// still opens here.
+    pub fn from_tag(tag: &str) -> Self {
+        Self::ALL.into_iter().find(|theme| theme.tag() == tag).unwrap_or_default()
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Velm => "Velm",
+            Self::Claude => "Claude",
+            Self::ChatGpt => "ChatGPT",
+            Self::Kimi => "Kimi",
+        }
+    }
+
+    /// What choosing this theme means, for the row that offers it.
+    ///
+    /// Beside the variant for `DisplayMode::note`'s reason: these rows are built from `ALL`
+    /// rather than from a command table, so a fifth theme would otherwise reach the
+    /// interface with nothing explaining it.
+    pub const fn note(self) -> &'static str {
+        match self {
+            Self::Velm => {
+                "The board's own paper and ink, and whichever accent you have chosen in \
+                 Preferences. The default, and the only theme that follows the rest of the \
+                 application."
+            }
+            Self::Claude => {
+                "Warm cream paper with a rust accent, after claude.ai's own light interface."
+            }
+            Self::ChatGpt => "White paper with a green accent, after ChatGPT's light interface.",
+            Self::Kimi => "Cool near-white paper with an indigo accent, after Kimi's.",
+        }
+    }
+
+    /// `(paper, ink, muted, accent)` as sRGB bytes, or `None` for [`Self::Velm`], which has
+    /// no colours of its own — it *is* the board's palette, and returning a copy of it here
+    /// would be a fifth place the app's neutrals are written down.
+    pub const fn colours(self) -> Option<ChatPalette> {
+        Some(match self {
+            Self::Velm => return None,
+            // #FAF9F5 paper, #141413 ink, #6B6A65 muted, #D97757 accent.
+            Self::Claude => ([0xFA, 0xF9, 0xF5], [0x14, 0x14, 0x13], [0x6B, 0x6A, 0x65], [0xD9, 0x77, 0x57]),
+            // #FFFFFF paper, #0D0D0D ink, #6E6E80 muted, #10A37F accent.
+            Self::ChatGpt => ([0xFF, 0xFF, 0xFF], [0x0D, 0x0D, 0x0D], [0x6E, 0x6E, 0x80], [0x10, 0xA3, 0x7F]),
+            // #FBFBFE paper, #15161A ink, #6A6B78 muted, #4B3FE4 accent.
+            Self::Kimi => ([0xFB, 0xFB, 0xFE], [0x15, 0x16, 0x1A], [0x6A, 0x6B, 0x78], [0x4B, 0x3F, 0xE4]),
+        })
+    }
+}
+
+/// A chat theme's four colours, as sRGB bytes: `(paper, ink, muted, accent)`.
+///
+/// A named tuple rather than four loose arrays so the order cannot be got wrong at the one
+/// call site that unpacks it — `vellum_app::theme::Theme::for_chat`, where swapping ink and
+/// muted produces a transcript whose body text is the colour of its own scaffolding.
+pub type ChatPalette = ([u8; 3], [u8; 3], [u8; 3], [u8; 3]);
 
 /// A rectangle of the board an orchestrator is responsible for, in world units.
 ///
@@ -243,6 +377,39 @@ pub struct AgentModel {
     /// every node that never chose — feature 2's "new agents inherit your preferred mode".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display: Option<DisplayMode>,
+
+    /// How this one transcript is dressed. `None` inherits the app-wide default, exactly as
+    /// [`Self::display`] does and for the same reason: *"i should be able to set individual
+    /// chats with individual themes"* is answered by a per-node value, and *"themes for
+    /// chats that i can adjust"* by a default that moves every node which never chose.
+    ///
+    /// **Written only when set** — `skip_serializing_if`, like every optional field here —
+    /// so a board saved before this existed is byte for byte what it was. RULE ZERO.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_theme: Option<ChatTheme>,
+
+    /// How see-through this node's transcript is, 0–255. `None` is opaque.
+    ///
+    /// *"i should be able to make it so that adjust the transparency."* Per node rather than
+    /// app-wide, because it is the half of a theme you tune against **what is behind that
+    /// particular node** — a picture, a frame, or bare board.
+    ///
+    /// Not the same thing as `Style::opacity`, which fades the whole item including its
+    /// words. This fades the *paper* and leaves the text alone, which is what makes it
+    /// usable: a transcript at 40% whole-item opacity is a transcript you cannot read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_opacity: Option<u8>,
+
+    /// A picture behind the transcript, by content hash into the shared blob store.
+    ///
+    /// *"put my own themes a picture as a theme."* Addressed exactly as a pasted screenshot
+    /// is (`docs/07` §4), so deduplication and the 268MB texture budget come for free and
+    /// nothing new is cached anywhere.
+    ///
+    /// A **hash, not a path**: a path would break the day the file moved, and a board is
+    /// meant to open on another machine. The bytes travel with the board's blob store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_background: Option<String>,
 
     /// This agent's own rule overrides. See [`AgentRules`] and [`crate::rules`].
     #[serde(skip_serializing_if = "is_default")]
@@ -489,6 +656,11 @@ mod tests {
             provider: None,
             working_dir: Some("/tmp/project".into()),
             display: Some(DisplayMode::Raw),
+            // Every one of the three, so the round trip covers the whole chat-theme layer
+            // rather than the two thirds of it that happen to be `Option::None` by default.
+            chat_theme: Some(ChatTheme::Claude),
+            chat_opacity: Some(200),
+            chat_background: Some("d2a1f0".into()),
             rules: AgentRules {
                 text: "talk to me formally".into(),
                 overrides: vec!["tone".into()],

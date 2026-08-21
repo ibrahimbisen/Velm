@@ -443,6 +443,31 @@ impl Input {
         }
     }
 
+    /// Turns the press that is being resolved into a **placement** sweep.
+    ///
+    /// [`Self::resolve_press`]'s third answer, and it exists because a press can begin a
+    /// placement without the *tool* being a placing one. A drag from one of Miro's four
+    /// connector ports is the case: the palette says Select, the press arrives as
+    /// [`Gesture::Pending`], and only the application knows a port was under it.
+    ///
+    /// # Why `set_tool(Tool::Place)` is not enough on its own
+    ///
+    /// It is what the application does next, and it decides what *future* presses mean —
+    /// the gesture already in flight is untouched. So the press resolved to `Move` or
+    /// `Marquee`, [`Self::placement`] answered `None` for the whole drag, and the live
+    /// preview drew nothing until the button came up. Measured: *"mid-drag: armed true,
+    /// previewing false"*, which is feedback 7, 23 and 34's shape a fourth time — state
+    /// accumulated where the painter cannot see it — arriving through the one layer that is
+    /// deliberately ignorant of the scene.
+    ///
+    /// Only ever converts a `Pending` press, so it cannot hijack a move or a marquee that
+    /// is already under way.
+    pub fn begin_placement(&mut self) {
+        if let Gesture::Pending { origin, .. } = self.gesture {
+            self.gesture = Gesture::Place { origin, current: origin };
+        }
+    }
+
     /// Abandons whatever left gesture is in flight, for Escape. Returns whether there
     /// was one, so the caller knows whether Escape has already been spent.
     pub fn cancel_gesture(&mut self) -> bool {

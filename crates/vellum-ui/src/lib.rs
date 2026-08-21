@@ -152,7 +152,8 @@ pub use event::{
 pub use find::FindBar;
 pub use icon::Icon;
 pub use library::{
-    BoardCard, IMPORT_STEPS, LayoutMode as LibraryLayout, Scope as LibraryScope, Space, Thumbnail,
+    BoardCard, IMPORT_STEPS, LayoutMode as LibraryLayout, Scope as LibraryScope, SettingsTab,
+    Space, Thumbnail,
 };
 pub use menu::{MenuFlags, MenuHeader, ProviderStatus};
 pub use properties::ColorTarget;

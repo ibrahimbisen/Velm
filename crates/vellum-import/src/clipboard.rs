@@ -32,6 +32,21 @@ use base64::engine::general_purpose::STANDARD;
 /// to miss; a full-board copy carries it.
 const MARKER_PREFIX: &str = "<--(miro-data-v";
 
+/// Whether an HTML flavour looks like a Miro payload, without decoding it.
+///
+/// A substring scan, so it costs nothing beside the decode it guards — `decode` base64s,
+/// deobfuscates and parses all 596 widgets, measured at 5.5 ms on the reference payload, and
+/// the import behind it is measured in *seconds*. The paste path uses this to find out
+/// whether it is about to do something slow **before** it starts, so it can say so.
+///
+/// Deliberately not a validity check: a string that starts to look like a payload and turns
+/// out to be malformed is `decode`'s to report, with its own message. This only answers
+/// "is this worth announcing".
+#[must_use]
+pub fn looks_like_miro(html: &str) -> bool {
+    html.contains(MARKER_PREFIX)
+}
+
 /// Format versions this decoder is known to handle.
 const SUPPORTED_MARKER_VERSIONS: &[&str] = &["1"];
 

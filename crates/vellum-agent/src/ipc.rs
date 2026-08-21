@@ -271,6 +271,41 @@ pub enum Request {
     #[serde(rename = "note.list")]
     NoteList,
 
+    /// Follow a note's links and return the whole trail — feature 8's chaining, and the only
+    /// verb that reaches [`crate::NoteStore::context_chain`].
+    ///
+    /// # Why this is a verb and not four `note read` calls
+    ///
+    /// An agent *could* read a note, notice its markdown links and read those. It would take
+    /// a turn per hop, it would not know when to stop, and it would follow a cycle for ever —
+    /// two notes pointing at each other is the first thing anybody builds. `walk` is already
+    /// cycle-safe and depth-bounded and enforces the private-scope check at every hop; none of
+    /// that was reachable, so the trail an agent was meant to follow was one it had to
+    /// improvise.
+    #[serde(rename = "note.chain")]
+    NoteChain {
+        path: String,
+        /// How many hops out. `None` takes `LinkLimits::default`'s depth; the total number of
+        /// notes is capped by the store regardless, so a deep number cannot cost unboundedly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        depth: Option<usize>,
+    },
+
+    /// Read a file, a document, a page or a video as context and attach it to this node —
+    /// feature 18 from the agent's side.
+    ///
+    /// ⚠ **`ingest.rs` is 3,000 tested lines and every door into it was the user's**: a
+    /// dropped file, a file picker, and (since tonight) a link prompt. So an agent that had
+    /// just been told about a specification, or had produced a report of its own, could not
+    /// ask Velm to read it — it could only open the file itself, which is nothing at all for a
+    /// PDF, a spreadsheet or a web page.
+    #[serde(rename = "ingest")]
+    Ingest {
+        /// A path on disk, or a URL. Which it is, is `ingest`'s own decision — the same
+        /// string the user's own two doors pass.
+        source: String,
+    },
+
     /// Ask for a sub-agent. Territory and cap are enforced by `orchestrator.rs`; this carries
     /// the request there and the refusal back.
     #[serde(rename = "spawn")]
@@ -314,6 +349,8 @@ impl Request {
             Self::NoteRead { .. } => "note.read",
             Self::NoteWrite { .. } => "note.write",
             Self::NoteList => "note.list",
+            Self::NoteChain { .. } => "note.chain",
+            Self::Ingest { .. } => "ingest",
             Self::Spawn(_) => "spawn",
             Self::Image { .. } => "image",
             Self::Options { .. } => "options",
@@ -397,6 +434,21 @@ pub enum Answer {
     Note { text: String },
     /// Every note this agent can see.
     Notes { notes: Vec<NoteEntry> },
+    /// A picture was stored, addressed by its content hash.
+    ///
+    /// ⚠ **The hash is the whole point of answering at all.** `Choice::image` is a blob hash,
+    /// and no sanctioned path ever handed an agent one: `image` replied *done*, so an agent
+    /// that had just produced three mock-ups had no way to name them in the option set it
+    /// wanted to offer. Feature 14's *"here are three UI directions I built"* — the pattern the
+    /// whole verb exists for — was unreachable from the agent's side while every piece of it
+    /// worked from Velm's.
+    Stored { blob: String },
+    /// A note and the trail of notes it links to, in the order they were reached.
+    ///
+    /// Carries the **text** of each rather than only the paths, because the whole point of
+    /// asking for a chain is to read it: paths alone would put the agent back to one `note
+    /// read` per hop, which is what this verb exists to replace.
+    Chain { notes: Vec<(String, String)> },
     /// The id of the agent that was created.
     Spawned { agent: String },
     /// A node's configuration.
@@ -494,6 +546,26 @@ pub trait IpcHandler: Send + Sync + 'static {
         Err(unwired("note.list"))
     }
 
+    /// Read `source` as context for this agent and answer the sentence describing what came
+    /// of it — `ingest::Outcome::message`, which is the only thing that knows whether a
+    /// converter was missing or the file was simply long.
+    fn ingest(&self, agent: &str, source: &str) -> crate::Result<String> {
+        let _ = (agent, source);
+        Err(unwired("ingest"))
+    }
+
+    /// The note at `path` and everything it links to, transitively, as `(path, text)` pairs
+    /// in the order they were reached. Cycle-safe and depth-bounded by the store.
+    fn note_chain(
+        &self,
+        agent: &str,
+        path: &str,
+        depth: Option<usize>,
+    ) -> crate::Result<Vec<(String, String)>> {
+        let _ = (agent, path, depth);
+        Err(unwired("note.chain"))
+    }
+
     /// Create a sub-agent, or refuse. The role check has already been made; the **cap and the
     /// territory have not**, and this is where they are applied.
     fn spawn(&self, parent: &str, request: &SpawnRequest) -> crate::Result<String> {
@@ -503,7 +575,14 @@ pub trait IpcHandler: Send + Sync + 'static {
 
     /// Put a picture in the agent's transcript. The bytes are the encoded file; the app hashes
     /// them into the blob store and records the hash.
-    fn post_image(&self, agent: &str, bytes: &[u8], caption: Option<&str>) -> crate::Result<()> {
+    /// Store a picture in the agent's transcript and answer **its content hash**, which is
+    /// what a later `options` call puts on a choice.
+    fn post_image(
+        &self,
+        agent: &str,
+        bytes: &[u8],
+        caption: Option<&str>,
+    ) -> crate::Result<String> {
         let _ = (agent, bytes, caption);
         Err(unwired("image"))
     }
@@ -808,13 +887,19 @@ fn dispatch(
             .note_write(&agent, &path, &text, append)
             .map(|()| Answer::Done),
         Request::NoteList => handler.note_list(&agent).map(|notes| Answer::Notes { notes }),
+        Request::Ingest { source } => handler
+            .ingest(&agent, &source)
+            .map(|summary| Answer::Note { text: summary }),
+        Request::NoteChain { path, depth } => handler
+            .note_chain(&agent, &path, depth)
+            .map(|notes| Answer::Chain { notes }),
         Request::Spawn(request) => {
             handler.spawn(&agent, &request).map(|agent| Answer::Spawned { agent })
         }
         Request::Image { data, caption } => match decode_base64(&data) {
             Some(bytes) => handler
                 .post_image(&agent, &bytes, caption.as_deref())
-                .map(|()| Answer::Done),
+                .map(|blob| Answer::Stored { blob }),
             None => {
                 return refuse(
                     ErrorCode::Malformed,
@@ -822,6 +907,24 @@ fn dispatch(
                 );
             }
         },
+        // Bounded **here**, where both doors meet, rather than in either of them. The MCP
+        // schema advertised up to eight and this socket accepted any number, while the
+        // painter draws `MAX_CHOICES`; the surplus arrived as a line of text saying how many
+        // options the user could not click. See [`crate::transcript::MAX_CHOICES`].
+        Request::Options { choices, .. }
+            if choices.len() < crate::transcript::MIN_CHOICES
+                || choices.len() > crate::transcript::MAX_CHOICES =>
+        {
+            Err(crate::AgentError::Refused(format!(
+                "an option set takes {} to {} choices and this one has {}; \
+                 they are drawn as a row of cards on your node, and any past the {}th \
+                 could not be clicked. Offer fewer, or ask in your reply instead.",
+                crate::transcript::MIN_CHOICES,
+                crate::transcript::MAX_CHOICES,
+                choices.len(),
+                crate::transcript::MAX_CHOICES,
+            )))
+        }
         Request::Options { prompt, choices } => handler
             .post_options(&agent, &prompt, &choices)
             .map(|()| Answer::Done),
@@ -1130,9 +1233,11 @@ mod tests {
             _agent: &str,
             bytes: &[u8],
             _caption: Option<&str>,
-        ) -> crate::Result<()> {
+        ) -> crate::Result<String> {
             self.images.lock().unwrap().push(bytes.to_vec());
-            Ok(())
+            // A stand-in hash: this handler stores nothing, and the shape of the answer is
+            // what the tests are about.
+            Ok(format!("blob-{}", bytes.len()))
         }
 
         fn read_config(&self, _node: &str) -> crate::Result<AgentModel> {

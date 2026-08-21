@@ -380,6 +380,107 @@ pub fn hit(placement: &Placement, at: WorldPoint, zoom: f64) -> Option<Handle> {
         .map(|(handle, _)| handle)
 }
 
+// ----- connector ports ------------------------------------------------------------
+//
+// Miro's four blue dots. *"in miro there are these 4 blue dots around the picture and there
+// should be 4 blue dots on images agents sticky notes and when i hold and draw i should be
+// able to connect it to other agents sticky notes or agents or pictures."*
+//
+// This closes the known defect that read *"there are no anchor dots on the canvas"* — the
+// panel could already insist on a side, and the only way to *draw* a connector was to arm
+// the connector tool and drag between two items, which is a tool nobody finds.
+
+/// A port's radius in **screen** pixels. Round, and smaller than a resize handle.
+///
+/// The shape is the whole distinction. A square handle changes an item's size and a round
+/// one starts a line — `docs/05-design-language.md` §4's rule ("square handles, no glow")
+/// already spends roundness on the rotate grip for exactly this reason, so a second round
+/// grip is consistent rather than novel. They are also never on screen together at the same
+/// place: a port sits *outside* the edge and a resize handle sits *on* it.
+pub const PORT_RADIUS: f32 = 4.0;
+
+/// How far outside the item's edge a port floats, in **screen** pixels, measured from the
+/// edge to the port's centre.
+///
+/// Outside rather than on the edge, which is what Miro draws and what makes the gesture
+/// unambiguous: a press on the outline is a resize, a press just beyond it is a connector.
+/// Overlapping the two would make the commonest gesture on the board — resizing — depend on
+/// a pixel.
+///
+/// # 9 → 20 → 40, at the user's word, twice
+///
+/// *"please put alot more spacing between the dragging connector dots that are around the
+/// object and actual object itself its too close"*, then, having seen 20: *"2 times more
+/// distance pelase"*. Nine screen pixels is roughly Miro's own stand-off and it was chosen
+/// for parity; on a real board it puts the dot inside the selection ring's visual weight, so
+/// the four ports read as part of the outline rather than as four separate things to grab.
+///
+/// The distance is also strictly better for the gesture, which is why it was not merely
+/// taste even at 20: the corner resize handles reach `HANDLE_SIZE / 2 + GRAB_SLOP` = 9
+/// pixels out from the corner, so at the original stand-off an edge port's grab circle
+/// *overlapped* the corner handle's, and which of the two a press meant was decided by which
+/// was asked first. `a_port_clears_the_corner_handles_reach` pins the clearance.
+///
+/// **What sets the ceiling**, for whoever is asked for more: a port has to stay obviously
+/// attached to its item, and on a *small* item the four dots are further from the box than
+/// the box is wide. At 40 that is anything under 80 world units at 100% zoom, which is
+/// smaller than every default size in the application — so nothing you can place by dragging
+/// reaches it. Much past this and the dots start reading as four loose objects on the board.
+pub const PORT_OFFSET: f32 = 40.0;
+
+/// How close a press has to be to count as landing on a port, in **screen** pixels.
+///
+/// Bigger than [`GRAB_SLOP`], because a port is smaller than a handle and is aimed at from
+/// outside the item where there is nothing else to hit. The cost of being generous is only
+/// that a press very near the edge draws a line instead of starting a marquee.
+pub const PORT_SLOP: f32 = 6.0;
+
+/// Where the four ports sit in world space, paired with the anchor each one binds to.
+///
+/// The anchor is [`crate::connector::ANCHORS`]' own tuple, so what the painter draws and
+/// what a press writes into `ConnectorEnd::bound` are one value — the `draw::kanban_runs`
+/// rule, and here it decides whether a line leaves the edge you aimed at.
+///
+/// Resolved against the **rotated** box and pushed out along that edge's own outward normal,
+/// so the four dots stay on the four edges of a turned item rather than at the compass
+/// points of its bounding box. `WidgetBounds::outward_normal` is the same function a
+/// connector's own endpoint normal comes from, so a line leaves its port along the direction
+/// the port is drawn in.
+pub fn ports(placement: &Placement, zoom: f64) -> Vec<((f64, f64), WorldPoint)> {
+    let bounds = bounds(placement);
+    let out = f64::from(PORT_OFFSET) / zoom;
+    crate::connector::ANCHORS
+        .into_iter()
+        .map(|anchor| {
+            let a = Anchor::new(anchor.0, anchor.1);
+            let at = bounds.resolve(a);
+            // `None` only for an anchor that is not on the outline, which none of the four
+            // is — so the fallback is unreachable rather than a case. Spelled as a default
+            // rather than an `expect` to keep this a total geometry helper, exactly as
+            // `connector::facing_anchor` does.
+            let normal = bounds.outward_normal(a);
+            let (dx, dy) = normal.map_or((0.0, 0.0), |n| (n.x * out, n.y * out));
+            (anchor, WorldPoint::new(at.x + dx, at.y + dy))
+        })
+        .collect()
+}
+
+/// The port under a world point, if any, as the anchor it would bind to.
+///
+/// The **nearest** qualifying port rather than the first, for [`hit`]'s reason: zoomed out
+/// the grab radius is large in world units and two ports can both be inside it, so taking
+/// the first would answer with whichever comes earliest in `ANCHORS` instead of the one
+/// under the pointer.
+pub fn port_hit(placement: &Placement, at: WorldPoint, zoom: f64) -> Option<(f64, f64)> {
+    let radius = f64::from(PORT_RADIUS + PORT_SLOP) / zoom;
+    ports(placement, zoom)
+        .into_iter()
+        .map(|(anchor, point)| (anchor, (point.x - at.x).hypot(point.y - at.y)))
+        .filter(|(_, distance)| *distance <= radius)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(anchor, _)| anchor)
+}
+
 /// The placement a resize drag produces.
 ///
 /// `original` is where the item was when the button went down and `delta` is the whole
@@ -851,5 +952,139 @@ mod aspect_tests {
             out.width / out.height
         );
         assert!(out.width >= MIN_SIZE && out.height >= MIN_SIZE);
+    }
+
+    // ----- connector ports --------------------------------------------------
+
+    /// The four dots sit **outside** the item, one per edge, and they are the anchors a
+    /// connector will actually be bound to.
+    ///
+    /// Outside is the load-bearing half. A port drawn on the outline overlaps the edge
+    /// resize handle, and then which verb a press means — resize or draw a line — is decided
+    /// by a pixel. The press path asks about ports first, so an overlap would make resizing
+    /// the commonest item on a board unreliable rather than merely ambiguous.
+    #[test]
+    fn a_port_sits_outside_the_edge_it_belongs_to() {
+        let placement = Placement::new(0.0, 0.0, 200.0, 100.0);
+        let ports = ports(&placement, 1.0);
+        assert_eq!(ports.len(), 4, "four dots, one per edge");
+
+        for (anchor, at) in &ports {
+            let on_edge = crate::connector::anchor_point(&placement, *anchor);
+            let out = (at.x - on_edge.0).hypot(at.y - on_edge.1);
+            assert!(
+                (out - f64::from(PORT_OFFSET)).abs() < 1e-6,
+                "a {anchor:?} port stands {out} from its edge, not {PORT_OFFSET}"
+            );
+            // Outward, not inward: the port must be further from the centre than the edge.
+            assert!(
+                at.x.hypot(at.y) > on_edge.0.hypot(on_edge.1),
+                "the {anchor:?} port fell inside the item"
+            );
+        }
+
+        // And they are the four `ANCHORS`, in that order, so what is drawn and what is
+        // written into `ConnectorEnd::bound` are one value.
+        let offered: Vec<(f64, f64)> = ports.iter().map(|(anchor, _)| *anchor).collect();
+        assert_eq!(offered, crate::connector::ANCHORS.to_vec());
+    }
+
+    /// A port stands off by a constant number of **screen** pixels, so it neither swallows
+    /// the item at a fitted zoom nor drifts out of reach when zoomed in.
+    ///
+    /// The same trade the rotate handle makes, and the failure it prevents is the same one:
+    /// at a 4% fit a world-unit stand-off of 9 is a quarter of a pixel — four dots on top of
+    /// each other and of the item's own corner.
+    #[test]
+    fn a_ports_stand_off_is_constant_on_screen() {
+        let placement = Placement::new(0.0, 0.0, 200.0, 100.0);
+        let out_at = |zoom: f64| {
+            let (anchor, at) = ports(&placement, zoom)[1];
+            let on_edge = crate::connector::anchor_point(&placement, anchor);
+            (at.x - on_edge.0).hypot(at.y - on_edge.1) * zoom
+        };
+        assert!((out_at(0.04) - f64::from(PORT_OFFSET)).abs() < 1e-6);
+        assert!((out_at(1.0) - f64::from(PORT_OFFSET)).abs() < 1e-6);
+        assert!((out_at(8.0) - f64::from(PORT_OFFSET)).abs() < 1e-6);
+    }
+
+    /// A turned item's ports stay on its four edges rather than at the compass points of
+    /// its bounding box.
+    ///
+    /// At 90° the "top" edge of the item is on the **right** of the screen, so a port
+    /// resolved against the axis-aligned box would be a dot floating above an edge that is
+    /// not there — and the connector leaving it would start somewhere the user did not aim.
+    #[test]
+    fn a_rotated_items_ports_follow_its_own_edges() {
+        let mut placement = Placement::new(0.0, 0.0, 200.0, 100.0);
+        placement.rotation = 90.0;
+        let ports = ports(&placement, 1.0);
+        let (_, top) = ports[0];
+        // The item's own "up" now points along +x, so its top-edge port is out to the right
+        // by half the *height* plus the stand-off.
+        assert!(top.x > 0.0, "the top port did not follow the rotation: {top:?}");
+        assert!(top.x.abs() > top.y.abs(), "the top port is still above the box: {top:?}");
+        assert!(
+            (top.x - (50.0 + f64::from(PORT_OFFSET))).abs() < 1e-6,
+            "the top port is at {top:?}, not half the height plus the stand-off out"
+        );
+    }
+
+    /// A port's grab circle must not reach a corner resize handle's.
+    ///
+    /// The press path asks about ports **first**, so an overlap does not read as ambiguity —
+    /// it reads as *"resizing from the corner sometimes draws a line instead"*, on the
+    /// commonest gesture on the board. At the original 9-pixel stand-off the two circles met
+    /// exactly, which is how the user came to say the dots were *"too close"*: they were
+    /// close enough to be in each other's way, not merely close enough to look crowded.
+    ///
+    /// Measured on a **small** item, where the four ports and the four corners are nearest
+    /// to each other in absolute terms.
+    #[test]
+    fn a_port_clears_the_corner_handles_reach() {
+        let placement = Placement::new(0.0, 0.0, 60.0, 40.0);
+        let corners: Vec<WorldPoint> = positions(&placement, 1.0)
+            .into_iter()
+            .filter(|(handle, _)| handle.is_corner())
+            .map(|(_, at)| at)
+            .collect();
+        let corner_reach = f64::from(HANDLE_SIZE / 2.0 + GRAB_SLOP);
+        let port_reach = f64::from(PORT_RADIUS + PORT_SLOP);
+
+        for (anchor, at) in ports(&placement, 1.0) {
+            for corner in &corners {
+                let gap = (at.x - corner.x).hypot(at.y - corner.y);
+                assert!(
+                    gap > corner_reach + port_reach,
+                    "the {anchor:?} port is {gap:.1} from a corner handle, and the two \
+                     grab circles reach {:.1} between them — a press near the corner is \
+                     decided by whichever is asked first",
+                    corner_reach + port_reach
+                );
+            }
+        }
+    }
+
+    /// A press picks the **nearest** port, not the first one within reach.
+    ///
+    /// Zoomed out the grab radius is large in world units and two ports are routinely both
+    /// inside it, so taking the first would answer with whichever comes earliest in
+    /// `ANCHORS` — a line leaving the top of a box you grabbed on the left.
+    #[test]
+    fn a_press_takes_the_nearest_port() {
+        let placement = Placement::new(0.0, 0.0, 40.0, 40.0);
+        // At a fitted zoom every port is inside every other's radius.
+        let zoom = 0.05;
+        let ports = ports(&placement, zoom);
+        for (anchor, at) in ports {
+            assert_eq!(
+                port_hit(&placement, at, zoom),
+                Some(anchor),
+                "a press exactly on the {anchor:?} port answered with another one"
+            );
+        }
+
+        // And far away is no port at all, rather than the least distant one.
+        assert_eq!(port_hit(&placement, WorldPoint::new(9_000.0, 9_000.0), 1.0), None);
     }
 }

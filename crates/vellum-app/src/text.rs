@@ -109,6 +109,30 @@ struct Entry {
 pub struct TextCache {
     engine: TextEngine,
     entries: HashMap<BlockKey, Entry>,
+    /// Auto-fitted sizes, keyed on **what the answer depends on** rather than on the item.
+    ///
+    /// # Why this is a second cache and not a field on [`Entry`]
+    ///
+    /// Finding the size that makes a block fit its box is a bisection, and every probe
+    /// shapes the text: `AutoFit::fit_font_size` costs roughly **fourteen shaping passes**
+    /// where drawing the result costs one. `entries` is keyed on the projection generation,
+    /// which moves whenever the *item* changes — so nudging a sticky, recolouring it, or
+    /// bringing it forward all threw the fitted size away and paid for the search again,
+    /// though none of them can change the answer. The answer depends on the words, the box
+    /// and the type; nothing else.
+    ///
+    /// Keyed by hash rather than by the text itself: the key would otherwise be a copy of
+    /// every string on the board. A collision would draw one block at another's fitted
+    /// size, which is why the hash covers the box and the type as well as the words —
+    /// see [`TextCache::fit_key`].
+    fits: HashMap<u64, f32>,
+    /// How many auto-fit searches have actually run.
+    ///
+    /// Counted because the obvious assertion cannot see them. A test that watched `fits`
+    /// grow passes whether or not the lookup happens — the insert lands either way, so the
+    /// map is the same size — and it was written that way first and proved nothing when
+    /// A/B'd. This counts the *work*, which is the thing the cache exists to avoid.
+    searches: u64,
 }
 
 impl std::fmt::Debug for TextCache {
@@ -123,13 +147,23 @@ impl std::fmt::Debug for TextCache {
 impl TextCache {
     /// Loads the system fonts.
     pub fn new() -> vellum_text::Result<Self> {
-        Ok(Self { engine: TextEngine::new()?, entries: HashMap::new() })
+        Ok(Self {
+            engine: TextEngine::new()?,
+            entries: HashMap::new(),
+            fits: HashMap::new(),
+            searches: 0,
+        })
     }
 
     /// Builds over exactly the supplied font files, with no system scan. How a test
     /// gets metrics that do not depend on the machine it runs on.
     pub fn with_fonts(fonts: impl IntoIterator<Item = Vec<u8>>) -> vellum_text::Result<Self> {
-        Ok(Self { engine: TextEngine::with_fonts(fonts)?, entries: HashMap::new() })
+        Ok(Self {
+            engine: TextEngine::with_fonts(fonts)?,
+            entries: HashMap::new(),
+            fits: HashMap::new(),
+            searches: 0,
+        })
     }
 
     pub fn engine_mut(&mut self) -> &mut TextEngine {
@@ -140,6 +174,12 @@ impl TextCache {
         self.entries.len()
     }
 
+    /// Auto-fit searches run since the cache was built. A number that climbs while the
+    /// board is untouched is a fit key that is not stable — see [`TextCache::fit_key`].
+    pub const fn fit_searches(&self) -> u64 {
+        self.searches
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -147,6 +187,63 @@ impl TextCache {
     /// Drops every layout. For a document reload, where nothing carries over.
     pub fn clear(&mut self) {
         self.entries.clear();
+        // The fitted sizes go too. They are keyed on content rather than on an item, so
+        // they would survive a board switch correctly — but "correct and unbounded" is how
+        // every leak in this application has started, and a board switch is the one moment
+        // it is certainly safe to drop them.
+        self.fits.clear();
+    }
+
+    /// The key a fitted size is remembered under: **everything the answer depends on.**
+    ///
+    /// The words, the box, and the type — family, weight, line height, alignment and any
+    /// explicitly requested size, because each of them moves a wrap point and a wrap point
+    /// moves the size that fits. Anything *not* in here is something the caller is asserting
+    /// cannot change the answer; getting that wrong draws a block at another block's size,
+    /// so the list is deliberately generous rather than minimal.
+    ///
+    /// Floats are hashed by bits. That is exact rather than approximate, which is the right
+    /// way round for a cache key: two boxes a millionth of a unit apart get their own
+    /// entries, where rounding could hand one block the other's answer.
+    fn fit_key(text: &StyledText, params: &LayoutParams, area: FitBox) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for span in text.spans() {
+            span.text.hash(&mut hasher);
+            span.style.bold.hash(&mut hasher);
+            span.style.italic.hash(&mut hasher);
+        }
+        area.width.to_bits().hash(&mut hasher);
+        area.height.to_bits().hash(&mut hasher);
+        params.font_family.hash(&mut hasher);
+        params.line_height.to_bits().hash(&mut hasher);
+        params.font_size.to_bits().hash(&mut hasher);
+        params.align.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The auto-fitted size for this text in this box, from the cache when it is there.
+    ///
+    /// **Bounded by clearing rather than by eviction.** An LRU would need an access order
+    /// per entry to save a few dozen kilobytes: a key and a size are 12 bytes, so even a
+    /// board of ten thousand distinct strings is well under a megabyte. What matters is
+    /// that it cannot grow without limit across a long session of edits, and emptying it
+    /// wholesale costs one search per visible block on the next frame — which the shaping
+    /// ration already spreads over frames without dropping a word, now that a starved block
+    /// greeks instead of drawing nothing.
+    fn fitted(&mut self, text: &StyledText, params: &LayoutParams, area: FitBox) -> f32 {
+        const MAX_FITS: usize = 20_000;
+        let key = Self::fit_key(text, params, area);
+        if let Some(size) = self.fits.get(&key) {
+            return *size;
+        }
+        self.searches += 1;
+        let size = self.engine.fit_font_size(text, params, area, &AutoFit::default());
+        if self.fits.len() >= MAX_FITS {
+            self.fits.clear();
+        }
+        self.fits.insert(key, size);
+        size
     }
 
     /// Drops every rasterised glyph bitmap, keeping the layouts.
@@ -239,9 +336,7 @@ impl TextCache {
                     let asked = size as f32;
                     match fit {
                         Some(box_) => {
-                            let fits = self
-                                .engine
-                                .fit_font_size(&converted, &params, box_, &AutoFit::default());
+                            let fits = self.fitted(&converted, &params, box_);
                             if fits < asked * Self::RUNAWAY_TEXT_RATIO { fits } else { asked }
                         }
                         None => asked,
@@ -249,10 +344,7 @@ impl TextCache {
                 }
                 // Miro's `fs: 0, fsa: 1`. Every sticky on the reference board.
                 _ => match fit {
-                    Some(box_) => {
-                        self.engine
-                            .fit_font_size(&converted, &params, box_, &AutoFit::default())
-                    }
+                    Some(box_) => self.fitted(&converted, &params, box_),
                     None => params.effective_font_size(),
                 },
             };
@@ -487,6 +579,68 @@ mod tests {
             || convert(&sticky_text()),
         );
         assert_eq!(ordinary, 48.0, "a tight but ordinary fit was restyled");
+    }
+
+    /// The fitted size survives a change that cannot have moved it.
+    ///
+    /// A generation bump means *the item changed* — it was nudged, recoloured, brought
+    /// forward. None of those can change what size fits, but each of them used to pay for
+    /// the whole bisection again: ~14 shaping passes to arrive at the number already known.
+    /// This asserts the size is identical **and** that the search did not run, which is the
+    /// half that matters — a test on the value alone passes whether or not it was cached,
+    /// since the search is deterministic and returns the same answer either way.
+    #[test]
+    fn a_fitted_size_survives_a_generation_bump_that_cannot_have_changed_it() {
+        let mut cache = cache();
+        let fit = Some(sticky_fit(199.0, 228.0));
+
+        let first = cache
+            .layout(BlockKey::primary(1), 1, &Style::default(), fit, || convert(&sticky_text()))
+            .1;
+        let searched = cache.fit_searches();
+        assert_eq!(searched, 1, "the first fit did not run a search");
+
+        // Same words, same box, new generation: the item moved or was restyled.
+        let second = cache
+            .layout(BlockKey::primary(1), 2, &Style::default(), fit, || convert(&sticky_text()))
+            .1;
+        assert!((second - first).abs() < f32::EPSILON, "{first} then {second}");
+        assert_eq!(cache.fit_searches(), searched, "the bisection ran again for a known answer");
+    }
+
+    /// Different words, or a different box, get their **own** answer.
+    ///
+    /// The cache is keyed on a hash, so the failure worth guarding is the one where a block
+    /// is handed a neighbour's fitted size — text drawn at a size that does not fit it, with
+    /// nothing in the document wrong. Two texts of very different length in the same box
+    /// must not agree, and one text in two very different boxes must not either.
+    #[test]
+    fn a_fitted_size_is_not_shared_between_different_text_or_different_boxes() {
+        let mut cache = cache();
+        let small_box = Some(sticky_fit(199.0, 228.0));
+        let short = cache
+            .layout(BlockKey::primary(1), 1, &Style::default(), small_box, || {
+                convert(&DocText::plain("hi"))
+            })
+            .1;
+        let long = cache
+            .layout(BlockKey::primary(2), 1, &Style::default(), small_box, || {
+                convert(&DocText::plain(
+                    "a paragraph considerably longer than the two characters above it, \
+                     which cannot possibly fit at the same size in the same box",
+                ))
+            })
+            .1;
+        assert!(long < short, "a long text was fitted at a short text's size: {long} vs {short}");
+
+        let wide_box = Some(sticky_fit(1600.0, 228.0));
+        let widened = cache
+            .layout(BlockKey::primary(3), 1, &Style::default(), wide_box, || {
+                convert(&DocText::plain("hi"))
+            })
+            .1;
+        assert_eq!(cache.fit_searches(), 3, "two distinct boxes shared one cached answer");
+        assert!(widened >= short, "a wider box fitted smaller: {widened} vs {short}");
     }
 
     /// The whole point of the cache: a second frame reuses the layout rather than

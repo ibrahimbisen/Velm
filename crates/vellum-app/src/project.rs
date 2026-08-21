@@ -276,18 +276,51 @@ impl Projection {
             pending.push((scene_id, depth(&item, index as i32, total), item));
         }
 
-        // Every item is stamped with the generation this rebuild produces, so a
-        // structural change invalidates every cached layout exactly as it used to.
+        // The generation this rebuild *would* stamp everything with. It still advances,
+        // because `Painter::sync` compares it to decide whether to prune caches for items
+        // the board no longer holds — a rebuild that left the counter alone would leave a
+        // deleted item's layout resident for ever.
         let generation = self.generation.wrapping_add(1);
 
         // Pass two: bounds. Connectors are resolved last because they are the only
         // kind whose extent depends on other items.
         for (scene_id, z, item) in pending {
-            let parent = board.parent_of(item.id).and_then(|p| by_doc.get(&p)).copied();
+            // `item.parent`, not a second `board.parent_of` — `Board::item` has already
+            // asked, and asking again was one extra CRDT lookup per item per rebuild.
+            let parent = item.parent.and_then(|p| by_doc.get(&p)).copied();
             let bounds = item_bounds(&item, &placements);
+            // **An item that did not change keeps its old generation.**
+            //
+            // Every layout cache in `crate::draw` — shaped text, tessellated ink, the
+            // three structured widgets, an agent node's pieces — is keyed on
+            // `Projected::generation`. Stamping the whole board with one new number meant
+            // that moving a single sticky threw away every laid-out block on the board and
+            // made the painter reshape all of them, rationed at `TEXT_LAYOUT_BUDGET`, so
+            // the words vanished and trickled back over many frames. Measured with
+            // `--demo reproject-cost` on a 1,002-item board before this line existed:
+            // *"one item moved and 1002 of 1002 were restamped, so 0 cached layout(s)
+            // survived"*.
+            //
+            // The comparison is everything a cached layout can depend on, not just the
+            // item: `bounds` and `z` are derived here and a cache keyed on the item alone
+            // would keep a stale layout when a *neighbour's* move changed a connector's
+            // extent. `parent` is in for the same reason — `clipped_by_frame` reads it.
+            //
+            // Deliberately **not** an optimisation of the read: every item is still
+            // decoded out of the CRDT, because that is how we find out whether it changed.
+            // What this saves is the reshaping downstream, which is the expensive half by
+            // a wide margin.
+            let unchanged = self.items.get(&scene_id).filter(|was| {
+                was.doc_id == item.id
+                    && was.parent == parent
+                    && was.bounds == bounds
+                    && was.z == z
+                    && was.item == item
+            });
+            let stamp = unchanged.map_or(generation, |was| was.generation);
             items.insert(
                 scene_id,
-                Projected { doc_id: item.id, parent, bounds, z, item, generation },
+                Projected { doc_id: item.id, parent, bounds, z, item, generation: stamp },
             );
         }
 
@@ -508,6 +541,26 @@ pub fn swatch(projected: &Projected, theme: Theme) -> Rgba {
         }
         ItemKind::Shape { .. } => projected.item.style.fill.map_or(theme.surface, theme::convert),
         ItemKind::Text { .. } | ItemKind::Group => Rgba::TRANSPARENT,
+
+        // The four Agent Canvas kinds, named rather than left to the catch-all — and this
+        // is a **defect fix, not a preference**. All four draw their card in `theme.surface`
+        // on the board, which is right there and useless here: `push_minimap` paints its own
+        // panel in `surface` at 0.92, so a surface-coloured item is a white rectangle on a
+        // white plate. They were drawn, every frame, and could not be seen — reported as
+        // *"agents dont show up on the minimap"* against a screenshot of a blank map with two
+        // agents plainly on the board.
+        //
+        // The colours are the ones the layer already wears, so the map and the canvas say the
+        // same thing: an agent is the accent (its status dot and its links are), a note is a
+        // note, and a file tree and a browser are content rather than actors.
+        ItemKind::Agent { .. } => theme.accent,
+        ItemKind::AgentNote { .. } => theme.sticky,
+        ItemKind::FileTree { .. } | ItemKind::Browser { .. } => theme.text_muted,
+
+        // ⚠ Anything landing here is drawn in the same colour as the map's own panel, i.e.
+        // invisible. That is tolerable only for a kind whose *job* is to be a backdrop — a
+        // table, a kanban and a chart are white cards and read as absence on the map. Adding
+        // a kind and leaving it to this arm is how the bug above happened; give it a colour.
         _ => theme.surface,
     };
     color.with_alpha(color.a * projected.opacity())
@@ -531,6 +584,82 @@ mod tests {
             ItemKind::Sticky { text: StyledText::plain("fan"), background: None },
             Placement::new(x, y, 199.0, 228.0),
         )
+    }
+
+    /// Both halves matter, and the second is the one that keeps this honest.
+    ///
+    /// Carrying an unchanged item's generation forward is what stops one edit throwing
+    /// away every laid-out block on the board. The hazard of getting it wrong is silent
+    /// and worse than the slowness it fixes: an item whose generation survives a change it
+    /// should not survive draws **the previous text, for ever**, and no assertion about
+    /// item content would catch it because the document is correct — only the picture is
+    /// wrong.
+    ///
+    /// So this asserts the bystander keeps its stamp *and* that each kind of change moves
+    /// the changed item's. A/B'd both ways: with the carry-forward removed the first
+    /// assertion fails, and with the comparison weakened to `doc_id` alone the later ones
+    /// do. A test that only checked the first would pass on a build that never
+    /// invalidated anything.
+    #[test]
+    fn only_the_item_that_changed_loses_its_cached_layout() {
+        let mut board = Board::new();
+        let moved = board.add(sticky(0.0, 0.0)).unwrap();
+        let bystander = board.add(sticky(500.0, 0.0)).unwrap();
+        let mut projection = Projection::new();
+        projection.rebuild(&board).unwrap();
+
+        let stamp = |projection: &Projection, id| {
+            let scene = projection.scene_id(id).expect("interned");
+            projection.get(scene).expect("projected").generation
+        };
+        let (was_moved, was_bystander) =
+            (stamp(&projection, moved), stamp(&projection, bystander));
+
+        // A move.
+        let mut placement = board.item(moved).unwrap().placement;
+        placement.x += 1.0;
+        board.set_placement(moved, placement).unwrap();
+        projection.rebuild(&board).unwrap();
+        assert_ne!(stamp(&projection, moved), was_moved, "a moved item kept its stamp");
+        assert_eq!(
+            stamp(&projection, bystander),
+            was_bystander,
+            "an untouched item lost its cached layout because a neighbour moved"
+        );
+
+        // A content change, which is the case a bounds-only comparison would miss: the
+        // box is identical and every word in it is different.
+        let was = stamp(&projection, bystander);
+        board.set_text(bystander, StyledText::plain("different words entirely")).unwrap();
+        projection.rebuild(&board).unwrap();
+        assert_ne!(
+            stamp(&projection, bystander),
+            was,
+            "retyped text kept a stamp, so the board would draw the old words for ever"
+        );
+
+        // A style change, which moves neither the box nor the words.
+        let was = stamp(&projection, moved);
+        let mut style = board.item(moved).unwrap().style;
+        style.font_size = Some(48.0);
+        board.set_style(moved, style).unwrap();
+        projection.rebuild(&board).unwrap();
+        assert_ne!(stamp(&projection, moved), was, "a restyled item kept its stamp");
+    }
+
+    /// The counter must keep advancing even when nothing changed, because it is what
+    /// `Painter::sync` compares to decide whether to prune caches for items the board no
+    /// longer holds. Carrying stamps forward must not quietly freeze it — a deleted item's
+    /// layout and tessellated ink would stay resident for the life of the session.
+    #[test]
+    fn the_projections_own_generation_advances_even_when_no_item_does() {
+        let mut board = Board::new();
+        board.add(sticky(0.0, 0.0)).unwrap();
+        let mut projection = Projection::new();
+        projection.rebuild(&board).unwrap();
+        let before = projection.generation();
+        projection.rebuild(&board).unwrap();
+        assert_ne!(projection.generation(), before, "the prune counter stopped moving");
     }
 
     #[test]
@@ -943,5 +1072,66 @@ mod tests {
         let vellum_scene::RenderPayload::SolidQuad { color } =
             projection.scene().get(id).unwrap().payload;
         assert_eq!(Rgba::from(color).pack(), Theme::LIGHT.sticky.pack());
+    }
+
+    /// Every Agent Canvas node has to be *visible* on the minimap, and the assertion has to
+    /// be about that rather than about which colour was chosen.
+    ///
+    /// `push_minimap` paints its own panel in `theme.surface`, so the failure this guards is
+    /// not "the wrong colour" but "the same colour as the plate underneath" — an item drawn
+    /// every frame that nobody can see. A test spelled `assert_eq!(swatch, accent)` would pass
+    /// on a build that painted the map's panel in the accent too; a **delta against
+    /// `surface`** is the thing that is actually true, and it is what fails on the old
+    /// `_ => theme.surface` arm.
+    ///
+    /// The floor is `theme.rs`'s own grid rule arrived at from the other side: 8/255 is where
+    /// a one-pixel difference stops being a difference. A minimap item is a few pixels across,
+    /// so this asks for a great deal more than that on at least one channel.
+    #[test]
+    fn every_agent_node_is_visible_against_the_minimaps_own_panel() {
+        use vellum_doc::StyledText;
+
+        let kinds = [
+            ("agent", ItemKind::Agent { model: String::new(), label: StyledText::plain("A") }),
+            ("note", ItemKind::AgentNote { model: String::new(), title: StyledText::plain("N") }),
+            ("file tree", ItemKind::FileTree { model: String::new() }),
+            ("browser", ItemKind::Browser { model: String::new() }),
+        ];
+
+        let mut board = Board::new();
+        let mut added = Vec::new();
+        for (name, kind) in kinds {
+            // Looked up by id rather than by walking `projection.iter()` in step: that
+            // iteration order is the scene's, not the order things were added, so a zip
+            // would be asserting about whichever node happened to come out first.
+            added.push((name, board.add(NewItem::new(kind, Placement::new(0.0, 0.0, 520.0, 400.0))).unwrap()));
+        }
+        let mut projection = Projection::new();
+        projection.rebuild(&board).unwrap();
+
+        let panel = Theme::LIGHT.surface;
+        let mut seen = Vec::new();
+        for (name, doc) in added {
+            let scene = projection.scene_id(doc).unwrap();
+            let projected = projection.get(scene).unwrap();
+            let colour = swatch(projected, Theme::LIGHT);
+            let delta = [
+                (colour.r - panel.r).abs(),
+                (colour.g - panel.g).abs(),
+                (colour.b - panel.b).abs(),
+            ];
+            let worst = delta[0].max(delta[1]).max(delta[2]);
+            assert!(
+                worst > 0.15,
+                "a {name} node draws at {delta:?} from the minimap's own panel — \
+                 that is a rectangle painted every frame that nobody can see"
+            );
+            assert!(colour.a > 0.0, "a {name} node is skipped by the minimap's alpha test");
+            seen.push(colour.pack());
+        }
+
+        // An agent must not read as a note. Two kinds sharing a colour is a map that cannot
+        // be used for the one thing a minimap is for — recognising the shape of your board.
+        assert_ne!(seen[0], seen[1], "an agent and a note are the same colour on the map");
     }
 }

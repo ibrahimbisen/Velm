@@ -1261,6 +1261,39 @@ pub fn floating_frame_over(palette: Palette, backing: Backing) -> egui::Frame {
         .shadow(Shadow { offset: [0, 1], blur: 3, spread: 0, color: palette.shadow })
 }
 
+/// The selection toolbar's corner radius.
+///
+/// Larger than [`radius::LARGE`] and its own constant because **three** things have to agree
+/// about it: the frame, the specular catch [`paint_glass_edge`] insets by it, and the
+/// `GlassSurface` whose blurred region sits behind it. Miss the third and a bright wedge shows
+/// at each corner of the one surface still made of glass.
+pub const SELECTION_BAR_RADIUS: f32 = 10.0;
+
+/// The frame the floating selection toolbar sits in.
+///
+/// *"please make this menu that i have in velm exactly like miros"*, with the two photographed
+/// side by side. Miro's bar is softer-cornered, has **no border at all**, and carries a larger,
+/// more diffuse shadow. Velm's read as a boxed panel by comparison, and on glass the hairline
+/// was most of why.
+///
+/// Its own builder rather than a tweak to [`floating_frame`], which also dresses the tool
+/// palette, the flyouts, the find bar, the status cluster and the command palette — restyling
+/// every floating surface in the application was not what was asked for.
+///
+/// The **material stays Velm's**: asked whether to go opaque like Miro's, the user said keep
+/// the glass. So this is Miro's proportions on Velm's surface, and `Backing::Canvas` and the
+/// `register_glass` call in `crate::chrome` are both deliberately untouched.
+pub fn selection_bar_frame(palette: Palette) -> egui::Frame {
+    egui::Frame::new()
+        .fill(palette.floating_fill(Backing::Canvas))
+        // No `.stroke(...)`. The shadow below is what carries the edge now.
+        .corner_radius(CornerRadius::same(SELECTION_BAR_RADIUS as u8))
+        // *"keep the divider also use more whitespace"* — the dividers stayed and the air grew,
+        // here and in `context_bar`'s item spacing.
+        .inner_margin(Margin::same(space::of(2) as i8))
+        .shadow(Shadow { offset: [0, 2], blur: 8, spread: 0, color: palette.shadow })
+}
+
 /// The frame a board-library card or row sits in. Docked, so never glass.
 /// The breathing room inside a card, on every side.
 ///
@@ -1305,9 +1338,18 @@ pub fn well_frame(palette: Palette) -> egui::Frame {
 /// Both are one draw call and neither is optional to the material — §3a is explicit
 /// that the top-edge highlight is what separates it from a plain blur. Called after
 /// the frame has laid itself out, because the rectangle is not known before then.
-pub fn paint_glass_edge(painter: &Painter, rect: Rect, palette: Palette, backing: Backing) {
+/// `corner` must be the radius the caller's own frame was built with. It used to be
+/// [`radius::LARGE`] unconditionally, which was true of every caller until the selection bar
+/// opened its corners — and a highlight inset by less than the arc it follows overhangs the
+/// corner, on a translucent surface, where it is exactly what you look at.
+pub fn paint_glass_edge(
+    painter: &Painter,
+    rect: Rect,
+    palette: Palette,
+    backing: Backing,
+    corner: f32,
+) {
     let Some(glass) = palette.glass(backing) else { return };
-    let corner = f32::from(radius::LARGE);
     let inset = rect.shrink(corner);
     if inset.width() <= 0.0 {
         return;

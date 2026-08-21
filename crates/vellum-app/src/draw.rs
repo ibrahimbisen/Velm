@@ -123,12 +123,32 @@ const SELECTION_RING_WIDTH: f32 = 1.0;
 /// once the importer emits `ItemKind::LinkPreview` instead of substituting text.
 const TEXT_LAYOUT_BUDGET: Duration = Duration::from_millis(3);
 
-/// Frame title height as a fraction of the frame, clamped. Miro scales a frame's
-/// name with the frame rather than with the zoom, so it stays readable as a label
-/// for the region rather than becoming a billboard.
+/// Frame title height as a fraction of the frame, clamped — in **world** units, so a bigger
+/// frame gets a bigger name and the label stays proportionate to the region it names.
+///
+/// ⚠ This used to claim that *"Miro scales a frame's name with the frame rather than with the
+/// zoom"*, offered as the reason no device floor was needed. **It is wrong**, and it is the
+/// belief that produced the bug: the user photographed the same board in both applications and
+/// Miro's "Education" and "Food" were large and perfectly legible over small frames while
+/// Velm's were an illegible smear. Miro scales with the frame *and clamps*. So does this now —
+/// see `FRAME_TITLE_MIN_DEVICE`, which floors the drawn size without touching either of these.
 const FRAME_TITLE_FRACTION: f64 = 0.03;
 const FRAME_TITLE_MIN: f64 = 14.0;
 const FRAME_TITLE_MAX: f64 = 96.0;
+
+/// The smallest a frame's title is ever **drawn**, in device pixels.
+///
+/// A frame's name is what tells you where you are on a board you have zoomed out of, which
+/// makes it precisely the text that must survive the zoom-out — and before this it was the one
+/// thing on the canvas that could not. At the default frame size it greeked below 18.5% zoom,
+/// and a greeked frame title is `GreekLines::Single`: one grey bar as wide as the whole frame.
+///
+/// Well clear of `MIN_DEVICE_FONT_SIZE` (5.0), which is the point — both greek guards read the
+/// clamped scale, so a frame title can no longer reach either of them.
+///
+/// It floors magnification only. Zoom *in* and the world size takes over again, so a title
+/// still grows with its frame and this constant becomes inert; see `Block::scale`.
+const FRAME_TITLE_MIN_DEVICE: f64 = 13.0;
 
 /// Fraction of a line's height a greeked bar occupies — roughly an x-height, so a
 /// stack of them has the visual weight of the text it replaces rather than reading
@@ -168,6 +188,36 @@ pub struct DrawContext<'a> {
     /// itself uses, rather than re-derived here: two copies of a hitbox is a click landing
     /// where the paint is not, which is the rule `card_layout` already exists to enforce.
     pub hovered_badge: Option<SceneId>,
+    /// The item wearing Miro's four connector ports — the blue dots you drag a line from.
+    ///
+    /// Resolved by the app, never here, for `hovered_badge`'s reason and one more: *which*
+    /// item wears them depends on the hover, the selection, the armed tool and whether a
+    /// gesture is in flight, and the painter is allowed to read none of those.
+    /// [`crate::actions::ActiveState::ported_item`] holds the whole rule.
+    ///
+    /// `None` on nearly every frame of an ordinary board, which is what keeps this free.
+    pub ports: Option<SceneId>,
+    /// A selected connector's two ends, in **world** units, as the grips that re-attach it.
+    ///
+    /// Resolved by the app through `crate::connector::endpoints` — the same function the
+    /// router resolves with — because the painter would otherwise have to look up both
+    /// targets itself and could then disagree with the line it is drawing about where the
+    /// line begins.
+    pub connector_grips: Option<((f64, f64), (f64, f64))>,
+    /// The chat theme a node with no choice of its own draws in — Preferences ▸ Agents.
+    ///
+    /// Resolved by the app because it lives in the library sidecar, which `vellum-agent`
+    /// must not know about and the painter cannot read. `DisplayMode`'s arrangement exactly.
+    pub default_chat_theme: vellum_agent::ChatTheme,
+    /// The display mode a node with no choice of its own is drawn in — the same arrangement,
+    /// for the same reason, and it was the arrangement that was missing.
+    ///
+    /// ⚠ Two places resolved `None` against `DisplayMode::default()` — the enum's own value,
+    /// which is not the user's. Both are reached only by a node the runtime has not attached a
+    /// session to, so with the app-wide default set to Raw a freshly placed agent drew its
+    /// toggle in Clean until the moment it first ran, and then changed under the user. The
+    /// value follows `default_chat_theme` from the same sidecar so the two cannot drift.
+    pub default_display: DisplayMode,
     /// The marquee in flight, in physical pixels.
     pub marquee: Option<(ScreenPoint, ScreenPoint)>,
     /// The pen stroke being drawn right now, if the button is down.
@@ -227,14 +277,14 @@ pub struct DrawContext<'a> {
     /// writes nothing to the document until the button comes up, so without it the
     /// drag is invisible and the card appears to jump on release.
     pub card_drop: Option<[(f64, f64); 4]>,
-    /// The region a selected orchestrator owns, or the one being swept for it right now.
+    /// Every orchestrator's region, and the one being swept right now.
     ///
-    /// `docs/07-agent-canvas.md` §9: *"the region is drawn as a labelled tint while the
-    /// orchestrator is selected"*. Resolved by the app — see
-    /// [`crate::actions::ActiveState::territory_preview`] — for `guides`' reason: which
-    /// node's region it is, and whether a gesture is redrawing it, are questions about the
-    /// selection and about `Input`, neither of which the painter is allowed to read.
-    pub territory: Option<TerritoryTint>,
+    /// Resolved by the app — see [`crate::actions::ActiveState::territories`] — for `guides`'
+    /// reason: whose region it is, whether it is the selected one and whether a gesture is
+    /// redrawing it are questions about the selection and about `Input`, neither of which the
+    /// painter is allowed to read. **Empty on every board with no orchestrator on it**, which
+    /// is the early-out the two loops below both take.
+    pub territories: Vec<TerritoryTint>,
     /// Where the minimap goes, in physical pixels — `[x, y, width, height]`. `None`
     /// hides it. Supplied by the caller rather than derived here because it has to
     /// clear the floating chrome, and only the caller knows where that is.
@@ -253,18 +303,58 @@ pub struct TerritoryTint {
     /// where an off-by-half-a-box error lives.
     pub region: [f64; 4],
     /// Whose region it is, as the node is named on the board.
+    ///
+    /// **This is the answer to *"the orchestrator for that area should somehow be
+    /// visible"***. With every region drawn at once rather than only the selected one, the
+    /// chip is the only thing on screen saying which of several rectangles belongs to which
+    /// node — so it stopped being decoration the moment the list grew past one.
     pub label: String,
-    /// The node itself. Only used as the text cache's key, so a label is shaped once and
-    /// retired with the item — see [`crate::text::TextCache::retain`].
+    /// The node itself. Used as the text cache's key, so a label is shaped once and retired
+    /// with the item — see [`crate::text::TextCache::retain`] — and to find the selected
+    /// node's own region.
     pub scene: SceneId,
+    /// The same node's document id, which is what an armed sweep remembers.
+    ///
+    /// Both are carried because they answer different questions and neither derives the
+    /// other cheaply: a `SceneId` is rebuilt by every reprojection, and the arm has to
+    /// survive one.
+    pub doc: vellum_doc::ItemId,
     /// The projection generation the label was composed against, so a renamed node reshapes
     /// and a panning board does not.
     pub generation: u64,
-    /// Whether this is the rectangle under the pointer rather than the stored region.
-    ///
-    /// Drawn a little more strongly, because during the one gesture where it matters most
-    /// which rectangle is which, the answer must not be "they look the same".
-    pub pending: bool,
+    /// How loudly this one is drawn.
+    pub emphasis: TerritoryEmphasis,
+}
+
+/// Which of the three things a region on screen is.
+///
+/// One enum rather than two booleans, because the three are exclusive and a pair of flags
+/// admits a fourth state — *swept but not selected* — that nothing can produce and that the
+/// alpha table would have to invent an answer for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerritoryEmphasis {
+    /// A region that is simply there. The faintest, and the commonest: with every region
+    /// drawn at all times this is what a board full of orchestrators looks like, and
+    /// anything louder would recolour the canvas.
+    Standing,
+    /// Its owner is the current selection — *"this is the one you are looking at"*.
+    Selected,
+    /// The rectangle under the pointer, right now. The strongest, because during the one
+    /// gesture where it matters most which rectangle is which, the answer must not be
+    /// "they look the same".
+    Sweeping,
+}
+
+impl TerritoryEmphasis {
+    /// The wash and the edge, as a pair, so the two can never be looked up separately and
+    /// come from different rungs.
+    const fn alphas(self) -> (f32, f32) {
+        match self {
+            Self::Standing => (TERRITORY_FILL_ALPHA_STANDING, TERRITORY_EDGE_ALPHA_STANDING),
+            Self::Selected => (TERRITORY_FILL_ALPHA, TERRITORY_EDGE_ALPHA),
+            Self::Sweeping => (TERRITORY_FILL_ALPHA_LIVE, TERRITORY_EDGE_ALPHA_LIVE),
+        }
+    }
 }
 
 impl TerritoryTint {
@@ -323,11 +413,22 @@ const TERRITORY_FILL_ALPHA: f32 = 0.05;
 /// The same, while the rectangle is being swept. Stronger, because the gesture is the one
 /// moment the fill *is* the feedback.
 const TERRITORY_FILL_ALPHA_LIVE: f32 = 0.10;
+/// The same, for a region whose owner is not selected — which since the regions became
+/// always-on is every region on the board nearly all of the time.
+///
+/// **Half the selected wash, not the same.** A territory routinely covers most of the board
+/// and there may be several; at the selected value they stack into a recoloured canvas, and
+/// the middle rung of [`TerritoryEmphasis`] stops meaning anything.
+const TERRITORY_FILL_ALPHA_STANDING: f32 = 0.025;
 /// The dashed edge, against a board of stickies. Above a guide's 0.45 because a territory is
 /// a boundary rather than a hint, and well under a selection ring's 1.0 because it is not
 /// an object's outline — see `push_territory`.
 const TERRITORY_EDGE_ALPHA: f32 = 0.60;
 const TERRITORY_EDGE_ALPHA_LIVE: f32 = 0.90;
+/// The edge of a region nobody has selected. Still clearly a boundary — this is the whole
+/// point of drawing it at all — and well under the selected one, so picking an orchestrator
+/// visibly answers *"which of these is yours"*.
+const TERRITORY_EDGE_ALPHA_STANDING: f32 = 0.30;
 
 /// Where the caret is, what is selected, and the string both index into.
 ///
@@ -426,6 +527,17 @@ pub struct PaintStats {
     pub drawn: usize,
     /// Text blocks skipped for being too small to read.
     pub text_skipped: usize,
+    /// Text blocks that wanted shaping this frame and did not get it, because
+    /// [`TEXT_LAYOUT_BUDGET`] was already spent.
+    ///
+    /// **Distinct from `text_skipped`, and the number that matters.** A skipped block is
+    /// *greeked* — it draws bars, so the board still reads as a board. A deferred one
+    /// draws **nothing at all** (the `None` arm below), and until this reaches zero the
+    /// board is missing words the user is waiting for. Counting it is what makes
+    /// "frames-to-quiet after an edit" measurable rather than eyeballed: an edit
+    /// invalidates every layout on the board, so this spikes and then drains over however
+    /// many frames the ration takes.
+    pub text_deferred: usize,
     /// Glyphs the atlas could not supply. Anything but zero is a bug in the
     /// prepare-then-draw ordering, and it shows on screen as missing characters.
     pub glyphs_missing: usize,
@@ -638,6 +750,13 @@ pub struct Painter {
     glyphs: Vec<(GlyphKey, GlyphImage)>,
     /// Time spent shaping new text this frame, against [`TEXT_LAYOUT_BUDGET`].
     text_spent: Duration,
+    /// Blocks that wanted shaping this frame and were refused it by the budget.
+    ///
+    /// Counted **here** rather than at the `None` arm in `paint`, because that arm is
+    /// reached for several other reasons — a zero-height box, a slot with no words — and a
+    /// number that conflates them would report a board as never settling when it had.
+    /// Reset with `text_spent`, which is the same lifetime.
+    text_deferred: usize,
     /// The board the caches currently hold entries for. See [`Painter::sync`].
     painted_board: BoardEpoch,
     /// The projection generation the caches were last pruned against.
@@ -654,7 +773,12 @@ pub struct Painter {
     /// At most one frame stale, and a frame is requested unconditionally from
     /// `about_to_wait`, so a camera move is always followed by a repaint before the next
     /// click can arrive.
-    edited_origin: Option<(BlockKey, ScreenPoint)>,
+    /// Where the edited block was drawn last frame, and the scale it was drawn at.
+    ///
+    /// The scale rides along because a click has to undo exactly the transform the
+    /// paint applied, and for a frame title — which is caret-editable and floors its
+    /// magnification — that is not the camera's zoom. See [`Block::scale`].
+    edited_origin: Option<(BlockKey, ScreenPoint, f32)>,
 }
 
 impl std::fmt::Debug for Painter {
@@ -681,6 +805,7 @@ impl Painter {
             order: Vec::new(),
             glyphs: Vec::new(),
             text_spent: Duration::ZERO,
+            text_deferred: 0,
             // No board has been painted yet. `Editor` counts epochs up from zero, so
             // this cannot collide with a real one, and the first `sync` clears caches
             // that are already empty.
@@ -702,8 +827,10 @@ impl Painter {
     /// The one thing a click on a caret needs and cannot work out for itself. `None`
     /// before the block has been painted with a caret in it, or once the caret has moved
     /// to another slot — both of which mean "there is nothing on screen to click into".
-    pub fn edited_origin(&self, key: BlockKey) -> Option<ScreenPoint> {
-        self.edited_origin.filter(|(painted, _)| *painted == key).map(|(_, origin)| origin)
+    pub fn edited_origin(&self, key: BlockKey) -> Option<(ScreenPoint, f32)> {
+        self.edited_origin
+            .filter(|(painted, ..)| *painted == key)
+            .map(|(_, origin, scale)| (origin, scale))
     }
 
     /// Cached text layouts. For the flight recorder — a count that climbs while the
@@ -793,6 +920,7 @@ impl Painter {
         let mut stats = PaintStats::default();
         list.clear();
         self.text_spent = Duration::ZERO;
+        self.text_deferred = 0;
         // An Agent Canvas node's contents are not in the document, so nothing the projection
         // knows about moves when an agent speaks. This counter is what retires last frame's
         // layout of one — see [`CachedNode::frame`]. Wrapping, because a counter that
@@ -805,6 +933,7 @@ impl Painter {
         // queue, the texture manager and `Assets` at once, which is why it lives here
         // rather than in `app`'s frame loop.
         assets.collect(device, queue, renderer.textures_mut());
+        assets.enforce_budget(renderer.textures_mut());
 
         let camera = ctx.camera;
         let board = list.view(View::board(camera));
@@ -871,6 +1000,10 @@ impl Painter {
         push_placing(list, ctx, board);
         push_pending_connector(list, ctx, board);
         self.push_selection(list, ctx, board);
+        // After the ring and the handles, so a port sitting just outside a corner is drawn
+        // over the handle rather than under it — which matches the press path, where a port
+        // is asked about first.
+        push_ports(list, ctx, board);
         push_card_drop(list, ctx, board);
         // After the selection ring, so a guide running along an item's edge is not hidden
         // under the ring that is on the same edge; before the marquee, which is a different
@@ -880,6 +1013,8 @@ impl Painter {
         push_minimap(list, ctx, screen);
 
         stats.draws = list.stats();
+        // Accumulated inside `block`, which has no `stats` to reach — see the field.
+        stats.text_deferred = self.text_deferred;
         stats
     }
 
@@ -940,20 +1075,29 @@ impl Painter {
             }
         }
 
-        // The territory label. **Not an item**, so it is not in `self.order` and cannot be
-        // reached by the loop above — and the region can be on screen while the node that
-        // owns it is culled, which is precisely when a label saying whose region this is
-        // earns its place. Rasterised at scale 1.0 for the reason
+        // The territory labels. **Not items**, so they are not in `self.order` and cannot be
+        // reached by the loop above — and a region can be on screen while the node that owns
+        // it is culled, which is precisely when a label saying whose region this is earns its
+        // place. That case stopped being an edge one when the regions became always-on:
+        // several orchestrators' rectangles overlapping is exactly when the chips are the
+        // only way to tell them apart. Rasterised at scale 1.0 for the reason
         // [`Painter::territory_label`] gives.
-        if let Some(label) = self.territory_label(ctx) {
-            let missing = self.text.layout_of(label.key).is_some_and(|layout| {
-                layout.glyphs().any(|glyph| {
-                    let key = glyph.physical(label.origin, 1.0).key;
-                    atlas.slot(key).is_none() && !atlas.is_blank(key)
-                })
-            });
-            if missing {
-                self.text.rasterise_into(label.key, label.origin, 1.0, &mut self.glyphs);
+        //
+        // Cloned rather than borrowed: `territory_label` needs `&mut self` for the text
+        // cache, and `ctx.territories` would otherwise be borrowed across it. Empty on every
+        // board with no orchestrator, so the allocation is not one an ordinary board makes.
+        if !ctx.territories.is_empty() {
+            for tint in ctx.territories.clone() {
+                let Some(label) = self.territory_label(ctx, &tint) else { continue };
+                let missing = self.text.layout_of(label.key).is_some_and(|layout| {
+                    layout.glyphs().any(|glyph| {
+                        let key = glyph.physical(label.origin, 1.0).key;
+                        atlas.slot(key).is_none() && !atlas.is_blank(key)
+                    })
+                });
+                if missing {
+                    self.text.rasterise_into(label.key, label.origin, 1.0, &mut self.glyphs);
+                }
             }
         }
 
@@ -992,8 +1136,19 @@ impl Painter {
     /// screen, so a label pinned to that corner is a label nobody ever sees — which is the
     /// whole of what it was for. It slides along the region's own edges to stay in view, and
     /// never leaves the region, so it cannot come to sit over a neighbouring orchestrator's.
-    fn territory_label(&mut self, ctx: &DrawContext<'_>) -> Option<TerritoryLabel> {
-        let tint = ctx.territory.as_ref()?;
+    ///
+    /// # It takes the tint rather than reading it off the context
+    ///
+    /// There are several regions on screen now, not one, so *"the territory's label"* is no
+    /// longer a question the context can answer on its own. Passing the tint is also what
+    /// keeps the two callers — the glyph-preparation pass and the paint — asking about the
+    /// **same** region in the same order, which is the `card_layout` rule: a second copy of a
+    /// layout is a label rasterised for one rectangle and drawn against another.
+    fn territory_label(
+        &mut self,
+        ctx: &DrawContext<'_>,
+        tint: &TerritoryTint,
+    ) -> Option<TerritoryLabel> {
         if tint.label.trim().is_empty() {
             return None;
         }
@@ -1066,7 +1221,30 @@ impl Painter {
         atlas: &GlyphAtlas,
         screen: u32,
     ) {
-        let Some(tint) = ctx.territory.as_ref() else { return };
+        // Sorted so the loudest is drawn last and therefore on top. Without it a standing
+        // region that happens to come later in the projection washes over the one being
+        // swept, and the whole three-rung emphasis says nothing.
+        let mut order: Vec<&TerritoryTint> = ctx.territories.iter().collect();
+        order.sort_by_key(|tint| match tint.emphasis {
+            TerritoryEmphasis::Standing => 0,
+            TerritoryEmphasis::Selected => 1,
+            TerritoryEmphasis::Sweeping => 2,
+        });
+        for tint in order {
+            self.push_one_territory(list, ctx, atlas, screen, tint);
+        }
+    }
+
+    /// One region. Split out of [`Self::push_territory`] so the loop above holds the
+    /// ordering decision and this holds the drawing, rather than one function holding both.
+    fn push_one_territory(
+        &mut self,
+        list: &mut DrawList,
+        ctx: &DrawContext<'_>,
+        atlas: &GlyphAtlas,
+        screen: u32,
+        tint: &TerritoryTint,
+    ) {
         let (min, max) = tint.screen_rect(ctx.camera);
         let viewport = ctx.camera.viewport();
         let (view_w, view_h) = (viewport.width as f32, viewport.height as f32);
@@ -1074,18 +1252,15 @@ impl Painter {
         // Entirely off screen: nothing to draw, and — the part that matters — nothing to
         // *dash*, since an edge a long way outside the window would otherwise emit a run of
         // quads nobody can see. The same clip `push_dashed` applies along its own axis,
-        // applied here across both.
+        // applied here across both. This became load-bearing rather than tidy when every
+        // region started drawing at once: a board of eight orchestrators is eight of these.
         if max.0 <= 0.0 || max.1 <= 0.0 || min.0 >= view_w || min.1 >= view_h {
             return;
         }
 
         list.use_view(screen);
         let theme = ctx.theme;
-        let (fill_alpha, edge_alpha) = if tint.pending {
-            (TERRITORY_FILL_ALPHA_LIVE, TERRITORY_EDGE_ALPHA_LIVE)
-        } else {
-            (TERRITORY_FILL_ALPHA, TERRITORY_EDGE_ALPHA)
-        };
+        let (fill_alpha, edge_alpha) = tint.emphasis.alphas();
 
         // The wash, clipped to the window. A region is routinely hundreds of screens wide
         // and a quad that big is a quad the rasteriser has to clip anyway; doing it here
@@ -1136,7 +1311,7 @@ impl Painter {
         // charcoal on the teal is 5.3:1 and white on it is 3.2:1, so a filled accent plate
         // would have to carry `on_accent` — which this canvas palette does not have, and
         // inventing one here would be a fifth copy of a colour three files already share.
-        let Some(label) = self.territory_label(ctx) else { return };
+        let Some(label) = self.territory_label(ctx, tint) else { return };
         list.use_view(screen);
         list.push_quad(
             QuadInstance::solid(
@@ -1646,11 +1821,58 @@ impl Painter {
                     )
                 };
 
+                // **This node's own palette**, if it is an agent and has chosen a chat theme.
+                // One substitution, and every colour below follows — the card, the wells, the
+                // primary and muted text, the accent rail — because they all resolve through
+                // a `&Theme` already. `Theme::for_chat` answers `theme` unchanged for
+                // `ChatTheme::Velm`, so a board that has never chosen one pays a compare.
+                let theme = chat_theme_of(&projected.item.kind, ctx).map_or(theme, |chat| theme.for_chat(chat));
+                // …and how see-through its paper is. The **paper only**: `opacity` fades the
+                // whole item including the words, which at anything under about 60% is a
+                // transcript nobody can read. This is what *"adjust the transparency"* means
+                // on a surface whose entire job is to carry text.
+                let paper = opacity * chat_opacity_of(&projected.item.kind);
+
                 // The card first. It is what all four are built on, and it is what makes a
                 // freshly placed node a real, selectable, movable box before anything at all
                 // has filled it.
                 let fill = projected.item.style.fill.map_or(theme.surface, theme::convert);
-                push_node_card(list, position, size, fill, rotation, opacity, &theme, hairline);
+                push_node_card(list, position, size, fill, rotation, paper, &theme, hairline);
+
+                // The user's own picture behind the transcript, if this node has one —
+                // *"put my own themes a picture as a theme"*. Between the card and the
+                // plates, so the wells and the words still sit on top of it, and it inherits
+                // the card's radius so it cannot square off the corners it fills.
+                if let Some(blob) = chat_background_of(&projected.item.kind)
+                    && let Some((texture, source)) =
+                        assets.texture(device, queue, renderer.textures_mut(), blob)
+                {
+                    renderer.textures_mut().mark(texture, 0.0);
+                    list.push_image(
+                        texture,
+                        // Cropped, never stretched — feedback 23. A wallpaper is whatever
+                        // shape the file was and a node is whatever shape it was dragged to.
+                        ImageInstance::new(
+                            position,
+                            size,
+                            cover_uv(source, (f64::from(size[0]), f64::from(size[1]))),
+                        )
+                        .with_corner_radius(CARD_RADIUS)
+                        .with_rotation(rotation)
+                        .with_opacity(paper),
+                    );
+                    // A scrim, in the theme's own paper. This is what makes an arbitrary
+                    // picture safe where an arbitrary *colour* is not: the ink's contrast is
+                    // against the paper above the image rather than against the image, so a
+                    // photograph cannot make the transcript unreadable. It is also why the
+                    // picture is a per-node choice and the colours are four presets.
+                    list.push_quad(
+                        QuadInstance::solid(position, size, fill.with_alpha(BACKGROUND_SCRIM))
+                            .with_corner_radius(CARD_RADIUS)
+                            .with_rotation(rotation)
+                            .with_opacity(paper),
+                    );
+                }
 
                 // Plates under the words, then pictures, then the chrome on top. Copied out
                 // of the cache first because `assets` borrows the renderer and this borrow
@@ -1660,7 +1882,7 @@ impl Painter {
                     (paint.plates.clone(), paint.images.clone(), paint.twisties.clone())
                 };
                 for plate in &plates {
-                    push_node_plate(list, at(plate.rect), *plate, rotation, opacity, &theme, hairline);
+                    push_node_plate(list, at(plate.rect), *plate, rotation, paper, &theme, hairline);
                 }
                 for image in &images {
                     let (origin, extent) = at(image.rect);
@@ -1721,7 +1943,7 @@ impl Painter {
                                 None => matches!(
                                     crate::agent::display_mode(
                                         &crate::agent::decode(model),
-                                        DisplayMode::default(),
+                                        ctx.default_display,
                                     ),
                                     DisplayMode::Raw
                                 ),
@@ -1989,6 +2211,7 @@ impl Painter {
                     favicon.is_some(),
                     url.is_some(),
                     url.as_deref().is_some_and(vellum_link::plays_video),
+                    drawn_title_chars(&projected.item.kind),
                 );
                 // A box in the item's own space becomes one in whatever space this list is
                 // drawing in, as a **fraction of the item**: `position` and `size` are already
@@ -2017,28 +2240,52 @@ impl Painter {
                 // The preview image, in the one mode that has room for it. `Card` and `Link`
                 // deliberately draw no image even when one has been fetched — that is what
                 // makes them smaller, and switching modes must not need a re-fetch.
+                //
+                // **The `else` is the fix, and it is the same one the favicon already
+                // has.** This chain had none, so a card whose picture had not arrived
+                // reserved the band and painted nothing into it — a white void where the
+                // image goes. It was the odd one out in its own file: a standalone
+                // `ItemKind::Image` has drawn `push_placeholder` all along, and the
+                // favicon forty lines down has `push_favicon_placeholder`. Only the
+                // biggest box on the card was left empty, which is most of what the user
+                // meant by *"i just see a box"*.
+                //
+                // Written as one `match` on the texture rather than a residency test
+                // beside the draw: `assets` is borrowed mutably by `texture`, and asking
+                // twice would either need a second query API or draw the placeholder
+                // *under* a translucent picture, which tints it.
                 if let Some(box_) = laid.image
                     && let Some(hash) = thumbnail
-                    && let Some((texture, source)) =
-                        assets.texture(device, queue, renderer.textures_mut(), hash)
                 {
-                    renderer.textures_mut().mark(texture, 0.0);
                     let (at, extent) = to_screen(box_);
-                    list.push_image(
-                        texture,
-                        // Cropped to the band's aspect rather than stretched into it. The
-                        // *layout* box is the right thing to measure against, not `extent`:
-                        // both are the same shape, but the layout box is in world units and
-                        // is not rounded to device pixels, so it does not make the crop
-                        // shiver by a texel as the board is zoomed.
-                        ImageInstance::new(at, extent, cover_uv(source, (box_.2, box_.3)))
-                            // Its own radius, slightly tighter than the card's, which is what
-                            // makes a picture read as sitting *in* the card rather than as the
-                            // card's own face.
-                            .with_corner_radius(CARD_RADIUS * 0.75)
-                            .with_rotation(rotation)
-                            .with_opacity(opacity),
-                    );
+                    match assets.texture(device, queue, renderer.textures_mut(), hash) {
+                        Some((texture, source)) => {
+                            renderer.textures_mut().mark(texture, 0.0);
+                            list.push_image(
+                                texture,
+                                // Cropped to the band's aspect rather than stretched into
+                                // it. The *layout* box is the right thing to measure
+                                // against, not `extent`: both are the same shape, but the
+                                // layout box is in world units and is not rounded to
+                                // device pixels, so it does not make the crop shiver by a
+                                // texel as the board is zoomed.
+                                ImageInstance::new(
+                                    at,
+                                    extent,
+                                    cover_uv(source, (box_.2, box_.3)),
+                                )
+                                // Its own radius, slightly tighter than the card's, which
+                                // is what makes a picture read as sitting *in* the card
+                                // rather than as the card's own face.
+                                .with_corner_radius(CARD_RADIUS * 0.75)
+                                .with_rotation(rotation)
+                                .with_opacity(opacity),
+                            );
+                        }
+                        None => push_card_image_placeholder(
+                            list, at, extent, rotation, opacity, &theme,
+                        ),
+                    }
                 }
 
                 // The site's icon, at the head of the provider row. Miro leads every card and
@@ -2141,13 +2388,16 @@ impl Painter {
                         atlas,
                         layout,
                         [block.origin.x as f32, block.origin.y as f32],
-                        camera.zoom() as f32,
+                        // The block's own scale, not the camera's. They are the same for
+                        // everything except a frame's title, which refuses to shrink past
+                        // legibility — see `Block::scale`.
+                        block.scale,
                         block.color.with_alpha(block.color.a * opacity),
                     );
                     if let Some(cursor) = caret {
                         push_caret(list, ctx, &block, layout, cursor);
                         // Kept for the *next* click to resolve against. See the field.
-                        self.edited_origin = Some((BlockKey::new(id, slot), block.origin));
+                        self.edited_origin = Some((BlockKey::new(id, slot), block.origin, block.scale));
                     }
                 }
                 Some(Painted::Greeked(greek)) => {
@@ -2276,6 +2526,9 @@ impl Painter {
 
         // Set by the card arm below; unused by every other kind.
         let mut card_line_budget = usize::MAX;
+        // Set by the frame-title arm below; zero — meaning "no floor" — for every other kind.
+        // See `FRAME_TITLE_MIN_DEVICE` and `Block::scale`.
+        let mut min_device_size = 0.0_f64;
         // Whether the caret is in *this* slot right now.
         //
         // The arms below skip a slot with no words in it, which is right — a fresh table
@@ -2369,6 +2622,9 @@ impl Painter {
                     return None;
                 }
                 let size = (height * FRAME_TITLE_FRACTION).clamp(FRAME_TITLE_MIN, FRAME_TITLE_MAX);
+                // The shaped size stays in world units — the floor is applied to the *draw
+                // scale* instead, below, for the cache reason `Block::scale` records.
+                min_device_size = FRAME_TITLE_MIN_DEVICE;
                 (
                     FitBox::new(width.max(1.0) as f32, size as f32),
                     Anchor::Above(size),
@@ -2381,7 +2637,6 @@ impl Painter {
                 ItemKind::LinkPreview { .. } | ItemKind::Embed { .. } | ItemKind::Document { .. },
                 BlockKey::PRIMARY | BlockKey::SECONDARY | CARD_BLURB_SLOT,
             ) => {
-                let inset = width * CARD_PADDING;
                 // The image band is reserved only when there is an image to put in it. A
                 // `Large` card with nothing fetched yet would otherwise draw its text halfway
                 // down over 55% of empty surface, which reads as a broken card rather than as
@@ -2400,16 +2655,6 @@ impl Painter {
                 // Scaled by the card's width so a deliberately enlarged card enlarges its
                 // text with it, rather than keeping 13pt type in a 1000-unit box.
                 let size = card_font_size(width);
-                // The collapsed row gets one line of room. Anything taller would let the
-                // title wrap, which is the one thing the mode exists to prevent.
-                let box_height = if matches!(mode, CardMode::Link) {
-                    size * CARD_LINE_HEIGHT
-                } else {
-                    // The rest of the card, less the image band in the mode that has one.
-                    let reserved =
-                        if mode.shows_image() { height * mode.image_fraction() } else { 0.0 };
-                    (height - reserved - inset * 2.0).max(size)
-                };
                 let laid = card_layout(
                     width,
                     height,
@@ -2419,6 +2664,7 @@ impl Painter {
                     has_favicon(&projected.item.kind),
                     has_link(&projected.item.kind),
                     is_video(&projected.item.kind),
+                    drawn_title_chars(&projected.item.kind),
                 );
                 // **Three slots, because a layout carries one colour and one size.** Miro's
                 // card is a muted site name, then a large title, then a smaller grey blurb.
@@ -2434,8 +2680,12 @@ impl Painter {
                 };
                 // Each block is set at its own size, which is the half that makes the title
                 // read from a distance — colour alone left the card looking like one paragraph.
+                //
+                // **Three sizes, not two.** The site name used to be the base size: identical
+                // to the title and *larger* than the blurb, so the card's largest text was the
+                // one thing on it that matters least. See `PROVIDER_SCALE`.
                 let size = match slot {
-                    BlockKey::SECONDARY => size,
+                    BlockKey::SECONDARY => size * PROVIDER_SCALE,
                     CARD_BLURB_SLOT => size * BLURB_SCALE,
                     _ => size * TITLE_SCALE,
                 };
@@ -2449,10 +2699,9 @@ impl Painter {
                 // page's blurb is any length: without this, a forum page with a 400-character
                 // description drew its text straight out through the bottom of the card and on
                 // to the board, over whatever was beneath it.
-                let per_line = ((w / (size * 0.5)).floor() as usize).max(8);
+                let per_line = chars_per_line(w, size);
                 let lines = ((h / (size * CARD_LINE_HEIGHT)).floor() as usize).max(1);
                 card_line_budget = per_line.saturating_mul(lines).max(per_line);
-                let _ = (box_height, inset);
                 (
                     FitBox::new(w.max(1.0) as f32, h.max(1.0) as f32),
                     Anchor::Inset(x, y),
@@ -2508,7 +2757,58 @@ impl Painter {
         }
 
         let size = largest_font_size(&style, fit);
-        if size * ctx.camera.zoom() < f64::from(MIN_DEVICE_FONT_SIZE) {
+
+        // **The floor, applied to magnification rather than to the shaped size.**
+        //
+        // A frame's name is the label that says where you are on a zoomed-out board, so it is
+        // exactly the text that must survive being zoomed out — and it was the one thing on the
+        // canvas that could not. At a default 1600x900 frame it is 27 world units, which is
+        // 6.75 device pixels at 25% zoom and greeks below 18.5%, where it became *one grey bar
+        // as wide as the whole frame*. That smudge is what the user photographed beside Miro's
+        // perfectly legible "Education" and "Food".
+        //
+        // The comment on `FRAME_TITLE_FRACTION` used to assert that Miro scales a frame's name
+        // with the frame rather than with the zoom. Their own screenshot disproves it: Miro
+        // clamps. The belief is what produced the bug, so it was rewritten rather than tuned.
+        //
+        // Identity for every other kind — `min_device_size` is zero, and `max` with the zoom
+        // leaves the zoom.
+        let draw_scale = if min_device_size > 0.0 && size > 0.0 {
+            ctx.camera.zoom().max(min_device_size / size)
+        } else {
+            ctx.camera.zoom()
+        };
+        // The gap above a frame is expressed in font sizes (`Anchor::Above`), in **world**
+        // units. Magnified glyphs over an unmagnified gap sit on the frame's own top edge, so
+        // the offset has to grow by exactly what the type did. A no-op when the two agree.
+        let anchor = match anchor {
+            Anchor::Above(by) if ctx.camera.zoom() > 0.0 => {
+                Anchor::Above(by * draw_scale / ctx.camera.zoom())
+            }
+            other => other,
+        };
+
+        // **A block that cannot be shaped this frame is greeked, not dropped.**
+        //
+        // `TEXT_LAYOUT_BUDGET` rations shaping to 3 ms a frame, and this used to answer
+        // `None` for everything past the ration — drawing *nothing at all*. On a board
+        // where an edit had just invalidated every layout that meant the words vanished
+        // and trickled back over many frames, reported as the app being slow to do and
+        // undo edits. The bars below are the same ones the too-small guard already draws,
+        // cost no shaping by construction (`GreekLines::Estimated` is sized from the type,
+        // not from a layout), and say *"words are coming here"* instead of leaving a hole.
+        //
+        // The caret is exempt: a block being typed into must be shaped whatever the
+        // budget says, or there is no origin to draw the cursor against — feedback 25,
+        // arrived at from a third direction.
+        let fresh = !self.text.is_current(key, generation);
+        let starved = fresh && !caret_here && self.text_spent >= TEXT_LAYOUT_BUDGET;
+        if starved {
+            self.text_deferred += 1;
+        }
+        // `draw_scale`, not the raw zoom: a frame title is drawn magnified below the floor, so
+        // testing the camera here would greek text that is about to be 13 device pixels tall.
+        if starved || size * draw_scale < f64::from(MIN_DEVICE_FONT_SIZE) {
             let zoom = ctx.camera.zoom();
             let spacing = size * style.line_height.unwrap_or(CARD_LINE_HEIGHT);
             let width = f64::from(fit.width);
@@ -2517,9 +2817,22 @@ impl Painter {
             // same collapse the post-shape path applies, for the same reason, and it is what
             // keeps a 4%-zoom board from emitting a stack of sub-pixel quads per item.
             let lines = if spacing > 0.0 && spacing * zoom >= GREEK_LINE_SPACING_MIN {
+                // **The same relative nudge `whole_lines` needs, for the same reason and one
+                // conversion further on.** A card's title box is built as an exact multiple of
+                // this spacing, and then stored in a `FitBox`, which is `f32`: two lines of
+                // 17.55 come back as 35.099998474121094, `/ 17.55` is 1.9999999, and `floor`
+                // answers **one**. The block then drew a single bar sized from the whole box —
+                // the exact slab this branch exists to avoid, reintroduced by a rounding error
+                // rather than by the arithmetic.
+                //
+                // Measured: it appeared the moment the title box stopped always being three
+                // lines, because 3 × 17.55 happens to round *up* in `f32` and 2 × 17.55 down.
+                // A box that is an exact number of lines must be read as that many.
+                const SNAP: f64 = 1e-6;
                 #[expect(clippy::cast_sign_loss, reason = "both are positive here")]
                 #[expect(clippy::cast_possible_truncation, reason = "clamped to a small count")]
-                let count = (height / spacing).floor().clamp(1.0, MAX_GREEK_LINES) as usize;
+                let count =
+                    ((height / spacing) + SNAP).floor().clamp(1.0, MAX_GREEK_LINES) as usize;
                 count
             } else {
                 1
@@ -2539,6 +2852,10 @@ impl Painter {
                 anchor,
                 font_size: 0.0,
                 color,
+                // Unread on this path — `locate_world` places the box and the bars are drawn
+                // in the board view — but carried honestly rather than defaulted, so the two
+                // constructions of a request cannot drift.
+                scale: draw_scale as f32,
             });
             return Some(Painted::Greeked(Greek {
                 origin,
@@ -2552,10 +2869,6 @@ impl Painter {
         // Shaping a block the cache does not hold is the expensive path, and it is
         // rationed. A block that misses out this frame simply draws no text until a
         // later one has room — never a stall, and never a wrong layout.
-        let fresh = !self.text.is_current(key, generation);
-        if fresh && self.text_spent >= TEXT_LAYOUT_BUDGET {
-            return None;
-        }
         let started = fresh.then(Instant::now);
 
         let kind = &projected.item.kind;
@@ -2592,14 +2905,19 @@ impl Painter {
             anchor,
             font_size,
             color,
+            scale: draw_scale as f32,
         };
 
         // Shaped, and still too small to read. The auto-fitted size is only knowable
         // *after* the fit, so this is a second and genuinely different threshold from
         // the one above: a sticky whose box clears it can easily hold 14 px text that
         // does not. These are the blocks that used to vanish silently.
+        //
+        // The **sibling** of the guard above, and it has to read the same scale — fixing one
+        // and not the other is how a frame title would clear the pre-shape check and then greek
+        // anyway, three statements later, for exactly the reason the first check was changed.
         let zoom = ctx.camera.zoom();
-        if font_size * zoom as f32 >= MIN_DEVICE_FONT_SIZE {
+        if font_size * draw_scale as f32 >= MIN_DEVICE_FONT_SIZE {
             return Some(Painted::Glyphs(self.locate(ctx, request)));
         }
 
@@ -2699,6 +3017,9 @@ impl Painter {
             origin: ScreenPoint::new(device.x.round(), device.y.round()),
             font_size,
             color,
+            // A widget's internals draw at the camera's own zoom. Only a frame's title
+            // floors its magnification — see `Block::scale`.
+            scale: ctx.camera.zoom() as f32,
         }))
     }
 
@@ -2888,6 +3209,9 @@ impl Painter {
             origin: ScreenPoint::new(device.x.round(), device.y.round()),
             font_size,
             color: if run.muted { theme.text_muted } else { theme.text },
+            // A widget's internals draw at the camera's own zoom. Only a frame's title
+            // floors its magnification — see `Block::scale`.
+            scale: ctx.camera.zoom() as f32,
         }))
     }
 
@@ -3012,6 +3336,9 @@ impl Painter {
             origin: ScreenPoint::new(device.x.round(), device.y.round()),
             font_size,
             color: colour,
+            // A widget's internals draw at the camera's own zoom. Only a frame's title
+            // floors its magnification — see `Block::scale`.
+            scale: ctx.camera.zoom() as f32,
         }))
     }
 
@@ -3097,6 +3424,9 @@ impl Painter {
             origin: ScreenPoint::new(device.x.round(), device.y.round()),
             font_size,
             color: colour,
+            // A widget's internals draw at the camera's own zoom. Only a frame's title
+            // floors its magnification — see `Block::scale`.
+            scale: ctx.camera.zoom() as f32,
         }))
     }
 
@@ -3104,6 +3434,7 @@ impl Painter {
     fn locate(&self, ctx: &DrawContext<'_>, request: BlockRequest<'_>) -> Block {
         let font_size = request.font_size;
         let color = request.color;
+        let scale = request.scale;
         let device = ctx.camera.world_to_screen(Self::locate_world(request));
         Block {
             // Snapping to whole device pixels keeps a glyph's subpixel phase stable
@@ -3111,6 +3442,7 @@ impl Painter {
             origin: ScreenPoint::new(device.x.round(), device.y.round()),
             font_size,
             color,
+            scale,
         }
     }
 
@@ -3128,6 +3460,10 @@ impl Painter {
             anchor,
             font_size: _,
             color: _,
+            // The world point is unaffected by how large the glyphs are drawn: the anchor
+            // already carries the magnified offset — see `Painter::block`, which scales
+            // `Anchor::Above` before building the request.
+            scale: _,
         } = request;
         let (width, height) = placement.scaled_size();
         let left = placement.x - block_width / 2.0;
@@ -3175,6 +3511,55 @@ impl Painter {
     }
 }
 
+/// Miro's four blue dots, on whichever item is wearing them this frame.
+///
+/// *"in miro there are these 4 blue dots around the picture … and when i hold and draw i
+/// should be able to connect it to other agents sticky notes or agents or pictures."*
+///
+/// Drawn in the **board** view for `push_handles`' reason: the ports sit on the item as it
+/// is drawn, including when it is turned, and every size is divided by the zoom so they stay
+/// constant on screen. A screen-space dot would be visibly off the edge it names on any
+/// rotated item.
+///
+/// **Round, filled with the accent, ringed in the surface colour** — the inverse of a resize
+/// handle, which is surface filled and accent ringed. That inversion is the whole
+/// distinction: at a glance the four dots are *solid* and the eight handles are *hollow*, so
+/// which grip is under the pointer is answerable without aiming at it. A filled dot also
+/// survives being drawn over a dark image, where a hollow one disappears into it.
+///
+/// Not gated on the selection: [`DrawContext::ports`] is already the app's whole answer to
+/// *"which item, if any"*, and re-deciding here would be the second copy of a rule that
+/// `card_layout` exists to warn about.
+fn push_ports(list: &mut DrawList, ctx: &DrawContext<'_>, board: u32) {
+    let Some(id) = ctx.ports else { return };
+    let Some(projected) = ctx.projection.get(id) else { return };
+    let zoom = ctx.camera.zoom();
+    let radius = f64::from(crate::handle::PORT_RADIUS) / zoom;
+    let ring = (SELECTION_WIDTH as f64 / zoom) as f32;
+
+    list.use_view(board);
+    for (_, at) in crate::handle::ports(&projected.item.placement, zoom) {
+        let origin = WorldPoint::new(at.x - radius, at.y - radius);
+        let side = (radius * 2.0) as f32;
+        list.push_quad(
+            QuadInstance::solid(
+                ctx.camera.to_camera_relative(origin),
+                [side, side],
+                ctx.theme.accent,
+            )
+            // A circle, drawn as a quad whose corner radius is its own half-width — the
+            // same construction the rotate handle uses, so there is one way of making a
+            // round grip in this file rather than two.
+            .with_corner_radius(side / 2.0)
+            // Against the item's own fill, which is what a dot sitting half off the edge of
+            // a dark image needs to stay a dot. It is **not** rotated: a circle has no
+            // orientation, and passing the item's rotation would only cost the vertex
+            // shader work that changes nothing.
+            .with_border(ctx.theme.surface, ring),
+        );
+    }
+}
+
 /// The resize and rotate handles, on a single selection.
 ///
 /// Only one item, matching what `crate::actions` will actually grab: handles on a
@@ -3218,6 +3603,30 @@ fn push_handles(list: &mut DrawList, ctx: &DrawContext<'_>, board: u32) {
                 )
                 .with_border(ctx.theme.accent, border)
                 .with_corner_radius(if handle.is_rotate() { (size / 2.0) as f32 } else { 0.0 }),
+            );
+        }
+        return;
+    }
+
+    // A connector gets its **two ends** instead, and nothing else. Its box is derived from
+    // its bindings rather than chosen (`connector::placement_for`), so eight resize handles
+    // on it are eight grips that move nothing a user can see — and the rotate grip is worse,
+    // since rotating a rectangle that is only there to normalise free ends turns the line
+    // without turning what it joins. Miro gives a line two round grips; so does this.
+    if let Some((from, to)) = ctx.connector_grips {
+        list.use_view(board);
+        let radius = f64::from(crate::handle::PORT_RADIUS) / zoom;
+        for (x, y) in [from, to] {
+            let origin = WorldPoint::new(x - radius, y - radius);
+            let side = (radius * 2.0) as f32;
+            list.push_quad(
+                QuadInstance::solid(
+                    ctx.camera.to_camera_relative(origin),
+                    [side, side],
+                    ctx.theme.accent,
+                )
+                .with_corner_radius(side / 2.0)
+                .with_border(ctx.theme.surface, border),
             );
         }
         return;
@@ -3421,6 +3830,8 @@ struct BlockRequest<'a> {
     anchor: Anchor,
     font_size: f32,
     color: Rgba,
+    /// See [`Block::scale`]. The camera's zoom for everything but a frame's title.
+    scale: f32,
 }
 
 /// Where a text block hangs off its item.
@@ -3447,6 +3858,21 @@ struct Block {
     /// World-pixel size the block was shaped at.
     font_size: f32,
     color: Rgba,
+    /// Device pixels per world unit for *these* glyphs — normally the camera's zoom.
+    ///
+    /// **Its own field because a frame's title refuses to shrink past legibility.** The naive
+    /// way to floor a world-sized label is to raise `font_size` as the camera pulls back, and
+    /// that silently does nothing: `TextCache::layout` keys staleness on `(BlockKey,
+    /// generation)` alone, zooming bumps neither, so the cache keeps handing back the layout
+    /// shaped at the old size *and* the old `font_size` — which is the number the greek guard
+    /// then tests. Measured before writing the fix; it looked like the fix had no effect.
+    ///
+    /// `DrawList::push_layout` applies its `scale` purely as glyph magnification and transforms
+    /// the origin separately, which is the seam `territory_label` already uses from the other
+    /// end — it passes `1.0` in the screen view. So the layout is shaped once at a world size
+    /// and simply drawn larger. No cache key changes, nothing re-shapes, and a zoom gesture
+    /// costs exactly what it did.
+    scale: f32,
 }
 
 /// What one of an item's text slots contributes to the frame.
@@ -3674,13 +4100,50 @@ fn push_favicon_placeholder(
 /// mistaken for an icon that failed to load into a box that was meant to be dark.
 const FAVICON_PLACEHOLDER_ALPHA: f32 = 0.7;
 
-/// Sans is what `font_family: None` resolves to through fontdb's `sans-serif` alias on this
-/// machine (`CLAUDE.md` trap 10). Nothing is bundled, so a card asked to shape that
-/// character would draw a tofu box on any machine whose fallback chain does not happen to
-/// reach a symbols face. Three quads always draw.
+/// What a link card's picture band draws before its pixels arrive.
 ///
-/// The arrowhead is the reason it is only three: for a `↗` the two barbs run **straight left
-/// and straight down** from the tip, so only the shaft needs rotating.
+/// The band is by far the largest box on a card, so this is the difference between a card
+/// that reads as *loading* and one that reads as broken — *"i just see a box"*.
+///
+/// **Quieter than the favicon's stand-in, deliberately.** That one fills a 12-point square
+/// and needs to be seen; this fills most of a card, and at the favicon's weight a wall of
+/// unfetched cards would read as a grid of grey slabs — louder than the pictures it is
+/// standing in for. It carries the picture's own corner radius rather than the card's, so
+/// the placeholder sits exactly where the image will, and a card whose image arrives
+/// mid-session does not appear to change shape.
+fn push_card_image_placeholder(
+    list: &mut DrawList,
+    at: [f32; 2],
+    extent: [f32; 2],
+    rotation: f32,
+    opacity: f32,
+    theme: &crate::theme::Theme,
+) {
+    if extent[0] <= 0.0 || extent[1] <= 0.0 {
+        return;
+    }
+    list.push_quad(
+        QuadInstance::solid(at, extent, theme.border)
+            .with_corner_radius(CARD_RADIUS * 0.75)
+            .with_rotation(rotation)
+            .with_opacity(opacity * CARD_IMAGE_PLACEHOLDER_ALPHA),
+    );
+}
+
+/// See [`push_card_image_placeholder`]. A third of the favicon's weight, because it covers
+/// something like forty times the area.
+const CARD_IMAGE_PLACEHOLDER_ALPHA: f32 = 0.25;
+
+/// The **mark is geometry, not a character**, and that is not negotiable: U+2197 and U+29C9
+/// both live outside every face bundled with this build, and `font_family: None` resolves
+/// through fontdb's `sans-serif` alias to a face that has neither (`CLAUDE.md` trap 10) — so a
+/// card asked to shape one draws a tofu box on the one control whose whole job is to look
+/// pressable. Seven quads always draw.
+///
+/// *"make the outgoing link more like miro as well please."* Miro's is a thin dark outline of
+/// a box with an arrow leaving through its missing top-right corner, on a rounded-square white
+/// plate. Velm's was a heavy accent-coloured `↗` on a disc — which on the user's own build,
+/// where the accent is the blue, made it the loudest thing on a board made mostly of cards.
 ///
 /// # `pixel` is one device pixel in the units this list is drawing in
 ///
@@ -3715,47 +4178,71 @@ fn push_open_badge(
     // the pointer sits still, which is the cost `docs/05-design-language.md` weighs against
     // every animation in this app. The state changes the instant the pointer crosses the
     // badge, which is what "I am on it" has to mean anyway.
+    // **Dark, not the accent.** It used to be `theme.accent`, which on a build where the user
+    // has chosen the blue put a heavy blue arrow in the top corner of every card — the loudest
+    // thing on a board made mostly of cards. Miro's is a thin near-black outline that reads as
+    // a control rather than as decoration. The muted ink is the same one the site name uses,
+    // so the two pieces of card chrome agree.
     let (plate, ink) =
-        if hovered { (theme.accent, theme.surface) } else { (theme.surface, theme.accent) };
-    // The plate. Round rather than rounded-square: it has to sit on a photograph without
-    // reading as a second card corner, and a circle is the one shape that never lines up
-    // with the picture's own edges.
+        if hovered { (theme.accent, theme.surface) } else { (theme.surface, theme.text_muted) };
+    // The plate. **A rounded square**, matching Miro's. It was a circle, on the reasoning that
+    // a disc never lines up with the picture's own edges — true, and it made the badge read as
+    // a bubble stuck on the card rather than as a button belonging to it. The radius is small
+    // enough that the shape is unambiguous and large enough not to echo the card's own corner.
     list.push_quad(
         QuadInstance::solid(at, extent, plate)
-            .with_corner_radius(side * 0.5)
+            .with_corner_radius(side * BADGE_RADIUS)
             .with_border(if hovered { theme.accent } else { theme.border }, 1.0)
             .with_rotation(rotation)
             .with_opacity(opacity),
     );
 
+    // Half the mark's extent, so the unit coordinates below run -1..1 about the centre.
     #[expect(clippy::cast_possible_truncation, reason = "a glyph is screen-scale")]
-    let reach = (side as f64 * BADGE_GLYPH * 0.5) as f32;
-    // At least one device pixel: below that the arrow stops being drawn at all rather than
+    let half = (side as f64 * BADGE_GLYPH * 0.5) as f32;
+    // At least one device pixel: below that the mark stops being drawn at all rather than
     // being drawn faintly, and a badge with no glyph looks like a rendering fault.
-    let weight = (side * 0.10).max(pixel);
+    let weight = (side * BADGE_WEIGHT).max(pixel);
     let centre = [at[0] + extent[0] * 0.5, at[1] + extent[1] * 0.5];
-    let tip = [centre[0] + reach, centre[1] - reach];
-    let bar = |origin: [f32; 2], size: [f32; 2], spin: f32| {
-        QuadInstance::solid(origin, size, ink)
+
+    // One stroked segment between two points of the unit box, as a rotated quad. The list has
+    // no path primitive — everything here is a quad — which is also why the mark is geometry
+    // rather than a character: U+2197 and U+29C9 are outside every face bundled with this
+    // build, so a card asked to shape one draws tofu (`CLAUDE.md` trap 10).
+    let mut seg = |a: (f32, f32), b: (f32, f32)| {
+        let (ax, ay) = (centre[0] + a.0 * half, centre[1] + a.1 * half);
+        let (bx, by) = (centre[0] + b.0 * half, centre[1] + b.1 * half);
+        let (dx, dy) = (bx - ax, by - ay);
+        // Plus one weight so the round caps land *on* the ends rather than short of them,
+        // which is what closes the corners of the box below without mitring anything.
+        let length = dx.hypot(dy) + weight;
+        list.push_quad(
+            QuadInstance::solid(
+                [(ax + bx) * 0.5 - length * 0.5, (ay + by) * 0.5 - weight * 0.5],
+                [length, weight],
+                ink,
+            )
             .with_corner_radius(weight * 0.5)
-            .with_rotation(rotation + spin)
-            .with_opacity(opacity)
+            .with_rotation(rotation + dy.atan2(dx))
+            .with_opacity(opacity),
+        );
     };
 
-    // The shaft, corner to corner. `hypot` because it spans both axes, plus one weight so
-    // the round caps land on the ends rather than short of them.
-    let shaft = (reach * 2.0).hypot(reach * 2.0) + weight;
-    list.push_quad(bar(
-        [centre[0] - shaft * 0.5, centre[1] - weight * 0.5],
-        [shaft, weight],
-        // Up and to the right. Screen y runs down, so this is negative.
-        -std::f32::consts::FRAC_PI_4,
-    ));
-    // The two barbs, from the tip. Each overlaps the tip by half a weight so the corner is
-    // filled rather than notched.
-    let barb = reach * 1.15 + weight * 0.5;
-    list.push_quad(bar([tip[0] - barb + weight * 0.5, tip[1] - weight * 0.5], [barb, weight], 0.0));
-    list.push_quad(bar([tip[0] - weight * 0.5, tip[1] - weight * 0.5], [weight, barb], 0.0));
+    // Miro's mark, which is the standard "open in a new place" one: a box with its top-right
+    // corner missing and an arrow leaving through the gap. Coordinates are Lucide's
+    // `square-arrow-out-up-right` mapped from its 24-unit box onto -1..1, y down.
+    //
+    // The box, anticlockwise from the break in its right-hand side.
+    seg((0.75, 0.08), (0.75, 0.75));
+    seg((0.75, 0.75), (-0.75, 0.75));
+    seg((-0.75, 0.75), (-0.75, -0.75));
+    seg((-0.75, -0.75), (-0.08, -0.75));
+    // The arrow through the gap, and its two barbs. They run straight left and straight down
+    // from the tip — an arrowhead on a 45° shaft is axis-aligned, which is why this needs no
+    // trigonometry beyond what `seg` already does.
+    seg((-0.17, 0.17), (0.75, -0.75));
+    seg((0.25, -0.75), (0.75, -0.75));
+    seg((0.75, -0.75), (0.75, -0.25));
 }
 
 /// The sub-rectangle of a texture to sample so it **fills** a box of `into` without being
@@ -3923,11 +4410,28 @@ const FAVICON_SCALE: f64 = 1.15;
 /// recognisable. At the reference card's 13-unit type this is ~23 units square.
 const BADGE_SCALE: f64 = 1.75;
 
-/// How much of the badge the arrow occupies, as a fraction of its edge.
+/// How much of the badge the mark occupies, as a fraction of its edge.
 ///
-/// The rest is the plate's margin. Small: an arrow that reaches the plate's rim reads as a
-/// box with a line in it rather than as a button with a glyph on it.
-const BADGE_GLYPH: f64 = 0.34;
+/// The rest is the plate's margin. Raised from 0.34 with the mark: a bare arrow reads at a
+/// smaller size than an outlined box does, because the box's own strokes are what you see
+/// first. Still short of the rim — a glyph that reaches it reads as a box with a line in it
+/// rather than as a button with something on it.
+const BADGE_GLYPH: f64 = 0.46;
+
+/// The badge plate's corner radius, as a fraction of its edge.
+///
+/// Miro's is a rounded square. This was `0.5` — a circle — and the reasoning for it was sound
+/// (a disc never lines up with the picture's own edges) and produced something that read as a
+/// bubble stuck onto the card rather than a control belonging to it.
+const BADGE_RADIUS: f32 = 0.22;
+
+/// The mark's stroke weight, as a fraction of the badge's edge.
+///
+/// Thin, because it is a line drawing rather than a filled arrow — the same intent as
+/// `vellum_ui::widgets::ICON_STROKE`'s 1.5 px, expressed as a fraction because this one is
+/// drawn on the board and has to hold up at any zoom. Floored at one device pixel by the
+/// caller, which is not the same as one *world* unit — see `push_open_badge`.
+const BADGE_WEIGHT: f32 = 0.075;
 
 /// The title's size, as a multiple of the card's base size.
 ///
@@ -3941,8 +4445,48 @@ const BADGE_GLYPH: f64 = 0.34;
 /// them that shrank, which is what the reference shows.
 const TITLE_SCALE: f64 = 1.0;
 
-/// How many lines of title a card will give up before the blurb gets what is left.
+/// The site name's size, as a multiple of the card's base size.
+///
+/// **Below the base**, so the three voices of a card are three sizes rather than two. It used
+/// to be the base itself — the same size as the title and *larger* than the blurb, which is
+/// backwards from every card this is modelled on, and is most of what the user was describing
+/// as *"it kind of just looks a little bit off"* with a Miro card open beside it. Measured off
+/// that reference, Miro runs roughly 0.65 : 1.0 : 0.76 for name : title : blurb.
+///
+/// The title deliberately did **not** move to reach that ratio: `TITLE_SCALE` was raised once
+/// and the user asked for it back down, so the distance is opened from below instead. That also
+/// leaves the title's greek threshold where they asked for it.
+const PROVIDER_SCALE: f64 = 0.80;
+
+/// The most lines of title a card will give up before the blurb gets what is left.
+///
+/// A **ceiling**, not a reservation — see `title_lines_for`. It used to be taken flat, so a
+/// one-line title left two empty lines between itself and the blurb while a three-line title
+/// got none, and the user photographed exactly that band under *"Crush 80 Reboot Pro"*.
 const TITLE_LINES: f64 = 3.0;
+
+/// The most lines of blurb a card will draw.
+///
+/// *"less decription more white space"*. Unbounded before this, so a tall card gave the blurb
+/// six or more lines and the card read as a paragraph with a heading. Three is what Miro's own
+/// card shows before it ellipsises, and the lines this gives up are what pay for the gaps
+/// below — the card's own box does not change.
+const BLURB_LINES: f64 = 3.0;
+
+/// Air under the site name, as a fraction of the card's padding.
+///
+/// Zero before this: **every gap inside a card came from `CARD_LINE_HEIGHT` alone**, so the
+/// three blocks were as close to each other as two lines of one paragraph are, and no amount
+/// of size or colour difference could make them read as three things. Miro's card separates
+/// them visibly. This is the *"more white space"* half of the same feedback.
+const PROVIDER_GAP: f64 = 0.5;
+
+/// Air under the title, as a fraction of the card's padding.
+///
+/// Larger than `PROVIDER_GAP`: the name and the title belong together — the name is a label
+/// *for* the title — and the blurb is the separate thing. A uniform gap makes the card read as
+/// three equal strangers rather than as a heading and its description.
+const TITLE_GAP: f64 = 0.75;
 
 /// …and how many a **video** card gets, where the picture is the point.
 ///
@@ -3974,6 +4518,53 @@ const BLURB_BOTTOM_AIR: f64 = 0.5;
 /// reads as one block of text at a glance, which is the state the user was describing.
 const BLURB_SCALE: f64 = 0.86;
 
+/// How many characters of a card's text fit on one line of a box `width` wide at `size`.
+///
+/// **The one estimate.** Both the character budget a card's text is clipped to and the number
+/// of lines its title box reserves are answers to "how long is this run", and two copies of the
+/// arithmetic would be two answers — a layout that reserves two lines for a title the clip cut
+/// to one is the empty band this pair exists to prevent.
+///
+/// Advance-blind on purpose: half the font size is a proportional face's mean advance to within
+/// a few percent, and measuring properly needs a shaping pass, which is the very thing this
+/// decides the input to. The floor of 8 keeps a degenerate box from answering zero.
+///
+/// **Discounted by `WRAP_EFFICIENCY`, and that is not a fudge factor — it is the difference
+/// between how many characters *fit* on a line and how many a *word wrap* puts there.** Text
+/// breaks at spaces, so every line but the last gives up part of a word; the raw advance
+/// estimate is the count for a string with no spaces in it, which is the one case that never
+/// happens in a title.
+///
+/// Both readers want to be wrong in the same direction, which is what lets one number serve
+/// them: under-counting makes the clip budget *shorter* (less overflow) and the line
+/// reservation *taller* (no collision). Over-counting breaks both.
+pub(crate) fn chars_per_line(width: f64, size: f64) -> usize {
+    ((width / (size * 0.5) * WRAP_EFFICIENCY).floor() as usize).max(8)
+}
+
+/// How much of a line's raw character capacity survives being word-wrapped.
+///
+/// **Measured against the failure, not guessed.** At 0.5 em with no discount, the reference
+/// card's title — *"rust-lang/rust: Empowering everyone to build reliable software"*, 62
+/// characters in a 238-unit box at 15 units — estimated 31 per line and so **two** lines. It
+/// shapes to three: the wrap puts 26 on each of the first two. The blurb was then positioned
+/// two lines down and drew straight through the title's third line, which is a worse fault
+/// than the empty band the estimate replaced, and the `--demo links` screenshot is what found
+/// it — no assertion about box geometry could, because the boxes were exactly as asked for.
+///
+/// 0.85 turns that 31 into 26, which is what the text actually does.
+const WRAP_EFFICIENCY: f64 = 0.85;
+
+/// The lines `chars` characters need in a box `width` wide at `size`.
+///
+/// ⚠ **Bolding widens advances by 3-5%**, so a title within a character or two of a line
+/// boundary can shape one line longer than this predicts. `whole_lines` clamps the box to the
+/// card either way, so the failure mode is a tighter gap under the title rather than text
+/// leaving the card — which is the direction to be wrong in.
+pub(crate) fn estimated_lines(chars: usize, width: f64, size: f64) -> f64 {
+    chars.max(1).div_ceil(chars_per_line(width, size)) as f64
+}
+
 #[expect(
     clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
@@ -3989,6 +4580,7 @@ pub(crate) fn card_layout(
     has_favicon: bool,
     has_link: bool,
     is_video: bool,
+    title_chars: usize,
 ) -> CardLayout {
     let pad = width * CARD_PADDING;
     let line = font_size * CARD_LINE_HEIGHT;
@@ -4074,7 +4666,14 @@ pub(crate) fn card_layout(
             // and below the last line. Shorting it by half a pad made the title box come out
             // at *zero* — the caption did not fit, so `whole_lines` correctly offered no line
             // at all and the card drew a poster and a provider row with no title under it.
-            let caption = line + title_line_for(TITLE_SCALE) * VIDEO_TITLE_LINES + pad;
+            // The gap under the provider row is part of the caption too. Leaving it out was
+            // worth exactly one failing test: `y` moved down by `pad * PROVIDER_GAP` and the
+            // reservation did not, so `body_h` came up short of a single line and
+            // `whole_lines` correctly answered **zero** — a poster with a site name and no
+            // title under it. Precisely the failure the comment above already describes,
+            // reached by adding air rather than by shorting a pad.
+            let caption =
+                line + pad * PROVIDER_GAP + title_line_for(TITLE_SCALE) * VIDEO_TITLE_LINES + pad;
             (height - caption - pad * 2.0).max(1.0)
         } else {
             // Per mode: a `Large` card is mostly picture, a `Card` is about half. See
@@ -4105,7 +4704,7 @@ pub(crate) fn card_layout(
     let collides = |top: f64| badge.is_some_and(|(bx, by, _, bh)| top < by + bh && pad < bx);
     let text_right = if collides(y) { pad + badge_side + pad * 0.5 } else { pad };
     let provider = (text_left, y, (width - text_left - text_right).max(1.0), line);
-    y += line;
+    y += line + pad * PROVIDER_GAP;
 
     // **The body has to yield too**, and this is the half the first version missed. The
     // badge is `BADGE_SCALE` (1.75) line-heights tall against a provider row of one, so on
@@ -4158,18 +4757,43 @@ pub(crate) fn card_layout(
         (((available / line_height) + SNAP).floor() * line_height).max(0.0)
     };
 
-    // Two lines on a poster card, three otherwise — and on a poster card there is no blurb
-    // beneath them, so the picture above got the room instead.
-    let lines = if poster { VIDEO_TITLE_LINES } else { TITLE_LINES };
+    // **The lines the title needs, not the lines it may have.** `TITLE_LINES` was taken flat,
+    // so the box was three lines tall whatever was in it: a one-line title left two empty lines
+    // of card between itself and the blurb, and a three-line title left none. The user
+    // photographed the first case — a band of white under *"Crush 80 Reboot Pro"* — while
+    // asking for *more* white space, which is the tell that this gap was never read as spacing.
+    // It was read as a broken card, because air a reader cannot account for always is.
+    //
+    // Estimated rather than shaped, for the reason `chars_per_line` gives. A poster card still
+    // takes its fixed one line: there the reservation is the *point*, since the picture below
+    // is sized from whatever the caption does not use.
+    let lines = if poster {
+        VIDEO_TITLE_LINES
+    } else {
+        estimated_lines(title_chars, body_w, title_line / CARD_LINE_HEIGHT).clamp(1.0, TITLE_LINES)
+    };
     let title_h = whole_lines(body_h.min(title_line * lines), title_line);
     let blurb_line = font_size * BLURB_SCALE * CARD_LINE_HEIGHT;
+    // The blurb hangs off the title rather than touching it — see `TITLE_GAP`. Taken out of the
+    // blurb's room rather than added to the card, so the item's own box is untouched: *"without
+    // changing the over all size"*.
+    let title_gap = if poster { 0.0 } else { pad * TITLE_GAP };
     // …and the blurb keeps a line's worth of air beneath it. The bottom `pad` alone is derived
     // from the card's *width*, so on a tall narrow card it is a hairline — and text that ends
     // flush against an edge reads as clipped even when every glyph is inside the box.
     // A poster card has no blurb at all — a zero-height box is what `block` reads as "draw
     // nothing", so `card_text`'s blurb arm is never asked for one.
-    let blurb_room =
-        if poster { 0.0 } else { (body_h - title_h - blurb_line * BLURB_BOTTOM_AIR).max(0.0) };
+    //
+    // …and it is capped at `BLURB_LINES` rather than taking everything left over. *"less
+    // decription"*: a tall card used to give it six or more lines, which is a paragraph with a
+    // heading rather than a card. The lines it gives up are what pay for the two gaps above.
+    let blurb_room = if poster {
+        0.0
+    } else {
+        (body_h - title_h - title_gap - blurb_line * BLURB_BOTTOM_AIR)
+            .max(0.0)
+            .min(blurb_line * BLURB_LINES)
+    };
     // Centred on the **poster**, not on the card: Miro puts it over the picture, and a ▶
     // floating in a block of text is a button aimed at nothing. Sized from the band rather
     // than from the type, because it is a target on an image and has to stay proportionate to
@@ -4190,7 +4814,7 @@ pub(crate) fn card_layout(
         favicon,
         provider,
         title: (pad, y, body_w, title_h),
-        blurb: (pad, y + title_h, body_w, whole_lines(blurb_room, blurb_line)),
+        blurb: (pad, y + title_h + title_gap, body_w, whole_lines(blurb_room, blurb_line)),
         body: (pad, y, body_w, body_h),
         badge,
         play,
@@ -4347,7 +4971,16 @@ pub(crate) fn card_mode(kind: &ItemKind) -> CardMode {
 /// Built here rather than stored on the item because it is a *presentation* of
 /// several document fields — `vellum_doc::ItemKind::LinkPreview` deliberately keeps
 /// them apart, and an absent description is a different thing from an empty one.
-fn card_text(kind: &ItemKind, slot: u16, line_budget: usize) -> vellum_text::StyledText {
+/// A card's own text fields, decoded.
+///
+/// **One source, because two readers now need it.** `card_text` builds the spans and
+/// `drawn_title_chars` counts the title's length so `card_layout` can reserve the right number
+/// of lines for it — and a layout that reserves for a different string than the painter draws
+/// is exactly the empty band the reservation was changed to remove. Same rule as
+/// `draw::kanban_runs`: the press path calls the layout rather than reproducing it.
+fn card_fields(
+    kind: &ItemKind,
+) -> (Option<String>, Option<String>, Option<String>, Option<String>, CardMode) {
     let (title, url, description, provider, mode) = match kind {
         ItemKind::LinkPreview { title, url, description, provider, mode, .. } => {
             (title.clone(), url.clone(), description.clone(), provider.clone(), *mode)
@@ -4377,8 +5010,30 @@ fn card_text(kind: &ItemKind, slot: u16, line_budget: usize) -> vellum_text::Sty
     // fix cannot corrupt one. It is idempotent — a decoded string holds no entity for a second
     // pass to find — and it is cheap: three short strings on the cards that are on screen.
     let decode = |value: Option<String>| value.map(|v| vellum_link::decode_entities(&v));
-    let (title, url, description, provider) =
-        (decode(title), decode(url), decode(description), decode(provider));
+    (decode(title), decode(url), decode(description), decode(provider), mode)
+}
+
+/// How many characters the title block will actually **draw**, which is what `card_layout`
+/// reserves lines for.
+///
+/// Not `title.chars().count()`. The painter decodes entities and then strips the site affix
+/// before it shapes, so `&#39;` is five stored characters and one drawn one, and
+/// *"Amazon.com : Superbat 3G/6G SDI Cable"* loses its first eleven. Counting the stored string
+/// over-reserves — which is the band under a one-line title, arriving by a second route.
+///
+/// A card with no title falls back to its URL, as `card_text` does; one with neither draws
+/// nothing and needs no line at all.
+pub(crate) fn drawn_title_chars(kind: &ItemKind) -> usize {
+    let (title, url, _, provider, _) = card_fields(kind);
+    match (&title, &url) {
+        (Some(title), _) => strip_site_affix(title, provider.as_deref()).chars().count(),
+        (None, Some(url)) => url.chars().count(),
+        (None, None) => 0,
+    }
+}
+
+fn card_text(kind: &ItemKind, slot: u16, line_budget: usize) -> vellum_text::StyledText {
+    let (title, url, description, provider, mode) = card_fields(kind);
 
     let mut spans = Vec::new();
     match slot {
@@ -4435,16 +5090,26 @@ fn card_text(kind: &ItemKind, slot: u16, line_budget: usize) -> vellum_text::Sty
                 // third block, so that the two can be set at different sizes — `room` is kept
                 // because the fallback below still shares this block's budget.
                 let _ = room(&spans, line_budget);
+                // **Bold, and it never was.** Two doc comments in this file have described "a
+                // large bold title" since the third block was added, and both arms below wrote
+                // `DocSpan::plain` — so the card's hierarchy rested on colour alone, and with
+                // the site name set at the same size as the title the whole card read as one
+                // paragraph. That is what the user was looking at when they said Velm "looks a
+                // little bit off" with Miro open beside it.
+                //
+                // Real weight rather than a different face: Inter Bold is bundled and
+                // `set_sans_serif_family` points the alias at it, so `family_has_bold` no longer
+                // drops the request and silently leaves the family (trap 10).
                 match (&title, &url) {
                     (Some(title), _) => {
                         let trimmed = strip_site_affix(title, provider.as_deref());
                         let clipped = ellipsise(trimmed, line_budget);
-                        spans.push(DocSpan::plain(clipped));
+                        spans.push(DocSpan::new(clipped, vellum_doc::SpanStyle::bold()));
                     }
                     // No title: the URL is the only name it has.
                     (None, Some(url)) => {
                         let clipped = ellipsise(url, line_budget);
-                        spans.push(DocSpan::plain(clipped));
+                        spans.push(DocSpan::new(clipped, vellum_doc::SpanStyle::bold()));
                     }
                     (None, None) => {}
                 }
@@ -4658,7 +5323,7 @@ const MAX_ENTRIES: usize = 40;
 /// Feature 14 is *"here are three UI directions I built"*. Four is one more than that; past it
 /// each card is narrower than its own title and the row stops being scannable. The rest are
 /// counted in a line underneath rather than silently dropped.
-const MAX_OPTION_CARDS: usize = 4;
+const MAX_OPTION_CARDS: usize = vellum_agent::transcript::MAX_CHOICES;
 
 /// How much of an option card is picture, when any of the choices carries one.
 const OPTION_IMAGE_FRACTION: f64 = 0.56;
@@ -4765,9 +5430,20 @@ struct NodeImage {
 pub(crate) struct OptionCard {
     /// The card's box in the item's own space, already scaled.
     pub(crate) rect: NodeRect,
-    /// Which `TranscriptEvent::Options` it belongs to — its index in `AgentView::events`.
-    #[allow(dead_code)]
-    pub(crate) event: usize,
+    /// **Which question this card answers**, by the prompt that asked it.
+    ///
+    /// ⚠ This was the card's index into `AgentView::events` and was `#[allow(dead_code)]` —
+    /// dead because that index cannot cross the seam it needed to: the view is the
+    /// mode-filtered, `VIEW_EVENTS`-bounded list, and `choose_option` searches the node's
+    /// whole ring, which is numbered differently. So a click carried only its choice *id*,
+    /// and with two unanswered option sets on one node — an agent that asked twice, which is
+    /// exactly what a long run does — a shared id like `yes` answered whichever the search
+    /// reached first rather than the card that was pressed.
+    ///
+    /// The prompt is an identity that survives the seam because it is *in* the event on both
+    /// sides. Not a generated id, because these events are also read back off disk, where
+    /// nothing would have assigned one.
+    pub(crate) prompt: String,
     /// `Choice::id`, sent back verbatim when the user picks this one.
     pub(crate) choice: String,
     /// Already chosen, so the row records an answer rather than offering one again.
@@ -5108,7 +5784,11 @@ impl Column {
 /// message is a railed block"* is a rule stated once rather than six functions that happen to
 /// agree about padding.
 fn transcript_entry(
-    index: usize,
+    // The event's position in the view, which nothing reads now that an option card carries
+    // its question instead of an index into a list `choose_option` does not share. Kept as a
+    // parameter rather than removed from the signature: it is the natural place for any
+    // future per-entry identity, and the caller already has it.
+    _index: usize,
     event: &TranscriptEvent,
     x: f64,
     width: f64,
@@ -5353,7 +6033,7 @@ fn transcript_entry(
                     }
                     column.paint.options.push(OptionCard {
                         rect,
-                        event: index,
+                        prompt: prompt.clone(),
                         choice: choice.id.clone(),
                         chosen: picked,
                     });
@@ -5384,6 +6064,27 @@ fn transcript_entry(
 /// the thing being watched, and it would be the first casualty. What *is* cut is said so, on
 /// screen — the same rule `AgentView::truncated` exists for one layer up.
 ///
+/// What a node says while it is listening, or while its audio is with a transcriber.
+///
+/// The elapsed seconds are shown rather than a level meter: a meter needs the samples, which
+/// are on the capture thread and deliberately never cross to the painter, and *how long have I
+/// been talking* is the thing that actually matters against
+/// [`vellum_agent::voice::MAX_UTTERANCE_SECONDS`].
+///
+/// The transcribing line **names the backend**, which is not decoration: it is the one moment
+/// the user can tell whether their voice stayed on the machine or went to somebody's API, and
+/// leaving them to guess is the wrong default for a feature that opens a microphone.
+fn voice_line(status: &crate::voice::VoiceStatus) -> String {
+    match status {
+        crate::voice::VoiceStatus::Listening { held_ms } => {
+            format!("Listening… {}s — let go of ⌥D to put it in the prompt", held_ms / 1000)
+        }
+        crate::voice::VoiceStatus::Transcribing { backend } => {
+            format!("Transcribing with {backend}…")
+        }
+    }
+}
+
 /// Pure, and free rather than a method, for `kanban_runs`' reason: the press path calls it too.
 pub(crate) fn agent_paint(view: &AgentView, laid: &AgentLayout, font: f64) -> NodePaint {
     let mut paint = NodePaint::default();
@@ -5403,12 +6104,28 @@ pub(crate) fn agent_paint(view: &AgentView, laid: &AgentLayout, font: f64) -> No
         let size = font * SUBTITLE_SCALE;
         let line = size * NODE_LINE_HEIGHT;
         let top = laid.role.y + laid.role.height - line;
-        let text = if view.detail.trim().is_empty() { &view.subtitle } else { &view.detail };
+        // **Voice beats both**, for the same reason `detail` beats `subtitle` one step down:
+        // there is room for one line and the live one is the one worth having. *Is it hearing
+        // me* is the only question a person holding a key down has, and until this the answer
+        // was drawn nowhere at all — see `AgentView::voice`.
+        let spoken = view.voice.as_ref().map(voice_line);
+        let text = match spoken.as_deref() {
+            Some(spoken) => spoken,
+            None if view.detail.trim().is_empty() => &view.subtitle,
+            None => &view.detail,
+        };
+        // Accent while the microphone is open, so a listening node is legible across the
+        // board rather than reading as one more grey subtitle among a dozen.
+        let tone = match (&view.voice, view.status) {
+            (Some(_), _) => Tone::Accent,
+            (None, Status::Error) => Tone::Failed,
+            (None, _) => Tone::Muted,
+        };
         paint.text(
             NodeRect::new(laid.role.x, top, laid.role.width, line),
             text,
             size,
-            if matches!(view.status, Status::Error) { Tone::Failed } else { Tone::Muted },
+            tone,
             Align::Left,
         );
     }
@@ -5617,6 +6334,19 @@ pub(crate) fn tree_paint(
     view: Option<&TreeView>,
     laid: &crate::filetree::TreeLayout,
     font: f64,
+    // How many rows are scrolled off the top.
+    //
+    // ⚠ **The list used to draw the first `visible_rows()` and stop**, so on any tree with
+    // more entries than fitted, everything below was unreachable: no gesture existed to
+    // reach it, and the node's own *"n more"* line named a number the user could do nothing
+    // about. Held app-side (`AgentRuntime::tree_scroll`) rather than in the document: a
+    // scroll position is not board content, and putting one in the CRDT would add an undo
+    // step per wheel notch.
+    //
+    // The press path passes the **same** offset, and resolves clicks against the rectangles
+    // this function records rather than re-deriving them — so a scrolled row is pressed
+    // where it is drawn, by construction.
+    scroll: usize,
 ) -> NodePaint {
     let mut paint = NodePaint::default();
     if laid.too_small {
@@ -5654,11 +6384,15 @@ pub(crate) fn tree_paint(
     };
 
     let fits = laid.visible_rows();
+    // Clamped here rather than where it is stored: the row count changes as directories open
+    // and close, and a stale offset must degrade to "the last screenful" instead of an empty
+    // list. `saturating_sub` gives 0 for a tree that now fits entirely.
+    let scroll = scroll.min(view.rows.len().saturating_sub(fits));
     // One row is kept back for the count of what did not fit, so the node's last row is never a
     // file the reader believes is the last file.
-    let more = view.rows.len() > fits || view.truncated;
+    let more = view.rows.len() > scroll + fits || view.truncated;
     let shown = if more { fits.saturating_sub(1) } else { fits };
-    for (index, row) in view.rows.iter().take(shown).enumerate() {
+    for (index, row) in view.rows.iter().skip(scroll).take(shown).enumerate() {
         let rect = crate::filetree::row_rect(laid.list, index, 0);
         let twisty = row
             .entry
@@ -5798,6 +6532,39 @@ fn status_colour(status: Status, theme: &Theme) -> Rgba {
         Status::WaitingForPermission => STATUS_NEEDS_YOU,
         Status::Error => STATUS_FAILED,
     }
+}
+
+/// How much of its own paper a node lays over a background picture.
+///
+/// High on purpose. The picture is decoration and the transcript is the point, so this is
+/// tuned so that ink on the scrim clears its contrast target over **any** image, including a
+/// white one and a black one. Turning it down is how you get a personalised node you cannot
+/// read; the lever for "I want to see more of my picture" is the node's own opacity.
+const BACKGROUND_SCRIM: f32 = 0.86;
+
+/// The chat theme an agent node draws in, or `None` for anything that is not one.
+///
+/// The **resolved** theme — the node's own choice, or the app-wide default when it has not
+/// made one — through `crate::agent::chat_theme`, which is the single place that fallback is
+/// spelled. Only `ItemKind::Agent`: a note, a file tree and a browser are not transcripts,
+/// and dressing them in a chat theme would make "ChatGPT" a statement about a directory
+/// listing.
+fn chat_theme_of(kind: &ItemKind, ctx: &DrawContext<'_>) -> Option<vellum_agent::ChatTheme> {
+    let ItemKind::Agent { model, .. } = kind else { return None };
+    Some(crate::agent::chat_theme(&crate::agent::decode(model), ctx.default_chat_theme))
+}
+
+fn chat_opacity_of(kind: &ItemKind) -> f32 {
+    let ItemKind::Agent { model, .. } = kind else { return 1.0 };
+    crate::agent::chat_opacity(&crate::agent::decode(model))
+}
+
+fn chat_background_of(kind: &ItemKind) -> Option<&str> {
+    let ItemKind::Agent { model, .. } = kind else { return None };
+    // Borrowed out of the token's own JSON rather than decoded, which would allocate an
+    // `AgentModel` per node per frame for a string that is usually absent. The key is
+    // `AgentModel::chat_background`'s serde name; a test pins the two together.
+    crate::agent::background_hash(model)
 }
 
 /// What a [`Tone`] means against a palette.
@@ -6240,6 +7007,15 @@ fn node_signature(kind: &ItemKind, view: Option<&AgentView>) -> u64 {
         // empty buffer, or leaving it — which alters the run without altering a byte of text,
         // and would otherwise draw a placeholder where the caret is.
         hash = fnv1a(&[u8::from(view.caret.is_some())], hash);
+        // ⚠ **And the voice line, which changes once a second while nothing else does.** The
+        // elapsed count is the only thing on a listening node that moves, so a signature blind
+        // to it leaves the node reading *"Listening… 0s"* for the whole of a press on any path
+        // that does not bump the frame counter. Hashed as the drawn string rather than as a
+        // discriminant, because that string is what is on screen — the same reason `detail` is
+        // hashed above and not the status it was derived from.
+        if let Some(spoken) = view.voice.as_ref().map(voice_line) {
+            hash = fnv1a(spoken.as_bytes(), hash);
+        }
         hash = fnv1a(&view.events.len().to_le_bytes(), hash);
         // The newest entry is the one that streams, and it is the one whose *identity* the rest
         // of this signature cannot see: a tail that gained an event and lost one off the front
@@ -6273,6 +7049,12 @@ fn build_node_paint(
                 None => {
                     fallback = AgentView {
                         subtitle: crate::agent::subtitle(&crate::agent::decode(model)),
+                        // The same resolution the toggle above makes, so a node with no
+                        // session yet paints its transcript area and its badge in one mode.
+                        mode: crate::agent::display_mode(
+                            &crate::agent::decode(model),
+                            ctx.default_display,
+                        ),
                         ..AgentView::default()
                     };
                     &fallback
@@ -6291,6 +7073,7 @@ fn build_node_paint(
             tree_view(ctx, id),
             &crate::filetree::layout(width, height),
             font,
+            ctx.agents.tree_scroll(id),
         ),
         ItemKind::Browser { model } => {
             let browser = crate::browser::decode(model);
@@ -6657,7 +7440,12 @@ fn push_caret(
         return;
     }
     let caret = layout.caret(cursor.text, cursor.cursor);
-    let zoom = ctx.camera.zoom() as f32;
+    // **The block's own scale, not the camera's.** They differ for a frame title,
+    // which is caret-editable and refuses to shrink past legibility — so below the
+    // floor the glyphs draw magnified and a caret measured off the camera would sit
+    // at the unmagnified position, which is the paint/press disagreement this file
+    // hunts. `Block::scale` is the camera's zoom for every other kind.
+    let zoom = block.scale;
     let origin = [
         block.origin.x as f32 + caret.x * zoom,
         block.origin.y as f32 + caret.top * zoom,
@@ -6681,7 +7469,12 @@ fn push_selection_boxes(
         return;
     }
     let range = cursor.cursor.min(cursor.anchor)..cursor.cursor.max(cursor.anchor);
-    let zoom = ctx.camera.zoom() as f32;
+    // **The block's own scale, not the camera's.** They differ for a frame title,
+    // which is caret-editable and refuses to shrink past legibility — so below the
+    // floor the glyphs draw magnified and a caret measured off the camera would sit
+    // at the unmagnified position, which is the paint/press disagreement this file
+    // hunts. `Block::scale` is the camera's zoom for every other kind.
+    let zoom = block.scale;
     for box_ in layout.selection_boxes(cursor.text, range) {
         list.push_quad(QuadInstance::solid(
             [
@@ -7330,6 +8123,14 @@ mod tests {
     use vellum_doc::{Board, ItemKind, NewItem, Placement, StyledText};
     use vellum_scene::{ScreenSize, WorldRect};
 
+    /// A title long enough to want every line `TITLE_LINES` offers.
+    ///
+    /// The layout tests below predate the title reservation being derived from the title's
+    /// own length and are about other things — the badge, the image band, the play button —
+    /// so they pass this to keep the three-line reservation they were written against. A test
+    /// that is *about* the reservation passes its own count.
+    const LONG_TITLE: usize = 240;
+
     pub(super) fn projection_with(items: impl IntoIterator<Item = NewItem>) -> Projection {
         let mut board = Board::new();
         for item in items {
@@ -7386,6 +8187,10 @@ mod tests {
             theme: Theme::LIGHT,
             selection: &[],
             hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
             marquee: None,
             placing: None,
             guides: &[],
@@ -7395,7 +8200,7 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territory: None,
+            territories: Vec::new(),
             minimap: None,
         }
     }
@@ -7918,6 +8723,146 @@ mod tests {
         assert!(card_text(&kind, BlockKey::SECONDARY, usize::MAX).is_empty());
     }
 
+    /// A frame's name survives being zoomed out of — which is the entire job of a frame's name.
+    ///
+    /// *"also please dont make the titles of the frames small like this thank you"*, with the
+    /// same board photographed in both applications: Miro's "Education" and "Food" large and
+    /// legible over small frames, Velm's an illegible smear. The smear was literal — a frame
+    /// title greeks as `GreekLines::Single`, which is **one grey bar as wide as the whole
+    /// frame**, and at the default frame size that began below 18.5% zoom.
+    ///
+    /// The A/B is the low-zoom half: with the `draw_scale` floor removed this greeks. The
+    /// high-zoom half is not decoration — a clamp that stayed engaged would pin every frame
+    /// title to 13 px and stop it growing with its frame, which is the opposite complaint.
+    #[test]
+    fn a_frame_title_never_greeks_however_far_the_board_is_zoomed_out() {
+        let projection = projection_with([NewItem::new(
+            ItemKind::Frame {
+                title: StyledText::plain("Education"),
+                order: None,
+                speaker_notes: None,
+            },
+            // The default a frame is placed at, so the numbers here are the ones a user meets.
+            Placement::new(0.0, 0.0, 1600.0, 900.0),
+        )]);
+        let (&id, projected) = projection.iter().next().unwrap();
+        let mut painter = painter();
+
+        // 900 x 0.03 = 27 world units, so before the floor this was 27 x zoom device pixels:
+        // 2.7 at 10%, well under `MIN_DEVICE_FONT_SIZE`, and greeked.
+        for zoom in [0.04, 0.10, 0.18, 0.5] {
+            let camera = camera_at(zoom);
+            let painted =
+                painter.block(id, projected, BlockKey::SECONDARY, &context(&camera, &projection));
+            assert!(
+                matches!(painted, Some(Painted::Glyphs(_))),
+                "a frame title must be real glyphs at {}% zoom, not a bar: {painted:?}",
+                zoom * 100.0
+            );
+            let Some(Painted::Glyphs(block)) = painted else { unreachable!() };
+            let drawn = f64::from(block.font_size) * f64::from(block.scale);
+            assert!(
+                drawn >= FRAME_TITLE_MIN_DEVICE - 0.01,
+                "…and at least {FRAME_TITLE_MIN_DEVICE} device pixels: {drawn:.2} at {}%",
+                zoom * 100.0
+            );
+        }
+
+        // Zoomed *in*, the floor is inert and the world size takes over again — a frame's name
+        // still grows with its frame, which is what `FRAME_TITLE_FRACTION` is for.
+        let camera = camera_at(2.0);
+        let painted =
+            painter.block(id, projected, BlockKey::SECONDARY, &context(&camera, &projection));
+        let Some(Painted::Glyphs(block)) = painted else { panic!("glyphs at 200%") };
+        assert!(
+            (f64::from(block.scale) - 2.0).abs() < 1e-6,
+            "the clamp must not still be engaged at 200%: scale {}",
+            block.scale
+        );
+    }
+
+    /// The three blocks read as three voices, and the title hangs off the site name rather
+    /// than floating in the middle of the card.
+    ///
+    /// *"i am tryint ofigure out why my velm looks little bit off"*, with a Miro card open
+    /// beside a Velm one. Four faults in one picture, all measured off that pair:
+    ///
+    /// - the site name was the **base size** — identical to the title and *larger* than the
+    ///   blurb, so the card's biggest text was the thing on it that matters least;
+    /// - **nothing was bold**, though two doc comments in this file had claimed "a large bold
+    ///   title" since the third block was added;
+    /// - the blurb took every line left over, six or more on a tall card;
+    /// - and `TITLE_LINES` was reserved flat, so a one-line title left **two empty lines**
+    ///   before the blurb and a three-line title left none.
+    ///
+    /// The last is the one that reads as a bug rather than as a style: air a reader cannot
+    /// account for always does.
+    #[test]
+    fn a_cards_three_voices_are_three_sizes_and_the_blurb_hangs_off_the_title() {
+        let (w, h, font) = (250.0, 250.0, card_font_size(250.0));
+
+        // Sizes, in the order `Painter::block` resolves them. Strictly ordered, and the
+        // *provider* is the one that moved — the title deliberately did not, because it was
+        // raised once and the user asked for it back down.
+        let (name, title, blurb) =
+            (font * PROVIDER_SCALE, font * TITLE_SCALE, font * BLURB_SCALE);
+        assert!(
+            name < blurb && blurb < title,
+            "name {name:.2} < blurb {blurb:.2} < title {title:.2}"
+        );
+
+        // A one-line title. The blurb must start within a line and the gap of it — not two
+        // lines below, which is what the flat reservation gave and what was photographed.
+        let short = "Crush 80 Reboot Pro";
+        let laid = card_layout(w, h, font, CardMode::Card, true, true, true, false, short.len());
+        let (_, ty, _, th) = laid.title;
+        let (_, by, _, bh) = laid.blurb;
+        let line = font * TITLE_SCALE * CARD_LINE_HEIGHT;
+        assert!(
+            (th - line).abs() < 0.01,
+            "a one-line title reserves one line: {th:.2} against {line:.2}"
+        );
+        // The A/B: on the flat `TITLE_LINES` reservation this was `ty + 3 * line`.
+        assert!(
+            by - ty < line * 2.0,
+            "the blurb hangs off the title, not two empty lines below it: \
+             title at {ty:.1}, blurb at {by:.1}, line {line:.2}"
+        );
+
+        // …and the blurb is capped rather than taking the rest of the card. *"less
+        // decription more white space"*.
+        let blurb_line = font * BLURB_SCALE * CARD_LINE_HEIGHT;
+        assert!(
+            bh <= blurb_line * BLURB_LINES + 0.01,
+            "the blurb stops at {BLURB_LINES} lines: {bh:.2} against {:.2}",
+            blurb_line * BLURB_LINES
+        );
+
+        // A long title still gets every line it is allowed, so shortening the reservation did
+        // not turn into truncating the thing the card is named after.
+        let long = "a".repeat(400);
+        let tall = card_layout(w, h, font, CardMode::Card, true, true, true, false, long.len());
+        assert!(
+            (tall.title.3 - line * TITLE_LINES).abs() < 0.01,
+            "a long title still gets {TITLE_LINES} lines: {:.2}",
+            tall.title.3
+        );
+
+        // And the title is drawn **bold**. Asserted on the span rather than on a measured
+        // width, because a width assertion cannot tell "heavier" from "different" — the trap
+        // that let every bold span on the board render in Courier for a whole round.
+        let kind = ItemKind::link_preview(
+            Some(short.into()),
+            Some("https://example.com/k".into()),
+            None,
+        );
+        let spans = card_text(&kind, BlockKey::PRIMARY, usize::MAX);
+        assert!(
+            spans.spans().iter().any(|s| s.style.bold),
+            "the title block carries a bold span"
+        );
+    }
+
     /// What each mode says, and what it leaves out. The three are different amounts of card,
     /// so this is the assertion that keeps them from collapsing into one appearance.
     #[test]
@@ -8017,7 +8962,7 @@ mod tests {
         let (w, h, font) = (250.0, 190.0, 13.0);
 
         // Large, with a picture: image, then favicon and site name, then the title block.
-        let large = card_layout(w, h, font, CardMode::Large, true, true, true, false);
+        let large = card_layout(w, h, font, CardMode::Large, true, true, true, false, LONG_TITLE);
         let (ix, iy, iw, ih) = large.image.expect("a large card with an image draws one");
         let (fx, fy, fw, fh) = large.favicon.expect("and its site's icon");
         let (px, py, ..) = large.provider;
@@ -8032,7 +8977,7 @@ mod tests {
         assert!(bx + bw <= w && by + bh <= h, "the body stays inside the card");
 
         // No image fetched: nothing reserves the band, so the text starts at the top.
-        let unfetched = card_layout(w, h, font, CardMode::Large, false, true, true, false);
+        let unfetched = card_layout(w, h, font, CardMode::Large, false, true, true, false, LONG_TITLE);
         assert!(unfetched.image.is_none(), "no picture, no band");
         assert!(
             unfetched.provider.1 < py,
@@ -8042,20 +8987,20 @@ mod tests {
         // A plain `Card` shows its picture too — that is the mode a pasted link is in, so
         // restricting the image to `Large` meant a fetched YouTube poster frame sat on disk
         // while the card drew a box of text. The two differ in how much of the card it takes.
-        let ordinary = card_layout(w, h, font, CardMode::Card, true, true, true, false);
+        let ordinary = card_layout(w, h, font, CardMode::Card, true, true, true, false, LONG_TITLE);
         let (_, _, _, card_image_h) = ordinary.image.expect("a Card with an image draws it");
         assert!(card_image_h < ih, "and gives it less room than Large: {card_image_h} vs {ih}");
         assert!(ordinary.body.3 > large.body.3, "leaving more room for the blurb");
 
         // Collapsed: one line, an icon, and no body at all.
-        let row = card_layout(w, h, font, CardMode::Link, true, true, true, false);
+        let row = card_layout(w, h, font, CardMode::Link, true, true, true, false, LONG_TITLE);
         assert!(row.image.is_none(), "a collapsed row draws no picture even when one exists");
         assert!(row.favicon.is_some(), "but it keeps its icon — that is what makes rows scannable");
         assert_eq!(row.body.3, 0.0, "and has no second block");
         assert!(row.provider.3 <= font * CARD_LINE_HEIGHT + 0.01, "one line tall");
 
         // Without an icon the row is not indented for one.
-        let bare = card_layout(w, h, font, CardMode::Card, false, false, true, false);
+        let bare = card_layout(w, h, font, CardMode::Card, false, false, true, false, LONG_TITLE);
         assert!(bare.favicon.is_none());
         assert!(bare.provider.0 < px, "no icon, no indent: {} vs {px}", bare.provider.0);
     }
@@ -8069,7 +9014,7 @@ mod tests {
     fn every_card_form_carries_an_open_badge_in_its_top_right_corner() {
         let (w, h, font) = (250.0, 190.0, 13.0);
         for mode in CardMode::ALL {
-            let laid = card_layout(w, h, font, mode, true, true, true, false);
+            let laid = card_layout(w, h, font, mode, true, true, true, false, LONG_TITLE);
             let (bx, by, bw, bh) = laid.badge.unwrap_or_else(|| panic!("{mode:?} has no badge"));
 
             assert!(bx > w / 2.0, "{mode:?}: not in the right half");
@@ -8082,7 +9027,7 @@ mod tests {
             // Nothing to open, no button. A badge that answers "that card's address is not a
             // web page" is worse than no badge.
             assert!(
-                card_layout(w, h, font, mode, true, true, false, false).badge.is_none(),
+                card_layout(w, h, font, mode, true, true, false, false, LONG_TITLE).badge.is_none(),
                 "{mode:?}: a card with no address still offered one"
             );
         }
@@ -8101,23 +9046,23 @@ mod tests {
         // Sharing: a collapsed row *is* one row, and a card whose picture has not arrived
         // has its provider at the top.
         for (name, laid) in [
-            ("collapsed", card_layout(w, h, font, CardMode::Link, true, true, true, false)),
-            ("unfetched", card_layout(w, h, font, CardMode::Card, false, true, true, false)),
+            ("collapsed", card_layout(w, h, font, CardMode::Link, true, true, true, false, LONG_TITLE)),
+            ("unfetched", card_layout(w, h, font, CardMode::Card, false, true, true, false, LONG_TITLE)),
         ] {
             let (px, _, pw, _) = laid.provider;
             let (bx, ..) = laid.badge.expect("a badge");
             assert!(px + pw <= bx, "{name}: the site name runs under the badge");
             let without = match name {
-                "collapsed" => card_layout(w, h, font, CardMode::Link, true, true, false, false),
-                _ => card_layout(w, h, font, CardMode::Card, false, true, false, false),
+                "collapsed" => card_layout(w, h, font, CardMode::Link, true, true, false, false, LONG_TITLE),
+                _ => card_layout(w, h, font, CardMode::Card, false, true, false, false, LONG_TITLE),
             };
             assert!(pw < without.provider.2, "{name}: the row did not actually yield");
         }
 
         // Not sharing: a picture pushes the site name below the badge entirely, so the row
         // keeps its full width.
-        let with_picture = card_layout(w, h, font, CardMode::Large, true, true, true, false);
-        let no_badge = card_layout(w, h, font, CardMode::Large, true, true, false, false);
+        let with_picture = card_layout(w, h, font, CardMode::Large, true, true, true, false, LONG_TITLE);
+        let no_badge = card_layout(w, h, font, CardMode::Large, true, true, false, false, LONG_TITLE);
         assert!(
             (with_picture.provider.2 - no_badge.provider.2).abs() < 1e-9,
             "the badge shortened a row it does not touch"
@@ -8138,7 +9083,7 @@ mod tests {
         //    26 tall put the badge's top at 36 — ten points below its own bottom edge.
         for (w, h) in [(600.0, 26.0), (600.0, 8.0), (120.0, 400.0), (40.0, 40.0)] {
             for mode in CardMode::ALL {
-                let laid = card_layout(w, h, font, mode, true, true, true, false);
+                let laid = card_layout(w, h, font, mode, true, true, true, false, LONG_TITLE);
                 if let Some((bx, by, bw, bh)) = laid.badge {
                     assert!(
                         bx >= 0.0 && by >= 0.0 && bx + bw <= w + 1e-9 && by + bh <= h + 1e-9,
@@ -8152,19 +9097,19 @@ mod tests {
         // 2. The body yields to the badge. Without a picture the provider is at the top and
         //    the badge — 1.75 line-heights tall against a one-line row — reaches past it into
         //    the *title*, which is the line most worth reading.
-        let bare = card_layout(250.0, 190.0, font, CardMode::Card, false, true, true, false);
+        let bare = card_layout(250.0, 190.0, font, CardMode::Card, false, true, true, false, LONG_TITLE);
         let (bx, ..) = bare.badge.expect("a badge");
         let (px, _, pw, _) = bare.provider;
         let (bodyx, _, bodyw, _) = bare.body;
         assert!(px + pw <= bx, "the site name runs under the badge");
         assert!(bodyx + bodyw <= bx, "the title runs under the badge");
         // …and with a picture, neither is shortened: the badge is up on the image.
-        let with_picture = card_layout(250.0, 190.0, font, CardMode::Large, true, true, true, false);
-        let no_badge = card_layout(250.0, 190.0, font, CardMode::Large, true, true, false, false);
+        let with_picture = card_layout(250.0, 190.0, font, CardMode::Large, true, true, true, false, LONG_TITLE);
+        let no_badge = card_layout(250.0, 190.0, font, CardMode::Large, true, true, false, false, LONG_TITLE);
         assert_eq!(with_picture.body.2, no_badge.body.2, "the title lost width for nothing");
 
         // 3. A card too short to hold one gets none at all, rather than a sliver.
-        assert!(card_layout(250.0, 1.0, font, CardMode::Card, false, false, true, false).badge.is_none());
+        assert!(card_layout(250.0, 1.0, font, CardMode::Card, false, false, true, false, LONG_TITLE).badge.is_none());
     }
 
     /// *"the images are all distorted"* — and what the fix has to guarantee.
@@ -8176,7 +9121,7 @@ mod tests {
     #[test]
     fn a_cards_picture_is_cropped_to_its_band_rather_than_stretched_into_it() {
         // A card's real image band, from the layout above.
-        let laid = card_layout(250.0, 190.0, 13.0, CardMode::Card, true, true, true, false);
+        let laid = card_layout(250.0, 190.0, 13.0, CardMode::Card, true, true, true, false, LONG_TITLE);
         let (_, _, bw, bh) = laid.image.expect("a Card with an image");
         let box_aspect = bw / bh;
 
@@ -8322,7 +9267,7 @@ mod tests {
     #[test]
     fn only_a_video_card_gets_a_play_button() {
         let laid = |video, image| {
-            card_layout(250.0, 190.0, 13.0, CardMode::Large, image, true, true, video)
+            card_layout(250.0, 190.0, 13.0, CardMode::Large, image, true, true, video, LONG_TITLE)
         };
         let (px, py, pw, ph) = laid(true, true).play.expect("a YouTube card plays");
         let (ix, iy, iw, ih) = laid(true, true).image.expect("a Large card with a picture");
@@ -8337,7 +9282,7 @@ mod tests {
         assert!(laid(false, true).play.is_none(), "an ordinary card with a photo gets no ▶");
         assert!(laid(true, false).play.is_none(), "no poster is nothing to centre it on");
         assert!(
-            card_layout(250.0, 40.0, 13.0, CardMode::Link, true, true, true, true).play.is_none(),
+            card_layout(250.0, 40.0, 13.0, CardMode::Link, true, true, true, true, LONG_TITLE).play.is_none(),
             "a collapsed row draws no picture"
         );
     }
@@ -8357,8 +9302,8 @@ mod tests {
         // lines — otherwise the control below passes for the wrong reason, having no blurb
         // because the card is small rather than because it is a video.
         let (w, h, font) = (320.0, 600.0, card_font_size(320.0));
-        let video = card_layout(w, h, font, CardMode::Large, true, true, true, true);
-        let ordinary = card_layout(w, h, font, CardMode::Large, true, true, true, false);
+        let video = card_layout(w, h, font, CardMode::Large, true, true, true, true, LONG_TITLE);
+        let ordinary = card_layout(w, h, font, CardMode::Large, true, true, true, false, LONG_TITLE);
 
         let (_, _, _, video_image) = video.image.expect("a poster");
         let (_, _, _, plain_image) = ordinary.image.expect("a picture");
@@ -8519,7 +9464,7 @@ mod tests {
     #[test]
     fn a_zero_sized_card_still_lays_out() {
         for mode in CardMode::ALL {
-            let laid = card_layout(0.0, 0.0, 13.0, mode, true, true, true, false);
+            let laid = card_layout(0.0, 0.0, 13.0, mode, true, true, true, false, LONG_TITLE);
             for (label, (x, y, w, h)) in [
                 ("provider", laid.provider),
                 ("body", laid.body),
@@ -8721,6 +9666,10 @@ mod tests {
             theme: Theme::LIGHT,
             selection: &[],
             hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
             marquee: None,
             placing: None,
             guides: &[],
@@ -8730,7 +9679,7 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territory: None,
+            territories: Vec::new(),
             minimap: None,
         };
         push_stroke(&mut list, &ctx, board);
@@ -8757,6 +9706,10 @@ mod tests {
             theme: Theme::LIGHT,
             selection: &[],
             hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
             marquee: None,
             placing: None,
             guides: &[],
@@ -8766,7 +9719,7 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territory: None,
+            territories: Vec::new(),
             minimap: None,
         };
         push_stroke(&mut list, &ctx, board);
@@ -8799,6 +9752,10 @@ mod tests {
             theme: Theme::LIGHT,
             selection: &[],
             hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
             marquee: None,
             placing: None,
             guides: &[],
@@ -8808,7 +9765,7 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territory: None,
+            territories: Vec::new(),
             minimap: None,
         };
         push_stroke(&mut list, &ctx, board);
@@ -8837,6 +9794,10 @@ mod tests {
             theme: Theme::LIGHT,
             selection: &[],
             hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
             marquee: Some((ScreenPoint::new(400.0, 300.0), ScreenPoint::new(100.0, 100.0))),
             placing: None,
             guides: &[],
@@ -8846,7 +9807,7 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territory: None,
+            territories: Vec::new(),
             minimap: None,
         };
         push_marquee(&mut list, &ctx, screen);
@@ -8882,6 +9843,10 @@ mod tests {
                 theme: Theme::LIGHT,
                 selection: &[],
                 hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
                 marquee: None,
                 guides: &[],
                 placing: Some(Placing {
@@ -8894,7 +9859,7 @@ mod tests {
                 card_drop: None,
                 pattern: Pattern::Plain,
                 grid_color: None,
-                territory: None,
+                territories: Vec::new(),
                 minimap: None,
             };
             push_placing(&mut list, &ctx, board);
@@ -8984,6 +9949,10 @@ mod tests {
                 theme: Theme::LIGHT,
                 selection: &[],
                 hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
                 marquee: None,
                 placing: None,
                 guides: &[],
@@ -8993,7 +9962,7 @@ mod tests {
                 card_drop: None,
                 pattern: Pattern::Plain,
                 grid_color: None,
-                territory: None,
+                territories: Vec::new(),
                 minimap: None,
             },
             screen,
@@ -9027,6 +9996,10 @@ mod tests {
                 &DrawContext {
                     agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
                     camera: &camera,
                     projection: &projection,
                     theme: Theme::LIGHT,
@@ -9040,7 +10013,7 @@ mod tests {
                     card_drop: None,
                     pattern: Pattern::Plain,
                     grid_color: None,
-                    territory: None,
+                    territories: Vec::new(),
                     minimap: None,
                 },
                 board,
@@ -9071,6 +10044,10 @@ mod tests {
             let ctx = DrawContext {
                 agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
                 camera: &camera,
                 projection: &projection,
                 theme: Theme::LIGHT,
@@ -9084,7 +10061,7 @@ mod tests {
                 card_drop: None,
                 pattern: Pattern::Plain,
                 grid_color: None,
-                territory: None,
+                territories: Vec::new(),
                 minimap: None,
             };
             push_handles(&mut list, &ctx, board);
@@ -9125,6 +10102,10 @@ mod tests {
         let ctx = DrawContext {
             agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
             camera: &camera,
             projection: &projection,
             theme: Theme::LIGHT,
@@ -9138,7 +10119,7 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territory: None,
+            territories: Vec::new(),
             minimap: None,
         };
         push_handles(&mut list, &ctx, board);
@@ -9157,6 +10138,137 @@ mod tests {
         assert!((group.x - 200.0).abs() < 1e-9, "centre {}", group.x);
     }
 
+    /// A block that loses the shaping ration draws **bars, not nothing**.
+    ///
+    /// This is the user-visible half of the edit-speed work. `TEXT_LAYOUT_BUDGET` rations
+    /// shaping to 3 ms a frame and used to answer `None` past it — no glyphs, no bars, a
+    /// hole. Since an edit invalidated every layout on the board (see
+    /// `Projection::rebuild`), that meant the words vanished after every edit and undo and
+    /// came back over dozens of frames.
+    ///
+    /// **Why the budget is spent by hand rather than by shaping 3 ms of real text.** A
+    /// test that raced the clock would pass or fail with the machine's load — the same
+    /// thing that makes `glass_budget` unreliable — and would take 3 ms of wall time to
+    /// say so. Setting `text_spent` directly is the same state the ration produces, with
+    /// no clock in the assertion.
+    ///
+    /// A/B'd: with the starved case restored to `return None` the first assertion fails
+    /// with *"a starved block drew nothing"*.
+    #[test]
+    fn a_block_that_runs_out_of_shaping_budget_draws_bars_rather_than_nothing() {
+        let projection = projection_with([NewItem::new(
+            ItemKind::Sticky {
+                text: StyledText::plain("words the user is waiting for"),
+                background: None,
+            },
+            Placement::new(0.0, 0.0, 400.0, 400.0),
+        )]);
+        let (id, projected) = projection.iter().next().expect("one sticky");
+        // A zoom at which the text is comfortably readable, so the too-small guard is not
+        // what produces the bars — otherwise this would pass on a build with the fix
+        // removed, which is the mistake `--demo grid-snap` already made once.
+        let camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+        assert!(
+            largest_font_size(&Style::default(), FitBox::new(400.0, 400.0)) * camera.zoom()
+                >= f64::from(MIN_DEVICE_FONT_SIZE),
+            "the fixture is too small to read, so it would greek either way"
+        );
+        let ctx = DrawContext {
+            agents: crate::agent_view::AgentViews::empty(),
+            hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
+            camera: &camera,
+            projection: &projection,
+            theme: Theme::LIGHT,
+            selection: &[],
+            marquee: None,
+            placing: None,
+            guides: &[],
+            stroke: None,
+            pending_connector: None,
+            editing: None,
+            card_drop: None,
+            pattern: Pattern::Plain,
+            grid_color: None,
+            territories: Vec::new(),
+            minimap: None,
+        };
+
+        let mut painter = Painter::new(TextCache::new().expect("the test machine has fonts"));
+        painter.text_spent = TEXT_LAYOUT_BUDGET;
+        let starved = painter.block(*id, projected, 0, &ctx);
+        assert!(
+            matches!(starved, Some(Painted::Greeked(_))),
+            "a starved block drew nothing: {starved:?}"
+        );
+        assert_eq!(painter.text_deferred, 1, "the starved block was not counted");
+        assert_eq!(painter.text.len(), 0, "a starved block shaped anyway, which is the cost");
+
+        // And with budget, the same block shapes for real — so the bars are the *waiting*
+        // state and not a permanent downgrade.
+        painter.text_spent = Duration::ZERO;
+        let shaped = painter.block(*id, projected, 0, &ctx);
+        assert!(matches!(shaped, Some(Painted::Glyphs(_))), "a block with budget drew bars");
+    }
+
+    /// The caret's block is shaped whatever the ration says.
+    ///
+    /// Greeking the block being typed into would be worse than the bug this fixes: bars
+    /// have no glyph positions, so there is no origin to draw the cursor against and the
+    /// caret disappears while the user is typing. Feedback 25 arrived at the same rule
+    /// from the empty-sticky direction.
+    #[test]
+    fn the_block_holding_the_caret_is_never_starved() {
+        let projection = projection_with([NewItem::new(
+            ItemKind::Sticky { text: StyledText::plain("typing here"), background: None },
+            Placement::new(0.0, 0.0, 400.0, 400.0),
+        )]);
+        let (id, projected) = projection.iter().next().expect("one sticky");
+        let camera = Camera::new(ScreenSize::new(1600.0, 900.0));
+        let editing = TextCursor {
+            scene: *id,
+            slot: 0,
+            idle_for: 0.0,
+            cursor: 0,
+            anchor: 0,
+            text: "typing here",
+        };
+        let ctx = DrawContext {
+            agents: crate::agent_view::AgentViews::empty(),
+            hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
+            camera: &camera,
+            projection: &projection,
+            theme: Theme::LIGHT,
+            selection: &[],
+            marquee: None,
+            placing: None,
+            guides: &[],
+            stroke: None,
+            pending_connector: None,
+            editing: Some(editing),
+            card_drop: None,
+            pattern: Pattern::Plain,
+            grid_color: None,
+            territories: Vec::new(),
+            minimap: None,
+        };
+
+        let mut painter = Painter::new(TextCache::new().expect("the test machine has fonts"));
+        painter.text_spent = TEXT_LAYOUT_BUDGET;
+        let painted = painter.block(*id, projected, 0, &ctx);
+        assert!(
+            matches!(painted, Some(Painted::Glyphs(_))),
+            "the caret's own block was greeked, so the cursor has nothing to sit against"
+        );
+    }
+
     #[test]
     fn an_unknown_selected_id_is_skipped_rather_than_panicking() {
         let projection = projection_with([]);
@@ -9170,6 +10282,10 @@ mod tests {
             &DrawContext {
                 agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
+            ports: None,
+            connector_grips: None,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            default_display: DisplayMode::default(),
                 camera: &camera,
                 projection: &projection,
                 theme: Theme::LIGHT,
@@ -9183,7 +10299,7 @@ mod tests {
                 card_drop: None,
                 pattern: Pattern::Plain,
                 grid_color: None,
-                territory: None,
+                territories: Vec::new(),
                 minimap: None,
             },
             board,
@@ -9434,6 +10550,7 @@ mod card_overflow_tests {
             truncated: false,
             draft: String::new(),
             caret: None,
+            voice: None,
         }
     }
 
@@ -9580,7 +10697,8 @@ mod card_overflow_tests {
             crate::filetree::DEFAULT_SIZE.1,
         );
         let model = vellum_agent::FileTreeModel::default();
-        let paint = tree_paint(&model, Some(&view), &laid, node_font_size(crate::filetree::DEFAULT_SIZE.0));
+        let paint =
+            tree_paint(&model, Some(&view), &laid, node_font_size(crate::filetree::DEFAULT_SIZE.0), 0);
 
         assert!(!paint.tree_rows.is_empty(), "a drawn tree recorded no pressable rows");
         assert!(
@@ -9808,7 +10926,10 @@ mod card_overflow_tests {
             );
             let hit = paint.option_at(cx, cy).expect("a card was not pressable at its centre");
             assert_eq!(hit.choice, card.choice, "a press landed on the wrong card");
-            assert_eq!(hit.event, 0);
+            // The question the card answers travels with it, so a node holding two
+            // unanswered sets resolves the press to the one that was clicked.
+            assert_eq!(hit.prompt, card.prompt, "a card lost which question it belonged to");
+            assert!(!hit.prompt.is_empty(), "a card carried no question");
         }
         // The gap between two cards belongs to neither.
         let (a, b) = (&paint.options()[0], &paint.options()[1]);
@@ -9950,6 +11071,7 @@ mod card_overflow_tests {
             Some(&view),
             &laid,
             node_font_size(crate::filetree::DEFAULT_SIZE.0),
+            0,
         );
 
         let fits = laid.visible_rows();
@@ -9966,6 +11088,69 @@ mod card_overflow_tests {
         );
     }
 
+    /// ⚠ **Everything below the fold used to be unreachable.** The list drew the first
+    /// `visible_rows()` and stopped, with no gesture to reach the rest — so a `src` directory
+    /// with forty files showed the first dozen and named the remainder in a line the user
+    /// could do nothing with.
+    ///
+    /// Two properties, and each rules out a build the other would pass: a scrolled list must
+    /// **start at a different row**, and the press path must resolve a click on a scrolled row
+    /// to *that* row — which it does by construction here, because both read the rectangles
+    /// this function records.
+    #[test]
+    fn a_scrolled_tree_shows_later_rows_and_presses_resolve_to_them() {
+        use vellum_agent::filetree::{Entry, Row};
+        let rows: Vec<Row> = (0..100)
+            .map(|n| Row {
+                entry: Entry {
+                    name: format!("file-{n}.rs"),
+                    relative: format!("file-{n}.rs"),
+                    path: std::path::PathBuf::from(format!("/p/file-{n}.rs")),
+                    is_dir: false,
+                    len: 12,
+                    ignored: false,
+                    is_symlink: false,
+                },
+                depth: 0,
+                expanded: false,
+            })
+            .collect();
+        let view = TreeView { rows, truncated: false };
+        let laid = crate::filetree::layout(
+            crate::filetree::DEFAULT_SIZE.0,
+            crate::filetree::DEFAULT_SIZE.1,
+        );
+        let font = node_font_size(crate::filetree::DEFAULT_SIZE.0);
+        let model = vellum_agent::FileTreeModel::default();
+
+        let top = tree_paint(&model, Some(&view), &laid, font, 0);
+        let scrolled = tree_paint(&model, Some(&view), &laid, font, 20);
+
+        let first = |paint: &NodePaint| paint.tree_rows()[0].relative.clone();
+        assert_eq!(first(&top), "file-0.rs");
+        assert_eq!(first(&scrolled), "file-20.rs", "the list did not move");
+        assert_eq!(
+            top.tree_rows().len(),
+            scrolled.tree_rows().len(),
+            "scrolling changed how many rows fit"
+        );
+
+        // A press at the first row's centre resolves to the row now drawn there — the whole
+        // point of the press path reading painted rectangles rather than re-deriving an index.
+        let row = &scrolled.tree_rows()[0];
+        let (cx, cy) = (
+            row.rect.x + row.rect.width / 2.0,
+            row.rect.y + row.rect.height / 2.0,
+        );
+        let (hit, _) = scrolled.tree_row_at(cx, cy).expect("the first drawn row is pressable");
+        assert_eq!(hit.relative, "file-20.rs");
+
+        // Past the end, the offset is clamped rather than emptying the list: a stale offset
+        // after directories close must degrade to the last screenful.
+        let past = tree_paint(&model, Some(&view), &laid, font, 10_000);
+        assert!(!past.tree_rows().is_empty(), "an over-scrolled tree drew nothing");
+    }
+
     /// A tree with nothing read yet says so rather than drawing an empty well.
     #[test]
     fn a_tree_with_no_rows_explains_itself() {
@@ -9973,7 +11158,7 @@ mod card_overflow_tests {
             crate::filetree::DEFAULT_SIZE.0,
             crate::filetree::DEFAULT_SIZE.1,
         );
-        let paint = tree_paint(&vellum_agent::FileTreeModel::default(), None, &laid, 13.0);
+        let paint = tree_paint(&vellum_agent::FileTreeModel::default(), None, &laid, 13.0, 0);
         assert!(
             paint.runs.iter().any(|run| run.text.contains("not been read")),
             "an unread tree drew an empty box"

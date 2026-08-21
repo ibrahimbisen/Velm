@@ -84,6 +84,10 @@ pub struct Facts<'a> {
     /// because egui lays out in them while `ScreenPoint` is physical everywhere in this
     /// crate (trap 4). `None` when nothing is selected.
     pub selection_rect: Option<egui::Rect>,
+    /// Whether a text session on the canvas owns the keyboard — the on-canvas caret, a
+    /// note's body, or an agent's prompt row. See `vellum_ui::ChromeState::text_session`,
+    /// which carries the whole reason this has to be told rather than asked.
+    pub text_session: bool,
 }
 
 /// A question the app asked, so its answer can be matched to what it was about.
@@ -115,8 +119,32 @@ pub enum Ask {
     /// with a ⓘ saying why it matters. Answering *Continue* runs what `ImportFromMiro`
     /// used to run straight away.
     ImportSteps,
+    /// A delete that would take one or more agent nodes with it.
+    ///
+    /// Carries no ids: the answer is acted on against whatever is selected when it comes
+    /// back, which is the same selection the dialog described a moment earlier — nothing can
+    /// change the selection while a modal is up. That is `EmptyTrash`'s reasoning, and it is
+    /// what keeps this from going stale against an undo that happened in between.
+    DeleteAgentNodes,
     /// The rules editor was opened on one agent node.
     AgentRules(vellum_doc::ItemId),
+    /// A worktree removal was confirmed for this agent node.
+    RemoveWorktree(vellum_doc::ItemId),
+    /// A web address was asked for, to attach to this agent node as context.
+    ///
+    /// Carries the node because the answer arrives as a bare string and a modal can outlive
+    /// the selection that raised it — the same correlation problem `AgentRules` solves the
+    /// same way.
+    AttachLink(vellum_doc::ItemId),
+    /// The rules editor was opened on an **inherited** layer — the global file, or the
+    /// project's — rather than on a node.
+    ///
+    /// Carries the layer for the same reason [`Self::SignIn`] carries the provider: the dialog
+    /// is the same `Dialog::Rules` in both cases and does not know which file it is editing,
+    /// so the correlation between "what I asked" and "what came back" lives here. Without it
+    /// the answer would be applied to whichever agent happened to be selected — writing the
+    /// user's global rules into one node's own layer, silently.
+    RuleLayer(vellum_agent::Layer),
     /// The schedule editor was opened on one agent node.
     AgentSchedule(vellum_doc::ItemId),
     /// A provider's API key was asked for. Carries which provider, because the dialog does
@@ -150,6 +178,13 @@ pub struct Shell {
     /// application exists not to have. Refreshed by [`Shell::refresh_providers`] when a
     /// sign-in changes something, which is the only time the answer can move.
     providers: Vec<vellum_ui::ProviderStatus>,
+    /// The whisper binary found on this machine, if any — Preferences ▸ Voice's status line.
+    ///
+    /// ⚠ **Probed once and cached, exactly as `providers` is.** `Speech::detect_local` walks
+    /// `PATH` looking for a file; doing that while building a menu would be a directory scan
+    /// per frame the menu is open. It is a fact about the machine, so a session is the right
+    /// lifetime — the same reasoning `provider_status` records for itself.
+    local_transcriber: Option<String>,
     cards: Vec<BoardCard>,
     fonts: Vec<String>,
     find_matches: Option<(usize, usize)>,
@@ -210,8 +245,10 @@ impl Shell {
         };
 
         let providers = library.provider_status();
+        let local_transcriber = library.speech().detect_local();
         let mut shell = Self {
             providers,
+            local_transcriber,
             // Filled in by the first `run`. Default until then, which greys every row —
             // correct, since there is nothing to act on before the first frame.
             command_context: vellum_ui::CommandContext::default(),
@@ -547,10 +584,36 @@ impl Shell {
             "pen" => self.chrome.set_open_flyout(Some(Flyout::Pen)),
             "eraser" => self.chrome.set_open_flyout(Some(Flyout::Eraser)),
             "more" => self.chrome.set_open_flyout(Some(Flyout::More)),
+            // The settings page, in the board library. Not a flyout or a popup like the
+            // seven above — it is a *scope*, so raising it is a state change rather than
+            // opening something over the top. Here anyway, because it shares their whole
+            // reason for existing: it is a surface only a click can otherwise reach, and
+            // `--screenshot` photographs a window nobody is touching.
+            // `settings`, or `settings:agents` / `settings:providers` for one of its tabs.
+            // A tab is reached by a click and nothing else, so without the suffix two of the
+            // three pages could not be photographed at all — which is the whole argument
+            // `--show` already makes for the seven flyouts.
+            _ if what == "settings" || what.starts_with("settings:") => {
+                let tab = what.strip_prefix("settings:").unwrap_or("general");
+                let Some(tab) = vellum_ui::SettingsTab::ALL
+                    .into_iter()
+                    .find(|page| page.label().eq_ignore_ascii_case(tab))
+                else {
+                    return false;
+                };
+                self.screen = vellum_ui::Screen::Library;
+                self.chrome.set_library_scope(vellum_ui::LibraryScope::Settings);
+                self.chrome.set_settings_tab(tab);
+            }
             "menu" => vellum_ui::menu::force_open_menu(&self.ctx),
             _ => return false,
         }
         true
+    }
+
+    /// Re-probe for a local transcriber. See [`Shell::local_transcriber`].
+    pub fn refresh_local_transcriber(&mut self) {
+        self.local_transcriber = self.library.speech().detect_local();
     }
 
     pub fn toast(&mut self, toast: Toast) {
@@ -578,6 +641,28 @@ impl Shell {
     /// have changed.
     pub fn refresh_providers(&mut self) {
         self.providers = self.library.provider_status();
+    }
+
+    /// What the last probe found, without re-probing.
+    ///
+    /// Read at launch to decide whether a delegated CLI is actually on this machine — see
+    /// `ActiveState::agent_launch_spec`. Probing there instead would spawn a process per
+    /// start for an answer that was taken at the last sign-in and cannot have changed without
+    /// one.
+    pub fn provider_status(
+        &self,
+        provider: vellum_agent::Provider,
+    ) -> Option<&vellum_ui::ProviderStatus> {
+        self.providers.iter().find(|status| status.provider == provider)
+    }
+
+    /// The modal that is up, without consuming it.
+    ///
+    /// For the `--demo` fixtures, which have to be able to *answer* a confirmation they
+    /// raised — a fixture that could only observe one would have to stop at the dialog, and
+    /// the thing worth measuring is on the far side of the button.
+    pub fn pending_ask(&self) -> Option<(DialogId, &Ask)> {
+        self.pending.last().map(|(id, ask)| (*id, ask))
     }
 
     /// What a dialog was about, consumed so an answer cannot be acted on twice.
@@ -788,7 +873,56 @@ impl Shell {
             modifiers,
         });
     }
+}
 
+/// The `egui::Key` a winit key maps to, for the fixtures that drive both doors.
+///
+/// Only what a keyboard produces while typing — a letter, a digit, Space and Backspace.
+/// Nothing here needs to be exhaustive: it feeds a `--demo`, and a key it cannot name is a
+/// key the chrome would not have had a binding for either.
+pub(crate) fn egui_key_for(key: &winit::keyboard::Key) -> Option<egui::Key> {
+    use winit::keyboard::{Key, NamedKey};
+    match key.as_ref() {
+        Key::Named(NamedKey::Backspace) => Some(egui::Key::Backspace),
+        Key::Named(NamedKey::Delete) => Some(egui::Key::Delete),
+        Key::Named(NamedKey::Space) => Some(egui::Key::Space),
+        Key::Named(NamedKey::Enter) => Some(egui::Key::Enter),
+        Key::Named(NamedKey::Tab) => Some(egui::Key::Tab),
+        Key::Character(text) => egui::Key::from_name(text),
+        _ => None,
+    }
+}
+
+impl Shell {
+    /// Puts a key press into egui's input queue, exactly as `egui-winit` would have.
+    ///
+    /// **For the `--demo` fixtures**, and it exists because the defect it checks for is
+    /// invisible from anywhere else. `winit::event::KeyEvent` cannot be built outside winit
+    /// — its `platform_specific` field is crate-private — so a fixture cannot hand
+    /// [`Self::on_window_event`] a synthetic keystroke, and a fixture that calls
+    /// `ActiveState::type_key` directly (`--demo typing` does) enters *downstream* of the
+    /// chrome and passes whatever the chrome would have done with the same key.
+    ///
+    /// That gap is exactly where three of the user's reports lived: every key reaches egui
+    /// through `on_window_event` **before** the app's own text sessions claim it, so the
+    /// command table ran on the letters of every word typed on a board. Pushing the same
+    /// `egui::Event::Key` the translation would have produced is the closest a fixture can
+    /// stand to the real thing, and it is the same push [`Self::restore_clipboard_key`]
+    /// already makes in production.
+    pub fn press_key_in_chrome(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
+        let input = self.winit.egui_input_mut();
+        input.modifiers = modifiers;
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+    }
+}
+
+impl Shell {
     /// Draws one frame of chrome and returns everything the user asked for.
     pub fn run(&mut self, window: &Window, facts: &Facts<'_>) -> Vec<UiEvent> {
         // The OS reading is re-supplied every frame rather than at launch, which is
@@ -822,8 +956,12 @@ impl Shell {
                 ..
             } = self;
 
+            // Taken before the struct so the `String` outlives the borrow it is handed as.
+            let speech_model = self.library.speech().model_file.clone();
             let view_state = ViewState { zoom: facts.zoom, ..*view };
             let state = ChromeState {
+                default_provider: self.library.default_provider(),
+                default_chat_theme: self.library.default_chat_theme(),
                 // The Agent Canvas settings, all four application-wide rather than per board.
                 // A grid is a drawing aid you want everywhere (feedback 31's reasoning); so
                 // is the mode agent output is shown in, whether a browser engine may run at
@@ -832,6 +970,10 @@ impl Shell {
                 browser_nodes: self.library.browser_nodes(),
                 worktrees: self.library.worktrees(),
                 providers: providers.as_slice(),
+                speech: self.library.speech().preference,
+                local_transcriber: self.local_transcriber.as_deref(),
+                speech_model: speech_model.as_deref(),
+                speech_hosted: self.library.speech().hosted_is_configured(),
                 link_previews: self.library.link_previews(),
                 align_objects: self.library.align_objects(),
                 snap_to_grid: self.library.snap_to_grid(),
@@ -861,6 +1003,7 @@ impl Shell {
                 background: facts.background,
                 now: SystemTime::now(),
                 selection_rect: facts.selection_rect,
+                text_session: facts.text_session,
             };
 
             let mut chrome_output = None;

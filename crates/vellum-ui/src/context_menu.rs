@@ -59,6 +59,9 @@ pub enum Row {
     Command(Command),
     Separator,
     Sub(Submenu),
+    /// A band's name — [`crate::command::Entry::Heading`]'s twin, drawn by the same
+    /// function so a section is spelled the same on the right button and in the menu bar.
+    Heading(&'static str),
     /// A link card's three display forms, as a nested list. Not a [`Submenu`] because
     /// it emits a [`StyleEdit`] rather than a command, and because it is drawn from
     /// the selection's current mode so it can tick the one in force.
@@ -90,13 +93,21 @@ pub fn rows(target: ContextTarget, model: &PanelModel, cmd_ctx: &CommandContext)
             out.push(Row::Command(Command::Duplicate));
             out.push(Row::Command(Command::Delete));
 
-            // The Agent Canvas band. Every row here is an ordinary command, and all five
+            // The Agent Canvas band. Every row here is an ordinary command, and all of them
             // are also in Edit ▸ Agent — which is not tidiness but the rule
             // `every_command_offered_here_is_also_in_the_menu_bar` enforces: a verb that
             // exists only on the right button is a verb a user who does not right-click
             // never finds, and the shortcut sheet is generated from the menu tree.
+            //
+            // **Named, and complete.** It used to be four rows sitting between two
+            // separators, indistinguishable from the clipboard band above them and missing
+            // two of Edit ▸ Agent's verbs — reported as *"i want all of the settings that are
+            // associated to the ai / terminal mode to have its own section"* and *"more
+            // options here"*, of the `⋮` popup. Both halves are the same fix: say what the
+            // band is, and put the whole of it in.
             if model.has_agent() {
                 out.push(Row::Separator);
+                out.push(Row::Heading(crate::command::AGENT_SECTION));
                 // One row, naming what pressing it will do — the same rule the lock row
                 // follows. Both are still in Edit ▸ Agent for the mixed case, where
                 // neither label is the whole truth.
@@ -108,6 +119,10 @@ pub fn rows(target: ContextTarget, model: &PanelModel, cmd_ctx: &CommandContext)
                 out.push(Row::Command(Command::ToggleAgentRaw));
                 out.push(Row::Command(Command::EditAgentRules));
                 out.push(Row::Command(Command::EditAgentSchedule));
+                // The two that were only ever in the menu bar. `SetTerritory` in particular
+                // is the one verb on this list you reach *while looking at the node you want
+                // to draw a region for*, which is the gesture the right button is for.
+                out.push(Row::Command(Command::SetTerritory));
             }
             if model.has_note() && model.note_path().is_some() {
                 out.push(Row::Separator);
@@ -303,6 +318,7 @@ fn draw(
             crate::menu::menu_item(ui, palette, command, cmd_ctx, header, events);
         }
         Row::Sub(sub) => crate::menu::submenu(ui, palette, sub, cmd_ctx, header, events),
+        Row::Heading(title) => crate::menu::section_heading(ui, palette, title),
         Row::CardMode => card_mode(ui, palette, model, events),
         Row::OpenPage => {
             let Some(url) = model.link_url.clone() else { return };
@@ -391,7 +407,7 @@ fn is_in_the_menu_bar(command: Command) -> bool {
         entries.iter().any(|entry| match entry {
             Entry::Item(c) => *c == wanted,
             Entry::Sub(sub) => walk(sub.entries(), wanted),
-            Entry::Separator => false,
+            Entry::Separator | Entry::Heading(_) => false,
         })
     }
     crate::command::Menu::ALL.iter().any(|menu| walk(menu.entries(), command))
@@ -428,6 +444,9 @@ mod tests {
         let own = vellum_agent::AgentRules::default();
         SelectionItem {
             agent: Some(crate::AgentSummary {
+                chat_theme: None,
+                chat_opacity: 255,
+                has_chat_background: false,
                 role: "Reviewer".to_owned(),
                 role_kind: vellum_agent::RoleKind::Worker,
                 provider: None,

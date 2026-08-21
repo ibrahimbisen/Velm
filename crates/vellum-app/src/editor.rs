@@ -53,6 +53,13 @@ pub struct Editor {
     autosave: Option<Autosave>,
     path: Option<PathBuf>,
     selection: Vec<SceneId>,
+    /// How long the last [`Self::reproject`] took, for the HUD.
+    ///
+    /// Every edit and every undo rebuilds the whole document (see `reproject`), so this is
+    /// the number that says what an edit costs on *this* board rather than on a fixture.
+    /// Kept rather than logged: an edit happens too often to log and the figure is only
+    /// interesting next to the frame time it lands in.
+    last_reproject: std::time::Duration,
 }
 
 impl std::fmt::Debug for Editor {
@@ -118,6 +125,7 @@ impl Editor {
             autosave: None,
             path: None,
             selection: Vec::new(),
+            last_reproject: std::time::Duration::ZERO,
         };
         editor.reproject();
         editor
@@ -317,6 +325,30 @@ impl Editor {
         }
     }
 
+    /// Opens an undo group without touching the projection.
+    ///
+    /// The caret and the eraser hold a group open across many calls, and they used to open
+    /// and close it through [`Self::edit`] — which reprojects the whole document and asks
+    /// the autosave writer to look for a delta. Neither is right here: opening or closing a
+    /// group changes **no item**, so there is nothing to project and nothing to save, and
+    /// on a 1,000-item board each of those cost a full rebuild plus the invalidation of
+    /// every cached layout on the board. Every click away from a sticky paid one.
+    ///
+    /// Errors are logged rather than returned. The one failure `group_start` has is
+    /// *"there is already an active group"*, which the callers cannot act on and which
+    /// `ActiveState::settle` exists to prevent — see trap 11.
+    pub fn begin_group(&mut self) {
+        if let Err(error) = self.board.begin_undo_group() {
+            log::error!("opening an undo group: {error}");
+        }
+    }
+
+    /// Closes the group [`Self::begin_group`] opened. Idempotent, and free when nothing is
+    /// open, which is what makes it safe to call from every path a gesture can end on.
+    pub fn end_group(&mut self) {
+        self.board.end_undo_group();
+    }
+
     /// The restore points the store has kept for this board.
     pub fn restore_points(&self) -> Result<Vec<vellum_store::RestorePoint>> {
         match self.autosave.as_ref() {
@@ -331,10 +363,17 @@ impl Editor {
     /// discrete act, and a per-frame check would either rebuild a 596-item board
     /// sixty times a second or need a flag that some future mutator forgets to set.
     pub fn reproject(&mut self) {
+        let started = std::time::Instant::now();
         if let Err(error) = self.projection.rebuild(&self.board) {
             log::error!("projecting the board: {error}");
         }
         self.selection.retain(|id| self.projection.get(*id).is_some());
+        self.last_reproject = started.elapsed();
+    }
+
+    /// What the last whole-document rebuild cost. See [`Self::last_reproject`].
+    pub const fn last_reproject(&self) -> std::time::Duration {
+        self.last_reproject
     }
 
     /// Tells the writer the document changed. Cheap enough for the frame path.
@@ -438,11 +477,37 @@ impl Editor {
         &mut self,
         placements: &[(DocId, vellum_doc::Placement)],
     ) -> Result<usize> {
-        if placements.is_empty() {
+        self.commit_move(placements, &[])
+    }
+
+    /// [`Self::commit_placements`], plus the frames the moved items now belong to.
+    ///
+    /// **One edit and one undo group, deliberately.** A move that changes what an item is
+    /// parented to is still one thing the user did, so `⌘Z` has to put both halves back
+    /// together — and opening a second group for the reparenting would hit
+    /// `UndoGroupAlreadyStarted` and break every grouped operation after it (trap 11).
+    ///
+    /// The reparenting is written **before** the placements. `Board::reparent` moves a node in
+    /// the tree and `Placement` is absolute, so the order does not affect where anything lands;
+    /// doing it first means a frame that has just adopted an item already owns it when the item
+    /// is placed, which is the order `paste_internal` uses for the same reason.
+    pub fn commit_move(
+        &mut self,
+        placements: &[(DocId, vellum_doc::Placement)],
+        reparents: &[(DocId, Option<DocId>)],
+    ) -> Result<usize> {
+        if placements.is_empty() && reparents.is_empty() {
             return Ok(0);
         }
         self.edit(|board| {
             board.begin_undo_group()?;
+            for (id, parent) in reparents {
+                if let Err(error) = board.reparent(*id, *parent) {
+                    // Refused rather than fatal: a cycle, or an item deleted from under the
+                    // drag. The move itself still stands, which is the half the user watched.
+                    log::debug!("reparenting {id}: {error}");
+                }
+            }
             let mut written = 0;
             for (id, placement) in placements {
                 match board.set_placement(*id, *placement) {
@@ -628,11 +693,36 @@ impl Editor {
         archive: Option<&mut ArchiveSet>,
         after: AfterImport,
     ) -> Result<Option<ImportOutcome>> {
-        let before = self.board.item_count();
-        let outcome = vellum_import::import(html, archive, self.assets.blobs(), &mut self.board)?;
-        let Some(outcome) = outcome else {
+        let Some(decoded) = vellum_import::import_clipboard(html)? else {
             return Ok(None);
         };
+        self.import_decoded(&decoded, archive, after, None).map(Some)
+    }
+
+    /// The half of an import that must happen where the document is, with the assets
+    /// already fetched.
+    ///
+    /// Split from [`Self::import_html_selecting`] so the expensive half — pulling assets out
+    /// of a `.rtb` and into the blob store, measured at 2,012 ms of a 2,076 ms paste — can
+    /// run on a worker while the window keeps painting. This part is about 50 ms.
+    ///
+    /// `ready` is the worker's answer; `None` makes it do the work itself, which is what the
+    /// `--import` command line and every test still do.
+    pub fn import_decoded(
+        &mut self,
+        decoded: &vellum_import::ImportedBoard,
+        archive: Option<&mut ArchiveSet>,
+        after: AfterImport,
+        ready: Option<vellum_import::PrefetchedAssets>,
+    ) -> Result<ImportOutcome> {
+        let before = self.board.item_count();
+        let outcome = vellum_import::import_widgets_with(
+            decoded,
+            archive,
+            self.assets.blobs(),
+            &mut self.board,
+            ready,
+        )?;
 
         log::info!(
             "imported {} items ({} -> {} on the board)",
@@ -650,7 +740,23 @@ impl Editor {
                 .collect();
         }
         self.record()?;
-        Ok(Some(outcome))
+        Ok(outcome)
+    }
+
+    /// The assets a decoded payload will ask for, and where the backups are.
+    ///
+    /// Everything a worker needs to run `vellum_import::prefetch_assets`, gathered here
+    /// because the blob store lives behind `Assets` and the archives behind the app.
+    pub fn prefetch_plan(
+        &self,
+        decoded: &vellum_import::ImportedBoard,
+        archive: Option<&ArchiveSet>,
+    ) -> (Vec<String>, Vec<std::path::PathBuf>, vellum_store::BlobStore) {
+        (
+            vellum_import::requested_assets(decoded, self.assets.blobs()),
+            archive.map(ArchiveSet::paths).unwrap_or_default(),
+            self.assets.blobs().clone(),
+        )
     }
 }
 

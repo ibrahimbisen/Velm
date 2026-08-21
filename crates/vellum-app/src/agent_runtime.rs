@@ -219,6 +219,25 @@ pub fn unix_now() -> Timestamp {
         .map_or(0, |since| since.as_secs())
 }
 
+/// The same instant in milliseconds, for the one thing in this layer that is faster than a
+/// second: the message pulse travelling along a connector.
+///
+/// ⚠ **This exists because `unix_now() * 1_000` is not a millisecond clock**, and every
+/// millisecond argument in this layer used to be exactly that. `bus::PULSE_MS` is 600, so a
+/// clock that only ever advances in whole seconds makes `LinkPulse::progress` — which is
+/// `1.0 - left / PULSE_MS` — answer **0.0 on every frame the pulse is visible**. The dot sat
+/// on the connector's first endpoint, never travelled, and vanished at the next second
+/// boundary, which could be the very next frame. The animation feature 3 asks for was drawn
+/// correctly and was mathematically pinned to its start.
+///
+/// A schedule still takes [`unix_now`]: a daily job does not care about milliseconds, and
+/// `Timestamp` is what goes into a board file.
+pub fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+}
+
 // ---------------------------------------------------------------------------------------
 // Keys
 // ---------------------------------------------------------------------------------------
@@ -252,6 +271,32 @@ impl NodeKey {
         }
         Some(Self { board: BoardKey::from_raw(board), item: item.to_owned() })
     }
+}
+
+/// How a node names itself to [`vellum_agent::notes`], which is **not** how it names itself
+/// to anything else.
+///
+/// ⚠ **This is one id in two forms, and getting it wrong made every private note unreachable
+/// by the one agent it belonged to.** `NoteScope::Private { agent }` is written by the
+/// inspector and the context bar from an `AgentLink`'s id, which is a bare document id
+/// (`7@1`); `notes::Requester::Agent` is documented as taking *"an agent, by its item id — the
+/// same string `NoteScope::Private` stores"*; and the three `serve_note_*` handlers were
+/// passing [`NodeKey::wire`], which is `<board-key>:<item-id>`. So `access_check`'s
+/// `who == agent` compared `a1b2c3d4:7@1` against `7@1` and answered no, forever, to the
+/// owner — and `may_read_path` looked for a directory slugged from the wire form beside one
+/// slugged from the id. Feature 8's private half was refused at both gates at once.
+///
+/// The bare item id is the right one of the two, for two reasons that agree:
+///
+/// - **A note store is already per board** ([`AgentRuntime::store_for`] resolves one from
+///   `key.board`), so the board half is not disambiguating anything. This is *not* the
+///   cross-board collision feedback 34 fixed: that was a global map keyed by item alone, and
+///   this is a map that has already been keyed by board.
+/// - **This id becomes a directory name on the user's disk**, `<project>/.velm/notes/<slug>/`.
+///   A person opening their own project should find `7-1` there, not a folder named after a
+///   hash of the board's path.
+fn requester_id(key: &NodeKey) -> String {
+    key.item.clone()
 }
 
 /// What the board on screen was, the last time its agent wiring was derived.
@@ -334,6 +379,14 @@ pub enum DocumentWork {
     ReadConfig { node: NodeKey },
     /// Replace a node's configuration. Meta agent only.
     WriteConfig { node: NodeKey, model: Box<AgentModel> },
+    /// Record something an agent asked Velm to read, on that agent's own node.
+    ///
+    /// ⚠ **The reading has already happened, on the IPC thread, and that is the point of the
+    /// split.** `ingest` parses a PDF or fetches a page; doing that here would put a network
+    /// round trip on the frame the user is looking at — the defect this layer's own notes
+    /// record for the *user's* attach path. What crosses into the frame loop is the finished
+    /// text, and all that is left to do with the document open is one small model write.
+    Attach { node: NodeKey, ingested: Box<vellum_agent::ingest::Ingested> },
 }
 
 /// A deferred job and the channel its answer goes back down.
@@ -389,6 +442,10 @@ pub enum Reply {
     Done,
     Text(String),
     Notes(Vec<NoteEntry>),
+    /// A note and the trail of notes it links to — feature 8's chaining.
+    Chain(Vec<(String, String)>),
+    /// A picture reached the blob store, addressed by this hash.
+    Stored(String),
     Spawned(String),
     Config(Box<AgentModel>),
 }
@@ -405,7 +462,9 @@ struct Job {
 /// The verb, in the shape the runtime wants it.
 enum Call {
     Send { to: String, text: String },
+    Attach { ingested: Box<vellum_agent::ingest::Ingested> },
     NoteRead { path: String },
+    NoteChain { path: String, depth: Option<usize> },
     NoteWrite { path: String, text: String, append: bool },
     NoteList,
     Spawn(Box<SpawnRequest>),
@@ -532,6 +591,12 @@ pub struct AgentRuntime {
     /// already authenticates the process tree rather than the individual node
     /// (`ipc.rs`'s own header says so), so stale-by-a-frame changes nothing.
     roles: Arc<RwLock<HashMap<String, RoleKind>>>,
+    /// How a media file an agent ingests is turned into words — feature 18's last step.
+    ///
+    /// Shared exactly as `roles` is, and for the same reason: `Handler::ingest` runs on the
+    /// IPC server's own thread and needs a fact the user can change from a menu. Written by
+    /// [`AgentRuntime::set_speech`], which the app calls whenever Preferences ▸ Voice changes.
+    speech: Arc<RwLock<vellum_agent::voice::Speech>>,
 
     ipc: Option<IpcServer>,
     inbox: Receiver<Job>,
@@ -597,6 +662,8 @@ pub struct AgentRuntime {
     /// [`resolve_blob`]. Without it the placeholder itself was written to the JSONL, where it
     /// stayed across restarts as a picture that resolves to nothing.
     failed_blobs: HashSet<String>,
+    /// How far each file tree is scrolled. See [`AgentRuntime::tree_scroll`].
+    tree_scroll: HashMap<NodeKey, usize>,
 
     /// Each note node's file contents, as last read from disk.
     ///
@@ -635,6 +702,14 @@ pub struct AgentRuntime {
 
     /// When the window last lost focus, for the away-mode digest.
     away_since: Option<Timestamp>,
+
+    /// Push-to-talk, and any transcription in flight. **`None` until the first press.**
+    ///
+    /// Lazy for `docs/07` §0.2's reason and not merely as a nicety: constructing it makes a
+    /// channel and — with the `voice` feature on — a capture that owns a `cpal` host. A board
+    /// with agent nodes nobody has spoken to must cost nothing at all, so the pool is built by
+    /// [`AgentRuntime::begin_voice`] and by nothing else.
+    voice: Option<crate::voice::VoicePool>,
 }
 
 impl AgentRuntime {
@@ -668,12 +743,127 @@ impl AgentRuntime {
             reports: Vec::new(),
             blob_names: HashMap::new(),
             failed_blobs: HashSet::new(),
+            tree_scroll: HashMap::new(),
             note_text: HashMap::new(),
             note_models: HashMap::new(),
             note_checked: HashMap::new(),
             trees: HashMap::new(),
             away_since: None,
+            voice: None,
+            speech: Arc::new(RwLock::new(vellum_agent::voice::Speech::default())),
         }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Voice — feature 12
+    // -----------------------------------------------------------------------------------
+
+    /// Starts recording for one node, building the pool if this is the first press.
+    ///
+    /// `target` is the gate and it is the only way in: [`crate::voice::target_for`] answers
+    /// `None` for a node that has not turned voice on, so a node that did not ask for this
+    /// cannot be recorded against however this is called.
+    pub fn begin_voice(
+        &mut self,
+        target: &vellum_agent::voice::VoiceTarget,
+        now_ms: u64,
+    ) -> vellum_agent::Result<()> {
+        self.voice.get_or_insert_with(crate::voice::VoicePool::new).press(target, now_ms)
+    }
+
+    /// Ends the press and hands the audio to a worker. Answers what the node says while it
+    /// waits — *"whisper.cpp, on this machine"* — or the refusal to show instead.
+    pub fn end_voice(&mut self, now_ms: u64) -> vellum_agent::Result<String> {
+        let data_dir = self.data_dir.clone();
+        let speech = self.speech();
+        let Some(pool) = self.voice.as_mut() else {
+            return Err(vellum_agent::AgentError::Refused(
+                "nothing was being recorded — hold the microphone key on an agent to talk to it"
+                    .into(),
+            ));
+        };
+        pool.release(now_ms, &speech, Some(&data_dir))
+    }
+
+    /// How a media file an agent ingests is transcribed.
+    ///
+    /// Pushed by the app rather than read from it, because this crate holds no `Library`.
+    /// Cheap and idempotent: it writes only when the value actually moved, so calling it every
+    /// frame would cost one comparison — though the app calls it when the setting changes.
+    pub fn set_speech(&mut self, speech: &vellum_agent::voice::Speech) {
+        if let Ok(mut held) = self.speech.write()
+            && *held != *speech
+        {
+            *held = speech.clone();
+        }
+    }
+
+    /// The transcription setting this runtime is working from.
+    ///
+    /// ⚠ **The single reader, and it was a split before it was one.** `end_voice` and
+    /// `poll_voice` used to *take* a `&Speech` from the app while `Handler::ingest` read the
+    /// copy held here — so a spoken prompt and an agent's media ingestion were configured from
+    /// two places that agreed only because [`crate::actions::ActiveState::publish_speech`]
+    /// happened to write both. The fourth writer would have broken that silently, which is the
+    /// grid's-two-controls shape this repository has already paid for twice. One holder, one
+    /// reader, one feed.
+    fn speech(&self) -> vellum_agent::voice::Speech {
+        self.speech.read().map(|held| held.clone()).unwrap_or_default()
+    }
+
+    /// Installs a canned microphone and transcriber. **`--demo agent-voice` only.**
+    ///
+    /// See [`crate::voice::VoicePool::canned`] for what is and is not substituted.
+    pub fn install_canned_voice(&mut self, capture: Box<dyn vellum_agent::voice::VoiceCapture>, transcript: &str) {
+        self.voice = Some(crate::voice::VoicePool::canned(capture, transcript));
+    }
+
+    /// Abandons a press and throws the audio away. Idempotent; see [`crate::voice::VoicePool::cancel`].
+    pub fn cancel_voice(&mut self) {
+        if let Some(pool) = self.voice.as_mut() {
+            pool.cancel();
+        }
+    }
+
+    /// The node being recorded for, if any.
+    pub fn voice_holding(&self) -> Option<NodeKey> {
+        self.voice.as_ref().and_then(crate::voice::VoicePool::holding)
+    }
+
+    /// Whether voice wants the frame loop to keep repainting. False when the pool does not
+    /// exist, which is the overwhelmingly common case.
+    pub fn voice_is_busy(&self) -> bool {
+        self.voice.as_ref().is_some_and(crate::voice::VoicePool::is_busy)
+    }
+
+    /// The utterance-length bound and the worker answers, both drained once per frame.
+    ///
+    /// Returns everything the caller must act on: a [`vellum_agent::voice::VoiceEvent::Transcribed`]
+    /// becomes a prompt draft, a `Failed` becomes a message on the node.
+    pub fn poll_voice(&mut self, now_ms: u64) -> Vec<vellum_agent::voice::VoiceEvent> {
+        let data_dir = self.data_dir.clone();
+        let speech = self.speech();
+        let Some(pool) = self.voice.as_mut() else { return Vec::new() };
+
+        let mut out = Vec::new();
+        // The clock half of the bound **first**, so a press held past the limit turns into a
+        // transcription on this frame rather than waiting for a key-up that is not coming.
+        // The node is read before `poll`, because `poll` is what ends the press: asking
+        // afterwards always answers `None` and the refusal would have nothing to name.
+        let held = pool.holding();
+        if let Some(Err(error)) = pool.poll(now_ms, &speech, Some(&data_dir)) {
+            out.push(vellum_agent::voice::VoiceEvent::Failed {
+                node: held.map(|node| node.wire()).unwrap_or_default(),
+                message: error.to_string(),
+            });
+        }
+        out.extend(pool.drain());
+        out
+    }
+
+    /// What this node is doing about voice, for the painter's snapshot.
+    pub fn voice_status(&self, key: &NodeKey, now_ms: u64) -> Option<crate::voice::VoiceStatus> {
+        self.voice.as_ref().and_then(|pool| pool.status(key, now_ms))
     }
 
     /// Whether there is nothing at all to do this frame.
@@ -948,6 +1138,7 @@ impl AgentRuntime {
             post: Mutex::new(self.post.clone()),
             roles: Arc::clone(&self.roles),
             stopping: Arc::clone(&self.stopping),
+            speech: Arc::clone(&self.speech),
         });
         match IpcServer::start(&self.data_dir, handler) {
             Ok(server) => {
@@ -1004,7 +1195,9 @@ impl AgentRuntime {
         if self.dormant() {
             return;
         }
-        let now_ms = now.saturating_mul(1_000);
+        // Read, not derived from `now`. See [`unix_now_ms`]: seconds multiplied by a thousand
+        // is a clock that ticks once a second, and the pulse it feeds lives for 600 ms.
+        let now_ms = unix_now_ms();
 
         self.drain_sessions(now, now_ms);
         self.drain_bus(now, now_ms);
@@ -1175,6 +1368,12 @@ impl AgentRuntime {
         let answer = match call {
             Call::Send { to, text } => self.serve_send(&key, &to, &text, now_ms),
             Call::NoteRead { path } => self.serve_note_read(&key, &path),
+            Call::NoteChain { path, depth } => self.serve_note_chain(&key, &path, depth),
+            // Straight to the frame loop: the read is done and only the document write is
+            // left. `defer` returns, so this arm cannot fall through to the reply below.
+            Call::Attach { ingested } => {
+                return self.defer(DocumentWork::Attach { node: key, ingested }, reply);
+            }
             Call::NoteWrite { path, text, append } => {
                 self.serve_note_write(&key, &path, &text, append)
             }
@@ -1196,26 +1395,46 @@ impl AgentRuntime {
                     reply,
                 );
             }
-            Call::ReadConfig { node } => {
-                let Some(node) = NodeKey::from_wire(&node) else {
-                    let _ = reply.send(Err(AgentError::Refused(format!(
-                        "\"{node}\" is not an agent node on any open board"
-                    ))));
+            // ⚠ **A label resolves here exactly as it does for `send`.** The system context
+            // tells the meta agent to `configure <node>`, and the only ids it can *see* are
+            // the labels on the board — the wire form is `<board-key>:<counter@peer>`, which
+            // appears in no transcript, no reply and no listing. Parsing the wire form alone
+            // made the instruction true only for a node this agent had spawned itself and
+            // remembered the id of; for the case the feature exists for — the person asking
+            // the meta agent to change *the Reviewer* — every call was refused. `Bus::resolve`
+            // is the same door `send` uses, so one spelling addresses a node for both verbs,
+            // and an ambiguous label is refused with the count rather than resolved by luck.
+            Call::ReadConfig { node } => match self.resolve_node(&node) {
+                Ok(node) => return self.defer(DocumentWork::ReadConfig { node }, reply),
+                Err(error) => {
+                    let _ = reply.send(Err(error));
                     return;
-                };
-                return self.defer(DocumentWork::ReadConfig { node }, reply);
-            }
-            Call::WriteConfig { node, model } => {
-                let Some(node) = NodeKey::from_wire(&node) else {
-                    let _ = reply.send(Err(AgentError::Refused(format!(
-                        "\"{node}\" is not an agent node on any open board"
-                    ))));
+                }
+            },
+            Call::WriteConfig { node, model } => match self.resolve_node(&node) {
+                Ok(node) => return self.defer(DocumentWork::WriteConfig { node, model }, reply),
+                Err(error) => {
+                    let _ = reply.send(Err(error));
                     return;
-                };
-                return self.defer(DocumentWork::WriteConfig { node, model }, reply);
-            }
+                }
+            },
         };
         let _ = reply.send(answer);
+    }
+
+    /// A node id or a label, resolved to a key — the same resolution `send` applies.
+    ///
+    /// Wire form first, because an id an agent was handed by `spawn` is exact and a board may
+    /// legitimately hold a node whose *label* looks like one. Then the topology, which is
+    /// where a human-readable name lives.
+    fn resolve_node(&self, query: &str) -> vellum_agent::Result<NodeKey> {
+        if let Some(key) = NodeKey::from_wire(query) {
+            return Ok(key);
+        }
+        let wire = self.bus.resolve(query).into_result(query)?;
+        NodeKey::from_wire(&wire).ok_or_else(|| {
+            AgentError::Refused(format!("\"{query}\" is not an agent node on any open board"))
+        })
     }
 
     /// Park a job for the frame loop.
@@ -1405,7 +1624,7 @@ impl AgentRuntime {
     fn serve_note_read(&self, key: &NodeKey, path: &str) -> vellum_agent::Result<Reply> {
         let store = self.store_for(key)?;
         let file = store.resolve_stored(path)?;
-        let who = key.wire();
+        let who = requester_id(key);
         if !store.may_read_path(&file, Requester::Agent(&who)) {
             return Err(AgentError::Refused(format!(
                 "{path} is private to another agent; {} may not read it",
@@ -1426,7 +1645,7 @@ impl AgentRuntime {
     ) -> vellum_agent::Result<Reply> {
         let store = self.store_for(key)?;
         let file = store.resolve_stored(path)?;
-        let who = key.wire();
+        let who = requester_id(key);
         if !store.may_read_path(&file, Requester::Agent(&who)) {
             return Err(AgentError::Refused(format!(
                 "{path} is private to another agent; {} may not write it",
@@ -1452,12 +1671,65 @@ impl AgentRuntime {
         Ok(Reply::Done)
     }
 
+    /// A note and everything it links to, transitively — feature 8's chaining.
+    ///
+    /// The walk is `NoteStore`'s: cycle-safe, depth-bounded, and it applies the private-scope
+    /// check at **every hop**, which is the reason this is one call rather than an agent
+    /// following links itself. A chain that started in a shared note and reached another
+    /// agent's private one must stop there, and only the store knows that.
+    fn serve_note_chain(
+        &self,
+        key: &NodeKey,
+        path: &str,
+        depth: Option<usize>,
+    ) -> vellum_agent::Result<Reply> {
+        let store = self.store_for(key)?;
+        let file = store.resolve_stored(path)?;
+        let who = requester_id(key);
+        if !store.may_read_path(&file, Requester::Agent(&who)) {
+            return Err(AgentError::Refused(format!(
+                "{path} is private to another agent; {} may not read it",
+                key.item
+            )));
+        }
+        // Deeper than the default is refused rather than granted: the depth is a bound, and a
+        // caller that could raise it could ask for the whole project one hop at a time.
+        let mut limits = vellum_agent::notes::LinkLimits::default();
+        if let Some(asked) = depth {
+            limits.depth = asked.min(limits.depth);
+        }
+        // The model the walk starts from, built from the **file** rather than from a node's
+        // token: an agent may chain from any note it can see, and most of them are not the
+        // note on its own node.
+        //
+        // The scope is read off where the file lives, which `NoteStore::dir_for` and
+        // `may_read_path` agree is the encoding. Naming the requester as the owner of a
+        // private one is exact rather than a guess *because* of the check just above: a file
+        // in a private directory that this agent may read is, by that function's definition, a
+        // file in this agent's own directory.
+        let scope = if file.parent() == Some(store.root()) {
+            vellum_agent::NoteScope::Shared
+        } else {
+            vellum_agent::NoteScope::Private { agent: who.clone() }
+        };
+        let start = vellum_agent::NoteModel {
+            path: store.stored_path(&file),
+            scope,
+            links: Vec::new(),
+            seen_mtime: None,
+            seen_len: None,
+        };
+        // `walk` seeds its queue with the start note, so the trail already begins with it.
+        let chain = store.context_chain(&start, Requester::Agent(&who), limits)?;
+        Ok(Reply::Chain(chain))
+    }
+
     /// Every note this agent may see: the board's shared notes, plus its own private ones.
     fn serve_note_list(&self, key: &NodeKey) -> vellum_agent::Result<Reply> {
         let store = self.store_for(key)?;
         let mut entries = Vec::new();
         collect_notes(store, store.root(), &NoteScope::Shared, &mut entries);
-        let mine = NoteScope::Private { agent: key.wire() };
+        let mine = NoteScope::Private { agent: requester_id(key) };
         collect_notes(store, &store.dir_for(&mine), &mine, &mut entries);
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(Reply::Notes(entries))
@@ -1477,9 +1749,12 @@ impl AgentRuntime {
             .blobs
             .put(bytes)
             .map_err(|error| AgentError::Refused(format!("that picture would not store: {error}")))?;
-        let event = TranscriptEvent::Image { blob: hash.to_hex().to_string(), caption };
+        let blob = hash.to_hex().to_string();
+        let event = TranscriptEvent::Image { blob: blob.clone(), caption };
         self.record(key, now, &event);
-        Ok(Reply::Done)
+        // The hash goes back to the caller: it is what a following `options` call puts on a
+        // choice, and answering `Done` was why a choice could never carry a picture.
+        Ok(Reply::Stored(blob))
     }
 
     fn store_for(&self, key: &NodeKey) -> vellum_agent::Result<&NoteStore> {
@@ -1597,6 +1872,23 @@ impl AgentRuntime {
         self.note_models.get(key)
     }
 
+    /// The live model of whichever note node on this board holds `path`.
+    ///
+    /// By path rather than by key because the inspector asks about the note it is drawing and
+    /// holds its path, not its node id — and because two nodes pointing at one file is a state
+    /// the store allows: they are two views of the same note, and either one's freshly derived
+    /// links are the file's links.
+    pub fn note_model_at(
+        &self,
+        board: &BoardKey,
+        path: &str,
+    ) -> Option<&vellum_agent::NoteModel> {
+        self.note_models
+            .iter()
+            .find(|(key, note)| &key.board == board && note.path == path)
+            .map(|(_, note)| note)
+    }
+
     pub fn set_note_model(&mut self, key: &NodeKey, model: vellum_agent::NoteModel) {
         self.note_models.insert(key.clone(), model);
     }
@@ -1612,14 +1904,19 @@ impl AgentRuntime {
     /// the ring would then draw as a *second* question. The consequence is stated rather than
     /// hidden: reopening a board shows the question unanswered again. That is honest — the
     /// session it was an answer to is gone, so asking again is the correct offer.
-    pub fn choose_option(&mut self, key: &NodeKey, choice: &str) -> bool {
+    pub fn choose_option(&mut self, key: &NodeKey, asked: &str, choice: &str) -> bool {
         let Some(state) = self.nodes.get_mut(key) else { return false };
-        // Newest first: a long-running agent can ask more than one question, and the one on
-        // screen being answered is the last one it asked.
+        // Newest first, and **matched on the question as well as the answer**. The prompt is
+        // what the card carried away with it (`draw::OptionCard::prompt`); without it a node
+        // holding two unanswered questions resolved a click by choice id alone, so pressing
+        // *yes* on the older card marked the newer one answered and sent its own reply.
         for event in state.events.iter_mut().rev() {
             let TranscriptEvent::Options { prompt, choices, chosen } = event.as_ref() else {
                 continue;
             };
+            if prompt != asked {
+                continue;
+            }
             if chosen.is_some() || !choices.iter().any(|option| option.id == choice) {
                 continue;
             }
@@ -1807,6 +2104,10 @@ impl AgentRuntime {
                     // which this module deliberately knows nothing about — the app puts it
                     // over the top afterwards. See `AgentView::draft`.
                     caret: None,
+                    // Answered from the pool, which is `None` on every board nobody has
+                    // spoken to — so this is one `Option::and_then` per visible node and no
+                    // allocation at all in the overwhelmingly common case.
+                    voice: self.voice_status(&key, now_ms),
                 },
             );
         }
@@ -2023,6 +2324,57 @@ impl AgentRuntime {
     }
 
     /// Every node that has a transcript on this board, for the digest.
+    /// Every board this runtime is holding agent state for, in a stable order.
+    ///
+    /// ⚠ **An agent on a parked tab keeps running**, which is the whole point of parking one
+    /// rather than closing it — so a digest built from the board in front alone reports on a
+    /// fraction of what happened while the user was away, and says nothing about the tab
+    /// where the long job was left to run. The keys are the runtime's own, so this covers
+    /// exactly the boards that have agent state and no others.
+    /// The label the wiring last saw for a node, whichever board it is on.
+    ///
+    /// The document is the better source and is only reachable for the board in front, so
+    /// this is what a digest uses for the rest: a parked agent named *"Reviewer"* rather
+    /// than `7@1`, which is what the person walked away from and what they will look for.
+    /// How far one file tree is scrolled, in whole rows.
+    ///
+    /// App-side rather than in the document, for the reason `draw::tree_paint`'s parameter
+    /// records: a scroll position is not board content, and one undo step per wheel notch is
+    /// the mistake this codebase already avoided for the caret.
+    pub fn tree_scroll(&self, key: &NodeKey) -> usize {
+        self.tree_scroll.get(key).copied().unwrap_or(0)
+    }
+
+    /// Scroll a tree by `rows`, clamped to `limit` (the last row that can sit at the top).
+    ///
+    /// Answers whether anything moved, so the caller can decide whether the gesture was
+    /// consumed — a wheel over a tree that is already at its end must fall through and zoom
+    /// the board, or the node becomes a dead patch of canvas.
+    pub fn scroll_tree(&mut self, key: &NodeKey, rows: i64, limit: usize) -> bool {
+        let at = self.tree_scroll(key);
+        let next = usize::try_from(at as i64 + rows).unwrap_or(0).min(limit);
+        if next == at {
+            return false;
+        }
+        self.tree_scroll.insert(key.clone(), next);
+        true
+    }
+
+    pub fn label_of(&self, key: &NodeKey) -> Option<String> {
+        self.bus.with_topology(|topology| topology.name_of(&key.wire()).map(str::to_owned))
+    }
+
+    pub fn boards_with_nodes(&self) -> Vec<BoardKey> {
+        let mut boards: Vec<BoardKey> = Vec::new();
+        for key in self.nodes.keys() {
+            if !boards.contains(&key.board) {
+                boards.push(key.board.clone());
+            }
+        }
+        boards.sort_by_key(std::string::ToString::to_string);
+        boards
+    }
+
     pub fn nodes_on(&self, board: &BoardKey) -> Vec<NodeKey> {
         self.nodes
             .keys()
@@ -2212,6 +2564,7 @@ struct Handler {
     post: Mutex<Sender<Job>>,
     roles: Arc<RwLock<HashMap<String, RoleKind>>>,
     stopping: Arc<AtomicBool>,
+    speech: Arc<RwLock<vellum_agent::voice::Speech>>,
 }
 
 impl Handler {
@@ -2263,6 +2616,36 @@ impl IpcHandler for Handler {
         }
     }
 
+    fn ingest(&self, agent: &str, source: &str) -> vellum_agent::Result<String> {
+        // ⚠ **Read here, on the IPC server's own thread.** This is a worker: blocking it
+        // blocks the one agent that asked, which is exactly who should wait. `ingest` opens
+        // files and, for a page or a video, the network — and the frame loop must never do
+        // either. The agent's socket read timeout is what bounds it.
+        let mut ingested = vellum_agent::ingest::ingest(source);
+        // Feature 18's last step, on **this** thread — which is the whole reason it can be
+        // done at all. Transcribing a video is minutes of CPU; the frame loop must never do
+        // it, and here it blocks only the one agent that asked, which is exactly who should
+        // wait. A machine with no local transcriber leaves the source attached by path, which
+        // is the state that was true before.
+        let speech = self.speech.read().map(|held| held.clone()).unwrap_or_default();
+        crate::app::ActiveState::transcribe_media(&speech, &mut ingested);
+        let said = ingested.outcome.message();
+        self.call(agent, Call::Attach { ingested: Box::new(ingested) })?;
+        Ok(said)
+    }
+
+    fn note_chain(
+        &self,
+        agent: &str,
+        path: &str,
+        depth: Option<usize>,
+    ) -> vellum_agent::Result<Vec<(String, String)>> {
+        match self.call(agent, Call::NoteChain { path: path.to_owned(), depth })? {
+            Reply::Chain(notes) => Ok(notes),
+            other => Err(wrong_answer("note.chain", &other)),
+        }
+    }
+
     fn note_write(
         &self,
         agent: &str,
@@ -2296,12 +2679,14 @@ impl IpcHandler for Handler {
         agent: &str,
         bytes: &[u8],
         caption: Option<&str>,
-    ) -> vellum_agent::Result<()> {
-        self.call(
+    ) -> vellum_agent::Result<String> {
+        match self.call(
             agent,
             Call::Image { bytes: bytes.to_vec(), caption: caption.map(str::to_owned) },
-        )
-        .map(|_| ())
+        )? {
+            Reply::Stored(blob) => Ok(blob),
+            other => Err(wrong_answer("image", &other)),
+        }
     }
 
     fn post_options(
@@ -2552,6 +2937,66 @@ mod tests {
         BoardKey::from_raw("00000000deadbeef")
     }
 
+    /// ⚠ **A private note has to be readable by the agent it is private to.**
+    ///
+    /// Feature 8's private scope is *"visible/writable only to one specific agent"*, and both
+    /// halves of that sentence were failing: the owner was refused as hard as a stranger. The
+    /// scope is written by the inspector as a bare document id and was being checked against
+    /// [`NodeKey::wire`]'s `<board>:<item>` form, so the comparison could not succeed for any
+    /// note, any agent, any board. See [`requester_id`].
+    ///
+    /// The test asserts all three verbs, because the id was wrong at three separate call
+    /// sites and fixing two of them would leave a note an agent could read and not write —
+    /// which is feedback 35's *fix applied at N−1 of N sites* exactly. It also asserts a
+    /// second agent is still refused: a fix that simply stopped checking would pass a test
+    /// that only looked at the owner, and would make "private" mean nothing.
+    ///
+    /// A/B: with `requester_id` returning `key.wire()`, the owner's read fails with
+    /// *"is private to another agent"*.
+    #[test]
+    fn a_private_note_is_readable_and_writable_by_its_owner_and_by_nobody_else() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let board = board();
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).expect("a scratch project");
+        runtime.register_board(&board, Some(&project));
+
+        let owner = NodeKey::new(&board, "7@1");
+        let stranger = NodeKey::new(&board, "9@1");
+
+        // Written exactly as the inspector writes it: the scope carries the node's own
+        // document id, which is what `AgentLink::id` is.
+        let scope = NoteScope::Private { agent: owner.item.clone() };
+        let store = runtime.note_store(&board).expect("a registered board has a note store");
+        // `Requester::User`, because this is the inspector creating a note *for* an agent —
+        // the person is allowed to make a note private to somebody else.
+        let model = store
+            .create("Plan", scope, "# Plan\n", Requester::User)
+            .expect("the note file");
+        let stored = model.path.clone();
+
+        let read = runtime.serve_note_read(&owner, &stored);
+        assert!(read.is_ok(), "the owner could not read its own private note: {read:?}");
+
+        let written = runtime.serve_note_write(&owner, &stored, "# Plan\n\nstep one\n", false);
+        assert!(written.is_ok(), "the owner could not write its own private note: {written:?}");
+
+        let listed = runtime.serve_note_list(&owner).expect("a listing");
+        match listed {
+            Reply::Notes(entries) => assert!(
+                entries.iter().any(|entry| entry.path == stored),
+                "the owner's own private note was not in its listing: {entries:?}"
+            ),
+            other => panic!("note list answered {other:?}"),
+        }
+
+        let refused = runtime.serve_note_read(&stranger, &stored);
+        assert!(refused.is_err(), "another agent read a private note: {refused:?}");
+        let refused = runtime.serve_note_write(&stranger, &stored, "mine now", false);
+        assert!(refused.is_err(), "another agent wrote a private note: {refused:?}");
+    }
+
     /// The property the whole layer rests on. If this stops being true, every board in the
     /// application pays for a feature it is not using.
     #[test]
@@ -2619,6 +3064,66 @@ mod tests {
         assert_eq!(state.events.len(), TAIL_EVENTS);
         assert!(state.truncated, "the ring dropped history without saying so");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⚠ **Two questions in flight are answered independently**, which is what the prompt on
+    /// the card is for.
+    ///
+    /// A long-running agent asks more than once, and the ids in an option set are the
+    /// agent's own — `yes`/`no` in both is the normal case, not a contrived one. Resolving a
+    /// click by choice id alone marked the *newest* matching question answered and sent its
+    /// reply, so pressing a card on the older set answered the newer one and left the card
+    /// the user actually clicked still offering itself.
+    ///
+    /// A/B: with the `prompt != asked` guard removed, the first assertion below passes and
+    /// the second fails — the older question is already marked answered.
+    #[test]
+    fn two_unanswered_questions_are_answered_by_the_card_that_was_pressed() {
+        let dir = scratch();
+        let mut runtime = open(&dir);
+        let key = NodeKey::new(&board(), "5@1");
+        let choices = vec![Choice::new("yes", "Yes"), Choice::new("no", "No")];
+        for prompt in ["ship it?", "run the tests?"] {
+            runtime.record(
+                &key,
+                1,
+                &TranscriptEvent::Options {
+                    prompt: prompt.into(),
+                    choices: choices.clone(),
+                    chosen: None,
+                },
+            );
+        }
+
+        // The **older** card, pressed while a newer question is also unanswered.
+        assert!(runtime.choose_option(&key, "ship it?", "yes"));
+        // The newer one is untouched and still answerable.
+        assert!(
+            runtime.choose_option(&key, "run the tests?", "no"),
+            "answering one question settled the other"
+        );
+
+        let answers: Vec<(String, Option<String>)> = runtime
+            .nodes
+            .get(&key)
+            .expect("the node exists")
+            .events
+            .iter()
+            .filter_map(|event| match event.as_ref() {
+                TranscriptEvent::Options { prompt, chosen, .. } => {
+                    Some((prompt.clone(), chosen.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            vec![
+                ("ship it?".to_owned(), Some("yes".to_owned())),
+                ("run the tests?".to_owned(), Some("no".to_owned())),
+            ],
+            "each question kept its own answer"
+        );
     }
 
     /// Away-mode's whole condition. Alt-tabbing to a browser and straight back is not being
@@ -2806,10 +3311,11 @@ mod tests {
             },
         );
 
-        assert!(runtime.choose_option(&key, "a"), "the first press found nothing to answer");
-        assert!(!runtime.choose_option(&key, "a"), "a second press answered the same question");
-        assert!(!runtime.choose_option(&key, "b"), "a second card answered a settled question");
-        assert!(!runtime.choose_option(&key, "nonsense"), "an unknown choice was accepted");
+        let asked = "which?";
+        assert!(runtime.choose_option(&key, asked, "a"), "the first press found nothing to answer");
+        assert!(!runtime.choose_option(&key, asked, "a"), "a second press answered the same question");
+        assert!(!runtime.choose_option(&key, asked, "b"), "a second card answered a settled question");
+        assert!(!runtime.choose_option(&key, asked, "nonsense"), "an unknown choice was accepted");
 
         let state = runtime.nodes.get(&key).expect("the node exists");
         match state.events.back().map(std::convert::AsRef::as_ref) {

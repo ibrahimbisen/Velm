@@ -83,6 +83,16 @@ pub struct AgentView {
     /// the same `TextCursor` the on-canvas caret uses, so the caret, the selection highlight
     /// and the blink are one implementation rather than a second one for prompts.
     pub caret: Option<PromptCaret>,
+    /// Whether this node's microphone is open, or its audio is with a transcriber.
+    ///
+    /// ⚠ **This field is the feature, not a decoration.** Voice was written, tested and
+    /// feature-gated with no way for the painter to know any of it was happening — so the one
+    /// thing a person needs while holding a key down, *is it hearing me*, could not be drawn.
+    /// That is this repository's signature defect (the pen, feedback 7; the frame, 23; the
+    /// prompt row, 34): state accumulated where the painter cannot reach it is state that does
+    /// not exist. It rides beside `status` rather than inside it because a node can be
+    /// listening *and* running, and one enum would make the status dot lie about one of them.
+    pub voice: Option<crate::voice::VoiceStatus>,
 }
 
 /// Where the caret is in a prompt row.
@@ -163,6 +173,8 @@ pub struct AgentViews {
     /// both off screen would otherwise be drawn as an ordinary line. The link would flicker
     /// between styles as the user panned, which is worse than either answer alone.
     has_agents: bool,
+    /// Per-tree scroll offsets, filled by the app from `AgentRuntime::tree_scroll`.
+    tree_scrolls: std::collections::HashMap<SceneId, usize>,
 }
 
 impl AgentViews {
@@ -266,6 +278,18 @@ impl AgentViews {
     /// The `Arc` is deliberately not in this signature: the painter borrows the rows for the
     /// frame and has no reason to keep them, so every reader stays exactly as it was when the
     /// sharing was introduced.
+    /// How far one tree is scrolled, in whole rows. `0` for a tree nobody has scrolled.
+    ///
+    /// Carried on the views because the painter has no runtime to ask, exactly as the browser
+    /// permission and the chat default are.
+    pub fn tree_scroll(&self, id: SceneId) -> usize {
+        self.tree_scrolls.get(&id).copied().unwrap_or(0)
+    }
+
+    pub fn set_tree_scroll(&mut self, id: SceneId, rows: usize) {
+        self.tree_scrolls.insert(id, rows);
+    }
+
     pub fn tree(&self, id: SceneId) -> Option<&vellum_agent::filetree::View> {
         self.trees.get(&id).map(|view| &**view)
     }
@@ -310,6 +334,7 @@ impl AgentViews {
         self.trees.clear();
         self.browser_notes.clear();
         self.has_agents = false;
+        self.tree_scrolls.clear();
         // Deliberately **not** `browser_nodes`: it is a preference rather than a per-frame
         // answer, and the caller sets it right after this. Clearing it would make the value
         // depend on the order of two calls that have no reason to be ordered.

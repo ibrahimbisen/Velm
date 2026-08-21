@@ -89,7 +89,7 @@ pub(crate) fn show(
                 });
             });
             cluster = inner.response.rect;
-            paint_glass_edge(ui.painter(), cluster, palette, Backing::Canvas);
+            paint_glass_edge(ui.painter(), cluster, palette, Backing::Canvas, f32::from(radius::LARGE));
         });
 
     if let Some(spec) = palette.glass(Backing::Canvas)

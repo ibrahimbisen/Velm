@@ -16,7 +16,7 @@
 //! trade at all — the sampler was already going to use the small level. Keeping the
 //! large ones was pure waste.
 //!
-//! # The policy, in four numbers
+//! # The policy, in five numbers
 //!
 //! Everything here is one decision per texture per frame, taken from the largest
 //! whole-image texel count any of that frame's draws asked for:
@@ -28,16 +28,31 @@
 //! - **[`DetailPolicy::demote_threshold_levels`]** — how much surplus is worth acting
 //!   on. Two levels (16× the memory) makes ordinary zooming free: only a real change
 //!   of scale moves anything.
-//! - **[`DetailPolicy::refinements_per_frame`]** — how many textures may be dropped
-//!   per frame for being too coarse. Refinement costs a decode, and the caller's
-//!   decode budget is per-frame, so asking for twenty at once would only produce
-//!   twenty placeholders.
+//! - **[`DetailPolicy::refine_threshold_levels`]** — how much *deficit* is worth acting
+//!   on, and it is the newer half. This side had no threshold at all, so a refinement
+//!   fired on any magnification however slight while the demote side had hysteresis
+//!   from the start. Two levels means only a magnification past 2× moves anything.
+//! - **[`DetailPolicy::refinements_per_frame`]** — how many textures may be *asked* to
+//!   refine per frame. Refinement costs a decode on a two-thread pool, so asking for
+//!   twenty at once would only queue twenty.
 //! - **[`DetailPolicy::min_dimension`]** — a floor, so an image drawn at one pixel
 //!   does not churn its way down to a 1 × 1 texture and back.
 //!
-//! The gap between the last two thresholds is the hysteresis. A texture demotes when
-//! it has ≥ 3 levels of surplus and refines when it has < 0, so it settles two to
-//! eight times the drawn size and stays there through any zoom smaller than 4×.
+//! The gap between the two thresholds is the hysteresis, and it is deliberately
+//! **asymmetric**: a texture demotes at ≥ 3 levels of surplus and refines at ≤ −2, so it
+//! settles two to eight times the drawn size and stays there through any zoom smaller
+//! than 4× out or 2× in. Demotion is a `copy_texture_to_texture` with no decode and no
+//! visible change; refinement is a full decode. Paying more zoom before the expensive
+//! direction is the trade, not an accident.
+//!
+//! # Nothing is destroyed to ask for a refinement
+//!
+//! A texture too coarse for its drawn size used to be **dropped**, and that drop *was* the
+//! message to the caller. It held while `Assets::texture` decoded and uploaded inline; once
+//! decoding moved to worker threads the same signal became several frames of flat grey
+//! placeholder on every image a zoom swept past — *"when i zoom in and out images flicker
+//! alot"*. `TextureManager::wants_refinement` asks instead, and the coarse texture keeps
+//! drawing until its replacement is ready.
 //!
 //! # Why not BC7 or ASTC as well
 //!
@@ -61,7 +76,21 @@ pub struct DetailPolicy {
     pub retain_slack_levels: u32,
     /// Surplus levels, past the slack, before a texture is rebuilt smaller.
     pub demote_threshold_levels: u32,
-    /// Textures that may be dropped for re-upload at a finer level in one frame.
+    /// Levels a texture must be **too coarse** by before a refinement is asked for.
+    ///
+    /// This side had no threshold at all: `surplus < 0` fired on any deficit however slight,
+    /// while the demote side has had hysteresis since it was written. Because every texture
+    /// settles somewhere inside a two-level band, one continuous zoom gesture crossed each
+    /// image's refine edge at a **different zoom** — which is why the user saw *"images flicker
+    /// alot"* rather than one clean swap.
+    ///
+    /// **Two, and one would be a no-op.** `surplus_levels` floors, so `surplus < 0` and
+    /// `surplus <= -1` are the same condition — a threshold of 1 reproduces the hair trigger
+    /// exactly. At 2 a texture is refined once it is magnified more than 2×, which is where
+    /// softness starts being visible; going further would trade the flicker for blur, in a
+    /// session that started with "it looks a little bit off".
+    pub refine_threshold_levels: u32,
+    /// Textures that may be asked to refine in one frame.
     pub refinements_per_frame: usize,
     /// A stored top level never goes below this on its longer side.
     pub min_dimension: u32,
@@ -72,6 +101,7 @@ impl Default for DetailPolicy {
         Self {
             retain_slack_levels: 1,
             demote_threshold_levels: 2,
+            refine_threshold_levels: 2,
             refinements_per_frame: 4,
             min_dimension: 8,
         }
@@ -166,10 +196,44 @@ pub(crate) fn decide(
         let drop = droppable.min(allowed);
         return if drop > 0 { Detail::Demote(drop as u32) } else { Detail::Keep };
     }
-    if surplus < 0 && (stored.0 < ceiling.0 || stored.1 < ceiling.1) {
+    // A deficit inside the deadband is a magnification of less than
+    // `2^refine_threshold_levels`, which trilinear sampling and 16x anisotropy absorb. It is
+    // not worth a decode, and acting on it is what made one zoom gesture cross a separate
+    // refine edge per image. `.max(1)` because a zero here would mean "refine a texture that is
+    // exactly the right size", for ever.
+    let deficit = levels(policy.refine_threshold_levels.max(1));
+    if surplus <= -deficit && (stored.0 < ceiling.0 || stored.1 < ceiling.1) {
         return Detail::Refine;
     }
     Detail::Keep
+}
+
+/// The size a too-coarse texture should come back at: the smallest level of the source's own
+/// chain that still keeps `retain_slack_levels` in hand.
+///
+/// **Not the ceiling.** `TextureManager::upload` builds to `TextureBudget::max_dimension`, so
+/// every refinement decoded and uploaded 2048² — 21.3 MB with its mips — for a texture that the
+/// very next `resolve_detail` demoted to about 1.3 MB, in the same frame. The refinement paid
+/// full price and kept none of it, and four of those a frame is most of a 268 MB budget spent
+/// on work that is thrown away before it is drawn twice.
+pub(crate) fn refine_target(
+    policy: &DetailPolicy,
+    ceiling: (u32, u32),
+    demanded: (f32, f32),
+) -> (u32, u32) {
+    let slack = policy.retain_slack_levels.min(i32::MAX as u32) as i32;
+    let mut best = ceiling;
+    for level in 1..32u32 {
+        let candidate = ((ceiling.0 >> level).max(1), (ceiling.1 >> level).max(1));
+        if surplus_levels(candidate, demanded) < slack {
+            break;
+        }
+        best = candidate;
+        if candidate == (1, 1) {
+            break;
+        }
+    }
+    best
 }
 
 /// Levels that can come off before the longer side falls under the floor.
@@ -189,6 +253,63 @@ mod tests {
 
     fn policy() -> DetailPolicy {
         DetailPolicy::default()
+    }
+
+    /// The hair trigger that made a zoom gesture flicker.
+    ///
+    /// `Refine` used to fire on `surplus < 0` — any deficit however slight — while the demote
+    /// side has had hysteresis since it was written. Because every texture settles somewhere
+    /// inside a two-level band, one continuous zoom crossed each image's edge at a *different*
+    /// zoom, and each crossing destroyed the texture and drew a flat placeholder until a
+    /// worker-thread decode came back. That is *"when i zoom in and out images flicker alot"*.
+    #[test]
+    fn a_deficit_inside_the_deadband_is_not_worth_a_decode() {
+        // 512 stored against 700 demanded: 1.37x magnification, which trilinear sampling and
+        // 16x anisotropy absorb.
+        assert_eq!(
+            decide(&policy(), (512, 512), (2048, 2048), (700.0, 700.0)),
+            Detail::Keep,
+            "a 1.37x magnification is soft, not broken"
+        );
+        // Past the deadband, and now the decode earns its place.
+        assert_eq!(
+            decide(&policy(), (512, 512), (2048, 2048), (1100.0, 1100.0)),
+            Detail::Refine
+        );
+    }
+
+    /// The mirror of `no_demand_both_demotes_and_refines_the_result`, and the reason the
+    /// deadband is safe: a texture that has just been refined must not be immediately
+    /// demotable, or a held zoom would decode and shrink the same image for ever.
+    #[test]
+    fn nothing_both_refines_and_then_demotes_the_result() {
+        let ceiling = (2048, 2048);
+        let mut demanded = 0.5_f32;
+        while demanded < 8192.0 {
+            // Deliberately far too coarse, so `Refine` is the answer wherever it can be.
+            if decide(&policy(), (16, 16), ceiling, (demanded, demanded)) == Detail::Refine {
+                let target = refine_target(&policy(), ceiling, (demanded, demanded));
+                let after = decide(&policy(), target, ceiling, (demanded, demanded));
+                assert!(
+                    !matches!(after, Detail::Demote(_)),
+                    "demand {demanded} refined to {target:?} and immediately demoted"
+                );
+            }
+            demanded *= 1.05;
+        }
+    }
+
+    /// A refinement asks for the size it is drawn at, not for the budget's ceiling.
+    ///
+    /// Uploading at `TextureBudget::max_dimension` costs 21.3 MB with mips for a texture the
+    /// very next resolve demotes to about 1.3 MB, in the same frame — so every refinement paid
+    /// full price and kept none of it, four times a frame, against a 268 MB budget.
+    #[test]
+    fn a_refinement_asks_for_the_size_it_is_drawn_at() {
+        assert_eq!(refine_target(&policy(), (2048, 2048), (256.0, 256.0)), (512, 512));
+        assert_eq!(refine_target(&policy(), (2048, 2048), (2048.0, 2048.0)), (2048, 2048));
+        // Never below the source: there is nothing finer to ask for.
+        assert_eq!(refine_target(&policy(), (256, 256), (4096.0, 4096.0)), (256, 256));
     }
 
     /// The board view's `units_per_pixel` is `1/zoom`, so this is the whole reason the

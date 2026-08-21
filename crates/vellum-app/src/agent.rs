@@ -27,7 +27,7 @@
 //! lands where the paint is not. Anything that can be pressed on an agent node gets its
 //! rectangle from here.
 
-use vellum_agent::{AgentModel, DisplayMode, RoleKind};
+use vellum_agent::{AgentModel, ChatTheme, DisplayMode, RoleKind};
 use vellum_doc::{ArrowKind, ItemKind};
 
 /// An axis-aligned box in the item's own space: origin at the item's top-left, units are
@@ -316,6 +316,59 @@ pub const fn display_mode(model: &AgentModel, fallback: DisplayMode) -> DisplayM
         Some(mode) => mode,
         None => fallback,
     }
+}
+
+/// The chat theme this node actually draws in, resolving `None` against the app-wide default.
+///
+/// [`display_mode`]'s twin, in the same shape and for the same reason: the default lives in
+/// the library sidecar and `vellum-agent` must not know about it.
+pub const fn chat_theme(
+    model: &AgentModel,
+    fallback: ChatTheme,
+) -> ChatTheme {
+    match model.chat_theme {
+        Some(theme) => theme,
+        None => fallback,
+    }
+}
+
+/// How see-through this node's paper is, as a multiplier.
+///
+/// **Floored well above zero.** A transcript at zero opacity is a node you cannot find, let
+/// alone select — the same argument `Library::persist`'s transparency slider makes for the
+/// chrome, and sharper here, because the thing that would vanish is the only handle on a
+/// running process. The words are never faded by this at all; see
+/// [`vellum_agent::AgentModel::chat_opacity`].
+pub fn chat_opacity(model: &AgentModel) -> f32 {
+    let raw = model.chat_opacity.map_or(1.0, |a| f32::from(a) / 255.0);
+    raw.clamp(MIN_CHAT_OPACITY, 1.0)
+}
+
+/// The floor under [`chat_opacity`]. A fifth is still plainly a card.
+pub const MIN_CHAT_OPACITY: f32 = 0.2;
+
+/// The background picture's hash, read straight out of the token.
+///
+/// # Why this reads the JSON rather than decoding
+///
+/// The painter asks once per visible agent node per frame, and `decode` builds a whole
+/// `AgentModel` — a provider, a rule set, a schedule, a vector of context sources — to
+/// answer a question about one optional string that is usually absent. That is the idle cost
+/// `docs/07-agent-canvas.md` §0 forbids, and it is the defect feedback 34 found twenty lines
+/// from a correct use of the R-tree.
+///
+/// The key is [`vellum_agent::AgentModel::chat_background`]'s serde name.
+/// `the_background_key_is_the_one_serde_writes` pins the two together, which is the trap
+/// `inspect.rs`'s `THEME_BORDER` fell into once already.
+pub fn background_hash(token: &str) -> Option<&str> {
+    let needle = "\"chat_background\":\"";
+    let start = token.find(needle)? + needle.len();
+    let rest = token.get(start..)?;
+    let end = rest.find('"')?;
+    // A hash is hex, so an escape cannot appear inside one and a plain scan to the next
+    // quote is exact. Non-empty, because a zero-length hash names no blob and would send
+    // `Assets::texture` looking for one every frame.
+    rest.get(..end).filter(|hash| !hash.is_empty())
 }
 
 /// What a connector between two nodes *means*, when at least one end is an agent.
@@ -722,6 +775,68 @@ mod tests {
             display_mode(&chosen, DisplayMode::Clean),
             DisplayMode::Raw,
             "a node's own choice was overridden by the global default"
+        );
+    }
+
+    /// The same, for the theme a transcript is dressed in.
+    #[test]
+    fn a_node_that_never_chose_a_theme_follows_the_global_default() {
+        let inherited = AgentModel::worker();
+        assert_eq!(chat_theme(&inherited, ChatTheme::Claude), ChatTheme::Claude);
+
+        let chosen = AgentModel { chat_theme: Some(ChatTheme::Kimi), ..AgentModel::worker() };
+        assert_eq!(
+            chat_theme(&chosen, ChatTheme::Claude),
+            ChatTheme::Kimi,
+            "a node's own theme was overridden by the global default"
+        );
+    }
+
+    /// [`background_hash`] finds the key **serde actually writes**.
+    ///
+    /// It scans the token's JSON for a string literal rather than decoding, because the
+    /// painter asks once per visible agent node per frame and `decode` builds a whole
+    /// `AgentModel` to answer a question about one usually-absent field. The cost of that
+    /// shortcut is a **hardcoded field name**, and this is the join that keeps it honest:
+    /// rename `AgentModel::chat_background` — or give it a `#[serde(rename)]` — and every
+    /// picture on every board silently stops being drawn, with nothing failing to compile
+    /// and no test failing either.
+    ///
+    /// That is precisely the trap `inspect.rs`'s `THEME_BORDER` and the old `locked: false`
+    /// constant both fell into: a value hand-copied across a boundary, made wrong by an edit
+    /// in a different crate that breaks nothing. The test is written from the **encoder**,
+    /// never from a literal, so it cannot agree with a stale reader.
+    #[test]
+    fn the_background_key_is_the_one_serde_writes() {
+        let hash = "d0a1f0beef";
+        let model = AgentModel {
+            chat_background: Some(hash.to_owned()),
+            ..AgentModel::worker()
+        };
+        let token = encode(&model);
+        assert_eq!(
+            background_hash(&token),
+            Some(hash),
+            "the painter cannot find the picture serde just wrote into {token}"
+        );
+
+        // A node with no picture, and one whose picture was cleared, must both answer
+        // `None` — an empty hash names no blob and would send `Assets::texture` looking for
+        // one on every frame for the life of the board.
+        assert_eq!(background_hash(&encode(&AgentModel::worker())), None);
+        let empty = AgentModel { chat_background: Some(String::new()), ..AgentModel::worker() };
+        assert_eq!(background_hash(&encode(&empty)), None);
+
+        // And it must not match a *different* field that happens to contain the words. A
+        // node's working directory is free text the user chose.
+        let decoy = AgentModel {
+            working_dir: Some("/tmp/\"chat_background\":\"nope".to_owned()),
+            ..AgentModel::worker()
+        };
+        assert_eq!(
+            background_hash(&encode(&decoy)),
+            None,
+            "a path was read as a picture hash"
         );
     }
 }

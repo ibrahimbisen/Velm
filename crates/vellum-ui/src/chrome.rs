@@ -19,7 +19,7 @@ use crate::selection::{ItemFacet, PanelModel, SelectionItem};
 use crate::tabs::{BoardTab, TabStrip};
 use crate::theme::{GlassSurface, Palette, SystemAppearance, Theme, ThemePreference};
 use crate::tool::{CustomShape, PenPreset, Tool};
-use crate::toolbar::{ToolbarState, register_glass};
+use crate::toolbar::ToolbarState;
 use egui::{Context, Key, Modifiers, Rect, Ui};
 use std::path::Path;
 use std::time::SystemTime;
@@ -109,6 +109,13 @@ pub struct ChromeState<'a> {
     /// The display mode a **new** agent node inherits — feature 2's second half. The app
     /// owns it and persists it, exactly as it does the accent.
     pub default_display: vellum_agent::DisplayMode,
+    /// The provider a node that has not chosen one runs on — feature 16's *Inherit*. Supplied
+    /// and persisted by the app exactly as `default_display` is.
+    pub default_provider: vellum_agent::Provider,
+    /// The chat theme a node with no look of its own draws in. Supplied and persisted by the
+    /// app exactly as `default_display` is, and for the same reason: it lives in the library
+    /// sidecar, which this crate must not know about.
+    pub default_chat_theme: vellum_agent::ChatTheme,
     /// Whether browser nodes may run a real engine at all — feature 13. Off by default.
     pub browser_nodes: bool,
     /// Whether coding agents on this board get their own worktrees — feature 4. Off by
@@ -118,6 +125,32 @@ pub struct ChromeState<'a> {
     /// Which providers this machine can reach and how each is paid for. Never a key —
     /// see [`ProviderStatus`](crate::ProviderStatus).
     pub providers: &'a [crate::menu::ProviderStatus],
+    /// How a spoken prompt is transcribed — feature 12's app-wide half.
+    ///
+    /// Four flattened facts rather than the `Speech` struct itself, because `MenuHeader` is
+    /// `Copy` and because these are the only parts the menu draws. `local_transcriber` is a
+    /// *status* like `providers`: the chrome cannot probe a `PATH`, and *Automatic* is the
+    /// default, so without it the commonest configuration could not be explained.
+    pub speech: vellum_agent::voice::Preference,
+    pub local_transcriber: Option<&'a str>,
+    pub speech_model: Option<&'a str>,
+    pub speech_hosted: bool,
+    /// Whether a text session on the **canvas** owns the keyboard: the on-canvas caret, a
+    /// note's body, or an agent's prompt row.
+    ///
+    /// None of the three is an egui widget, so `Context::egui_wants_keyboard_input` — the
+    /// only thing this crate could otherwise ask — is false throughout all of them. The app
+    /// is the only party that knows, which is why this is supplied rather than derived.
+    ///
+    /// **What it cost while it did not exist.** Every keystroke reaches egui through
+    /// `Shell::on_window_event` *before* the app's own sessions claim it, so the shortcut
+    /// table below ran on the letters of every word typed on a board: renaming a frame and
+    /// pressing Backspace fired [`Command::Delete`] and **deleted the frame**, a word
+    /// containing `r` or `o` armed the shape tool so the click that left the field placed a
+    /// rectangle, and `v`/`n`/`t`/`f` changed the tool under the hands typing them. The
+    /// user's own three reports, one root cause. See [`Chrome::shortcuts`] for what
+    /// suppression means exactly — it is not all of them.
+    pub text_session: bool,
 }
 
 impl Default for ChromeState<'_> {
@@ -125,6 +158,7 @@ impl Default for ChromeState<'_> {
         Self {
             screen: Screen::Library,
             board: BoardState::default(),
+            default_provider: vellum_agent::Provider::default(),
             tool: Tool::Select,
             selection: &[],
             view: ViewState::default(),
@@ -139,9 +173,15 @@ impl Default for ChromeState<'_> {
             grid: crate::event::GridSettings::default(),
             selection_rect: None,
             default_display: vellum_agent::DisplayMode::Clean,
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
             browser_nodes: false,
             worktrees: false,
             providers: &[],
+            speech: vellum_agent::voice::Preference::default(),
+            local_transcriber: None,
+            speech_model: None,
+            speech_hosted: false,
+            text_session: false,
         }
     }
 }
@@ -165,6 +205,17 @@ impl ChromeState<'_> {
         CommandContext {
             agents_selected,
             manager_selected: manager_selected && agents_selected == 1,
+            // *Has* a worktree, not *should have* one: `WorktreeState::At` is the state that
+            // names a directory, and there is nothing to remove without one.
+            git_available: crate::command::git_available(),
+            worktree_selected: agents_selected == 1
+                && self.selection.iter().filter_map(|item| item.agent.as_ref()).any(|agent| {
+                    matches!(
+                        agent.worktree,
+                        crate::selection::WorktreeState::At(_)
+                            | crate::selection::WorktreeState::Orphaned(_)
+                    )
+                }),
             any_agent_running: running > 0,
             all_agents_running: agents_selected > 0 && running == agents_selected,
             board_open: self.screen == Screen::Board,
@@ -625,6 +676,20 @@ impl Chrome {
         self.dialogs.dismiss(id);
     }
 
+    /// Puts the board library on one of its scopes.
+    ///
+    /// For `--show settings`, which needs to reach a page that is otherwise one sidebar
+    /// click away — and a click is the one thing an unattended `--screenshot` run cannot
+    /// make. The same argument `--open-dialog` and the seven flyouts already carry.
+    pub fn set_library_scope(&mut self, scope: crate::LibraryScope) {
+        self.library.scope = scope;
+    }
+
+    /// Which page of the settings is open. See [`Self::set_library_scope`].
+    pub fn set_settings_tab(&mut self, tab: crate::SettingsTab) {
+        self.library.settings_tab = tab;
+    }
+
     /// Shows a transient message.
     pub fn toast(&mut self, ctx: &Context, toast: Toast) {
         let now = ctx.input(|i| i.time);
@@ -729,12 +794,29 @@ impl Chrome {
         // the header every frame to avoid that would be an allocation per frame to
         // work around an ordering that costs nothing to get right.
         if state.screen == Screen::Library {
+            // Built here rather than borrowed from `MenuHeader`, which cannot exist yet —
+            // it borrows `self.library.spaces` and the panel below needs `&mut self.library`.
+            // Every field is `Copy` or borrows `state`, so there is nothing to clone.
+            let settings = crate::library::SettingsView {
+                accent: self.accent,
+                glass_opacity: self.glass_opacity(),
+                transparency_blocked: cmd_ctx.transparency_blocked,
+                link_previews: state.link_previews,
+                align_objects: state.align_objects,
+                snap_to_grid: state.snap_to_grid,
+                default_display: state.default_display,
+                default_chat_theme: state.default_chat_theme,
+                browser_nodes: state.browser_nodes,
+                worktrees: state.worktrees,
+                providers: state.providers,
+            };
             crate::library::show(
                 ui,
                 palette,
                 &mut self.library,
                 state.library,
                 state.now,
+                &settings,
                 &mut events,
             );
         }
@@ -747,6 +829,7 @@ impl Chrome {
         // Read by the menu bar and by the context menu, which is drawn after the canvas
         // rectangle is known — hence out here rather than inside the board's arm.
         let header = crate::menu::MenuHeader {
+            default_provider: state.default_provider,
             title: state.board.title,
             path: state.board.path,
             dirty: state.board.dirty,
@@ -758,7 +841,19 @@ impl Chrome {
             glass_opacity: self.glass_opacity(),
             accent: self.accent,
             default_display: state.default_display,
+            default_chat_theme: state.default_chat_theme,
+            // The selected node's own look, for the ticks and the two controls a preset
+            // cannot carry. Read off the panel model rather than tracked separately: it is
+            // already the one flattened answer to "what is selected", and a second copy
+            // would be a tick that disagrees with the node.
+            node_theme: model.agent.as_ref().and_then(|a| a.chat_theme),
+            node_opacity: model.agent.as_ref().map_or(255, |a| a.chat_opacity),
+            node_has_background: model.agent.as_ref().is_some_and(|a| a.has_chat_background),
             providers: state.providers,
+            speech: state.speech,
+            local_transcriber: state.local_transcriber,
+            speech_model: state.speech_model,
+            speech_hosted: state.speech_hosted,
             flags,
         };
 
@@ -862,7 +957,15 @@ impl Chrome {
                     state.font_families,
                     &mut events,
                 );
-                register_glass(&mut self.glass, palette, out.rect);
+                // The bar's own radius, not the shared one — see `register_glass_rounded`.
+                // Its frame opened to 10 and the blurred region behind it has to follow, or
+                // the corners of the one surface still made of glass show unblurred canvas.
+                crate::toolbar::register_glass_rounded(
+                    &mut self.glass,
+                    palette,
+                    out.rect,
+                    crate::theme::SELECTION_BAR_RADIUS,
+                );
                 // `⋮` is the same menu the right button opens. The bar reports where
                 // rather than opening it, so `context_bar` never has to know the menu
                 // exists.
@@ -967,6 +1070,25 @@ impl Chrome {
             return;
         }
 
+        // A caret on the canvas takes the keys a *typing hand* produces, and the four chords
+        // it implements itself. Nothing else.
+        //
+        // The line is drawn at ⌘/⌃ rather than at the whole table, and the difference is
+        // deliberate. Everything without one of those two is something typing emits by
+        // definition — a bare letter, a shifted capital, Backspace, and on macOS an ⌥ chord,
+        // which is a character (`⌥D` is `∂`). Everything *with* one is a chord nobody
+        // produces by accident, so `⌘Z`, `⌘S` and `⌘K` keep working mid-word exactly as they
+        // do inside a focused field, which is what Miro does. Suppressing the *whole* table
+        // instead would be one line shorter and would take Undo away from someone in the
+        // middle of typing, which is the moment they most want it.
+        //
+        // **The ⌘ rule alone is not enough, and assuming it was nearly shipped the same
+        // bug it fixes.** A session claiming `⌘X` in the app does not take the key out of
+        // egui's queue — `Shell::restore_clipboard_key` deliberately puts one *back* — so
+        // the session cut the characters and this table cut the item they were in, ending
+        // the edit on the way. [`Command::claimed_by_a_text_session`] is that list.
+        let chords_only = state.text_session;
+
         // egui matches modifiers *logically*: an extra Shift or Alt is ignored, so a
         // press of `Cmd+Shift+Z` also matches the pattern `Cmd+Z`. Walking the table
         // in declaration order therefore fires Undo for Redo and Save for Save-as —
@@ -989,6 +1111,11 @@ impl Chrome {
                     .into_iter()
                     .flatten()
                     .filter(|s| specificity(s.modifiers) == level)
+                    .filter(|s| {
+                        !chords_only
+                            || ((s.modifiers.command || s.modifiers.ctrl)
+                                && !command.claimed_by_a_text_session())
+                    })
                     .fold(false, |hit, shortcut| {
                         ctx.input_mut(|i| i.consume_shortcut(&shortcut)) || hit
                     });
@@ -1001,6 +1128,13 @@ impl Chrome {
         self.tab_shortcuts(ctx, events);
 
         if state.screen != Screen::Board {
+            return;
+        }
+        // Both loops below are bare keys by construction, so a text session takes all of
+        // them: `v`, `n`, `t`, `f` are tools and `r`, `o` are shapes — the letters of
+        // ordinary words, which is how typing came to arm the shape tool and how the click
+        // that left the field then placed a rectangle.
+        if chords_only {
             return;
         }
         for tool in Tool::ALL {

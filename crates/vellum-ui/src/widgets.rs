@@ -167,6 +167,89 @@ pub fn row<R>(
     .inner
 }
 
+/// A colour swatch as a **disc**, for the floating selection bar.
+///
+/// Miro shows the selection's colour as a filled circle; Velm showed a 36x32 rounded chip with
+/// a hairline permanently around it, which reads as a button that happens to be coloured
+/// rather than as the colour itself. *"please make this menu that i have in velm exactly like
+/// miros"*.
+///
+/// Three things it keeps from [`swatch`], each for a reason a plain circle would lose:
+///
+/// - **The hit target stays the full `size`.** Only the paint shrinks. A 20 px disc as the
+///   *widget* is a materially harder click than a 36x32 chip, and it would quietly change what
+///   `a_link_cards_bar_copies_its_address_as_well_as_opening_it` is testing — that one clicks
+///   every control's rect in turn — without failing it.
+/// - **The ring survives on a near-white colour.** Miro's discs carry no outline, which is
+///   fine until the colour is white on a white bar and the control disappears. Drawn only when
+///   it is needed rather than always, which is the difference from the old chip.
+/// - **The checkerboard survives for a translucent colour**, so alpha still reads as alpha.
+pub fn swatch_disc(
+    ui: &mut Ui,
+    palette: Palette,
+    color: Option<Color32>,
+    size: Vec2,
+    diameter: f32,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let face = Rect::from_center_size(rect.center(), Vec2::splat(diameter));
+        let radius = diameter * 0.5;
+        match color {
+            Some(color) => {
+                if color.a() < 255 {
+                    checkerboard(ui, palette, face, CornerRadius::same(radius as u8));
+                }
+                ui.painter().circle_filled(face.center(), radius, color);
+                // Only when the colour would otherwise vanish into the bar. `floating_fill`
+                // is white at 47%, so "close to the surface" is the test that matters rather
+                // than "close to white".
+                if needs_outline(palette, color) {
+                    ui.painter().circle_stroke(
+                        face.center(),
+                        radius,
+                        Stroke::new(palette.hairline_width(), palette.border),
+                    );
+                }
+            }
+            None => {
+                ui.painter().circle_filled(face.center(), radius, palette.well);
+                ui.painter().circle_stroke(
+                    face.center(),
+                    radius,
+                    Stroke::new(palette.hairline_width(), palette.border),
+                );
+                let inset = face.shrink(radius * 0.3);
+                ui.painter().line_segment(
+                    [inset.left_bottom(), inset.right_top()],
+                    Stroke::new(ICON_STROKE, palette.danger),
+                );
+            }
+        }
+        if response.hovered() {
+            ui.painter().circle_stroke(
+                face.center(),
+                radius,
+                Stroke::new(palette.hairline_width(), palette.info),
+            );
+        }
+    }
+    response
+}
+
+/// Whether a swatch's colour is close enough to the surface behind it to need a ring.
+///
+/// Channel distance rather than luminance: a pale yellow and a pale blue are the same
+/// lightness as the bar and neither should disappear into it.
+fn needs_outline(palette: Palette, color: Color32) -> bool {
+    let surface = palette.surface;
+    let delta = |a: u8, b: u8| i32::from(a) - i32::from(b);
+    let near = delta(color.r(), surface.r()).abs().max(
+        delta(color.g(), surface.g()).abs().max(delta(color.b(), surface.b()).abs()),
+    );
+    near < 24 || color.a() < 255
+}
+
 /// A colour swatch. `None` renders the "no fill" diagonal rather than a colour,
 /// because an empty square and a white square are otherwise identical.
 pub fn swatch(
@@ -261,22 +344,42 @@ impl<T> Segment<T> {
 /// Takes a [`Field`] rather than a value so a mixed selection shows *no* segment
 /// highlighted, which is the only honest rendering: highlighting one would claim the
 /// selection agrees.
+/// The segment height when the caller has no opinion — the docked panel, where segments sit in
+/// a row that has to fit a 250-point column and run tighter than a standalone button.
+pub const SEGMENT_SIZE: f32 = 26.0;
+
 pub fn segmented<T: Copy + PartialEq>(
     ui: &mut Ui,
     palette: Palette,
     current: &Field<T>,
     options: &[Segment<T>],
 ) -> Option<T> {
+    segmented_sized(ui, palette, current, options, SEGMENT_SIZE)
+}
+
+/// [`segmented`], at a caller-chosen size.
+///
+/// **This parameter exists because the size was hardcoded and the drift was real.**
+/// `context_bar`'s own comment claims *"this is one number because every control on the bar is
+/// sized from it, which is what stops the swatch, the stepper and the icon buttons drifting
+/// apart"* — and `CONTROL` is 32 while every segment in the bar was 26, so a card's Row/Card/
+/// Large control and a connector's routing control sat six points short in a 32-point row.
+/// The one place the claim did not hold.
+pub fn segmented_sized<T: Copy + PartialEq>(
+    ui: &mut Ui,
+    palette: Palette,
+    current: &Field<T>,
+    options: &[Segment<T>],
+    size: f32,
+) -> Option<T> {
     let mut chosen = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        // Segments sit in a row that has to fit the panel, so they run tighter than
-        // a standalone button.
         ui.spacing_mut().button_padding.x = 5.0;
         for option in options {
             let selected = current.value().is_some_and(|v| *v == option.value);
             let response = match option.icon {
-                Some(icon) => icon_button(ui, palette, icon, 26.0, selected),
+                Some(icon) => icon_button(ui, palette, icon, size, selected),
                 None => {
                     let button = egui::Button::selectable(selected, option.label).frame(true);
                     ui.add(button)

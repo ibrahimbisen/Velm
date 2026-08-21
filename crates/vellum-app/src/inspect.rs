@@ -148,6 +148,15 @@ pub struct AgentFacts<'a> {
     /// `locked: false` trap exactly — a stand-in kept correct by a fact in another crate,
     /// where the change that falsifies it breaks no test here.
     pub note_state: &'a dyn Fn(&str) -> (bool, bool),
+    /// How many other notes this one links to, **as the file on disk says right now**.
+    ///
+    /// A closure for the same reason `note_state` is one: a frame may not read a file, and the
+    /// runtime is the half that already has. The document token's own `links` list is written
+    /// once, when the note is created — every reload since then has updated the runtime's copy
+    /// and nothing else — so a panel reading the token showed the count the note had when it
+    /// was made, which for a note created from a title is always zero. A row that says
+    /// "Links to 0 other notes" under a note full of links is a row nobody can trust twice.
+    pub note_links: &'a dyn Fn(&str) -> usize,
 }
 
 impl AgentFacts<'_> {
@@ -183,6 +192,7 @@ impl AgentFacts<'_> {
             },
             label_of: &|_| None,
             note_state: &|_| (false, false),
+            note_links: &|_| 0,
         }
     }
 }
@@ -238,12 +248,20 @@ fn agent_of(
         inherited_provider: agents.inherited_provider.clone(),
         display: config.display,
         inherited_display: agents.inherited_display,
+        // The **stored** theme, not the resolved one: a tick has to tell "this node is set
+        // to Claude" from "this node inherits, and the default happens to be Claude".
+        chat_theme: config.chat_theme,
+        chat_opacity: config.chat_opacity.unwrap_or(u8::MAX),
+        has_chat_background: config.chat_background.is_some(),
         working_dir: config.working_dir.clone(),
         project_dir: agents.project_dir.clone(),
         // Three states rather than a bool and a path, because the fourth combination —
         // "no worktree, but here is its path" — means nothing. See `WorktreeState`.
         worktree: match (config.worktree, config.worktree_path.as_deref()) {
-            (false, _) => vellum_ui::WorktreeState::Off,
+            // A path with the switch off is a checkout nothing will use and nothing would
+            // otherwise offer to remove. See `WorktreeState::Orphaned`.
+            (false, Some(path)) => vellum_ui::WorktreeState::Orphaned(path.to_owned()),
+            (false, None) => vellum_ui::WorktreeState::Off,
             (true, None) => vellum_ui::WorktreeState::Pending,
             (true, Some(path)) => vellum_ui::WorktreeState::At(path.to_owned()),
         },
@@ -289,7 +307,7 @@ fn note_of(
             vellum_agent::NoteScope::Shared => None,
         },
         scope: note.scope.clone(),
-        links: note.links.len(),
+        links: (agents.note_links)(&note.path),
         path: note.path,
         conflicted,
         on_disk,
@@ -608,7 +626,16 @@ fn apply_one(
                 *background = *fill;
                 touched_kind = true;
             }
-            ItemKind::Frame { .. } => {
+            // A shape and a frame both keep their interior on the **style**, which is what
+            // `fill_of` reads back and what both painters draw from. The shape arm was
+            // missing: `apply_style` matched `Sticky` and `Frame` and dropped everything
+            // else into `_ => {}`, so every fill a shape was given — including the alpha in
+            // the picker, which is the only transparency a shape's bar offered — was
+            // discarded silently and the swatch went on reporting *no fill*. Reported as
+            // *"when you change the color or the transparency of a rectangle or a shape it
+            // doesnt take effect"*, and the reason the bar's first control read as a button
+            // with no purpose.
+            ItemKind::Frame { .. } | ItemKind::Shape { .. } => {
                 style.fill = *fill;
                 touched_style = true;
             }
@@ -1095,6 +1122,36 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(board.item(frame).unwrap().style.fill, Some(blue));
+    }
+
+    /// *"when you change the color or the transparency of a rectangle or a shape it doesnt
+    /// take effect"* — and it did not, for as long as shapes have had a fill swatch.
+    ///
+    /// [`apply_style`]'s `Fill` arm matched `Sticky` and `Frame` and let everything else
+    /// fall into `_ => {}`, so the edit was discarded and the swatch went on reporting the
+    /// `None` [`fill_of`] reads back. Both halves of the report are one write: the picker's
+    /// alpha rides on the same `Color`, so a shape could be given neither a colour nor a
+    /// transparency. Asserted through `Applied` as well as through the document, because
+    /// dropping the edit answered `NotApplicable` — a silent "nothing to do" — rather than
+    /// failing.
+    #[test]
+    fn a_fill_edit_reaches_a_shape_including_its_alpha() {
+        let mut board = Board::new();
+        let shape = board
+            .add(NewItem::new(shape(), Placement::new(0.0, 0.0, 400.0, 300.0)))
+            .unwrap();
+
+        let translucent = Color::rgba(0x2B, 0xA1, 0xE8, 0x80);
+        assert_eq!(
+            apply_style(&mut board, &[shape], &StyleEdit::Fill(Some(translucent))).unwrap(),
+            Applied::Changed
+        );
+        assert_eq!(board.item(shape).unwrap().style.fill, Some(translucent));
+
+        // And "no fill" still reaches it, which is a statement rather than an absence —
+        // `Style::fill`'s own doc comment draws the distinction.
+        apply_style(&mut board, &[shape], &StyleEdit::Fill(None)).unwrap();
+        assert_eq!(board.item(shape).unwrap().style.fill, None);
     }
 
     /// A colour applied to a whole selection has to be **one** undo step, not one per

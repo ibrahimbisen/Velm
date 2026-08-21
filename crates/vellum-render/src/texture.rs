@@ -118,6 +118,16 @@ impl Default for TextureBudget {
     }
 }
 
+
+/// Frames of visibility a texture is protected by.
+///
+/// One, so a texture drawn on the *previous* frame survives as well as one drawn on this one.
+/// The guard used to be `last_marked < frame` alone, which is right only if eviction runs after
+/// the frame's marks — and the caller runs it before the draw list is built, because evicting
+/// after the list is built strands textures that list already references. Both orderings are
+/// wrong with a zero-frame window; a one-frame window is correct in either.
+const PROTECT_FRAMES: u64 = 1;
+
 struct Resident {
     /// Kept, not just its bind group: demotion copies out of it.
     texture: wgpu::Texture,
@@ -153,11 +163,45 @@ pub struct TextureManager {
     /// `u64::MAX` so the first call always runs, whether or not the caller keeps a
     /// frame clock at all.
     resolved_frame: u64,
-    /// Decided too coarse by the last resolve, dropped at the next
-    /// [`TextureManager::begin_frame`]. Deferring by one frame is what keeps the
-    /// current frame drawing something: the caller re-uploads while building the
-    /// *next* list, so no frame is ever missing the image.
-    pending_refinement: Vec<TextureId>,
+    /// What the last resolve found too coarse. **Every one is still resident** — see
+    /// [`TextureManager::wants_refinement`], and [`TextureManager::begin_frame`] for what
+    /// this used to be and what it cost.
+    pending_refinement: Vec<Refinement>,
+}
+
+/// One texture the last resolve found too coarse, and the size it should come back at.
+///
+/// Carries the target because the demand it was derived from does not survive: `demanded` is
+/// `take()`n out of the `Resident` as it is read, and the upload happens several frames later,
+/// in another crate, by which time there is nothing left to ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refinement {
+    /// Still bound, still drawable. This is a request, not a handle to a dead texture.
+    pub texture: TextureId,
+    /// Top-level size to re-upload at, already capped by [`TextureBudget::max_dimension`].
+    pub target: (u32, u32),
+}
+
+/// One texture `resolve_detail` found too coarse, before pacing picks which four to ask for.
+///
+/// Named rather than a tuple because the sort and the filter each read a different pair of its
+/// fields, and `a.0.cmp(&b.0).then(a.1.cmp(&b.1))` says nothing about which is the deficit.
+#[derive(Debug, Clone, Copy)]
+struct RefineCandidate {
+    /// Negative levels: how far below the demanded size the stored one is. Sorted ascending,
+    /// so the most obviously soft image is refined first.
+    deficit: i32,
+    texture: TextureId,
+    target: (u32, u32),
+    stored: (u32, u32),
+}
+
+impl Refinement {
+    /// The cap to hand [`TextureManager::upload_within`].
+    #[must_use]
+    pub fn max_dimension(&self) -> u32 {
+        self.target.0.max(self.target.1)
+    }
 }
 
 impl TextureManager {
@@ -270,13 +314,33 @@ impl TextureManager {
         queue: &wgpu::Queue,
         image: &ImageSource<'_>,
     ) -> Result<TextureId, RenderError> {
+        self.upload_within(device, queue, image, self.budget.max_dimension)
+    }
+
+    /// [`Self::upload`], with an explicit ceiling on the stored top level.
+    ///
+    /// For a refinement, which knows the size it is about to be drawn at — see
+    /// [`Refinement::max_dimension`]. Uploading one at [`TextureBudget::max_dimension`] costs
+    /// 21.3 MB with mips and the very next `resolve_detail` demotes it to about 1.3 MB in the
+    /// same frame, so the work is thrown away before it is drawn twice. Four of those a frame
+    /// during a zoom is most of the residency budget spent on nothing.
+    ///
+    /// Never exceeds the budget's own cap: that one is a memory decision and this one is a
+    /// sharpness decision, and the memory decision wins.
+    pub fn upload_within(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        image: &ImageSource<'_>,
+        max_dimension: u32,
+    ) -> Result<TextureId, RenderError> {
         image.validate()?;
 
         let levels = mip_chain(
             image.width,
             image.height,
             premultiply(image.rgba),
-            self.budget.max_dimension,
+            max_dimension.clamp(1, self.budget.max_dimension),
         );
         let (width, height, _) = levels[0];
         let bytes: usize = levels.iter().map(|(_, _, data)| data.len()).sum();
@@ -333,41 +397,42 @@ impl TextureManager {
         Ok(id)
     }
 
-    /// Advances the frame counter, and drops what the last frame found too coarse.
+    /// Advances the frame counter.
     ///
     /// Anything marked since the last call is protected from eviction, because
     /// evicting a texture the current frame needs would guarantee a re-upload stall
     /// in the middle of a pan.
     ///
-    /// The refinement drops happen here rather than where they were decided so the
-    /// frame that decided them still had something to draw: the caller discovers the
-    /// handle is gone while building the *next* list, re-uploads from its blob store
-    /// in the same pass, and no frame is ever missing the image. Returns the ids it
-    /// dropped, for a caller that keys on content hashes and wants to prune its map
-    /// eagerly rather than waiting for [`Self::contains`] to say so.
-    pub fn begin_frame(&mut self) -> Vec<TextureId> {
+    /// # It used to destroy textures here, and that was the flicker
+    ///
+    /// A texture the last resolve found too coarse was **removed** — and that removal *was* the
+    /// message to the caller, which noticed the handle had gone and re-uploaded. The invariant
+    /// this file claimed, *"no frame is ever missing the image"*, held exactly as long as
+    /// `Assets::texture` decoded and uploaded inline in the same pass.
+    ///
+    /// `vellum_app::decode` later moved decoding onto worker threads and recorded that
+    /// *"nothing downstream had to change: the answer simply arrives a few frames later"*.
+    /// That is true of `Assets`' own `Option` contract and false of this one. The two modules'
+    /// contracts diverged, and a same-frame invisible swap became several frames of flat grey
+    /// placeholder on every image a zoom swept past — *"when i zoom in and out images flicker
+    /// alot"*.
+    ///
+    /// So nothing is destroyed to ask a question now. See [`Self::wants_refinement`].
+    pub fn begin_frame(&mut self) {
         self.frame += 1;
-        if self.pending_refinement.is_empty() {
-            return Vec::new();
-        }
+    }
 
-        let take = self.policy.refinements_per_frame.min(self.pending_refinement.len());
-        let dropped: Vec<TextureId> = self.pending_refinement.drain(..take).collect();
-        let mut done = Vec::with_capacity(dropped.len());
-        for id in dropped {
-            if let Some(resident) = self.resident.remove(&id) {
-                self.bytes -= resident.bytes;
-                done.push(id);
-            }
-        }
-        if !done.is_empty() {
-            log::debug!(
-                "dropped {} textures for re-upload at a finer level, {} bytes resident",
-                done.len(),
-                self.bytes
-            );
-        }
-        done
+    /// The textures the last resolve found too coarse, and the size each should come back at.
+    ///
+    /// **Not a destruction order.** Every one of these is still resident, still bound and still
+    /// drawing at its current resolution; this is the manager asking the caller to upload a
+    /// finer one and hand the old handle back. The caller keeps showing the coarse texture
+    /// until the replacement is ready, which is the whole fix.
+    ///
+    /// Rebuilt wholesale by each [`Self::resolve_detail`], so it is a per-frame observation
+    /// rather than a work queue — a texture that stops being drawn stops asking.
+    pub fn wants_refinement(&self) -> &[Refinement] {
+        &self.pending_refinement
     }
 
     /// Records that `id` is `distance` world pixels from the viewport this frame.
@@ -417,25 +482,39 @@ impl TextureManager {
         let mut demotions: Vec<(TextureId, u32)> = Vec::new();
         // Deficit first, so the paced refinement spends its frames on the images that
         // are most obviously soft rather than on whichever the map happened to yield.
-        let mut refinements: Vec<(i32, TextureId)> = Vec::new();
+        // The target and the stored size are captured *here* because `demanded` is consumed by
+        // the `take()` above and the upload is several frames and one crate away — there is
+        // nothing left to derive them from by then.
+        let mut refinements: Vec<RefineCandidate> = Vec::new();
         for (id, resident) in &mut self.resident {
             let Some(demanded) = resident.demanded.take() else { continue };
             let ceiling = capped_size(resident.source.0, resident.source.1, self.budget.max_dimension);
-            match detail::decide(&self.policy, (resident.width, resident.height), ceiling, demanded)
-            {
+            let stored = (resident.width, resident.height);
+            match detail::decide(&self.policy, stored, ceiling, demanded) {
                 Detail::Keep => {}
                 Detail::Demote(levels) => demotions.push((*id, levels)),
-                Detail::Refine => refinements.push((
-                    detail::surplus_levels((resident.width, resident.height), demanded),
-                    *id,
-                )),
+                Detail::Refine => refinements.push(RefineCandidate {
+                    deficit: detail::surplus_levels(stored, demanded),
+                    texture: *id,
+                    target: detail::refine_target(&self.policy, ceiling, demanded),
+                    stored,
+                }),
             }
         }
 
         self.pending_refinement.clear();
         if self.policy.refinements_per_frame > 0 {
-            refinements.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-            self.pending_refinement.extend(refinements.iter().map(|(_, id)| *id));
+            refinements.sort_by(|a, b| a.deficit.cmp(&b.deficit).then(a.texture.cmp(&b.texture)));
+            self.pending_refinement.extend(
+                refinements
+                    .iter()
+                    // A target no larger than what is already stored buys nothing and costs a
+                    // full decode. Only reachable when `min_dimension` has clamped a demote,
+                    // but it is one comparison against a wasted round trip.
+                    .filter(|c| c.target.0 > c.stored.0 || c.target.1 > c.stored.1)
+                    .take(self.policy.refinements_per_frame)
+                    .map(|c| Refinement { texture: c.texture, target: c.target }),
+            );
         }
 
         let mut demoted = 0;
@@ -557,7 +636,7 @@ impl TextureManager {
         let candidates = eviction_order(
             self.resident
                 .iter()
-                .filter(|(_, r)| r.last_marked < self.frame)
+                .filter(|(_, r)| r.last_marked + PROTECT_FRAMES < self.frame)
                 .map(|(id, r)| Candidate {
                     last_marked: r.last_marked,
                     distance: r.distance,

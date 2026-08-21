@@ -477,6 +477,10 @@ impl DialogStack {
         // `show_dialog` and the closure already holds `dialog` mutably. Revealing a file is
         // not an answer to the dialog — the editor stays open — so it cannot ride `outcome`.
         let mut reveal: Option<std::path::PathBuf> = None;
+        // An *Edit* pressed on one of the inherited rule layers. Collected out of the closure
+        // for the same borrow reason as `reveal` — but unlike a reveal, this **does** answer
+        // the dialog, because the app replaces this editor with one on that layer.
+        let mut edit_layer: Option<vellum_agent::Layer> = None;
 
         // Opaque, always: a modal exists to stop everything else, and one you can see
         // through undermines its own job. `dialog_frame` cannot be made glass even
@@ -690,6 +694,7 @@ impl DialogStack {
                                 resolved,
                                 files,
                                 &mut reveal,
+                                &mut edit_layer,
                                 confirm.as_str(),
                             ) {
                                 Some(crate::agent_dialogs::Answer::Save) => {
@@ -745,6 +750,15 @@ impl DialogStack {
             events.push(UiEvent::RevealPath(path));
         }
 
+        // Only when nothing else answered. The two cannot both happen in one frame — a click
+        // lands on one button — and preferring the real answer means that if they ever could,
+        // a *Save* is never discarded in favour of reopening the editor somewhere else.
+        if outcome.is_none()
+            && let Some(layer) = edit_layer
+        {
+            outcome = Some(DialogEvent::EditRuleLayer(id, layer));
+        }
+
         if let Some(outcome) = outcome {
             self.pending.pop_front();
             events.push(UiEvent::Dialog(outcome));
@@ -795,7 +809,13 @@ impl DialogStack {
                                 );
                             });
                         });
-                    paint_glass_edge(ui.painter(), inner.response.rect, palette, Backing::Canvas);
+                    paint_glass_edge(
+                    ui.painter(),
+                    inner.response.rect,
+                    palette,
+                    Backing::Canvas,
+                    f32::from(radius::LARGE),
+                );
                     drawn.push(inner.response.rect);
                 }
             });

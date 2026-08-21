@@ -98,6 +98,29 @@ const SCREENSHOT_MIN_FRAMES: u64 = 3;
 /// placeholder in it.
 const SCREENSHOT_MAX_WAIT: Duration = Duration::from_secs(20);
 
+/// `--demo zoom-flicker`'s progress across frames.
+///
+/// A refinement is decided by one frame's draws, requested on the next and answered several
+/// frames later by a worker thread, so nothing inside a single command can observe one. This
+/// is the state that lets the frame loop watch the whole sequence.
+#[derive(Debug, Clone, Copy, Default)]
+struct ZoomSweep {
+    /// Waiting for the first load to finish, so its decodes do not pollute the count.
+    settling: bool,
+    /// Consecutive settled frames seen so far.
+    quiet: u32,
+    frames: u32,
+    /// The zoom the sweep starts from, captured once the board has settled.
+    from: f64,
+    /// Frames on which *anything* drew a placeholder. Zero is the pass.
+    blinks: usize,
+    /// The most images pending at once, for a failure message that says how bad it was.
+    worst: usize,
+    /// The most refinements asked for at once. **Zero means the fixture proved nothing** —
+    /// the sweep never crossed an edge, so a green result would be vacuous.
+    queued: usize,
+}
+
 /// Everything that only exists once there is a window.
 pub(crate) struct ActiveState {
     pub(crate) window: Arc<Window>,
@@ -133,6 +156,20 @@ pub(crate) struct ActiveState {
     /// **not board content**: it must not be a CRDT write, must not join an undo group, and
     /// must not reach the file RULE ZERO protects. See `ActiveState::begin_prompting`.
     pub(crate) prompting: Option<crate::actions::Prompting>,
+    /// A note's body being typed on the canvas — feature 8's editing half.
+    ///
+    /// Beside `prompting` rather than inside it: the two are mutually exclusive and both are
+    /// off-document, but they end differently — a prompt is *sent* and a note is *saved to a
+    /// file* — and one enum carrying both would put that decision in a match on every key.
+    pub(crate) note_editing: Option<crate::actions::NoteEditing>,
+    /// The node a microphone press is open for — feature 12.
+    ///
+    /// Beside `prompting` rather than inside it, and for the opposite reason the two notes
+    /// above give: voice is **not** mutually exclusive with a prompt row. Dictating into a
+    /// half-typed instruction is the ordinary case, so this has to be able to be set while
+    /// `prompting` is too. It is the document id rather than a `NodeKey` because every
+    /// consumer here is on the board in front; the runtime holds the authoritative wire id.
+    pub(crate) voice_node: Option<vellum_doc::ItemId>,
     /// When the prompt row's caret last moved or its text last changed, for the blink.
     ///
     /// Its own instant rather than `editing_touched`: the two carets are mutually exclusive
@@ -173,6 +210,9 @@ pub(crate) struct ActiveState {
     pub(crate) show_hud: bool,
     timer: FrameTimer,
     stats: PaintStats,
+    /// `--demo zoom-flicker`'s state. `None` in every ordinary run, and the whole feature
+    /// costs one `Option` compare per frame.
+    zoom_sweep: Option<ZoomSweep>,
     last_frame: Instant,
     last_stats_log: Instant,
     /// `"Metal / Apple M3 Pro"`, built once at startup for the HUD.
@@ -274,6 +314,29 @@ pub(crate) struct ActiveState {
     /// The card whose ↗ badge the pointer is on. Resolved once in `run_chrome` and read
     /// again by the paint pass, so the highlight and the cursor cannot disagree.
     pub(crate) hovered_badge: Option<vellum_scene::ItemId>,
+    /// The item whose four connector ports the pointer is over — Miro's blue dots.
+    ///
+    /// Recomputed per frame like `hovered_badge`, and widened past the item's own bounds
+    /// because a port sits *outside* the edge: see
+    /// [`crate::actions::ActiveState::ports_under_pointer`].
+    pub(crate) hovered_ports: Option<vellum_scene::ItemId>,
+    /// The item and anchor a connector is being dragged **from**, while the button is down.
+    ///
+    /// Holds the [`vellum_doc::ItemId`] rather than the `SceneId` for `territory_arm`'s
+    /// reason: a reprojection renumbers scene ids and the gesture has to survive one.
+    ///
+    /// Its presence is also what makes the drag *a connector* rather than a marquee — the
+    /// port press borrows `input::Tool::Place`, so this is the only thing that says which
+    /// verb the release means.
+    pub(crate) port_arm: Option<(vellum_doc::ItemId, (f64, f64))>,
+    /// The connector whose end is being dragged, and whether it is the *end* rather than the
+    /// start — Miro's two round grips on a selected line.
+    ///
+    /// Its own field rather than a `DragMode`, following `card_drag`'s precedent and for its
+    /// reason: this changes **no placement**. A connector's geometry is two bindings, so
+    /// re-attaching one is a rewrite of `ItemKind::Connector`, which `Drag` has no way to
+    /// express and `Drag::placement_of` has nothing to answer for.
+    pub(crate) endpoint_arm: Option<(vellum_doc::ItemId, bool)>,
     /// The alignment guides the gesture in progress is reporting, in **world** units.
     ///
     /// Miro's *Align objects*. Rebuilt by whatever is dragging — a move, a resize, a
@@ -306,6 +369,23 @@ pub(crate) struct ActiveState {
     /// Holds the node's [`vellum_doc::ItemId`], not its `SceneId`: the sweep survives a
     /// reprojection, and a scene id does not.
     pub(crate) territory_arm: Option<vellum_doc::ItemId>,
+    /// Every orchestrator's stored region, rebuilt only when the document changes.
+    ///
+    /// # Why this is a cache and not a per-frame walk
+    ///
+    /// The regions used to be drawn only for a *selected* orchestrator, which made the whole
+    /// question cheap: one `selection().first()`, one `projection().get`, and a JSON parse
+    /// only on the frames a single agent node was picked. Showing all of them at all times —
+    /// *"the orchestrator area should be constantly shown"* — turns that into a walk of the
+    /// projection with a `serde_json` parse per agent node, and putting **that** behind every
+    /// frame is precisely the idle cost `docs/07-agent-canvas.md` §0 forbids and the defect
+    /// feedback 34 records finding twenty lines from a correct use of the R-tree.
+    ///
+    /// So it is keyed on the projection's generation, which is the number that changes when
+    /// and only when the board does. A pan, a zoom, a selection or a hover reuses it; an edit
+    /// rebuilds it. The live sweep is **not** in here — it changes every frame by
+    /// construction — and is composed on top at read time.
+    pub(crate) territories: crate::actions::TerritoryCache,
     /// A kanban card in flight. Separate from `drag` because it changes no placement:
     /// a card's position is decided by the column it is in and its rank within it, so
     /// moving one rewrites the item's token and leaves its box alone.
@@ -314,6 +394,13 @@ pub(crate) struct ActiveState {
     /// much of the window is actually canvas — which it cannot do before its first
     /// run, and startup happens before that.
     pub(crate) pending_fit: bool,
+    /// Where the last paste was aimed, rounded, and how many pastes have landed there in
+    /// a row. See `ActiveState::paste_now` — without the cascade they stack invisibly.
+    pub(crate) last_paste_at: Option<(i64, i64)>,
+    /// A Miro import announced on one frame and run on the next, so its toast can paint
+    /// before the window stops repainting for two seconds. See `ActiveState::paste_aimed`.
+    pub(crate) pending_import: Option<crate::actions::PendingImport>,
+    pub(crate) paste_repeats: u32,
     /// What `Cmd+F` last found, in paint order, and where in that list the user is.
     pub(crate) matches: Vec<vellum_doc::ItemId>,
     pub(crate) match_index: usize,
@@ -595,6 +682,8 @@ impl Vellum {
 
         let mut state = ActiveState {
             prompting: None,
+            note_editing: None,
+            voice_node: None,
             prompting_touched: Instant::now(),
             agents: crate::agent_view::AgentViews::new(),
             agent_runtime,
@@ -624,6 +713,7 @@ impl Vellum {
             show_hud: self.options.hud,
             timer: FrameTimer::new(),
             stats: PaintStats::default(),
+            zoom_sweep: None,
             last_frame: now,
             last_stats_log: now,
             gpu_label,
@@ -647,11 +737,18 @@ impl Vellum {
             editing: None,
             editing_touched: Instant::now(),
             hovered_badge: None,
+            hovered_ports: None,
+            port_arm: None,
+            endpoint_arm: None,
             guides: Vec::new(),
             rules_opened_on: None,
             territory_arm: None,
+            territories: crate::actions::TerritoryCache::default(),
             erased_from: None,
             pending_fit: self.options.zoom.is_none(),
+            last_paste_at: None,
+            pending_import: None,
+            paste_repeats: 0,
             matches: Vec::new(),
             match_index: 0,
             pending_open: self.options.open.clone(),
@@ -672,6 +769,11 @@ impl Vellum {
         // value and changed nothing on screen. See `Shell::set_font_families`.
         let families = state.painter.text_mut().engine_mut().families();
         state.shell.set_font_families(families);
+        // The transcription setting, handed to the agent runtime once at launch. Without this
+        // an agent ingesting a recording on a freshly opened board would use the *default*
+        // `Speech` rather than the user's, until they happened to change the setting — the
+        // written-and-never-called shape, arriving as a value that is merely wrong.
+        state.publish_speech();
         Ok(state)
     }
 }
@@ -856,7 +958,22 @@ impl ApplicationHandler for Vellum {
             }
 
             WindowEvent::MouseWheel { delta, phase, .. } if !taken => {
-                state.input.wheel(&mut state.camera, delta, phase)
+                // A selected file tree takes the wheel before the camera does, and only then
+                // — see `ActiveState::scroll_tree_under` for why selection is the condition.
+                // Asked here rather than in `crate::input` because that module deliberately
+                // knows nothing about the scene (trap 5), and which node is under the pointer
+                // is the whole question.
+                let notches = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+                    // A trackpad reports pixels and pans the board; a list that swallowed
+                    // those would take two-finger panning away over every tree.
+                    winit::event::MouseScrollDelta::PixelDelta(_) => 0.0,
+                };
+                let at = state.input.cursor(&state.camera);
+                let over_tree = state.scroll_tree_under(at, notches);
+                if !over_tree {
+                    state.input.wheel(&mut state.camera, delta, phase);
+                }
             }
 
             WindowEvent::PinchGesture { delta, .. } if !taken => {
@@ -904,9 +1021,27 @@ impl ApplicationHandler for Vellum {
                 // the letters of a prompt reach `input.key` and switch tools — `V`, `N` and
                 // `T` are all tools, which is the trap `--demo typing` exists to catch for
                 // the canvas caret, arrived at in a second place.
+                // The microphone chord is asked **before all three text sessions**, and it is
+                // the only one of the four that must see a key *up* as well as a key down —
+                // holding `⌥D` is the gesture, so the release is half of it. Asked first for
+                // the reason the prompt row is asked before the caret: on macOS `⌥D` is the
+                // character `∂`, so a text session that saw it first would type it and the
+                // gesture would never begin. It claims nothing at all unless exactly one
+                // agent node with voice turned on is selected — see `ActiveState::talk_key`.
+                if state.talk_key(event.physical_key, event.state.is_pressed(), event.repeat) {
+                    return;
+                }
                 if state.is_prompting()
                     && event.state.is_pressed()
                     && state.type_prompt_key(&event.logical_key, event.text.as_deref())
+                {
+                    return;
+                }
+                // A note's body claims the keyboard on exactly the same terms, and for the
+                // same reason: its letters must not reach `input.key` and switch tools.
+                if state.is_editing_note()
+                    && event.state.is_pressed()
+                    && state.type_note_key(&event.logical_key, event.text.as_deref())
                 {
                     return;
                 }
@@ -1107,23 +1242,17 @@ impl ActiveState {
     /// automatic; the shape to grow into is `crate::links`' worker pool, and the reason it
     /// is not that today is that a drop is one file at a time and a pool would have to carry
     /// the target node across the wait — during which the node can be deleted.
-    fn attach_context_to(&mut self, doc: vellum_doc::ItemId, source: &str) {
-        let ingested = vellum_agent::ingest::ingest(source);
-        let Ok(item) = self.editor.board().item(doc) else { return };
-        let vellum_doc::ItemKind::Agent { model, label } = &item.kind else { return };
-        let mut config = crate::agent::decode(model);
-        config.context.push(ingested.source.clone());
-        let kind = vellum_doc::ItemKind::Agent {
-            model: crate::agent::encode(&config),
-            label: label.clone(),
-        };
-        if let Err(error) = self.editor.edit(|board| Ok(board.set_kind(doc, kind)?)) {
-            self.shell
-                .toast(vellum_ui::Toast::error(format!("that file could not be attached: {error}")));
-            return;
-        }
-        self.shell.invalidate_selection();
-
+    pub(crate) fn attach_context_to(&mut self, doc: vellum_doc::ItemId, source: &str) {
+        // Read on this thread, because the user has just made a gesture and is waiting for it.
+        // An **agent** asking for the same thing is read on the IPC worker instead — see
+        // `Handler::ingest` — and both meet at `attach_ingested`, which is the half that
+        // touches the document.
+        let mut ingested = vellum_agent::ingest::ingest(source);
+        // Feature 18's last step. Audio and video arrive here as a hand-off with no text in
+        // them; this is what fills it, when a transcriber on this machine can. It runs on the
+        // frame thread for the same reason the read above does — the user is standing there
+        // having just dropped the file — and it is bounded by the tool's own runtime.
+        Self::transcribe_media(&self.shell.library.speech(), &mut ingested);
         let label = if ingested.source.label.is_empty() {
             source.to_owned()
         } else {
@@ -1132,7 +1261,11 @@ impl ActiveState {
         // The ingester's own sentence, never a second one composed here: it is the only
         // thing that knows whether a converter is missing or the file was simply long.
         let message = format!("{label} — {}", ingested.outcome.message());
-        if matches!(ingested.outcome, vellum_agent::ingest::Outcome::Failed { .. }) {
+        let failed = matches!(ingested.outcome, vellum_agent::ingest::Outcome::Failed { .. });
+
+        self.attach_ingested(doc, ingested);
+
+        if failed {
             self.shell.toast(vellum_ui::Toast::error(message));
         } else {
             self.shell.toast(vellum_ui::Toast::info(message));
@@ -1167,12 +1300,26 @@ impl ActiveState {
     /// (`⌘T`, `⌘⌥←`, `⌘⌥→`) are `vellum-ui`'s because they need no index. These reach
     /// the app because `egui-winit` reports a key as consumed only when a text field
     /// has focus, which [`Shell::keyboard_captured`] already guards.
-    fn shortcut(&mut self, key: &Key) {
+    pub(crate) fn shortcut(&mut self, key: &Key) {
         if self.shell.keyboard_captured() {
             return;
         }
         let modifiers = self.input.modifiers();
         let command = modifiers.super_key() || modifiers.control_key();
+        // A text session on the canvas takes the keys a typing hand produces, and the line
+        // is drawn at ⌘/⌃ exactly where `vellum_ui::Chrome::shortcuts` draws it — the same
+        // rule in the two places a keystroke can become a command, so they cannot drift.
+        //
+        // **What reaches here that the chrome never sees**, and why this is not belt and
+        // braces: the arrows. Only the on-canvas caret claims Up and Down —
+        // `type_note_key` and `type_prompt_key` deliberately have no vertical motion,
+        // because their buffers have no layout — so `↑` while typing a note's body fell
+        // through to `nudge` and **moved the node being typed into**. `⌘Q`, `⇧⌘T` and
+        // `⌘1`…`⌘9` all carry a modifier and are untouched; Escape never arrives at all,
+        // because all three sessions claim it.
+        if !command && self.text_session_owns_keyboard() {
+            return;
+        }
         // Miro's step and its coarse step. One world unit is one board pixel, which
         // is the unit every coordinate in the properties panel is already in.
         let step = if modifiers.shift_key() { COARSE_NUDGE } else { NUDGE };
@@ -1283,6 +1430,10 @@ impl ActiveState {
         // one function that closes all three and is private to `crate::actions`; the two
         // above are its other halves.)
         self.end_prompting();
+        // ⚠ And the microphone — the fourth of the gestures that can end without the event
+        // that normally ends it. Quitting mid-hold must close the device; unlike the three
+        // above there is nothing to keep, because half an utterance is not worth restoring.
+        self.cancel_talking();
         let path = self.editor.path().map(std::path::Path::to_path_buf);
         if let Some(path) = path.as_deref() {
             self.capture_thumbnail(path);
@@ -1380,6 +1531,9 @@ impl ActiveState {
         self.run_chrome();
         // Now, and not in `start`: the canvas rectangle is what the chrome leaves for
         // the board, and the chrome has only just run for the first time.
+        // Announced last frame, run now — the toast has painted, so the seconds the import
+        // takes are visibly the app working rather than the app hanging.
+        self.run_pending_import();
         if self.pending_fit {
             self.pending_fit = false;
             self.fit_board();
@@ -1444,7 +1598,7 @@ impl ActiveState {
             if !self.shell.force_open(&name) {
                 log::warn!(
                     "--show: nothing called `{name}` \
-                     (properties, palette, find, shapes, pen, eraser, more, menu)"
+                     (properties, palette, find, shapes, pen, eraser, more, menu, settings)"
                 );
             }
         }
@@ -1579,18 +1733,39 @@ impl ActiveState {
         }
     }
 
+    /// Whether one of the three canvas text sessions has the keyboard.
+    ///
+    /// The on-canvas caret, a note's body, an agent's prompt row. **One derivation**, read
+    /// by both places a keystroke can turn into a command — the chrome's table, through
+    /// `Facts::text_session`, and [`Self::shortcut`] — because two copies of this are two
+    /// answers that can disagree about whether someone is in the middle of a word.
+    ///
+    /// None of the three is an egui widget, so `Context::egui_wants_keyboard_input` is false
+    /// throughout all of them and the chrome cannot work this out for itself. See
+    /// `vellum_ui::ChromeState::text_session` for what that cost: renaming a frame and
+    /// pressing Backspace deleted the frame, and a word containing `r` or `s` armed a tool
+    /// so the click that left the field placed an item nobody asked for.
+    pub(crate) fn text_session_owns_keyboard(&self) -> bool {
+        self.editing.is_some() || self.is_editing_note() || self.is_prompting()
+    }
+
     /// Runs the chrome for this frame and acts on everything it reports.
-    fn run_chrome(&mut self) {
+    pub(crate) fn run_chrome(&mut self) {
         let handle = self.pointer_handle();
         // Recomputed per frame rather than tracked on a move event: the board scrolls and
         // zooms under a stationary pointer, so "what is under the cursor" changes without
         // the cursor moving at all.
-        self.hovered_badge =
-            if self.shell.pointer_over_ui() || self.shell.screen() != Screen::Board {
-                None
-            } else {
-                self.badge_under_pointer()
-            };
+        let over_board =
+            !self.shell.pointer_over_ui() && self.shell.screen() == Screen::Board;
+        self.hovered_badge = if over_board { self.badge_under_pointer() } else { None };
+        // The ports follow the same rule and the same reason — the board moves under a
+        // stationary pointer — but they are **kept** while the pointer is over the chrome
+        // rather than cleared. Reaching a selected item's dots from the context bar floating
+        // above it crosses the bar, and dots that blinked out on the way to them would be
+        // dots you cannot use.
+        if over_board {
+            self.hovered_ports = self.ports_under_pointer();
+        }
         let hovered_badge = self.hovered_badge;
         let title = self.editor.board().title();
         let path = self.editor.path().map(std::path::Path::to_path_buf);
@@ -1622,6 +1797,7 @@ impl ActiveState {
                 crate::shell::cursor_icon(self.input.cursor_icon(handle))
             },
             selection_rect: self.selection_screen_rect(),
+            text_session: self.text_session_owns_keyboard(),
         };
 
         self.sync_selection();
@@ -1781,6 +1957,14 @@ impl ActiveState {
         // `state_of` also resolves through the store rather than joining `base()` here, which
         // is what every other reader does: a path that escapes the store is now refused
         // rather than answered about.
+        // The live link count, from the model the runtime keeps up to date on every reload —
+        // see `AgentFacts::note_links`.
+        let note_links = |path: &str| -> usize {
+            let Some(board) = board.as_ref() else { return 0 };
+            agent_runtime
+                .note_model_at(board, path)
+                .map_or(0, |note| note.links.len())
+        };
         let note_state = |path: &str| -> (bool, bool) {
             let Some(board) = board.as_ref() else { return (false, false) };
             agent_runtime.note_store(board).map_or((false, false), |store| store.state_of(path))
@@ -1792,8 +1976,9 @@ impl ActiveState {
                 .and_then(std::path::Path::parent)
                 .map(|p| p.display().to_string()),
             inherited_display: shell.library.default_display_mode(),
+            // The setting, not a constant — see `Library::default_provider`.
             inherited_provider: vellum_agent::ProviderChoice::new(
-                vellum_agent::Provider::default(),
+                shell.library.default_provider(),
             ),
             browser_nodes_allowed: shell.library.browser_nodes(),
             // What this build can do, not what the user asked for. `vellum-app`'s own
@@ -1806,6 +1991,7 @@ impl ActiveState {
             rules: &rules,
             label_of: &label_of,
             note_state: &note_state,
+            note_links: &note_links,
         };
         shell.sync_selection(key, || {
             crate::inspect::selection_items(editor.projection(), editor.selection(), &facts)
@@ -1827,11 +2013,11 @@ impl ActiveState {
         // and it is the one place a create gesture's preview and its snapping are decided
         // together.
         let placing = self.placing_preview();
-        // The selected orchestrator's region, or the one being swept for it right now —
-        // `docs/07-agent-canvas.md` §9. `None` on every board with no agent on it, and on
-        // every selection that is not exactly one managing node, so this costs one
-        // `selection().first()` on an ordinary board.
-        let territory = self.territory_preview();
+        // Every orchestrator's region, and the one being swept right now. Empty on every
+        // board with no agent node on it, behind the same `has_agents()` compare the painter
+        // and the runtime both take, and cached against the projection so a pan does not
+        // re-parse a token — see `ActiveState::territories`.
+        let territories = self.territories();
         // Cloned, **not** taken. A drag recomputes its guides only when the pointer moves,
         // so taking them would blank the lines on every frame a hand held still — which is
         // exactly when someone is looking at them. Four `Copy` structs at the very most.
@@ -1869,6 +2055,25 @@ impl ActiveState {
                 self.editor.projection().marquee_hits(rect)
             })
             .unwrap_or_default();
+        // Both are asked **before** `frame_parts`, which takes a mutable borrow of the
+        // editor that has to live until `paint`. `pending_connector` and `ported_item` each
+        // read the projection, the selection, the armed tool and every in-flight gesture,
+        // so neither can run while that borrow is out — inside the initialiser they are a
+        // borrow error, and the fix is the order rather than the call.
+        let pending_connector = self.pending_connector();
+        let ports = self.ported_item();
+        // Read before the editor borrow below, like the two above it.
+        let default_chat_theme = self.shell.library.default_chat_theme();
+        // The same sidecar value the toggle and the transcript both resolve against — see
+        // `DrawContext::default_display`.
+        let default_display = self.shell.library.default_display_mode();
+        // The two grips on a selected connector, dropped while one of them is in flight:
+        // the end being dragged is not where the document still says it is, so a grip drawn
+        // there would sit at the line's old end while the preview runs to the pointer.
+        let connector_grips = (self.endpoint_arm.is_none())
+            .then(|| self.connector_grips())
+            .flatten()
+            .map(|(_, from, to)| (from, to));
         let (projection, selection, assets) = self.editor.frame_parts();
         let selection = if previewed.is_empty() { selection } else { previewed.as_slice() };
         let context = DrawContext {
@@ -1877,6 +2082,8 @@ impl ActiveState {
             projection,
             theme,
             hovered_badge: self.hovered_badge,
+            default_chat_theme,
+            default_display,
             selection,
             marquee,
             stroke,
@@ -1889,10 +2096,18 @@ impl ActiveState {
             // the gesture rather than from a field of our own — `Input::placement` already
             // tracks exactly this pair for every create tool, and a second copy would be a
             // second thing to keep in step.
-            pending_connector: (self.shell.tool() == vellum_ui::Tool::Connector)
-                .then(|| self.input.placement())
-                .flatten()
-                .map(|(from, to)| (camera.screen_to_world(from), camera.screen_to_world(to))),
+            // Either way of drawing one: the connector tool, or a drag begun on one of the
+            // four ports. The port drag borrows `input::Tool::Place` while the palette still
+            // says Select, so gating on the palette's tool alone would leave the commonest
+            // route to a connector — Miro's blue dots — drawing nothing at all until the
+            // button came up. That is feedback 7 (the pen) and 23 (the frame) a third time,
+            // and it is the failure this codebase reproduces most reliably.
+            pending_connector,
+            // Miro's four blue dots, on whichever item is wearing them — hover first, then a
+            // lone selection. `ported_item` holds the whole rule; the painter is handed the
+            // answer.
+            ports,
+            connector_grips,
             editing: self.editing.as_ref().map(|session| crate::draw::TextCursor {
                 scene: session.scene,
                 slot: session.slot,
@@ -1908,13 +2123,107 @@ impl ActiveState {
             card_drop,
             pattern,
             grid_color,
-            territory,
+            territories,
             minimap,
         };
         let (device, queue, renderer) = self.surface.parts();
         self.stats = self
             .painter
             .paint(device, queue, renderer, assets, &mut self.list, &context);
+        self.tick_zoom_sweep();
+    }
+
+    /// Arms `--demo zoom-flicker`. See [`Self::tick_zoom_sweep`].
+    pub(crate) fn arm_zoom_sweep(&mut self) {
+        self.zoom_sweep = Some(ZoomSweep { settling: true, ..ZoomSweep::default() });
+    }
+
+    /// One frame of `--demo zoom-flicker`.
+    ///
+    /// Here rather than in `actions` because the thing being measured is a *sequence of
+    /// frames*: a refinement is decided by one frame's draws, requested on the next, and
+    /// answered several frames after that by a worker thread. Nothing that runs inside a
+    /// single command can observe it, which is exactly why the whole path had unit tests on
+    /// every layer and no execution as a composed whole.
+    fn tick_zoom_sweep(&mut self) {
+        let Some(mut sweep) = self.zoom_sweep.take() else { return };
+        let pending = self.stats.images_pending;
+        let queued = self.surface.renderer().wants_refinement().len();
+
+        if sweep.settling {
+            // Wait for the first load to finish. Without this the initial decodes pollute the
+            // count and both builds look equally broken.
+            // Long enough for `resolve_detail` to demote at this zoom as well as for the
+            // decodes to land — the demotion is what the sweep sharpens back up.
+            sweep.quiet = if pending == 0 { sweep.quiet + 1 } else { 0 };
+            sweep.frames += 1;
+            if sweep.quiet >= 120 {
+                sweep.settling = false;
+                sweep.frames = 0;
+                sweep.from = self.camera.zoom();
+            } else if sweep.frames > 600 {
+                self.gap("zoom-flicker: the images never finished loading");
+                return;
+            }
+            self.zoom_sweep = Some(sweep);
+            return;
+        }
+
+        // The sweep proper. **At least 8x**, because the refine edge sits 2x from where a
+        // texture settles and a shorter sweep would never cross it — reporting a pass on a
+        // build where nothing was exercised.
+        const FRAMES: u32 = 240;
+        const RANGE: f64 = 12.0;
+        sweep.blinks += usize::from(pending > 0);
+        sweep.worst = sweep.worst.max(pending);
+        sweep.queued = sweep.queued.max(queued);
+        sweep.frames += 1;
+
+        let t = f64::from(sweep.frames) / f64::from(FRAMES);
+        let centre = self.canvas_centre();
+        self.camera.set_zoom_about(sweep.from * RANGE.powf(t), centre);
+
+        if sweep.frames < FRAMES {
+            self.zoom_sweep = Some(sweep);
+            return;
+        }
+
+        // The verdict, through the same channel every other fixture reports on.
+        // **Blinks first.** A build that draws placeholders has failed whatever the counter
+        // says — and the counter cannot see the old behaviour anyway, because destroying the
+        // texture *was* the signal and `begin_frame` drained the queue before anything could
+        // read it. Reporting "nothing queued" first hid the actual regression behind a
+        // bookkeeping complaint, which the A/B against that build is what exposed.
+        if sweep.blinks > 0 {
+            self.gap(&format!(
+                "zoom-flicker: {} of {FRAMES} frames drew a placeholder, worst {} images at \
+                 once — an image stopped being drawn while it sharpened",
+                sweep.blinks, sweep.worst
+            ));
+        } else if sweep.queued == 0 {
+            self.gap(&format!(
+                "zoom-flicker: no placeholder frames, but nothing was ever asked to refine \
+                 over a {RANGE:.0}x sweep — the path this fixture exists to drive never ran, \
+                 so the pass is vacuous"
+            ));
+        } else {
+            self.ok(format!(
+                "zoom-flicker: {FRAMES} frames over a {RANGE:.0}x zoom, {} refinement(s) asked \
+                 for, and 0 placeholder frames — every image kept drawing while it sharpened",
+                sweep.queued
+            ));
+        }
+    }
+
+    /// The middle of the visible board, in physical screen pixels.
+    ///
+    /// Where a paste goes when the pointer is somewhere it must not be aimed at — over a
+    /// panel, or outside the window. Taken from [`Self::canvas_pixels`] rather than from
+    /// the surface, so it is the centre of the board the user can *see* rather than of a
+    /// window whose left edge is under the tool palette.
+    pub(crate) fn canvas_centre(&self) -> vellum_scene::ScreenPoint {
+        let [x, y, width, height] = self.canvas_pixels();
+        vellum_scene::ScreenPoint::new(x + width / 2.0, y + height / 2.0)
     }
 
     /// The part of the window the board can actually be seen in, in physical pixels
@@ -2199,6 +2508,20 @@ impl ActiveState {
                 self.surface.renderer().textures().resident_bytes() / 1_048_576,
                 self.shell.thumbnail_count(),
                 self.session.len()
+            ),
+            // What an edit costs, which nothing on screen used to say. `REPROJ` is the
+            // whole-document rebuild every edit and every undo runs; `DEFER` is how many
+            // text blocks wanted shaping this frame and were refused it by the 3 ms
+            // ration — so a non-zero `DEFER` is words the user is waiting for, and the
+            // number of frames it takes to fall back to zero after an edit is the
+            // stutter, measured. `GREEK` is beside it because the two are easy to
+            // confuse: a greeked block draws bars, a deferred one draws nothing.
+            format!(
+                "REPROJ {:.1} MS   DEFER {}   GREEK {}   PENDIMG {}",
+                self.editor.last_reproject().as_secs_f64() * 1000.0,
+                self.stats.text_deferred,
+                self.stats.text_skipped,
+                self.stats.images_pending
             ),
         ];
         if let Some((text, at)) = &self.status

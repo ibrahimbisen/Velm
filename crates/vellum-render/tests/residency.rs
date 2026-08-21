@@ -117,7 +117,20 @@ fn eviction_takes_the_stale_and_distant_and_spares_what_is_on_screen() {
     );
     assert!(textures.resident_bytes() > budget.max_bytes, "and so it stays over budget");
 
-    // Frame 2: only the on-screen one is still in view.
+    // Frame 2: only the on-screen one is still in view. **Still nothing goes**, because a
+    // texture is protected for one frame *after* the last one that drew it — see
+    // `PROTECT_FRAMES`. The caller sweeps the budget before it builds the draw list, so at
+    // that moment every visible texture's `last_marked` is the *previous* frame's; a window
+    // of zero would make every one of them a candidate and evict the board out from under
+    // the list about to be built.
+    textures.begin_frame();
+    textures.mark(on_screen, 0.0);
+    assert!(
+        textures.evict_to_budget().is_empty(),
+        "a texture seen on the previous frame is still in use"
+    );
+
+    // Frame 3: unseen for two frames now, and eviction takes them in the documented order.
     textures.begin_frame();
     textures.mark(on_screen, 0.0);
     let evicted = textures.evict_to_budget();
@@ -468,19 +481,48 @@ fn an_image_drawn_larger_than_it_is_stored_is_dropped_for_re_upload() {
         "the frame that noticed still had something to draw"
     );
 
-    let dropped = renderer.begin_frame();
-    assert_eq!(dropped, vec![id], "and the next frame is where it goes");
-    assert!(!renderer.textures().contains(id));
-    assert_eq!(renderer.textures().resident_bytes(), 0);
+    // The frame the drop used to land on. Nothing is destroyed to ask a question now.
+    let coarse = renderer.textures().resident_bytes();
+    renderer.begin_frame();
+    assert!(
+        renderer.textures().contains(id),
+        "the texture was destroyed to signal a refinement; the caller's next \
+         `Assets::texture` answers None and the image draws a flat placeholder for the \
+         several frames the worker-thread decode takes"
+    );
+    assert!(renderer.textures().bind_group(id).is_some(), "and it is still drawable");
+    assert_eq!(renderer.textures().resident_bytes(), coarse, "and still accounted for");
 
-    // Re-uploaded from the source, it comes back at its ceiling and stays there.
-    let id = renderer
+    // It asks instead — and asks for the size it is *drawn* at, not for the 2048 ceiling.
+    // Re-uploading at the ceiling costs 21 MB with mips and is demoted back to about 1.3 MB
+    // by the very next resolve, in the same frame.
+    let want = renderer.wants_refinement();
+    assert_eq!(want.len(), 1);
+    assert_eq!(want[0].texture, id);
+    assert_eq!(
+        want[0].target,
+        (512, 512),
+        "a 512-texel demand against a 512 source: the whole chain, and no more"
+    );
+
+    // The request stands while the image keeps being drawn too large, rather than being a
+    // one-shot the caller can miss.
+    for _ in 0..2 {
+        renderer.begin_frame();
+        common::render(device, queue, &mut renderer, &one_image(id, 512.0));
+        assert!(renderer.textures().contains(id));
+    }
+
+    // And the caller's swap lands where it should: uploaded at the asked size, the old
+    // handle freed, the image never having stopped drawing.
+    let finer = renderer
         .textures_mut()
-        .upload(device, queue, &ImageSource::new(512, 512, &pixels))
+        .upload_within(device, queue, &ImageSource::new(512, 512, &pixels), 512)
         .expect("re-upload");
-    common::render(device, queue, &mut renderer, &one_image(id, 512.0));
-    assert_eq!(renderer.textures().size(id), Some((512, 512)));
-    assert_eq!(renderer.textures().detail_ceiling(id), Some((512, 512)));
+    renderer.textures_mut().remove(id);
+    common::render(device, queue, &mut renderer, &one_image(finer, 512.0));
+    assert_eq!(renderer.textures().size(finer), Some((512, 512)));
+    assert_eq!(renderer.textures().detail_ceiling(finer), Some((512, 512)));
 }
 
 /// Refinement costs a decode, and the caller decodes on a per-frame budget. Asking
@@ -518,10 +560,18 @@ fn refinement_is_paced_rather_than_dropping_everything_at_once() {
     }
     textures.resolve_detail(device, queue);
 
-    assert_eq!(textures.begin_frame().len(), 4);
-    assert_eq!(textures.begin_frame().len(), 2);
-    assert!(textures.begin_frame().is_empty());
-    assert!(textures.is_empty());
+    // Four exposed at a time, and — the half that changed — **the manager never goes empty**.
+    // It used to drop 4 then 2 then hold nothing at all, which is six images showing flat grey
+    // while their decodes came back.
+    assert_eq!(textures.wants_refinement().len(), 4, "paced");
+    assert!(!textures.is_empty(), "and none of them was destroyed to say so");
+    for id in &ids {
+        assert!(textures.contains(*id), "every one is still drawable while it waits");
+    }
+    // Each asks for the size it is drawn at rather than for the budget's ceiling.
+    for want in textures.wants_refinement() {
+        assert_eq!(want.target, (256, 256), "a 256-texel demand against a 256 source");
+    }
 }
 
 /// Only what a frame actually drew is reconsidered. A texture off screen is

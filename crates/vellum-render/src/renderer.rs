@@ -183,14 +183,22 @@ impl Renderer {
     /// Advances the residency clocks of both caches. Call once per frame, before
     /// marking anything.
     ///
-    /// Returns the textures dropped because the last frame drew them larger than
-    /// their stored resolution — see [`TextureManager::begin_frame`]. A caller that
-    /// maps content hashes to handles may prune those entries now; one that does not
-    /// finds out anyway, because [`TextureManager::contains`] stops recognising them.
-    pub fn begin_frame(&mut self) -> Vec<crate::texture::TextureId> {
-        let refined = self.textures.begin_frame();
+    /// It used to return the textures it had just **destroyed** to ask the caller for a finer
+    /// upload. Nothing is destroyed to ask a question now — see
+    /// [`TextureManager::begin_frame`] for why that was the flicker, and
+    /// [`Self::wants_refinement`] for what replaced it. The return type changed to `()` on
+    /// purpose: it makes the compiler name every caller that was reading the old meaning.
+    pub fn begin_frame(&mut self) {
+        self.textures.begin_frame();
         self.atlas.begin_frame();
-        refined
+    }
+
+    /// The textures the last frame found too coarse, and the size each should come back at.
+    ///
+    /// Each is still resident and still drawing. See [`TextureManager::wants_refinement`].
+    #[must_use]
+    pub fn wants_refinement(&self) -> &[crate::texture::Refinement] {
+        self.textures.wants_refinement()
     }
 
     /// Uploads everything `list` needs and records the batch plan.

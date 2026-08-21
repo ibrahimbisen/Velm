@@ -364,6 +364,13 @@ struct Shared {
     mcp_servers: Vec<Value>,
 }
 
+/// The flag an ACP agent is asked for a model with, when its `--help` says it has one.
+///
+/// A guess at somebody else's command line, which is why it is only ever used behind
+/// [`crate::transport::claude_cli::supports_flag`]. `--model` is what `claude` uses and what
+/// `codex` and `gemini` document; neither of the latter has been run from here.
+const MODEL_FLAG: &str = "--model";
+
 impl Shared {
     fn write_line(&self, message: &Value) -> Result<()> {
         let mut guard = self.stdin.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -514,15 +521,53 @@ impl AcpTransport {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
 
+        // The node's model, when this binary understands the flag — measured, never assumed.
+        //
+        // ⚠ **A per-node model was silently dropped here, and ACP is the default transport for
+        // OpenAI and Gemini.** Feature 16's promise is that the model is a per-node choice, so
+        // a field the user typed that reaches the process for one provider and evaporates for
+        // another is the feature quietly not being true. It is not simply pushed, either:
+        // `codex` and `gemini` have never been run from this machine (see `provider.rs`), and
+        // an unknown option is a non-zero exit rather than an ignored argument — so guessing
+        // would trade a dropped setting for a dead session. `supports_flag` reads the binary's
+        // own `--help`, which is the same measured-not-recalled rule that produced
+        // `transport/claude_cli.rs` in the first place, and a binary that does not answer is
+        // treated as "does not know" rather than "yes".
+        let mut argv: Vec<String> = Vec::new();
+        let model = spec.provider.model.as_deref().filter(|name| !name.is_empty());
+        let mut model_dropped = None;
+        if let Some(model) = model {
+            if super::claude_cli::supports_flag(&program, MODEL_FLAG) {
+                argv.push(MODEL_FLAG.to_owned());
+                argv.push(model.to_owned());
+            } else {
+                // Reported, not swallowed. The session still starts — the agent's own default
+                // model is a working session — but the person who typed a model name is told
+                // it did not take, on the node, rather than wondering later why the answer
+                // reads like a different model.
+                model_dropped = Some(model.to_owned());
+            }
+        }
+        argv.extend(spec.args.iter().cloned());
+
         let mut process = Command::new(&program);
         process
-            .args(&spec.args)
+            .args(&argv)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         process.current_dir(&cwd);
         for (key, value) in &spec.env {
             process.env(key, value);
+        }
+
+        if let Some(model) = &model_dropped {
+            let _ = events.send(TranscriptEvent::Error {
+                message: format!(
+                    "{command} does not take a model on its command line, so this node's \
+                     model ({model}) was not passed — it will use its own default."
+                ),
+            });
         }
 
         let mut child = process.spawn().map_err(|error| {

@@ -42,7 +42,10 @@ pub mod rtb;
 pub mod svg;
 
 pub use miro_model::{FidelityReport, Widget, WidgetKind};
-pub use pipeline::{AssetGap, Degradation, ImportOutcome, MissingAsset, import};
+pub use pipeline::{
+    AssetGap, Degradation, ImportOutcome, MissingAsset, PrefetchedAssets, import,
+    import_widgets_with, prefetch_assets, requested_assets,
+};
 
 /// A board fragment pasted out of Miro.
 #[derive(Debug, Clone)]

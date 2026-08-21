@@ -137,11 +137,17 @@ impl Menu {
                     Entry::Sub(Submenu::Transparency),
                     Entry::Sub(Submenu::Accent),
                     Separator,
-                    // The Agent Canvas band. Both toggles are off by default and both carry
-                    // a `Command::note` saying why, because a switch whose cost is invisible
-                    // from the switch is one people turn on and then report as a defect.
+                    // The Agent Canvas band, and it is a **named** section rather than one
+                    // more anonymous run between separators — the user's own ask. Every row
+                    // in it carries a `Command::note` or a hover written at its draw site,
+                    // enforced by `every_agent_row_explains_itself`: these are switches whose
+                    // cost or effect is invisible from the switch, which is the kind people
+                    // turn on and then report as a defect.
+                    Entry::Heading(AGENT_SECTION),
                     Entry::Sub(Submenu::AgentDisplay),
+                    Entry::Sub(Submenu::AgentTheme),
                     Entry::Sub(Submenu::Providers),
+                    Entry::Sub(Submenu::Voice),
                     Item(C::ToggleWorktrees),
                     Item(C::ToggleBrowserNodes),
                     Separator,
@@ -154,12 +160,39 @@ impl Menu {
     }
 }
 
+/// What the Agent Canvas band is called, wherever it is drawn.
+///
+/// One constant, used by Preferences and by the right-button menu, so the layer cannot come
+/// to be called two things in two places. **"Agents"**, matching Edit ▸ Agent — the user
+/// called it *"the ai / terminal mode"*, which is what it is and not what anything else in
+/// this interface is named after. Every other section here is named for the objects it acts
+/// on, not for the mode you are in.
+pub const AGENT_SECTION: &str = "Agents";
+
 /// One row in a menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
     Item(Command),
     Separator,
     Sub(Submenu),
+    /// A named band, drawn as a small faint label above the rows it introduces.
+    ///
+    /// # Why a heading rather than one more separator
+    ///
+    /// A separator says *"these belong together"* and nothing else, which is enough for four
+    /// clipboard verbs everybody already knows. It is not enough for a band of rows that
+    /// belong to a subsystem: *"the settings that are associated to the ai / terminal mode
+    /// [should] have its own section"*, said of a Preferences menu where the agent rows sat
+    /// between two separators looking exactly like the appearance rows above them.
+    ///
+    /// # It is not a row
+    ///
+    /// It cannot be clicked, cannot be ticked and carries no shortcut, so it is skipped by
+    /// everything that walks a menu looking for commands — the shortcut sheet, the palette,
+    /// and the tests that assert every menu entry is reachable. The `Entry` matches in this
+    /// crate are exhaustive, which is what makes that a compile error rather than an
+    /// omission.
+    Heading(&'static str),
 }
 
 /// A nested menu.
@@ -213,6 +246,23 @@ pub enum Submenu {
     /// command table would need one command per mode and would have to be kept in step with
     /// that enum.
     AgentDisplay,
+    /// Preferences ▸ Agents ▸ Chat theme — how a transcript is dressed, app-wide.
+    ///
+    /// Runtime state like [`Self::AgentDisplay`], and for the same reason: the rows are
+    /// `vellum_agent::ChatTheme`'s own values with a tick on the one in force, so the command
+    /// table would need one command per theme and would have to be kept in step with an enum
+    /// in another crate.
+    AgentTheme,
+    /// The **selected node's** theme, on the right button and the `⋮` — *"i should be able
+    /// to set individual chats with individual themes"*. The same four rows plus *Inherit*,
+    /// which is the row that makes the app-wide default mean anything.
+    NodeTheme,
+    /// Preferences ▸ Voice — which transcriber a spoken prompt goes to.
+    ///
+    /// Runtime rows like [`Self::Providers`], for the same reason: the choices are values of
+    /// `voice::Preference` plus what this machine happens to have installed, neither of which
+    /// the command table can hold.
+    Voice,
     /// Preferences ▸ Providers — which models are reachable, and how each one is paid for.
     ///
     /// Runtime state again: the list is `Provider::ALL` crossed with what the app found on
@@ -223,7 +273,7 @@ pub enum Submenu {
 }
 
 impl Submenu {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 15] = [
         Self::Export,
         Self::MoveToSpace,
         Self::Arrange,
@@ -235,7 +285,10 @@ impl Submenu {
         Self::GridOpacity,
         Self::Agent,
         Self::AgentDisplay,
+        Self::AgentTheme,
+        Self::NodeTheme,
         Self::Providers,
+        Self::Voice,
     ];
 
     pub const fn title(self) -> &'static str {
@@ -251,7 +304,10 @@ impl Submenu {
             Self::GridOpacity => "Grid opacity",
             Self::Agent => "Agent",
             Self::AgentDisplay => "Agent output",
+            Self::AgentTheme => "Chat theme",
+            Self::NodeTheme => "Chat theme",
             Self::Providers => "Providers",
+            Self::Voice => "Voice",
         }
     }
 
@@ -261,9 +317,15 @@ impl Submenu {
             Self::Export | Self::MoveToSpace | Self::Background => Menu::Board,
             Self::Grid | Self::GridColor | Self::GridOpacity => Menu::View,
             Self::Arrange | Self::Agent => Menu::Edit,
-            Self::Transparency | Self::Accent | Self::AgentDisplay | Self::Providers => {
-                Menu::Preferences
-            }
+            Self::Transparency
+            | Self::Accent
+            | Self::AgentDisplay
+            | Self::AgentTheme
+            | Self::Providers
+            | Self::Voice => Menu::Preferences,
+            // Beside the other things you do to a selected node, not beside the app-wide
+            // default it overrides. Edit ▸ Agent is where a per-node verb belongs.
+            Self::NodeTheme => Menu::Edit,
         }
     }
 
@@ -327,10 +389,18 @@ impl Submenu {
                     Item(C::StopAgent),
                     Separator,
                     Item(C::ToggleAgentRaw),
+                    Entry::Sub(Self::NodeTheme),
                     Separator,
                     Item(C::EditAgentRules),
                     Item(C::EditAgentSchedule),
                     Item(C::SetTerritory),
+                    Item(C::RemoveWorktree),
+                    // Also a row inside Chat theme ▸, which is where you reach it while
+                    // choosing a look. Here as well because a command reachable only from a
+                    // submenu built at runtime is one the shortcut sheet cannot list and
+                    // `every_command_appears_in_exactly_one_menu` cannot find — the
+                    // "written, tested and unreachable" shape this repository keeps hitting.
+                    Item(C::SetChatBackground),
                 ]
             },
             Self::MoveToSpace
@@ -340,8 +410,53 @@ impl Submenu {
             | Self::GridColor
             | Self::GridOpacity
             | Self::AgentDisplay
-            | Self::Providers => &[],
+            | Self::AgentTheme
+            | Self::NodeTheme
+            | Self::Providers
+            | Self::Voice => &[],
         }
+    }
+
+    /// A sentence shown on hovering the row, [`Command::note`]'s twin for a nested menu.
+    ///
+    /// Same contract, same reason: every Agent Canvas entry explains itself, because *Agent
+    /// output* and *Providers* name concepts that exist nowhere else in this interface, and a
+    /// submenu that only says what it is called makes you open it to find out what it is for.
+    /// Pinned by `every_agent_menu_entry_carries_a_tooltip`.
+    pub const fn note(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Agent => {
+                "Everything the agent nodes you have selected can be asked to do. The same \
+                 rows are on the right button, over the node itself."
+            }
+            Self::AgentDisplay => {
+                "What a **new** agent node shows by default — every tool call and reasoning \
+                 step, or only the final answer. A node that has been switched by hand keeps \
+                 its own setting and ignores this."
+            }
+            Self::AgentTheme => {
+                "How every agent transcript is dressed, unless a node has been given a look \
+                 of its own. Four palettes, each with its text contrast already checked \
+                 against its own paper."
+            }
+            Self::NodeTheme => {
+                "How this one transcript is dressed — its paper, its ink, how see-through it \
+                 is, and a picture of your own behind it. Overrides the app-wide default \
+                 until you set it back to Inherit."
+            }
+            Self::Providers => {
+                "Which models can be reached from this machine, and how each one is paid for. \
+                 A provider you already hold a subscription to is used through its own \
+                 command-line tool and needs no key; the rest need one, stored on this \
+                 machine only and never written into a board."
+            }
+            Self::Voice => {
+                "How Velm turns a spoken prompt into words. Hold ⌥D on an agent node that has \
+                 voice turned on to talk to it; this chooses what does the listening — a \
+                 transcriber on this machine, which is private and needs no key, or an API."
+            }
+            _ => return None,
+        })
     }
 
     /// Whether the submenu can be opened, and why not when it cannot.
@@ -387,7 +502,24 @@ impl Submenu {
             // The two agent preference lists join it. The default display mode and the
             // provider roster are the application's, not a board's, and a user setting up
             // their providers before opening anything should not have to open something.
-            Self::Accent | Self::AgentDisplay | Self::Providers => Availability::Enabled,
+            Self::Accent
+            | Self::AgentDisplay
+            | Self::AgentTheme
+            | Self::Providers
+            | Self::Voice => {
+                Availability::Enabled
+            }
+            // Per node, so it needs a node — and exactly one, because two agents have two
+            // themes and there is no shared one to tick.
+            Self::NodeTheme => {
+                if !ctx.board_open {
+                    Availability::Disabled(reason::NO_BOARD)
+                } else if ctx.agents_selected == 0 {
+                    Availability::Disabled(reason::NO_AGENT)
+                } else {
+                    Availability::Enabled
+                }
+            }
             // A submenu whose every row would be greyed out is a menu of things you cannot
             // do. Disabled as a whole, with the same reason its rows would each have given.
             Self::Agent => {
@@ -577,6 +709,26 @@ pub enum Command {
     /// selection from every board with an orchestrator on it — silently, and for the half of
     /// the gesture that gets used constantly.
     SetTerritory,
+    /// Remove one agent's git worktree from disk — feature 4's other half.
+    ///
+    /// **This exists because the interface already claimed it did.** The inspector's own
+    /// hover text on the Worktree switch read *"it is removed deliberately, and never while it
+    /// has uncommitted work in it"*, describing a deliberation the application could not
+    /// perform: `worktree::remove` and `worktree::dirty` were written, tested and called by
+    /// nothing, so a board that had run coding agents accumulated checkouts with no way to
+    /// clear them but a terminal. Never describe a gesture the user cannot perform.
+    ///
+    /// A command rather than a panel switch because it **deletes a directory** and therefore
+    /// takes a confirmation, and because it must refuse rather than proceed when the worktree
+    /// has uncommitted work in it — a decision with a sentence, not a toggle.
+    RemoveWorktree,
+    /// Put a picture of the user's own behind one agent node's transcript.
+    ///
+    /// A `Command` rather than an [`AgentEdit`](crate::AgentEdit) because it **opens a file
+    /// dialog**, which only the app can do — the chrome never touches the filesystem. The
+    /// resulting hash comes back as `AgentEdit::ChatBackground`, so the write itself still
+    /// goes through the one path every other node edit does.
+    SetChatBackground,
     // Preferences
     /// Whether a browser node may run a real web engine at all — feature 13.
     ///
@@ -658,6 +810,8 @@ impl Command {
         Self::EditAgentRules,
         Self::EditAgentSchedule,
         Self::SetTerritory,
+        Self::RemoveWorktree,
+        Self::SetChatBackground,
         Self::ToggleBrowserNodes,
         Self::ToggleWorktrees,
         Self::KeyboardShortcuts,
@@ -733,6 +887,8 @@ impl Command {
             Self::EditAgentRules => "Rules…",
             Self::EditAgentSchedule => "Schedule…",
             Self::SetTerritory => "Set territory…",
+            Self::RemoveWorktree => "Remove worktree…",
+            Self::SetChatBackground => "Chat picture…",
             Self::ToggleBrowserNodes => "Browser nodes",
             Self::ToggleWorktrees => "Worktree isolation",
             Self::KeyboardShortcuts => "Keyboard shortcuts",
@@ -790,7 +946,9 @@ impl Command {
             | Self::ToggleAgentRaw
             | Self::EditAgentRules
             | Self::EditAgentSchedule
-            | Self::SetTerritory => Menu::Edit,
+            | Self::SetTerritory
+            | Self::RemoveWorktree
+            | Self::SetChatBackground => Menu::Edit,
             Self::ZoomIn
             | Self::ZoomOut
             | Self::ZoomToFit
@@ -865,7 +1023,10 @@ impl Command {
             Self::Redo => Icon::Redo,
             Self::RunAgent => Icon::Play,
             Self::StopAgent => Icon::Stop,
-            Self::EditAgentRules | Self::EditAgentSchedule | Self::SetTerritory => Icon::Agent,
+            Self::EditAgentRules
+            | Self::EditAgentSchedule
+            | Self::SetTerritory
+            | Self::SetChatBackground => Icon::Agent,
             Self::ToggleBrowserNodes => Icon::Browser,
             _ => return None,
         })
@@ -874,16 +1035,74 @@ impl Command {
     /// A sentence shown on hovering the row **while it is enabled**.
     ///
     /// Distinct from [`Availability::reason`], which says why a row cannot be clicked. This
-    /// says why a row that *can* be clicked is set the way it is, and it exists for the two
-    /// preferences that are off by default for a cost the user cannot see from the switch.
-    /// `docs/07-agent-canvas.md` §0's third rule asks for a legible explanation rather than
-    /// a bare toggle; a switch with no stated cost is how somebody turns on a feature that
-    /// spends 150MB a page and reports it as a memory leak.
+    /// says what a row that *can* be clicked will actually do, or why it is set the way it
+    /// is. `docs/07-agent-canvas.md` §0's third rule asks for a legible explanation rather
+    /// than a bare toggle; a switch with no stated cost is how somebody turns on a feature
+    /// that spends 150MB a page and reports it as a memory leak.
     ///
-    /// Deliberately **not** on every command. A tooltip on a row whose label already says
-    /// everything is noise that trains people to ignore tooltips.
+    /// # Every Agent Canvas command carries one, and that is a contract
+    ///
+    /// *"for every future that is for the terminal / ai mode i want a tool tip"*. The layer
+    /// is the one part of Velm whose rows do not explain themselves from their labels — every
+    /// other menu in this application acts on a rectangle you are looking at, and *Rules…*,
+    /// *Schedule…* and *Set territory…* each name a concept that exists nowhere else in the
+    /// interface. `every_agent_command_carries_a_tooltip` pins it, so the next agent command
+    /// cannot ship mute.
+    ///
+    /// Two rules the sentences follow, both learned the hard way:
+    ///
+    /// - **Never describe a gesture that does not exist** — feedback 36's worst finding was
+    ///   three strings instructing the user to do things nothing implemented.
+    /// - **Say what it does, not how to use it.** A tooltip is read in about a second, over
+    ///   the row, by someone who has already decided to click.
+    ///
+    /// Deliberately **not** on every command in the application. A tooltip on *Copy* is noise
+    /// that trains people to ignore tooltips.
     pub const fn note(self) -> Option<&'static str> {
         Some(match self {
+            // ----- the Agent Canvas ------------------------------------------------------
+            Self::RunAgent => {
+                "Starts the selected agents on whatever is typed in their prompt row, or \
+                 re-runs their last instruction if it is empty. The reply streams onto the \
+                 node itself; nothing an agent says is written into the board file."
+            }
+            Self::StopAgent => {
+                "Ends the turn in progress and leaves the process running, so the next prompt \
+                 does not pay for a fresh start. What has already been said stays on the node."
+            }
+            Self::ToggleAgentRaw => {
+                "Raw shows every tool call, command and reasoning step as it happens. Clean \
+                 shows only what the agent finally answered. It changes what is displayed and \
+                 nothing about what the agent does."
+            }
+            Self::EditAgentRules => {
+                "The standing instructions this agent runs under. Three layers apply in order \
+                 — everything on this machine, then this project, then this one agent — and a \
+                 narrower layer overrides a wider one. The two outer layers are ordinary \
+                 files you can also edit by hand."
+            }
+            Self::EditAgentSchedule => {
+                "Run this agent on a timer — hourly, daily at a time you set, or on an \
+                 interval — instead of only when you ask. A scheduled run behaves exactly \
+                 like pressing Run, and the schedule stops when the board is closed."
+            }
+            Self::SetChatBackground => {
+                "Choose an image to sit behind this agent's transcript. It is copied into \
+                 the board rather than linked from your disk, so the board still looks \
+                 right on another machine, and the text keeps its own paper over it so a \
+                 picture cannot make the words unreadable."
+            }
+            Self::SetTerritory => {
+                "Draw the region of board this orchestrator owns. It may only create agents \
+                 inside that rectangle, which is what stops one spreading over work you have \
+                 elsewhere. The limit is enforced by Velm, not asked of the model."
+            }
+            Self::RemoveWorktree => {
+                "Delete this agent's own checkout of the repository. Turning worktree \
+                 isolation off does not do this — the directory stays, because a checkout is \
+                 not something a preference may throw away. Refused while it holds \
+                 uncommitted work."
+            }
             Self::ToggleBrowserNodes => {
                 "Off by default. A browser node runs a real web engine, which costs roughly \
                  60–150MB of memory per page while it sits there and more while it plays. \
@@ -1005,7 +1224,17 @@ impl Command {
             // one, and worktree isolation is **per project** — the open board is the
             // project, so on the library screen there is nothing for the switch to be about.
             Self::SnapToGrid => gate(ctx.board_open, "Open a board first"),
-            Self::ToggleWorktrees => gate(ctx.board_open, reason::NO_BOARD),
+            // **And on git existing.** `worktree::available()` was written specifically so
+            // this row could grey itself out and say why — its own doc says so — and it had no
+            // caller, so on a machine without git the switch was offered, accepted, stored,
+            // and failed at the first Start with an error about a command the user never
+            // typed. A switch that cannot work is worse than an absent one, because flipping
+            // it looks like it worked.
+            Self::ToggleWorktrees => match (ctx.board_open, ctx.git_available) {
+                (false, _) => Disabled(reason::NO_BOARD),
+                (_, false) => Disabled("git is not installed"),
+                _ => Enabled,
+            },
             Self::FetchLinkPreviews => gate(ctx.board_open, reason::NO_BOARD),
 
             _ if !ctx.board_open => Disabled(reason::NO_BOARD),
@@ -1084,7 +1313,7 @@ impl Command {
             // `crate::event::AgentEdit` says why — so the editors that produce them are
             // offered for exactly one selected agent rather than for a selection that
             // happens to contain one.
-            Self::EditAgentRules | Self::EditAgentSchedule => {
+            Self::EditAgentRules | Self::EditAgentSchedule | Self::SetChatBackground => {
                 gate(ctx.agents_selected == 1, reason::ONE_AGENT)
             }
 
@@ -1093,6 +1322,14 @@ impl Command {
             Self::SetTerritory => {
                 gate(ctx.agents_selected == 1 && ctx.manager_selected, reason::ONE_MANAGER)
             }
+
+            // Exactly one agent, and one that has a worktree: this deletes a specific
+            // directory, and offering it for a node with none is a button whose only possible
+            // answer is "there is nothing there".
+            Self::RemoveWorktree => gate(
+                ctx.agents_selected == 1 && ctx.worktree_selected,
+                "This agent has no worktree of its own",
+            ),
 
             Self::Group => gate(ctx.selected > 1, reason::NEEDS_TWO),
             Self::Ungroup => gate(ctx.any_group, reason::NO_GROUP),
@@ -1146,6 +1383,26 @@ impl Command {
     ///
     /// `SelectAll` is deliberately **absent**: with a caret on the board it selects the
     /// characters, not the items, and committing would end the edit it is acting inside.
+    /// The four a **canvas text session** implements for itself, and which the chrome must
+    /// therefore not also run.
+    ///
+    /// `ActiveState::type_key` and its two siblings claim `⌘A`, `⌘C`, `⌘X` and `⌘V` for the
+    /// *characters* — but claiming a key at the app layer does not take it out of egui's
+    /// queue, and for the clipboard three `Shell::restore_clipboard_key` deliberately
+    /// **puts one back**. So with only the ⌘/⌃ rule in [`crate::Chrome`]'s table, each of
+    /// these fired twice from one press: the session cut the selected characters and the
+    /// table cut the item they were in. `Cut` and `Paste` are in [`Self::mutates_board`],
+    /// so the second half also *ended the edit first* — which is feedback 40's Backspace
+    /// one chord over, and it would have shipped with the fix for it.
+    ///
+    /// **Undo and Redo are deliberately not here.** No session implements them, so letting
+    /// them through is the whole point of drawing the line at ⌘ rather than at the table:
+    /// `⌘Z` mid-word is the moment it is most wanted. This is the same list
+    /// `crate::menubar`'s accelerator ban keeps for the same reason, minus those two.
+    pub const fn claimed_by_a_text_session(self) -> bool {
+        matches!(self, Self::SelectAll | Self::Copy | Self::Cut | Self::Paste)
+    }
+
     pub const fn mutates_board(self) -> bool {
         matches!(
             self,
@@ -1231,10 +1488,33 @@ pub struct CommandContext {
     /// a region. Its own field rather than a `RoleKind` because the only question anybody asks
     /// of it is this one.
     pub manager_selected: bool,
+    /// Whether the one selected agent has a git worktree on disk right now.
+    ///
+    /// Read from `SelectionItem::worktree`'s `At(_)` state rather than from the node's
+    /// `worktree` switch: the switch says *should have one*, and this says *has one*. Removing
+    /// needs the second — a node switched on but never run has nothing to delete.
+    pub worktree_selected: bool,
+    /// Whether `git` is on this machine at all.
+    ///
+    /// Probed once per run rather than per frame — it spawns `git --version` — and false only
+    /// disables a switch, never hides one: the row stays visible so the feature is still
+    /// discoverable, with a reason where its tick would be.
+    pub git_available: bool,
     pub any_agent_running: bool,
     /// True only when at least one agent is selected and every one of them is running,
     /// which is what makes *Run* refuse rather than start something twice.
     pub all_agents_running: bool,
+}
+
+/// Whether `git` is installed, asked once and remembered.
+///
+/// Here rather than on the app side because the answer is a property of the machine, not of a
+/// board — and because the one consumer is this file's own availability table. `OnceLock`
+/// because the gate is evaluated on every frame that draws a menu and the probe spawns a
+/// process; git does not appear halfway through a session.
+pub fn git_available() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(vellum_agent::worktree::available)
 }
 
 /// Renders a shortcut for display.
@@ -1334,7 +1614,11 @@ mod tests {
             for entry in menu.entries() {
                 match entry {
                     Entry::Item(command) => found.push((*command, menu)),
-                    Entry::Separator => {}
+                    // Neither is a command, so neither is listed. A heading in particular
+                    // must not be: it has no label(), no shortcut and nothing to run, and
+                    // counting one would put a row in the shortcut sheet that cannot be
+                    // pressed.
+                    Entry::Separator | Entry::Heading(_) => {}
                     Entry::Sub(sub) => {
                         assert_eq!(sub.parent(), menu, "{sub:?} is drawn under {menu:?}");
                         for entry in sub.entries() {
@@ -1757,7 +2041,18 @@ mod tests {
 
         // Not on every row. A tooltip on a row whose label already says everything trains
         // people to stop reading tooltips, including the two above.
-        for quiet in [Command::Copy, Command::ZoomIn, Command::Save, Command::RunAgent] {
+        //
+        // **`Command::RunAgent` was in this list and has deliberately left it**, which is a
+        // reversal rather than a relaxation. The rule the list encodes is *"a label that
+        // already says everything needs no tooltip"*, and it was applied to the agent verbs
+        // on the reasoning that *Run* is self-evident. The user disagreed, of the whole layer
+        // rather than of one row: *"for every future that is for the terminal / ai mode i
+        // want a tool tip"*. They are right about the category — *Run* on a sticky would be
+        // meaningless, and on an agent node it starts a process on a subscription, streams
+        // third-party text onto the board and can be scheduled to happen again. That is not a
+        // label that says everything. The rule stands for the rest of the application, and
+        // `every_agent_menu_entry_carries_a_tooltip` is the exception stated positively.
+        for quiet in [Command::Copy, Command::ZoomIn, Command::Save, Command::Delete] {
             assert!(quiet.note().is_none(), "{quiet:?} does not need explaining");
         }
     }
@@ -1864,6 +2159,78 @@ mod tests {
         // Disabled as a whole rather than opening onto four greyed rows.
         let empty = CommandContext { board_open: true, ..CommandContext::default() };
         assert_eq!(Submenu::Agent.availability(&empty).reason(), Some(reason::NO_AGENT));
+    }
+
+    /// *"for every future that is for the terminal / ai mode i want a tool tip."*
+    ///
+    /// The contract, so the next agent command cannot ship mute. It is deliberately spelled
+    /// as *"everything in the Agent band"* rather than as a list of names — a list would
+    /// have to be edited to add a command, which is exactly the edit somebody skips.
+    ///
+    /// The Preferences half is picked out by the heading, which is the only thing that says
+    /// where that band begins and ends; a run of rows between separators has no boundary a
+    /// test can see, which is half of why the heading is worth having at all.
+    #[test]
+    fn every_agent_menu_entry_carries_a_tooltip() {
+        let mut checked = 0;
+        for entry in Submenu::Agent.entries() {
+            if let Entry::Item(command) = entry {
+                assert!(
+                    command.note().is_some_and(|note| note.len() > 40),
+                    "{command:?} is in Edit ▸ Agent with no tooltip, or with one too short \
+                     to explain anything"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 6, "only {checked} agent commands were checked — is the list right?");
+
+        // Preferences ▸ Agents: every row from the heading to the next separator.
+        let mut in_band = false;
+        let mut band = 0;
+        for entry in Menu::Preferences.entries() {
+            match entry {
+                Entry::Heading(title) if *title == AGENT_SECTION => in_band = true,
+                Entry::Separator if in_band => break,
+                Entry::Item(command) if in_band => {
+                    assert!(command.note().is_some(), "{command:?} is in the Agents band mute");
+                    band += 1;
+                }
+                Entry::Sub(sub) if in_band => {
+                    assert!(sub.note().is_some(), "{sub:?} is in the Agents band mute");
+                    band += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(in_band, "Preferences has no Agents heading — the band cannot be found");
+        assert!(band >= 4, "only {band} rows were found under the Agents heading");
+    }
+
+    /// A heading introduces rows; one with nothing under it is a label about nothing, and one
+    /// immediately after a separator that is itself followed by a separator is two rules and
+    /// a title where a band should be. Checked structurally rather than by eye because
+    /// headings are cheap to add and easy to leave stranded.
+    #[test]
+    fn a_heading_always_has_rows_under_it() {
+        for entries in Menu::ALL
+            .into_iter()
+            .map(Menu::entries)
+            .chain(Submenu::ALL.into_iter().map(Submenu::entries))
+        {
+            for (i, entry) in entries.iter().enumerate() {
+                let Entry::Heading(title) = entry else { continue };
+                let next = entries.get(i + 1);
+                assert!(
+                    matches!(next, Some(Entry::Item(_) | Entry::Sub(_))),
+                    "the {title:?} heading is followed by {next:?} rather than by a row"
+                );
+                assert!(
+                    !title.trim().is_empty(),
+                    "a heading with no words is a gap that looks like a bug"
+                );
+            }
+        }
     }
 
     /// The palette shows where a command lives, and the trail is derived so it cannot

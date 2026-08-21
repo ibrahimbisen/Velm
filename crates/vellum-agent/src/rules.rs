@@ -887,10 +887,35 @@ pub struct BoardTools {
     /// role but orchestrator and meta, so offering it to a worker only ever produces a
     /// wasted turn and a refusal.
     pub may_spawn: bool,
+    /// Whether this node may read and rewrite *other* nodes' configuration — feature 6's
+    /// whole power, and `false` for every role but [`crate::RoleKind::Meta`].
+    ///
+    /// The sibling of [`Self::may_spawn`], and it exists for the same reason: `configure` is
+    /// refused at the IPC boundary for any other role, so telling a worker about it buys a
+    /// wasted turn and a refusal. It is a *separate* field rather than being inferred from
+    /// `may_spawn` because an orchestrator may spawn and may not configure — the two
+    /// permissions are deliberately not the same permission.
+    pub may_configure: bool,
     /// Whether the same verbs are also registered as MCP tools. Worth one line, because an
     /// agent that has them will otherwise shell out for something it could call directly —
     /// and because an agent that has *neither* must not be told it has one.
     pub mcp: bool,
+
+    /// Whether this agent reaches the board by **calling tools directly** rather than by
+    /// running a command.
+    ///
+    /// ⚠ **An HTTP agent has no shell.** It is an API call: it can call the functions Velm
+    /// advertised on the wire and it can do nothing else. Telling it to run
+    /// `velm-agent-cli send …` describes a gesture it cannot perform — this file's own rule,
+    /// pointed at the agent instead of the user — and the failure is the expensive kind,
+    /// because a model told to run a command will *try*, spend a turn, and report that Velm's
+    /// tooling is broken.
+    ///
+    /// With this set, [`Self::section`] names the tools and drops every command line. The
+    /// *policy* half — messages only cross a connector, notes are the durable record, spawning
+    /// is capped — is identical either way, because it is a fact about the board rather than
+    /// about how the verb is spelled.
+    pub native: bool,
 }
 
 impl BoardTools {
@@ -900,7 +925,73 @@ impl BoardTools {
     /// move; there is no explanation of what a canvas is, because the agent does not need a
     /// model of the application to use a command correctly, and every sentence spent on one
     /// is a sentence competing with the user's own instructions further down.
+    /// The same section for an agent that **calls tools** instead of running commands.
+    ///
+    /// Deliberately shorter than its sibling. The tool schemas Velm advertises carry the
+    /// arguments and the refusals — `mcp::tool_definitions`' own doc says they are the only
+    /// documentation the calling model will ever see — so repeating them here would be a
+    /// second copy of a description that can drift from the one on the wire. What is *not* in
+    /// a schema is the policy: that a message needs a connector, that notes outlive the reply,
+    /// that spawning is capped. That is what this says.
+    fn native_section(&self) -> String {
+        let mut out = String::from("\n## Acting on the board\n\n");
+        out.push_str(
+            "You are running inside Velm, on a board a person is looking at. The tools you have \
+             been given act on that board; each one's description says what it takes and what \
+             it refuses.\n\n",
+        );
+        out.push_str(
+            "- `velm_send_message` reaches another agent **only where a connector on the board \
+             joins you to it**. A refusal means the person has not drawn that line — ask for \
+             one rather than looking for another route.\n",
+        );
+        out.push_str(
+            "- `velm_read_note`, `velm_write_note`, `velm_list_notes` and \
+             `velm_read_note_chain` are the board's shared markdown notes. Read the relevant \
+             note before you start and write what you found back into it: a note is what the \
+             other agents and the person read later, and your reply is not. Notes are written \
+             as a trail, so follow one with the chain tool rather than reading them one at a \
+             time.\n",
+        );
+        out.push_str(
+            "- `velm_post_image` puts a picture in front of the person — use it for a chart, a \
+             diagram or a screenshot instead of describing one. It answers with the picture's \
+             hash, which is what `velm_post_options` takes to put a picture on a choice card.\n",
+        );
+        out.push_str(
+            "- `velm_post_options` offers two or three real alternatives as cards they can \
+             click. Not for open questions, which belong in your reply.\n",
+        );
+        out.push_str(
+            "- `velm_ingest_context` has Velm read a document, a page or a video and keep it \
+             for you; it is given back at the start of your next session.\n",
+        );
+        if self.may_spawn {
+            out.push_str(
+                "- `velm_spawn_agent` creates another agent to take a piece of this work. You \
+                 may do this and most agents may not; it is capped, and refused outside your \
+                 territory. Prefer delegating a separable piece over doing everything here.\n",
+            );
+        }
+        if self.may_configure {
+            out.push_str(
+                "- `velm_configure_agent` reads another agent's configuration and writes it \
+                 back. You may do this and every other role is refused. Read it first, change \
+                 only what the person asked for, and write the whole thing back.\n",
+            );
+        }
+        out.push_str(
+            "- `research_search` and `research_fetch` browse the web for you. Prefer them over \
+             answering from memory when the question is about something current, and treat a \
+             refusal as final for that site rather than retrying it.\n",
+        );
+        out
+    }
+
     pub fn section(&self) -> String {
+        if self.native {
+            return self.native_section();
+        }
         let command = &self.command;
         let mut out = String::from("\n## Acting on the board\n\n");
         out.push_str(&format!(
@@ -922,8 +1013,19 @@ impl BoardTools {
              what the other agents and the person read later; your reply is not.\n"
         ));
         out.push_str(&format!(
+            "- `{command} note chain <path>` — that note **and everything it links to**, in \
+             one call. Notes are written as a trail on purpose; follow it with this rather \
+             than reading them one at a time.\n"
+        ));
+        out.push_str(&format!(
             "- `{command} image <file>` — put a picture in front of the person. Use it for a \
-             chart, a diagram or a screenshot instead of describing one in prose.\n"
+             chart, a diagram or a screenshot instead of describing one in prose. It prints \
+             the picture's hash, which is what puts a picture on a choice card below.\n"
+        ));
+        out.push_str(&format!(
+            "- `{command} ingest <path-or-url>` — have Velm read a document, a page or a \
+             video as context and keep it for you. Use it for a source you will need again; \
+             it is given back to you at the start of your next session.\n"
         ));
         out.push_str(&format!(
             "- `{command} options <question> --choice a=… --choice b=…` — when you have two or \
@@ -938,12 +1040,56 @@ impl BoardTools {
                  everything in this one conversation.\n"
             ));
         }
+        if self.may_configure {
+            out.push_str(&format!(
+                "- `{command} configure <node>` — read another agent's configuration, and \
+                 `{command} configure <node> --set <json>` to write it back. You may do this; \
+                 every other role is refused. This is how you change what another agent is for \
+                 — its role, its rules, its provider, the directory it works in — when the \
+                 person asks you to rather than clicking into that node themselves. Read the \
+                 configuration first, change only what they asked for, and write the whole \
+                 thing back.\n"
+            ));
+        }
         if self.mcp {
             out.push_str(
                 "\nThe same verbs are also available to you as tools named `velm_send_message`, \
-                 `velm_read_note`, `velm_write_note`, `velm_list_notes`, `velm_post_image` and \
-                 `velm_post_options`. Prefer the tools if you have them; the command above does \
-                 the same thing and is there either way.\n",
+                 `velm_read_note`, `velm_read_note_chain`, `velm_write_note`, `velm_list_notes`, \
+                 `velm_post_image`, `velm_post_options` and `velm_ingest_context`. Prefer the \
+                 tools if you have them; \
+                 the command above does the same thing and is there either way.\n",
+            );
+            // The two permissioned verbs get their tool names on the same condition their
+            // shell form got its bullet — otherwise an orchestrator is told it may
+            // `velm-agent-cli spawn` and never told the tool beside it exists, which is the
+            // drift `every_permitted_tool_is_named` now makes impossible.
+            if self.may_spawn {
+                out.push_str(
+                    "Spawning is a tool as well: `velm_spawn_agent`, with the same cap and \
+                     territory applied.\n",
+                );
+            }
+            if self.may_configure {
+                out.push_str(
+                    "Your configure power is a tool too: `velm_configure_agent`, which both \
+                     reads and writes.\n",
+                );
+            }
+            // ⚠ **Feature 19 is a tool the agent has to know it has.** `research_search` and
+            // `research_fetch` are registered on the same server as the verbs above, and were
+            // named in no system context anywhere — so discovery rested entirely on the model
+            // reading `tools/list` and inferring that a tool called `research_fetch` was
+            // better than the fetch it already knows. The refusal sentence is here for the
+            // reason the whole section is: a boundary an agent is told about is one it can
+            // plan around, and a boundary it discovers by walking into it costs a turn and
+            // usually an argument.
+            out.push_str(
+                "For research there are two more: `research_search` for the web, and \
+                 `research_fetch` for one page, which returns the readable text of it. Prefer \
+                 them over any fetch of your own — they carry a real browsing session, so \
+                 they get answers a bare HTTP request is refused. A site that declines is \
+                 reported to you as a refusal; that is the site's answer, not a bug, and \
+                 nothing here will work around it.\n",
             );
         }
         out.push_str(
@@ -1387,8 +1533,57 @@ mod tests {
         assert_eq!(resolved.extra["mood"], mood);
     }
 
+    /// The ordinary case: a node that may not reconfigure anybody, which is every role but
+    /// [`crate::RoleKind::Meta`]. Kept at two arguments so the tests written before
+    /// `may_configure` existed still say exactly what they said.
     fn tools(may_spawn: bool, mcp: bool) -> BoardTools {
-        BoardTools { command: crate::transport::AGENT_CLI.to_owned(), may_spawn, mcp }
+        BoardTools {
+            command: crate::transport::AGENT_CLI.to_owned(),
+            may_spawn,
+            may_configure: false,
+            mcp,
+            // The shim form, which is what every test written before the native one existed
+            // was about. `native_tools` below is the other half.
+            native: false,
+        }
+    }
+
+    fn meta_tools(mcp: bool) -> BoardTools {
+        BoardTools { may_configure: true, ..tools(true, mcp) }
+    }
+
+    /// An agent that calls tools rather than running commands — every HTTP-transport node.
+    fn native_tools(may_spawn: bool) -> BoardTools {
+        BoardTools { native: true, ..tools(may_spawn, true) }
+    }
+
+    /// ⚠ **An HTTP agent has no shell, so it must never be told to run a command.**
+    ///
+    /// The section it used to get was a page of `velm-agent-cli …` lines — a gesture the reader
+    /// cannot perform, which is this file's own prohibited shape aimed at the agent instead of
+    /// the user. The failure is the expensive kind: a model told to run a command tries, spends
+    /// a turn, and reports that Velm's tooling is broken.
+    ///
+    /// Both halves are asserted, because either alone passes on a broken build: no command
+    /// anywhere, **and** the verbs still named as tools. A section that dropped both would
+    /// satisfy the first and leave the agent unable to act at all.
+    #[test]
+    fn a_native_agent_is_told_about_tools_and_never_about_a_command() {
+        let section = native_tools(false).section();
+        assert!(
+            !section.contains(crate::transport::AGENT_CLI),
+            "an HTTP agent was told to run a command it has no shell for:\n{section}"
+        );
+        for tool in ["velm_send_message", "velm_write_note", "velm_post_options", "research_search"]
+        {
+            assert!(section.contains(tool), "`{tool}` was not named:\n{section}");
+        }
+        // The permissioned verbs stay behind the same gates as the shim form.
+        assert!(!section.contains("velm_spawn_agent"), "a worker must not be offered spawn");
+        assert!(native_tools(true).section().contains("velm_spawn_agent"));
+
+        // And the shim form is unchanged — this is an addition, not a replacement.
+        assert!(tools(false, true).section().contains(crate::transport::AGENT_CLI));
     }
 
     /// ⚠ **The section exists only when the shim does, and that is the whole point of it.**
@@ -1436,6 +1631,85 @@ mod tests {
         assert!(!worker.contains("velm_send_message"), "{worker}");
         let with_mcp = resolved.system_context_with(Some(&tools(false, true)));
         assert!(with_mcp.contains("velm_send_message"), "{with_mcp}");
+
+        // Feature 19's two tools ride the same server and the same condition. An agent that
+        // is not told they exist does not go looking for them, which is how a 3,000-line
+        // research module came to be reachable in principle and used by nothing.
+        assert!(with_mcp.contains("research_search"), "{with_mcp}");
+        assert!(with_mcp.contains("research_fetch"), "{with_mcp}");
+        assert!(
+            !worker.contains("research_search"),
+            "an agent with no MCP server was told about a tool it has not got: {worker}"
+        );
+    }
+
+    /// ⚠ **Feature 6 is a power an agent has to be told about, or it has it and never uses it.**
+    ///
+    /// The meta agent's whole job is reconfiguring other nodes on the user's behalf, and the
+    /// verb for it has existed on both the shim (`velm-agent-cli configure`) and the MCP
+    /// server (`velm_configure_agent`) the entire time — described in the shim's own `--help`,
+    /// authorised at the IPC boundary, and mentioned in the agent's system context nowhere at
+    /// all. An agent that is never told a verb exists does not run `--help` looking for one.
+    ///
+    /// The sibling check matters as much as the positive one: an **orchestrator** may spawn
+    /// and may *not* configure, so a build that inferred one permission from the other would
+    /// hand every orchestrator a verb Velm refuses.
+    #[test]
+    fn only_the_meta_agent_is_told_it_may_reconfigure_the_others() {
+        let resolved =
+            resolve(&RuleFile::default(), &RuleFile::default(), &AgentRules::default(), "Meta");
+
+        let worker = resolved.system_context_with(Some(&tools(false, true)));
+        assert!(!worker.contains("configure"), "a worker was offered configure: {worker}");
+        assert!(!worker.contains("velm_configure_agent"), "{worker}");
+
+        let orchestrator = resolved.system_context_with(Some(&tools(true, true)));
+        assert!(
+            !orchestrator.contains("configure"),
+            "spawning was read as configuring: {orchestrator}"
+        );
+
+        let meta = resolved.system_context_with(Some(&meta_tools(true)));
+        assert!(meta.contains("configure <node>"), "{meta}");
+        assert!(meta.contains("--set"), "the meta agent was not told how to write: {meta}");
+        assert!(meta.contains("velm_configure_agent"), "{meta}");
+
+        // The MCP sentence is conditional on the MCP server, exactly as the others are: a meta
+        // agent with no server has the command and must not be told it has a tool.
+        let shell_only = resolved.system_context_with(Some(&meta_tools(false)));
+        assert!(shell_only.contains("configure <node>"), "{shell_only}");
+        assert!(!shell_only.contains("velm_configure_agent"), "{shell_only}");
+    }
+
+    /// ⚠ **Every tool the agent is allowed to call is named, and the list is not written
+    /// twice.**
+    ///
+    /// The MCP sentence used to enumerate its tools as a hardcoded phrase, so adding a tool to
+    /// [`crate::mcp::TOOL_NAMES`] — registered, dispatched, schema and all — left the agent
+    /// never told it existed. That is this repository's signature defect wearing a sentence
+    /// instead of a function: `velm_read_note_chain` shipped registered and unmentioned, and
+    /// `velm_spawn_agent` had been unmentioned since the section was written.
+    ///
+    /// Asserting against `TOOL_NAMES` rather than against a copy of the list is what makes the
+    /// next one fail here instead of in a user's transcript. The two research tools are
+    /// included: they are on the same server and an agent that is not told about them does not
+    /// go looking.
+    #[test]
+    fn every_permitted_tool_is_named_in_the_context() {
+        let resolved =
+            resolve(&RuleFile::default(), &RuleFile::default(), &AgentRules::default(), "Meta");
+        // The most permissive node there is, so every conditional paragraph is present.
+        let told = resolved.system_context_with(Some(&meta_tools(true)));
+        for tool in crate::mcp::TOOL_NAMES {
+            assert!(told.contains(tool), "`{tool}` is registered and never mentioned: {told}");
+        }
+
+        // And the permissioned two are still withheld from a node that may not call them —
+        // naming everything unconditionally would be the opposite mistake.
+        let worker = resolved.system_context_with(Some(&tools(false, true)));
+        assert!(!worker.contains("velm_spawn_agent"), "{worker}");
+        assert!(!worker.contains("velm_configure_agent"), "{worker}");
+        assert!(worker.contains("velm_read_note_chain"), "an ordinary verb was withheld");
     }
 
     /// The user's own words still win.

@@ -152,7 +152,13 @@ impl CommandPalette {
                             }
                         });
                 });
-                paint_glass_edge(ui.painter(), inner.response.rect, palette, Backing::Canvas);
+                paint_glass_edge(
+                    ui.painter(),
+                    inner.response.rect,
+                    palette,
+                    Backing::Canvas,
+                    f32::from(radius::LARGE),
+                );
                 inner.response.rect
             });
 

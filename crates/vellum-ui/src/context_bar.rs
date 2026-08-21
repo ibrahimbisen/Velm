@@ -43,8 +43,8 @@ use crate::command::CommandContext;
 use crate::event::{EventSink, StyleEdit, UiEvent};
 use crate::icon::Icon;
 use crate::selection::{Field, FontWeight, PanelModel};
-use crate::theme::{Backing, Palette, floating_frame, floating_frame_over, paint_glass_edge, space};
-use crate::widgets::{icon_button, swatch};
+use crate::theme::{Backing, Palette, floating_frame_over, paint_glass_edge, space};
+use crate::widgets::{icon_button, swatch_disc};
 use vellum_connect::{Arrowhead, LineStyle, RoutingMode};
 use vellum_doc::{Align, CardMode, Color};
 
@@ -98,6 +98,10 @@ pub enum Control {
     /// coverage band and cannot be dashed, and ink has never asked to be.
     LineStyle,
     Routing,
+    /// The terminator at the near end. Beside [`Self::EndArrow`] because on an agent link an
+    /// arrowhead is not decoration — it is which way messages may travel — and a link pointing
+    /// the other way could not be made from this bar at all.
+    StartArrow,
     /// The terminator at the far end, which is the one anybody changes.
     EndArrow,
     /// Whole-item opacity — **only when nothing else on the bar already carries an
@@ -189,6 +193,7 @@ pub fn controls(model: &PanelModel) -> Vec<Control> {
         if !model.routing.is_absent() {
             out.push(Control::LineStyle);
             out.push(Control::Routing);
+            out.push(Control::StartArrow);
             out.push(Control::EndArrow);
         }
     }
@@ -200,10 +205,17 @@ pub fn controls(model: &PanelModel) -> Vec<Control> {
     // *flyout* behind its stroke swatch: *"for the pen strokes you can make it so that there
     // is also opacity etc"*. So a pen stroke gets five.
     //
-    // A **fill** still suppresses it, and that part is unchanged: a fill swatch's own picker
-    // carries alpha, so an unconditional control would put a second one beside it — two
-    // controls for one property, disagreeing whenever either is touched.
-    if !model.opacity.is_absent() && model.fill.is_absent() {
+    // A fill suppresses it **only when the fill is the whole item**, which is the sticky
+    // case the rule was written for: a note is its colour, its picker carries alpha, and a
+    // second control beside it would be two ways to say one thing.
+    //
+    // A shape is not that. It paints a fill *and* an outline *and* its words, so its fill's
+    // alpha cannot fade it — and the user went looking: *"where is the rtransparencuy
+    // slider"*, of a bar that had none. Derived from what the selection paints rather than
+    // from `ItemFacet::Shape`, which is this module's own rule: anything that carries both
+    // an interior and an outline has something a single swatch cannot express.
+    let fill_is_the_whole_item = !model.fill.is_absent() && model.border_color.is_absent();
+    if !model.opacity.is_absent() && !fill_is_the_whole_item {
         out.push(Control::Opacity);
     }
     if out.len() > paint_from && paint_from > 0 {
@@ -290,7 +302,11 @@ impl Default for Output {
 /// out, and by then the position has been chosen. It only has to be right enough to
 /// pick *above* or *below*, and it is one row of `space::of(6)` controls inside a
 /// frame whose margin is `space::UNIT` each side.
-const BAR_HEIGHT: f32 = CONTROL + space::UNIT * 3.0;
+// One row plus the frame's inner margin top and bottom. The margin grew with the rest
+// of the bar's air, and this is the one number that has to grow with it: it decides
+// *above or below*, so a bar 4pt taller than its guess is one that can clip at the top
+// of the window.
+const BAR_HEIGHT: f32 = CONTROL + space::of(2) * 2.0;
 
 /// The height of every control on the bar, and of the bar's own rhythm.
 ///
@@ -351,15 +367,18 @@ pub(crate) fn show(
         // where the last control cannot be reached.
         .constrain_to(room)
         .show(ctx, |ui| {
-            let inner = floating_frame(palette).show(ui, |ui| {
+            let inner = crate::theme::selection_bar_frame(palette).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // **Tight between controls, with the air in the dividers instead.** Miro's
-                    // bar looks roomy because its groups are separated by rules, not because
-                    // every button is held apart from its neighbour — *"use less padding
-                    // proportional to miro's"*. Spacing the buttons as well as ruling the
-                    // groups spends the width twice and makes the bar long enough to reach
-                    // past the item it belongs to.
-                    ui.spacing_mut().item_spacing = vec2(space::UNIT * 0.5, 0.0);
+                    // **Ruled *and* spaced.** This used to be `space::UNIT * 0.5` — 2 points —
+                    // under the argument that Miro's bar looks roomy because its groups are
+                    // ruled rather than because its buttons are held apart, and that doing
+                    // both spends the width twice. Measured against Miro's own bar that is
+                    // simply not what it does: its controls sit about 8 points apart.
+                    //
+                    // Asked to choose, the user took both — *"keep the divider also use more
+                    // whitespace"* — so the rules stay and the air grows. The bar does get
+                    // wider; `constrain_to(room)` is what keeps that from costing anything.
+                    ui.spacing_mut().item_spacing = vec2(space::UNIT * 1.5, 0.0);
                     for control in &items {
                         if let Some(pos) =
                             draw(ui, palette, state, *control, model, cmd_ctx, font_families, events)
@@ -369,7 +388,13 @@ pub(crate) fn show(
                     }
                 });
             });
-            paint_glass_edge(ui.painter(), inner.response.rect, palette, Backing::Canvas);
+            paint_glass_edge(
+                ui.painter(),
+                inner.response.rect,
+                palette,
+                Backing::Canvas,
+                crate::theme::SELECTION_BAR_RADIUS,
+            );
             inner.response.rect
         })
         .inner;
@@ -391,9 +416,12 @@ fn draw(
 ) -> Option<Pos2> {
     match control {
         Control::Separator => {
-            ui.add_space(space::UNIT);
+            // The rule's own flanking air, on top of the row's item spacing. Both grew
+            // together: a divider crowded against the control beside it reads as that
+            // control's edge rather than as a boundary between groups.
+            ui.add_space(space::UNIT * 1.5);
             crate::widgets::hairline_vertical(ui, palette, space::of(5));
-            ui.add_space(space::UNIT);
+            ui.add_space(space::UNIT * 1.5);
         }
 
         // ----- the Agent Canvas band -----------------------------------------
@@ -420,7 +448,16 @@ fn draw(
                     response.on_disabled_hover_text(format!("{} — {why}", command.label()));
                 }
                 None => {
-                    if response.on_hover_text(command.label()).clicked() {
+                    // The command's own sentence, not its label. A tooltip reading "Run"
+                    // over a button already drawn as ▶ is the kind that teaches people to
+                    // ignore tooltips — and this is the control the whole layer turns on.
+                    // One derivation with the menu row's, so the two cannot drift.
+                    let hint = command
+                        .note()
+                        .map_or_else(|| command.label().to_owned(), |note| {
+                            format!("{} — {note}", command.label())
+                        });
+                    if response.on_hover_text(hint).clicked() {
                         events.command(command);
                     }
                 }
@@ -489,15 +526,46 @@ fn draw(
                             Field::Uniform(Some(choice)) if choice.provider == provider
                         );
                         if ui.selectable_label(on, provider.label()).clicked() {
-                            events.push(UiEvent::Agent(crate::AgentEdit::Provider(Some(
-                                vellum_agent::ProviderChoice::new(provider),
-                            ))));
+                            // The same carry-forward the panel does, and for the same reason:
+                            // this control changes *which provider*, and a typed model name
+                            // or a local endpoint is not something a provider click asked to
+                            // throw away. Building a fresh `ProviderChoice` here made the bar
+                            // and the panel disagree about what a provider change costs —
+                            // silently, since neither says what it discarded.
+                            let previous = match &model.agent_provider {
+                                Field::Uniform(Some(choice)) => Some(choice.clone()),
+                                _ => None,
+                            };
+                            let mut next = vellum_agent::ProviderChoice::new(provider);
+                            next.model = previous.as_ref().and_then(|c| c.model.clone());
+                            if provider.default_base_url().is_none() {
+                                next.base_url = previous.and_then(|c| c.base_url);
+                            }
+                            events.push(UiEvent::Agent(crate::AgentEdit::Provider(Some(next))));
                         }
                     }
                 });
-            if !billing.is_empty() {
-                combo.response.on_hover_text(billing);
-            }
+            // **Always a tooltip, with the billing appended when it is known.** It used to be
+            // the billing *or nothing*, and `provider_summary` is empty for a node the
+            // runtime has not attached a session to — which is every freshly placed agent. So
+            // the commonest state of the commonest control on the bar was the one with
+            // nothing to hover, and a combo reading "Inherit" says neither what it inherits
+            // nor from where.
+            let hint = if billing.is_empty() {
+                // Two things this used to get wrong, both of the same kind: it named
+                // *Preferences > Agents > Providers*, a level deeper than the menu goes, and
+                // it said changing something there moves inheriting nodes — but that submenu
+                // signs providers in, and there is no app-wide *default provider* setting for
+                // Inherit to follow. Inherit resolves to Velm's own built-in default. A
+                // tooltip that sends someone to a menu path that does not exist, for a
+                // setting that does not exist, costs them the time to go and look.
+                "Which model this agent runs on. *Inherit* uses Velm's default provider; \
+                 sign providers in under Preferences ▸ Providers."
+                    .to_owned()
+            } else {
+                format!("{billing}\n\nChange it here for this node only.")
+            };
+            combo.response.on_hover_text(hint);
         }
 
         Control::NoteScope => {
@@ -622,7 +690,7 @@ fn draw(
                 crate::widgets::Segment::text(CardMode::Card, "Card"),
                 crate::widgets::Segment::text(CardMode::Large, "Large"),
             ];
-            if let Some(mode) = crate::widgets::segmented(ui, palette, &model.card_mode, &options) {
+            if let Some(mode) = crate::widgets::segmented_sized(ui, palette, &model.card_mode, &options, CONTROL) {
                 events.style(StyleEdit::CardMode(mode));
             }
         }
@@ -656,7 +724,7 @@ fn draw(
                 Field::Uniform(color) => color.map(to_egui),
                 Field::Absent | Field::Mixed => None,
             };
-            let response = swatch(ui, palette, shown, SWATCH, false).on_hover_text("Fill");
+            let response = swatch_disc(ui, palette, shown, SWATCH, SWATCH_DISC).on_hover_text("Fill");
             if response.clicked() {
                 let seed = model.fill.value().copied().flatten().unwrap_or(crate::color::DEFAULT_FILL);
                 state.open_picker(Swatch::Fill, seed, true);
@@ -666,7 +734,7 @@ fn draw(
 
         Control::Stroke => {
             let shown = model.border_color.value().copied().map(to_egui);
-            let response = swatch(ui, palette, shown, SWATCH, false).on_hover_text("Line colour");
+            let response = swatch_disc(ui, palette, shown, SWATCH, SWATCH_DISC).on_hover_text("Line colour");
             if response.clicked() {
                 let seed = model.border_color.or(DEFAULT_STROKE);
                 state.open_picker(Swatch::Stroke, seed, true);
@@ -694,7 +762,7 @@ fn draw(
                 crate::widgets::Segment::text(LineStyle::Dashed, "- -"),
                 crate::widgets::Segment::text(LineStyle::Dotted, "···"),
             ];
-            if let Some(style) = crate::widgets::segmented(ui, palette, &model.border_style, &options)
+            if let Some(style) = crate::widgets::segmented_sized(ui, palette, &model.border_style, &options, CONTROL)
             {
                 events.style(StyleEdit::BorderStyle(style));
             }
@@ -706,8 +774,35 @@ fn draw(
                 crate::widgets::Segment::text(RoutingMode::Orthogonal, "Elbow"),
                 crate::widgets::Segment::text(RoutingMode::Curved, "Curved"),
             ];
-            if let Some(routing) = crate::widgets::segmented(ui, palette, &model.routing, &options) {
+            if let Some(routing) = crate::widgets::segmented_sized(ui, palette, &model.routing, &options, CONTROL) {
                 events.style(StyleEdit::Routing(routing));
+            }
+        }
+
+        // The start arrow, offered beside the end one because on an **agent link** the
+        // arrowhead is not decoration: `agent::link_kind` reads the two ends to decide which
+        // way messages may flow, so an arrow at the start is how a link is pointed the other
+        // way — and it existed only in the docked properties panel, which is off by default.
+        // A user working from the floating bar could make a forward link and a bidirectional
+        // one and had no way to make a backward one at all.
+        Control::StartArrow => {
+            let current = model.start_arrow.value().copied().unwrap_or(Arrowhead::None);
+            let next = if current == Arrowhead::None {
+                Arrowhead::FilledTriangle
+            } else {
+                Arrowhead::None
+            };
+            let on = current != Arrowhead::None;
+            if icon_button(ui, palette, Icon::ChevronLeft, CONTROL, on)
+                .on_hover_text(if on {
+                    "Remove the arrowhead at this end"
+                } else {
+                    "Add an arrowhead at this end. Between two agents, an arrow is which way \
+                     messages may travel."
+                })
+                .clicked()
+            {
+                events.style(StyleEdit::StartArrow(next));
             }
         }
 
@@ -735,7 +830,7 @@ fn draw(
                 Icon::Opacity,
                 egui::DragValue::new(&mut percent).speed(1.0).range(0.0..=100.0).max_decimals(0).suffix("%"),
             )
-            .on_hover_text("Opacity");
+            .on_hover_text("Opacity — how see-through the whole item is on the board");
             if drag.changed() {
                 events.style(StyleEdit::Opacity(percent / 100.0));
             }
@@ -743,7 +838,7 @@ fn draw(
 
         Control::TextColor => {
             let shown = model.text_color.value().copied().map(to_egui);
-            let response = swatch(ui, palette, shown, SWATCH, false).on_hover_text("Text colour");
+            let response = swatch_disc(ui, palette, shown, SWATCH, SWATCH_DISC).on_hover_text("Text colour");
             if response.clicked() {
                 let seed = model.text_color.or(DEFAULT_INK);
                 state.open_picker(Swatch::Text, seed, false);
@@ -823,7 +918,7 @@ fn draw(
                 crate::widgets::Segment::icon(Align::Center, Icon::TextAlignCenter, "Centre"),
                 crate::widgets::Segment::icon(Align::Right, Icon::TextAlignRight, "Right"),
             ];
-            if let Some(align) = crate::widgets::segmented(ui, palette, &model.align, &options) {
+            if let Some(align) = crate::widgets::segmented_sized(ui, palette, &model.align, &options, CONTROL) {
                 events.style(StyleEdit::Align(align));
             }
         }
@@ -856,9 +951,20 @@ fn draw(
     None
 }
 
-/// Every colour control in the bar is this size — a wide-ish chip rather than a
-/// square, so the colour itself is readable at a glance.
+/// The **hit target** every colour control in the bar allocates.
+///
+/// Unchanged when the swatch became a disc, which is the point: only the paint shrank. A
+/// 20-point circle as the widget itself is a materially harder click than a 36x32 chip, and
+/// `tests/interaction.rs` clicks each control's rect in turn — so shrinking it would have
+/// quietly changed what that test exercises without failing it.
 const SWATCH: Vec2 = vec2(space::of(9), CONTROL);
+
+/// The disc drawn inside [`SWATCH`].
+///
+/// Miro shows a selection's colour as a filled circle rather than as a bordered chip, so the
+/// control reads as *the colour* rather than as a button that happens to be coloured. Sized to
+/// leave a clear ring of bar around it inside the 32-point row.
+const SWATCH_DISC: f32 = space::of(5);
 
 /// What a picker opens on when the selection has no agreed line colour.
 const DEFAULT_STROKE: Color = Color::rgb(0x33, 0x33, 0x33);
@@ -1028,6 +1134,9 @@ mod tests {
         let own = vellum_agent::AgentRules::default();
         SelectionItem {
             agent: Some(crate::AgentSummary {
+                chat_theme: None,
+                chat_opacity: 255,
+                has_chat_background: false,
                 role: "Reviewer".to_owned(),
                 role_kind: vellum_agent::RoleKind::Worker,
                 provider: None,
@@ -1280,6 +1389,34 @@ mod tests {
         }
     }
 
+    /// A shape gets an opacity and a sticky does not, and the rule is what they *paint*.
+    ///
+    /// *"where is the rtransparencuy slider"*, of a shape's bar. It had none: the gate was
+    /// "no fill swatch", written when the only things with a fill were a sticky and a
+    /// frame. A sticky is its colour, so the picker's alpha says everything about it; a
+    /// shape draws an interior, an outline and its words, and no single swatch can fade
+    /// all three. Both directions are asserted, because dropping the gate entirely — which
+    /// is the easy version — puts a second alpha beside the sticky's own picker, the exact
+    /// duplication a review already removed once.
+    #[test]
+    fn a_shape_gets_an_opacity_and_a_sticky_does_not() {
+        let shape = SelectionItem {
+            fill: Some(None),
+            border: Some(Border { color: DEFAULT_STROKE, width: 1.0, style: LineStyle::Solid }),
+            text: Some(text_summary()),
+            ..bare(1, ItemFacet::Shape)
+        };
+        let bar = of(&[shape]);
+        assert!(bar.contains(&Control::Fill), "{bar:?}");
+        assert!(bar.contains(&Control::Opacity), "a shape's bar offers no transparency: {bar:?}");
+
+        let note = of(&[sticky()]);
+        assert!(
+            !note.contains(&Control::Opacity),
+            "a sticky's fill picker already carries its alpha: {note:?}"
+        );
+    }
+
     /// The dash and the routing belong to wire alone. Ink has a stroke too, and giving
     /// it a dash control would offer a property `vellum-ink` cannot honour.
     #[test]
@@ -1342,15 +1479,19 @@ mod tests {
         }
     }
 
-    /// Opacity is offered to everything **except a fill**, and the exception is the point.
+    /// Opacity is offered to everything except an item that **is** its fill, and the
+    /// exception is the point.
     ///
     /// An image has neither fill nor stroke, so opacity is the only thing on its bar that can
     /// change how it is painted. A stroked item — ink, a connector — gets it too, at the
-    /// user's request. A **filled** item does not: a fill swatch's own picker carries an
-    /// alpha slider, so a second control would be two widgets for one property, disagreeing
-    /// the moment either is used.
+    /// user's request. A **sticky** does not: a note is its colour, and its picker's alpha
+    /// slider says everything a second control would, disagreeing the moment either is used.
+    ///
+    /// The exception is narrower than "has a fill", which is what it used to be — a shape has
+    /// a fill *and* an outline *and* words, so its swatch cannot fade it. See
+    /// [`a_shape_gets_an_opacity_and_a_sticky_does_not`].
     #[test]
-    fn opacity_is_offered_to_everything_but_a_fill() {
+    fn opacity_is_offered_unless_the_fill_is_the_whole_item() {
         for reachable in [of(&[image()]), of(&[ink()]), of(&[connector()])] {
             assert!(
                 reachable.contains(&Control::Opacity),

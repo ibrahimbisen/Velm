@@ -195,7 +195,7 @@ const STDERR_TAIL: usize = 40;
 ///
 /// A timeout answers *"no"*: not registering the server costs the board verbs, and guessing
 /// *"yes"* at a binary that has not answered costs the whole session.
-fn supports_flag(program: &Path, flag: &str) -> bool {
+pub(crate) fn supports_flag(program: &Path, flag: &str) -> bool {
     static HELP: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
     let cache = HELP.get_or_init(|| Mutex::new(HashMap::new()));
 
@@ -730,15 +730,38 @@ impl ClaudeCli {
         // `spec.env`), so the same verbs are reachable by shelling out even when this is
         // skipped. That redundancy is on purpose: it is the one path that needs no agreement
         // with another tool's command line.
-        if let Some(config) = spec.mcp_config()
-            && supports_flag(&program, MCP_CONFIG_FLAG)
-        {
-            args.push(MCP_CONFIG_FLAG.to_owned());
-            args.push(config.to_string());
+        // ⚠ **A dropped MCP registration is reported, because it takes six features with it.**
+        // `supports_flag` answers `false` both for *"this binary has no such flag"* and for
+        // *"it did not answer `--help` in two seconds"*, and treating a timeout as a refusal is
+        // right — guessing yes costs the whole session. What was wrong was doing it in
+        // silence: without the server the agent loses `research_search`, `research_fetch` and
+        // every board verb, its system context still describes them, and the failure surfaces
+        // as an agent that says it cannot find a tool it has just been told it has. The shim
+        // on `PATH` is the redundancy that keeps the board verbs reachable; research has no
+        // second route, which is why this says so out loud.
+        let mut mcp_dropped = false;
+        if let Some(config) = spec.mcp_config() {
+            if supports_flag(&program, MCP_CONFIG_FLAG) {
+                args.push(MCP_CONFIG_FLAG.to_owned());
+                args.push(config.to_string());
+            } else {
+                mcp_dropped = true;
+            }
         }
         args.extend(spec.args.iter().cloned());
 
         let cwd = spec.cwd.clone().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+
+        if mcp_dropped {
+            let _ = events.send(TranscriptEvent::Error {
+                message: format!(
+                    "{command} did not accept `{MCP_CONFIG_FLAG}` (it may be an older build, \
+                     or it did not answer `--help` in time), so Velm's tools are not \
+                     registered with it. Messaging and notes still work through the \
+                     `velm-agent-cli` command on its PATH; web research does not."
+                ),
+            });
+        }
 
         Ok(Self {
             shared: Arc::new(Shared::new(events)),

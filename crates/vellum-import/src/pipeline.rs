@@ -170,6 +170,11 @@ pub struct ImportOutcome {
     pub assets_recovered: usize,
     /// Total bytes stored, before deduplication against what was already there.
     pub asset_bytes: u64,
+    /// Wall time spent on assets alone — ZIP extraction, hashing and the blob write.
+    ///
+    /// Reported so a paste can be apportioned rather than guessed at. On the reference
+    /// board this is most of the import, which is what justifies moving it off the frame.
+    pub asset_time: std::time::Duration,
     /// Result of [`ImportOutcome::cross_check`], if it was run. `Some(vec![])`
     /// means the oracle agreed.
     pub oracle: Option<Vec<Discrepancy>>,
@@ -227,9 +232,10 @@ impl std::fmt::Display for ImportOutcome {
             let total = self.assets_recovered + self.missing_assets.len();
             writeln!(
                 f,
-                "  assets: {} of {total} recovered ({:.1} MB)",
+                "  assets: {} of {total} recovered ({:.1} MB) in {:.0} ms",
                 self.assets_recovered,
-                self.asset_bytes as f64 / 1_048_576.0
+                self.asset_bytes as f64 / 1_048_576.0,
+                self.asset_time.as_secs_f64() * 1000.0
             )?;
         }
 
@@ -305,13 +311,161 @@ pub fn import_widgets(
     blobs: &BlobStore,
     board: &mut Board,
 ) -> Result<ImportOutcome> {
+    import_widgets_with(source, archive, blobs, board, None)
+}
+
+/// [`import_widgets`] with the assets already in hand.
+///
+/// The half of an import that has to happen on the thread owning the document, once
+/// [`prefetch_assets`] has done the half that does not. Measured on the reference board:
+/// this part is **~50 ms** of a 1,774 ms paste, so a caller that prefetches on a worker and
+/// calls in here keeps its window painting for all but a few frames of the wait.
+///
+/// Passing `None` is the everything-here path and is what [`import_widgets`] does.
+pub fn import_widgets_with(
+    source: &ImportedBoard,
+    archive: Option<&mut ArchiveSet>,
+    blobs: &BlobStore,
+    board: &mut Board,
+    ready: Option<PrefetchedAssets>,
+) -> Result<ImportOutcome> {
     // One paste is one undo step, however many items it turns into. Closed on the
     // error path too, so a failed import cannot leave the group open and fuse the
     // user's next edit into it.
     board.begin_undo_group()?;
-    let outcome = build(source, archive, blobs, board);
+    let outcome = build(source, archive, blobs, board, ready);
     board.end_undo_group();
     outcome
+}
+
+/// How many threads pull assets out of the backups at once.
+///
+/// Four rather than the core count: the work is ZIP inflate plus a staged write and a
+/// rename per asset, so it is as much disk as CPU, and the machine this is developed on is
+/// an 8 GB laptop where a fan-out that large competes with the frame it is trying to keep
+/// free. Four measured well and leaves the UI thread a core.
+const ASSET_THREADS: usize = 4;
+
+/// Pulls every asset the board asks for out of the backups, in parallel.
+///
+/// # Why this exists
+///
+/// Measured on the reference board — 596 widgets, a 110.5 MB backup, a cold blob store —
+/// the import took **2,564 ms and 2,484 ms of it was assets**: 97%. Everything else, the
+/// 596 CRDT inserts included, came to about 80 ms. So the whole of a Miro paste's cost is
+/// ZIP inflate, BLAKE3 and a file write per asset, and all of it is independent per asset.
+///
+/// Safe to run concurrently against one [`BlobStore`]: it is content-addressed, every write
+/// stages to a uniquely-named temporary and is published by an atomic rename, so two threads
+/// racing on the *same* asset both write the same bytes to the same name and the loser's
+/// rename is a no-op. That property is the store's, not this function's — it is why writing
+/// blobs from several threads needs no lock.
+///
+/// A reader cannot be shared, because a `.rtb` archive owns a seek position, so each worker
+/// opens the backups again from their paths ([`ArchiveSet::paths`]).
+/// Assets already pulled out of the backups, ready for a conversion that must not block.
+///
+/// Resource id → its blob hash and size, or why it could not be had. Produced by
+/// [`prefetch_assets`] on whatever thread the caller likes, and handed to
+/// [`import_widgets_with`] on the one that owns the document.
+pub type PrefetchedAssets = HashMap<String, std::result::Result<(String, u64), AssetGap>>;
+
+/// One worker's answers: the resource id, and either its blob hash and size or why not.
+type PrefetchedBatch = Vec<(String, std::result::Result<(String, u64), AssetGap>)>;
+
+fn prefetch(
+    ids: &[String],
+    paths: &[std::path::PathBuf],
+    blobs: &BlobStore,
+) -> PrefetchedAssets {
+    let mut resolved = HashMap::new();
+    if ids.is_empty() || paths.is_empty() {
+        return resolved;
+    }
+
+    // Distinct, because one resource is commonly referenced by many widgets and fetching it
+    // twice is the thing the sequential path's cache already prevented.
+    let mut wanted: Vec<&str> = ids.iter().map(String::as_str).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+
+    let threads = ASSET_THREADS.min(wanted.len());
+    let chunk = wanted.len().div_ceil(threads);
+    let answers: Vec<PrefetchedBatch> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = wanted
+                .chunks(chunk)
+                .map(|slice| {
+                    scope.spawn(move || {
+                        // One reader per worker. An archive that fails to open here is not
+                        // fatal: every id it would have answered simply reports a gap, which
+                        // is the same answer the sequential path gives for a missing backup.
+                        let mut set = ArchiveSet::new();
+                        for path in paths {
+                            if let Err(error) = set.add(path) {
+                                log::warn!("prefetch: reopening {}: {error}", path.display());
+                            }
+                        }
+                        slice
+                            .iter()
+                            .map(|id| {
+                                let outcome = match set.asset_bytes(id) {
+                                    Ok(Some(bytes)) => blobs
+                                        .put(&bytes)
+                                        // The length travels with the hash: the paste's
+                                        // report states how many megabytes were recovered,
+                                        // and only the thread holding the bytes knows.
+                                        // Dropping it here reported 0 MB on the path that
+                                        // recovers everything, which a test caught.
+                                        .map(|hash| (hash.to_hex().to_string(), bytes.len() as u64))
+                                        .map_err(|error| AssetGap::Unreadable(error.to_string())),
+                                    Ok(None) => Err(AssetGap::NotInArchive),
+                                    Err(error) => Err(AssetGap::Unreadable(error.to_string())),
+                                };
+                                ((*id).to_owned(), outcome)
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|handle| handle.join().ok()).collect()
+        });
+
+    for batch in answers {
+        resolved.extend(batch);
+    }
+    resolved
+}
+
+/// Which archive resources a board's widgets ask for.
+///
+/// Runs the real `convert` with **no archive attached**, so the answer comes from the same
+/// code that will ask for them again — there is no second list of "which widgets have
+/// assets" to fall out of step with the first. Everything it converts is thrown away; only
+/// the requests are kept. Measured at **2 ms** for 596 widgets, which is what makes it
+/// affordable as a planning step before the expensive part.
+#[must_use]
+pub fn requested_assets(source: &ImportedBoard, blobs: &BlobStore) -> Vec<String> {
+    let geometry = Geometry::resolve(&source.widgets);
+    let mut probe = Assets::new(None, blobs);
+    for (index, widget) in source.widgets.iter().enumerate() {
+        let _ = convert(widget, index, &geometry, &mut probe);
+    }
+    probe.requested
+}
+
+/// Pulls the named assets out of the backups. **Safe to call off the UI thread.**
+///
+/// This is the whole point of the split: it is the part of an import that takes seconds —
+/// 2,012 ms of a 2,076 ms paste, measured — and it touches no document. Everything it needs
+/// is owned or cheap to clone, so a caller can run it on a worker and keep painting.
+#[must_use]
+pub fn prefetch_assets(
+    ids: &[String],
+    paths: &[std::path::PathBuf],
+    blobs: &BlobStore,
+) -> PrefetchedAssets {
+    prefetch(ids, paths, blobs)
 }
 
 fn build(
@@ -319,6 +473,7 @@ fn build(
     archive: Option<&mut ArchiveSet>,
     blobs: &BlobStore,
     board: &mut Board,
+    ready: Option<PrefetchedAssets>,
 ) -> Result<ImportOutcome> {
     let widgets = &source.widgets;
     let geometry = Geometry::resolve(widgets);
@@ -327,7 +482,53 @@ fn build(
     let mut report = source.report.clone();
     report.warnings.extend(hierarchy.warnings.iter().cloned());
 
+    // **Assets first, in parallel, and only then the conversion.**
+    //
+    // The conversion asks for an asset the moment it meets a widget that needs one, which
+    // made the import a sequence of 205 stop-the-world extractions interleaved with cheap
+    // work. Doing them together up front turns 2.5 seconds of that into a fraction, and
+    // costs one extra pass over the widgets to find out *which* assets are wanted.
+    //
+    // The probe pass runs the real `convert` with no archive attached, so the answer comes
+    // from the same code that will ask for them again — there is no second list of "which
+    // widgets have assets" to fall out of step. Its output is thrown away; only
+    // `Assets::requested` is kept.
+    let paths = archive.as_ref().map(|set| set.paths()).unwrap_or_default();
+    let prefetch_started = std::time::Instant::now();
+    let mut probe_time = std::time::Duration::ZERO;
+    // A caller that has already done this on a worker hands the answers in; one that has
+    // not pays for them here, on whatever thread it is on. Both paths converge on the same
+    // seeding below, so the conversion cannot tell the difference.
+    let prefetched = if let Some(ready) = ready {
+        ready
+    } else if paths.is_empty() {
+        HashMap::new()
+    } else {
+        let probe_started = std::time::Instant::now();
+        let mut probe = Assets::new(None, blobs);
+        for (index, widget) in widgets.iter().enumerate() {
+            let _ = convert(widget, index, &geometry, &mut probe);
+        }
+        probe_time = probe_started.elapsed();
+        prefetch(&probe.requested, &paths, blobs)
+    };
+    let prefetch_time = prefetch_started.elapsed();
+    log::info!(
+        "import: prefetched {} asset(s) in {:.0} ms ({:.0} ms of it the probe pass)",
+        prefetched.len(),
+        prefetch_time.as_secs_f64() * 1000.0,
+        probe_time.as_secs_f64() * 1000.0
+    );
+
     let mut assets = Assets::new(archive, blobs);
+    // Seeded, so the conversion below finds every asset already in hand and touches no
+    // archive. Anything the prefetch could not resolve is left out rather than cached as a
+    // failure, so the sequential path still gets its turn and reports the real gap.
+    for (id, outcome) in prefetched {
+        if outcome.is_ok() {
+            assets.adopt(id, outcome);
+        }
+    }
     let mut items = Vec::with_capacity(widgets.len());
     let mut missing_assets = Vec::new();
     let mut flattened_lists = 0usize;
@@ -360,6 +561,9 @@ fn build(
     report.warnings.extend(rebuild_hierarchy(board, &hierarchy.parent, &items));
 
     let assets_recovered = assets.recovered;
+    // The prefetch is where the asset work happens now; `assets.elapsed` only sees
+    // whatever the sequential path still had to do, which is normally nothing.
+    let asset_time = assets.elapsed + prefetch_time;
     let asset_bytes = assets.bytes;
 
     let counts: BTreeMap<String, usize> = report.counts.iter().cloned().collect();
@@ -401,6 +605,7 @@ fn build(
         degraded,
         missing_assets,
         assets_recovered,
+        asset_time,
         asset_bytes,
         oracle: None,
     })
@@ -696,17 +901,60 @@ struct Assets<'a> {
     resolved: HashMap<String, std::result::Result<String, AssetGap>>,
     recovered: usize,
     bytes: u64,
+    /// Every resource asked for, in first-use order.
+    ///
+    /// The list is what makes the parallel prefetch possible without a second copy of
+    /// "which widgets reference an asset": that rule lives in `convert`, and re-deriving it
+    /// here would be two sources of truth for something only a real board exercises. A probe
+    /// pass over the widgets with no archive attached fills this in, and every id it names is
+    /// one `convert` genuinely asked for.
+    requested: Vec<String>,
+    /// Wall time spent pulling assets out of the archive and into the blob store.
+    ///
+    /// Instrumentation, kept: on a real 596-widget board this is the great majority of a
+    /// paste, and it is the number that decides whether moving asset work off the UI thread
+    /// is worth the architecture. Measuring it beat guessing — an earlier round guessed the
+    /// item inserts were the cost and was wrong.
+    elapsed: std::time::Duration,
 }
 
 impl<'a> Assets<'a> {
     fn new(archive: Option<&'a mut ArchiveSet>, blobs: &'a BlobStore) -> Self {
-        Self { archive, blobs, resolved: HashMap::new(), recovered: 0, bytes: 0 }
+        Self {
+            archive,
+            blobs,
+            resolved: HashMap::new(),
+            recovered: 0,
+            bytes: 0,
+            elapsed: std::time::Duration::ZERO,
+            requested: Vec::new(),
+        }
     }
 
     /// The blob hash for an asset, or why there isn't one.
     ///
     /// A gap is never an error: a paste with no matching backup is an ordinary
     /// situation, and the item it belongs to still imports.
+    /// Takes an already-resolved asset, from the parallel prefetch.
+    ///
+    /// Counted into `recovered` **and `bytes`** exactly as a sequential fetch would be.
+    ///
+    /// The byte count is why `prefetch` hands back a length beside the hash: only the worker
+    /// that inflated the asset knows how big it was, and an earlier version of this dropped
+    /// it and reported *"0.0 MB"* on the very path that recovers everything. Two tests
+    /// caught it, which is the argument for their existing.
+    fn adopt(&mut self, id: String, outcome: std::result::Result<(String, u64), AssetGap>) {
+        let outcome = match outcome {
+            Ok((hash, bytes)) => {
+                self.recovered += 1;
+                self.bytes += bytes;
+                Ok(hash)
+            }
+            Err(gap) => Err(gap),
+        };
+        self.resolved.insert(id, outcome);
+    }
+
     fn hash_of(&mut self, id: &str) -> std::result::Result<String, AssetGap> {
         if let Some(known) = self.resolved.get(id) {
             return known.clone();
@@ -717,6 +965,16 @@ impl<'a> Assets<'a> {
     }
 
     fn fetch(&mut self, id: &str) -> std::result::Result<String, AssetGap> {
+        let started = std::time::Instant::now();
+        let answer = self.fetch_now(id);
+        self.elapsed += started.elapsed();
+        answer
+    }
+
+    fn fetch_now(&mut self, id: &str) -> std::result::Result<String, AssetGap> {
+        // Recorded before the archive is consulted, so a probe pass with no archive still
+        // names everything the board wants.
+        self.requested.push(id.to_owned());
         let Some(archive) = self.archive.as_deref_mut() else {
             return Err(AssetGap::NoArchive);
         };

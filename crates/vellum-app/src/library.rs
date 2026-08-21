@@ -126,12 +126,40 @@ struct Filing {
     /// somebody inserts a third in the middle. An unknown string degrades to the default
     /// rather than failing the whole file to parse.
     agent_display: Option<String>,
+    /// Which provider a node that has not chosen one runs on — feature 16's *Inherit*.
+    ///
+    /// ⚠ **The inspector has always offered "Inherit the board's default" and there was no
+    /// default to inherit**: the value was `ProviderChoice::new(Provider::default())`, a
+    /// compile-time constant, so every inheriting node followed Claude and the control's own
+    /// promise — *"a node that inherits follows when the board's default moves"* — described
+    /// something that could not move. A string for the reason `agent_display` above is one.
+    agent_provider: Option<String>,
+    /// The chat theme a node with no choice of its own draws in. A **string**, for
+    /// `agent_display`'s reason above, and unset means Velm's own palette — so a
+    /// `library.json` written before chat themes existed reads exactly as it did.
+    agent_chat_theme: Option<String>,
     /// Whether browser nodes may instantiate an engine at all. Off unless asked: an engine is
     /// 60–150MB idle and `docs/01-architecture.md` §1 rules a webview out of the canvas.
     browser_nodes: Option<bool>,
     /// Whether a coding agent gets its own git worktree. Off unless asked: it is a second
     /// checkout of the repository per agent, which is disk the user did not agree to spend.
     worktrees: Option<bool>,
+    /// How a spoken prompt is turned into words — feature 12's second half.
+    ///
+    /// App-wide rather than per node, because it names *this machine's* transcriber (which
+    /// whisper binary, which model file, or which API) and none of that is a property of one
+    /// agent. Whether a given node listens at all **is** per node, and stays on
+    /// `AgentModel::voice`.
+    ///
+    /// ⚠ **Carries no API key**, by construction — [`vellum_agent::voice::Speech`]'s own doc
+    /// says so and it is why this can live in a sidecar that is written in plain text. A
+    /// hosted transcription resolves its key from `credentials.json` when the request is
+    /// built, which is `docs/07` §8a's rule that a key lives in exactly one file.
+    ///
+    /// `None` is *never configured*, which is a different state from configured-and-default:
+    /// unset falls back to `Speech::default()`, whose `Preference::Auto` prefers a local
+    /// transcriber when one is installed and refuses by name when neither is.
+    speech: Option<vellum_agent::voice::Speech>,
     /// Miro's **Snap to grid**: whether a move, a resize or a placement lands on the
     /// board's own grid.
     ///
@@ -377,6 +405,43 @@ impl Library {
         self.persist();
     }
 
+    /// The provider an agent node that has not chosen one runs on.
+    ///
+    /// Velm's own default unless the user has said otherwise, so no existing board changes
+    /// where it runs because this setting appeared. An unrecognised tag degrades to that
+    /// default rather than failing the sidecar to parse.
+    pub fn default_provider(&self) -> vellum_agent::Provider {
+        self.filing
+            .agent_provider
+            .as_deref()
+            .and_then(|tag| {
+                vellum_agent::Provider::ALL.into_iter().find(|provider| provider.tag() == tag)
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn set_default_provider(&mut self, provider: vellum_agent::Provider) {
+        self.filing.agent_provider = Some(provider.tag().to_owned());
+        self.persist();
+    }
+
+    /// The chat theme new agent nodes, and every node still inheriting, draw in.
+    ///
+    /// **Velm's own** unless the user has said otherwise, so nothing about an existing board
+    /// changes appearance because this feature landed.
+    pub fn default_chat_theme(&self) -> vellum_agent::ChatTheme {
+        self.filing
+            .agent_chat_theme
+            .as_deref()
+            .map(vellum_agent::ChatTheme::from_tag)
+            .unwrap_or_default()
+    }
+
+    pub fn set_default_chat_theme(&mut self, theme: vellum_agent::ChatTheme) {
+        self.filing.agent_chat_theme = Some(theme.tag().to_owned());
+        self.persist();
+    }
+
     /// Whether a browser node may run a real engine. **Off** unless turned on.
     pub fn browser_nodes(&self) -> bool {
         self.filing.browser_nodes.unwrap_or(false)
@@ -394,6 +459,16 @@ impl Library {
 
     pub fn set_worktrees(&mut self, on: bool) {
         self.filing.worktrees = Some(on);
+        self.persist();
+    }
+
+    /// How a spoken prompt is transcribed. Defaults to *prefer a local transcriber*.
+    pub fn speech(&self) -> vellum_agent::voice::Speech {
+        self.filing.speech.clone().unwrap_or_default()
+    }
+
+    pub fn set_speech(&mut self, speech: vellum_agent::voice::Speech) {
+        self.filing.speech = Some(speech);
         self.persist();
     }
 

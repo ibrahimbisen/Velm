@@ -83,6 +83,22 @@ COMMANDS
     note list
         List the notes you can see: the board's shared notes plus your own private ones.
 
+    note chain <path> [--depth <n>]
+        Read a note and everything it links to, following the markdown links from note to
+        note and printing the whole trail. Use this rather than reading them one at a time
+        when a note points at others: it stops at a sensible depth, it will not loop on two
+        notes that point at each other, and it silently leaves out anything private to
+        another agent.
+            velm-agent-cli note chain plan.md --depth 2
+
+    ingest <path-or-url>
+        Have Velm read something as context for you: a PDF, a Word document, a spreadsheet,
+        a web page or a YouTube link. It extracts the text, stores it, and gives it to you
+        at the start of your next session — so use it for a source you will need again,
+        not for a file you can simply open. It answers with what it managed to read.
+            velm-agent-cli ingest ./docs/spec.pdf
+            velm-agent-cli ingest https://example.com/rfc
+
     spawn <label> [--role worker|orchestrator] [--prompt <text>] [--at <x>,<y>]
         Ask Velm to create another agent and put it on the board. Orchestrators only.
         There is a hard cap on how many you may have at once and a region of the board you
@@ -95,11 +111,16 @@ COMMANDS
         Put a picture in your transcript, where the user will see it inline. <file> is a
         path to a PNG or JPEG you have produced. Use this instead of describing a chart,
         a diagram or a screenshot in prose.
+        It prints the picture's hash on its own line, which is how a picture gets onto a
+        choice card: post the picture, keep the hash, pass it as that choice's image.
+            HASH=$(velm-agent-cli image mock-a.png)
 
-    options <prompt> --choice <id>=<title> [--choice ...]
-        Ask the user to pick one of several answers, drawn as a row of cards. Use this
-        when you have built two or three real alternatives rather than asking an open
-        question. The choice they click comes back as your next turn's input.
+    options <prompt> --choice <id>=<title> --choice <id>=<title> [--choice ...]
+        Ask the user to pick one of several answers, drawn as a row of cards. Two to four
+        of them: one option is not a choice, and a fifth would be drawn where nobody could
+        click it. Use this when you have built two or three real alternatives rather than
+        asking an open question. The choice they click comes back as your next turn's
+        input.
         For choices with a description or a picture, pass the full form instead:
             --choices '[{\"id\":\"a\",\"title\":\"Warm\",\"body\":\"amber, serif\"}]'
 
@@ -234,6 +255,23 @@ fn describe(answer: Option<Answer>) -> String {
                 .collect::<Vec<_>>()
                 .join("\n")
         }
+        // Each note under a heading naming its path, in the order the walk reached them.
+        // Printed rather than summarised for the same reason a single note is: this *is* the
+        // thing that was asked for.
+        Some(Answer::Chain { notes }) => {
+            if notes.is_empty() {
+                return "that note is not there, or it is empty".to_owned();
+            }
+            notes
+                .iter()
+                .map(|(path, text)| format!("===== {path} =====\n{}", text.trim_end()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        }
+        // The bare hash on its own line, so `HASH=$(velm-agent-cli image shot.png)` works —
+        // an agent that has to parse a sentence to get it will eventually parse it wrong,
+        // and this value's only use is being passed straight back in.
+        Some(Answer::Stored { blob }) => blob,
         Some(Answer::Spawned { agent }) => format!("spawned {agent}"),
         Some(Answer::Config { model }) => {
             serde_json::to_string_pretty(&model).unwrap_or_else(|_| "{}".to_owned())
@@ -276,7 +314,8 @@ fn environment() -> Result<(RuntimeFile, String), Failure> {
 /// Options that take a value. Anything else beginning with `-` is a mistake rather than a
 /// positional argument — an agent that mistypes `--promt` must be told, not silently obeyed
 /// with the prompt dropped.
-const VALUED: [&str; 7] = ["--role", "--prompt", "--caption", "--choice", "--choices", "--set", "--at"];
+const VALUED: [&str; 8] =
+    ["--role", "--prompt", "--caption", "--choice", "--choices", "--set", "--at", "--depth"];
 
 /// Switches that take none.
 const SWITCHES: [&str; 4] = ["--json", "--append", "--help", "-h"];
@@ -409,14 +448,37 @@ fn build_request(parsed: &Parsed) -> Result<Request, Failure> {
                 Ok(Request::NoteWrite { path, text, append: parsed.append })
             }
             "list" => Ok(Request::NoteList),
+            // Feature 8's chaining, and the only way to reach `NoteStore::context_chain`.
+            // A whole trail in one call: reading a note, then the notes it links to, then
+            // theirs — cycle-safe and depth-bounded, which is the part an agent following
+            // links by hand gets wrong.
+            "chain" => {
+                let path = parsed
+                    .word(2)
+                    .ok_or_else(|| Failure::usage("note chain needs a path"))?;
+                let depth = match parsed.value("--depth") {
+                    Some(value) => Some(value.parse::<usize>().map_err(|_| {
+                        Failure::usage(format!("--depth takes a whole number, not {value}"))
+                    })?),
+                    None => None,
+                };
+                Ok(Request::NoteChain { path: path.to_owned(), depth })
+            }
             "" => {
-                Err(Failure::usage("note needs read, write or list after it"))
+                Err(Failure::usage("note needs read, write, list or chain after it"))
             }
             other => Err(Failure::usage(format!(
-                "there is no note command called {other} — it is read, write or list"
+                "there is no note command called {other} — it is read, write, list or chain"
             ))),
         },
 
+        // Feature 18 from this side: hand Velm a path or a URL and have it read.
+        "ingest" => {
+            let source = parsed
+                .word(1)
+                .ok_or_else(|| Failure::usage("ingest needs a file path or a URL"))?;
+            Ok(Request::Ingest { source: source.to_owned() })
+        }
         "spawn" => {
             let label = parsed.rest(1);
             if label.trim().is_empty() {

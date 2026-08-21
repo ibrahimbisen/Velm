@@ -470,12 +470,21 @@ impl Board {
     // ----- reading items --------------------------------------------------
 
     /// Number of live items, including those nested inside frames and groups.
+    ///
+    /// Counted through [`Board::item_ids`] rather than `LoroTree::get_nodes`, which builds
+    /// a `Vec<TreeNode>` — id, parent, index, fractional index — for every live node and
+    /// then throws all of it away for a `.len()`. `item_ids` walks the same set and
+    /// allocates ids alone.
     pub fn item_count(&self) -> usize {
-        self.items.get_nodes(false).len()
+        self.item_ids().len()
     }
 
+    /// Whether the board holds nothing at all.
+    ///
+    /// One lookup rather than a whole-tree walk: an item can only exist under the root or
+    /// under something that does, so a root with no children is an empty board.
     pub fn is_empty(&self) -> bool {
-        self.item_count() == 0
+        self.children(None).is_empty()
     }
 
     /// Whether the item exists and has not been removed.
@@ -510,8 +519,14 @@ impl Board {
 
     /// Item ids in the same order as [`Board::items`], without decoding anything.
     pub fn item_ids(&self) -> Vec<ItemId> {
-        let mut out = Vec::with_capacity(self.item_count());
+        // Sized from the root's own children, which the next line fetches anyway, so the
+        // hint is free. It used to be `with_capacity(self.item_count())` — and `item_count`
+        // was a *second* full walk of the tree that allocated a struct per node, so every
+        // projection rebuild walked the whole document twice to size one `Vec`. Dropping
+        // the hint entirely was measured and was worse than either: on a board whose items
+        // are mostly top-level this is the exact answer, and it costs nothing.
         let mut stack: Vec<ItemId> = self.children(None).into_iter().rev().collect();
+        let mut out = Vec::with_capacity(stack.len());
         // Iterative rather than recursive: nesting depth comes from the file, and a
         // deeply nested import must not be able to overflow the stack.
         while let Some(id) = stack.pop() {
@@ -1379,7 +1394,11 @@ fn read_kind(meta: &LoroMap) -> Result<ItemKind> {
         },
         "text" => ItemKind::Text { text: read_text(meta) },
         "ink" => ItemKind::Ink {
-            points: binary_at(meta, key::POINTS).map(|b| decode_points(&b)).unwrap_or_default(),
+            // `points_at`, not `binary_at(...).map(decode_points)`: that copied the whole
+            // packed stroke out of the CRDT and then allocated the points from the copy,
+            // so every rebuild paid two full passes over strokes the doc comment on
+            // `encode_points` describes as "some thousands of points long".
+            points: points_at(meta, key::POINTS).unwrap_or_default(),
             color: color_at(meta, key::INK_COLOR),
             thickness: num_at(meta, key::THICKNESS).unwrap_or(1.0),
         },
@@ -1532,9 +1551,16 @@ fn string_at(map: &LoroMap, key: &str) -> Option<String> {
     }
 }
 
-fn binary_at(map: &LoroMap, key: &str) -> Option<Vec<u8>> {
+/// An ink stroke's points, decoded straight from the stored bytes.
+///
+/// The point of it is the copy that is *not* made. This used to read through a general
+/// `binary_at` helper that handed back an owned `Vec<u8>`, which [`decode_points`] then
+/// allocated the points from — so reading one stroke moved its whole buffer twice, on every
+/// projection rebuild, for every stroke on the board. This borrows and allocates once, and
+/// the helper is gone rather than left unused.
+fn points_at(map: &LoroMap, key: &str) -> Option<Vec<Point>> {
     match map.get(key)?.into_value().ok()? {
-        LoroValue::Binary(v) => Some(v.to_vec()),
+        LoroValue::Binary(bytes) => Some(decode_points(&bytes)),
         _ => None,
     }
 }

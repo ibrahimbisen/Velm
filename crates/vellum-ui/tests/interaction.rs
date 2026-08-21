@@ -27,13 +27,18 @@ const STRIP: f32 = vellum_ui::theme::TAB_STRIP_HEIGHT;
 /// The top of the menu bar, which now starts under the strip.
 /// Translucent chrome · Align objects · Fetch link previews · Transparency ▸ ·
 /// Accent colour ▸ · Keyboard shortcuts · Documentation · About, plus the Agent Canvas's
-/// four — Agent output ▸ · Providers ▸ · Browser nodes · Worktree isolation — the last
-/// group in the ☰ menu.
+/// five — Agent output ▸ · Chat theme ▸ · Providers ▸ · Browser nodes · Worktree
+/// isolation — the last group in the ☰ menu.
 ///
 /// The count is pinned rather than derived because it is what makes the *index* arithmetic
 /// below trustworthy: several tests reach a specific row by position, and a row silently
 /// appearing above one of them would move every click after it without failing anything.
-const PREFERENCES_ROWS: usize = 12;
+/// It moved 12 → 13 when the chat themes landed, and 13 → 14 when Preferences ▸ Voice did,
+/// which is precisely the event it exists to make visible. Both times the two clicks below
+/// were on rows 0 and 4 and the new row landed in the Agents band well beneath them, so
+/// neither needed re-aiming — which is the fact this constant is here to establish rather
+/// than assume.
+const PREFERENCES_ROWS: usize = 14;
 
 const MENU_TOP: f32 = STRIP;
 
@@ -986,8 +991,20 @@ fn space_rows(ctx: &Context, count: usize) -> Vec<Rect> {
     let rows: Vec<Rect> = widgets(ctx, |rect| {
         approx(rect.height(), 24.0) && rect.right() < 192.0 && rect.width() > 120.0
     });
-    assert!(rows.len() >= count + 3, "the rail drew {} rows", rows.len());
-    rows[rows.len() - count..].to_vec()
+    assert!(rows.len() >= count + 4, "the rail drew {} rows", rows.len());
+    // ⚠ **The last row in the rail is Settings, not a folder.**
+    //
+    // This used to take the final `count` rows outright, which was right while Settings
+    // sat *above* the folder list: the folders really were last. Settings is pinned to the
+    // foot of the panel now, so that assumption silently returned `[last folder, Settings]`
+    // and four drag-and-drop tests started acting on the wrong row — the failure read as
+    // "the pinned space offers to be unpinned", which sounds like a pinning bug and is not.
+    //
+    // Dropped by position rather than by matching its label, because the helper is
+    // deliberately geometric: it finds rows the way a pointer does, and a version that knew
+    // the word "Settings" would stop testing what is actually on screen.
+    let folders = &rows[..rows.len() - 1];
+    folders[folders.len() - count..].to_vec()
 }
 
 /// The user has six real spaces. Creating, pinning, renaming and deleting them all
@@ -1663,12 +1680,17 @@ fn dragging_a_board_onto_a_space_does_not_paint_over_its_name() {
     let grid = cards(&ctx);
     assert_eq!(grid.len(), 1, "one card: {grid:?}");
 
-    // The space rows sit in the sidebar, left of the grid. `Books` is the last of them.
+    // The space rows sit in the sidebar, left of the grid, and `Books` is the last of
+    // them — but **not the last row in the rail**: Settings is pinned to the foot of the
+    // panel below the folders, so the final row is one nothing can be dropped on. Taking it
+    // as the target aimed the drag at a row that draws no drop highlight, and the test
+    // reported "no drop highlight was painted", which reads as the highlight being broken
+    // rather than as the aim being wrong. Same correction as `space_rows`.
     let rows = widgets(&ctx, |rect| {
         rect.right() < grid[0].left() && rect.width() > 100.0 && rect.height() > 20.0
     });
-    assert!(rows.len() >= 2, "the sidebar drew {} candidate rows", rows.len());
-    let target = rows[rows.len() - 1].center();
+    assert!(rows.len() >= 3, "the sidebar drew {} candidate rows", rows.len());
+    let target = rows[rows.len() - 2].center();
 
     // Press on the card, then drag onto the space — and hold there, which is the state being
     // described. The release is deliberately not sent: the highlight is a mid-drag thing.
@@ -2250,6 +2272,9 @@ fn agent_node(running: bool) -> vellum_ui::SelectionItem {
     let own = AgentRules::default();
     SelectionItem {
         agent: Some(AgentSummary {
+                chat_theme: None,
+                chat_opacity: 255,
+                has_chat_background: false,
             role: "Reviewer".to_owned(),
             role_kind: RoleKind::Worker,
             provider: None,
@@ -2441,7 +2466,18 @@ fn the_inspector_shows_where_an_agents_rules_came_from() {
     let state = selected_state(&selection, Some(SELECTED));
     settle(&ctx, &mut chrome, &state);
 
-    let full = frame_painted(&ctx, &mut chrome, &state, input());
+    // A tall window, for the reason `the_properties_panel_stays_inside_the_window` already
+    // gives: the whole panel has to lay out without scrolling, or an assertion about what is
+    // *painted* is really an assertion about what fits. This test failed the day the Context
+    // section gained its *Attach a link…* button — one row taller, and the RULES section's
+    // last provenance caption fell off the bottom of a 900pt window while being drawn
+    // perfectly correctly. Nothing about the panel was wrong; the viewport was too short to
+    // hold the question being asked.
+    let tall = || RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 1600.0))),
+        ..RawInput::default()
+    };
+    let full = frame_painted(&ctx, &mut chrome, &state, tall());
     let painted: Vec<String> =
         painted_text(&full).into_iter().map(|(_, text, _)| text).collect();
     assert!(painted.iter().any(|t| t.contains("Reviewer")), "the role label: {painted:?}");

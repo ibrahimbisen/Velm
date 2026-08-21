@@ -86,6 +86,35 @@ const LINK_CARD_SIZE: (f64, f64) = (250.0, 190.0);
 /// The smallest eraser, in world units, whatever the nib is set to.
 const ERASER_MIN_RADIUS: f64 = 6.0;
 
+/// How much attached-file text an agent's system context may carry, in characters, across
+/// every source on the node.
+///
+/// ⚠ **This is prepended to every turn for the life of the session**, so it is not a display
+/// budget: it competes with the user's own instructions for the model's attention and, on a
+/// metered provider, is paid for on every message. 24,000 characters is roughly six thousand
+/// tokens — enough for a specification or a long article, and far short of a book.
+///
+/// The alternative shape, and why it is not this one yet: a `context.read` verb on the shim,
+/// so an agent fetches what it needs rather than being handed everything. That is the right
+/// end state and it is more machinery than this; what makes *this* honest in the meantime is
+/// that a truncation says so in the text, so an agent knows it is holding an excerpt.
+const CONTEXT_TEXT_BUDGET: usize = 24_000;
+
+/// The most any one source may take of [`CONTEXT_TEXT_BUDGET`].
+///
+/// Per-source as well as total, so four attachments are four excerpts rather than the first
+/// one and three names: attaching a long PDF and then a short brief must not silently drop
+/// the brief, which is the one the user just added and most likely meant.
+const CONTEXT_TEXT_PER_SOURCE: usize = 8_000;
+
+/// How many per-agent lines an away-mode digest puts in the toast when something needs the
+/// user.
+///
+/// Four, because a toast is read at a glance and a board of a dozen agents would otherwise
+/// produce a wall of text in the corner. The whole digest is in the log and the ranking puts
+/// Blocked and Failed first, so the four shown are the four worth showing.
+const MAX_DIGEST_LINES: usize = 4;
+
 /// A document ink item as a `vellum_ink::Stroke`, in **absolute** world coordinates.
 ///
 /// The direction that did not exist. `crate::draw` converts one way, per frame and
@@ -181,8 +210,40 @@ impl VectorFormat {
 ///
 /// Only the Miro arm needs asking: every other flavour has always gone to the pointer,
 /// and this exists because that arm did not and the difference read as a bug.
+/// A Miro import in flight, across the frames it takes.
+///
+/// # Why an import has states at all
+///
+/// Measured on the reference board: 596 widgets and a 110.5 MB backup take about two
+/// seconds, and **97% of that is assets** — inflating them out of the ZIP and fsyncing each
+/// into the blob store. That work touches no document, so it does not belong on the thread
+/// that has to keep drawing; what remains, creating the items, is ~50 ms and does have to
+/// be here because it writes to the CRDT.
+///
+/// So an import is announced on one frame, planned and handed to a worker on the next, and
+/// finished whenever the worker answers. The window paints throughout.
+pub(crate) enum PendingImport {
+    /// Seen on the pasteboard and toasted; nothing decoded yet. Holding the HTML rather
+    /// than re-reading the pasteboard next frame is deliberate — the user may well have
+    /// copied something else in the meantime, and the paste they asked for is the one they
+    /// pressed the key for.
+    Announced { aim: PasteAim, at: WorldPoint, html: String },
+    /// The assets are being fetched on a worker. `source` is boxed because this variant
+    /// would otherwise make the enum as large as a decoded board, and it is stored in an
+    /// `Option` that every frame moves.
+    Fetching {
+        aim: PasteAim,
+        at: WorldPoint,
+        source: Box<vellum_import::ImportedBoard>,
+        answers: std::sync::mpsc::Receiver<vellum_import::PrefetchedAssets>,
+        /// When the user pressed the key, so the finish can report the whole wait rather
+        /// than the part of it that happened on this thread.
+        since: Instant,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PasteAim {
+pub(crate) enum PasteAim {
     /// Under the mouse, camera untouched — `⌘V` into a board that already has content.
     Pointer,
     /// At Miro's own coordinates, then fit — Board ▸ Import from Miro, into a board made
@@ -364,6 +425,23 @@ pub(crate) struct Drag {
 /// Both layers, not only the one being edited, because the editor names both files and the
 /// user may save either from one sitting. `RuleFile::default()` stands for *there is no such
 /// file*, which is the same thing [`vellum_agent::RuleFile::read`] answers for an absent one.
+/// Every orchestrator's stored region, and the projection generation they were read at.
+///
+/// See [`ActiveState::territories`] for why this is a cache rather than a walk. The rule for
+/// anyone touching it: **only document-derived facts go in here.** The selection and the live
+/// sweep are composed on top at read time, because neither of them changes `generation` — a
+/// selected region cached under the document's number would keep its emphasis after the
+/// selection moved on, which is a highlight that lies about what you have picked.
+/// A selected connector, and where its two ends are: `(id, start, end)` in world space.
+pub(crate) type ConnectorGrips = (DocId, (f64, f64), (f64, f64));
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TerritoryCache {
+    /// `None` until the first read, and after [`Self::forget`].
+    pub(crate) generation: Option<u64>,
+    pub(crate) tints: Vec<crate::draw::TerritoryTint>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RulesSnapshot {
     pub(crate) global: vellum_agent::RuleFile,
@@ -540,6 +618,29 @@ impl ActiveState {
                 self.shell.library.set_default_display_mode(mode);
                 // Every node that never chose a mode follows this, so the views the painter
                 // reads are now stale — feature 2's second half is exactly that they move.
+                self.shell.invalidate_selection();
+            }
+            // Which provider an inheriting node runs on. Persisted like the display default,
+            // and read wherever `Inherit` is resolved — which until this existed was a
+            // constant, so the control promised a default that could not move.
+            UiEvent::DefaultProviderChanged(provider) => {
+                self.shell.library.set_default_provider(provider);
+                self.shell.invalidate_selection();
+            }
+            // Feature 12's app-wide half. Read back and written whole, so a change to one
+            // field cannot drop the others — the same reason `apply_agent_edit` does one
+            // `edit` call rather than one per row.
+            UiEvent::SpeechPreferenceChanged(preference) => {
+                let mut speech = self.shell.library.speech();
+                speech.preference = preference;
+                self.shell.library.set_speech(speech);
+                self.publish_speech();
+            }
+            UiEvent::ChooseSpeechModel => self.choose_speech_model(),
+            UiEvent::DefaultChatThemeChanged(theme) => {
+                self.shell.library.set_default_chat_theme(theme);
+                // Same reason as the display mode above: every node that never chose a
+                // theme of its own draws in this one, so the painter's views are stale.
                 self.shell.invalidate_selection();
             }
             UiEvent::ProviderSignIn(provider) => self.ask_provider_key(provider),
@@ -770,6 +871,11 @@ impl ActiveState {
             resolved.push((answer.item, answer.card, image, icon));
         }
 
+        // Kept for the failure path below, which is the only route back: `Fetcher::seen`
+        // already records these as asked-for, so a batch that is dropped without being
+        // applied would leave every card in it blank until the app restarted.
+        let filled: Vec<DocId> = resolved.iter().map(|(id, ..)| *id).collect();
+
         let result = self.editor.edit(|board| {
             board.begin_undo_group()?;
             for (id, card, image, icon) in &resolved {
@@ -824,6 +930,12 @@ impl ActiveState {
         });
         if let Err(error) = result {
             self.failed("filling in a link card", &error);
+            // Un-ask them, or these cards are blank for the life of the process. The next
+            // frame's `poll_visible_link_previews` will request them again if they are
+            // still on screen and still missing something.
+            for id in filled {
+                self.links.forget_item(id);
+            }
             return;
         }
         self.shell.invalidate_selection();
@@ -1121,6 +1233,99 @@ impl ActiveState {
         );
     }
 
+    /// Picks a picture for the selected agent node's chat to sit on.
+    ///
+    /// ⚠ **Written to unblock a build, and the shape is inferred rather than specified.**
+    /// `Command::SetChatBackground` was dispatched here before this existed, so everything
+    /// around it decided what it has to be: `AgentModel::chat_background` is an
+    /// `Option<String>`, `draw::chat_background_of` hands that string to `Assets` as a blob
+    /// hash, and `AgentEdit::ChatBackground` is the one writer. So this is *pick a file,
+    /// store it, set the hash* — the same three steps `attach_archive_from_picker` takes,
+    /// and it routes through `apply_agent_edit` so a background is one undo step and honours
+    /// the same locks and selection rules every other node edit does.
+    ///
+    /// **The bytes are copied into the blob store rather than referenced by path**, unlike
+    /// a `.rtb` archive. A board is a document that has to open on another machine and
+    /// after the picture has been moved; a path in the document would be a board that looks
+    /// different tomorrow. The store is content-addressed, so two nodes sharing a backdrop
+    /// share one copy.
+    ///
+    /// Cancelling the dialog does nothing at all, which is what a cancel means.
+    fn attach_chat_background(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose a background for this agent's chat")
+            .add_filter("Image", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
+            .pick_file()
+        else {
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.failed("reading that picture", &anyhow::Error::from(error));
+                return;
+            }
+        };
+        // Stored before the document is touched, for `apply_link_fetches`' reason: `put`
+        // hashes and writes a file, and doing that inside an undo group holds the group
+        // open across disk I/O.
+        let hash = match self.editor.assets().blobs().put(&bytes) {
+            Ok(hash) => hash.to_hex().to_string(),
+            Err(error) => {
+                self.failed("storing that picture", &error.into());
+                return;
+            }
+        };
+        self.apply_agent_edit(&vellum_ui::AgentEdit::ChatBackground(Some(hash)));
+    }
+
+    /// Hand the transcription setting to the agent runtime.
+    ///
+    /// ⚠ **One publisher, called by every writer.** The setting lives in the library sidecar
+    /// and is *read* by three unrelated things — the menu's ticks, `end_voice` on the frame
+    /// thread, and `Handler::ingest` on the IPC thread — and only the last of those cannot
+    /// reach the library. A second call site that forgot this is a machine where changing the
+    /// transcriber in the menu moves a spoken prompt and leaves an agent's media ingestion on
+    /// the old one, which is the kind of split nobody would think to look for.
+    pub(crate) fn publish_speech(&mut self) {
+        let speech = self.shell.library.speech();
+        self.agent_runtime.set_speech(&speech);
+        // The probe is cached for the session beside the provider status, so a newly named
+        // model or a newly installed binary has to refresh it or the menu's status line goes
+        // on describing the machine as it was at launch.
+        self.shell.refresh_local_transcriber();
+    }
+
+    /// Preferences ▸ Voice ▸ *Choose a model file…*
+    ///
+    /// A real picker rather than a text field, because the answer is a path to a file that is
+    /// gigabytes and lives wherever the user put it — which is exactly what a picker is for and
+    /// exactly what a text field gets wrong. The filter offers `.bin` (whisper.cpp's
+    /// `ggml-*.bin`) and `.gguf`, and **All files** stays available: a transcriber this does
+    /// not know about must not be unreachable because of a file extension.
+    fn choose_speech_model(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose a whisper model")
+            .add_filter("Whisper model", &["bin", "gguf"])
+            .add_filter("All files", &["*"])
+            .pick_file()
+        else {
+            return;
+        };
+        let named = path.display().to_string();
+        let mut speech = self.shell.library.speech();
+        speech.model_file = Some(named.clone());
+        self.shell.library.set_speech(speech);
+        self.publish_speech();
+        // Named rather than a bare "Saved": the whole difficulty of this setting is *which*
+        // file, so the confirmation is the file.
+        let shown = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or(named, std::borrow::ToOwned::to_owned);
+        self.shell.toast(Toast::success(format!("Transcribing with {shown}")));
+    }
+
     fn attach_archive_from_picker(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Choose the board's Miro backup")
@@ -1278,11 +1483,20 @@ impl ActiveState {
     }
 
     /// The configuration and the role label of an agent node.
+    ///
+    /// ⚠ **The label goes through [`node_name`], so it is never empty.** This is the string
+    /// that becomes *"You are the Reviewer"* in the resolved system context, and
+    /// `rules::resolve` drops the whole sentence when it is blank — so an agent whose label
+    /// the user cleared was launched with no statement of what it is, while every other
+    /// surface in the application went on calling it "Worker". A role that exists everywhere
+    /// except inside the agent's own instructions is feature 5 failing silently.
     fn agent_model(&self, doc: DocId) -> Option<(vellum_agent::AgentModel, String)> {
         let item = self.editor.board().item(doc).ok()?;
         match &item.kind {
             ItemKind::Agent { model, label } => {
-                Some((crate::agent::decode(model), label.to_plain()))
+                let config = crate::agent::decode(model);
+                let name = node_name(label, config.role_kind);
+                Some((config, name))
             }
             _ => None,
         }
@@ -1422,6 +1636,14 @@ impl ActiveState {
         if stale {
             self.sync_agent_wiring();
         }
+
+        // ⚠ **Voice is drained above the `dormant` early-out, and it has to be.** A node with
+        // voice turned on and no turn in flight makes the runtime dormant, which is the exact
+        // state someone is in when they select an agent and start talking to it — so draining
+        // voice below this line would mean a transcription that never arrives on precisely the
+        // board where the feature is being used. Its own first line is two cheap checks, so an
+        // ordinary board still pays nothing.
+        self.drain_voice();
 
         // The whole per-frame cost on an ordinary board ends here: two comparisons above,
         // one `is_some_and`, and one `dormant()`. Nothing below runs — not even a clock
@@ -1695,8 +1917,32 @@ impl ActiveState {
                     self.spawn_agent(&parent, &request, reply);
                 }
                 crate::agent_runtime::DocumentWork::ReadConfig { node } => {
-                    match self.agent_doc(&node).and_then(|doc| self.agent_model(doc)) {
-                        Some((model, _)) => reply.config(model),
+                    // The board in front, then any parked one — see `parked_agent_model`.
+                    match self
+                        .agent_doc(&node)
+                        .and_then(|doc| self.agent_model(doc))
+                        .map(|(model, _)| model)
+                        .or_else(|| self.parked_agent_model(&node))
+                    {
+                        Some(model) => reply.config(model),
+                        None => reply.refuse(self.unreachable_node(&node)),
+                    }
+                }
+                // The text is already read; this is the document half — cache it in the blob
+                // store and record it on the node, exactly as the user's own attach does.
+                // The board in front, then any parked one — the same two steps `ReadConfig`
+                // and `WriteConfig` take, and for the same reason. An agent on a parked board
+                // goes on running (`agent_runtime`'s header says so outright), so it can ask
+                // Velm to read a document at a moment when the user happens to be looking at a
+                // different tab — and refusing *because of which tab is in front* makes the
+                // verb work or not according to something the agent cannot see and did not do.
+                crate::agent_runtime::DocumentWork::Attach { node, ingested } => {
+                    match self.agent_doc(&node) {
+                        Some(doc) => {
+                            self.attach_ingested(doc, *ingested);
+                            reply.done();
+                        }
+                        None if self.attach_ingested_parked(&node, *ingested) => reply.done(),
                         None => reply.refuse(self.unreachable_node(&node)),
                     }
                 }
@@ -1706,6 +1952,7 @@ impl ActiveState {
                             self.write_agent_model(doc, &model);
                             reply.done();
                         }
+                        None if self.write_parked_agent_model(&node, &model) => reply.done(),
                         None => reply.refuse(self.unreachable_node(&node)),
                     }
                 }
@@ -1728,13 +1975,116 @@ impl ActiveState {
     /// defer — an agent process is blocked on the reply, bounded by `REPLY_TIMEOUT` — so the
     /// refusal is right and only the wording was wrong.
     fn unreachable_node(&self, node: &crate::agent_runtime::NodeKey) -> &'static str {
-        let parked =
-            self.agent_board.as_ref().map(|stamp| &stamp.key) != Some(&node.board);
-        if parked {
-            "that agent's board is open behind another tab; bring it forward and ask again"
-        } else {
-            "that node is not an agent on the board in front"
+        // Reaching here now means the board is not open at all: a parked one is served
+        // directly (`parked_agent_model`, `write_parked_agent_model`), so the sentence that
+        // told an agent to bring a tab forward would be describing a step that no longer
+        // changes anything.
+        let _ = self.agent_board.as_ref().map(|stamp| &stamp.key) != Some(&node.board);
+        "that node is not an agent on any board Velm has open"
+    }
+
+    /// A node's agent model on **any open board**, in front or parked.
+    ///
+    /// ⚠ **The meta agent's whole power was limited to whichever tab happened to be in
+    /// front.** Feature 6 is *"reach into and edit other agents' configuration"*, and a board
+    /// behind another tab is open — its document is in memory, its agents are running, and
+    /// the only thing standing between a configure request and it was that `agent_doc`
+    /// answers for one board. Parking a tab is not closing it, and a verb that acts on a
+    /// document does not need that document to be the one being painted.
+    ///
+    /// The refusal is kept for a board that is genuinely **not open**: that document is on
+    /// disk and writing to it behind the user's back is a different thing entirely, with no
+    /// undo history to hold the change and no window in which to see it.
+    fn parked_board_with(
+        &mut self,
+        node: &crate::agent_runtime::NodeKey,
+    ) -> Option<vellum_ui::TabKey> {
+        self.session.iter().find_map(|parked| {
+            let key = vellum_agent::BoardKey::for_board(parked.path());
+            (key == node.board).then_some(parked.key())
+        })
+    }
+
+    /// Reads one agent's configuration off a parked board.
+    fn parked_agent_model(
+        &mut self,
+        node: &crate::agent_runtime::NodeKey,
+    ) -> Option<vellum_agent::AgentModel> {
+        let tab = self.parked_board_with(node)?;
+        let doc: DocId = node.item.parse().ok()?;
+        let parked = self.session.iter().find(|parked| parked.key() == tab)?;
+        let item = parked.editor().board().item(doc).ok()?;
+        match &item.kind {
+            ItemKind::Agent { model, .. } => Some(crate::agent::decode(model)),
+            _ => None,
         }
+    }
+
+    /// Writes one agent's configuration onto a parked board.
+    ///
+    /// Through the parked `Editor`'s own `edit`, so the change joins that board's undo
+    /// history and its autosave exactly as it would have if the tab were in front — a write
+    /// that bypassed it would be a change the user cannot undo on a board they were not
+    /// looking at, which is the worst of both.
+    fn write_parked_agent_model(
+        &mut self,
+        node: &crate::agent_runtime::NodeKey,
+        model: &vellum_agent::AgentModel,
+    ) -> bool {
+        let Some(tab) = self.parked_board_with(node) else { return false };
+        let Ok(doc) = node.item.parse::<DocId>() else { return false };
+        let encoded = crate::agent::encode(model);
+        let Some(parked) = self.session.iter_mut().find(|parked| parked.key() == tab) else {
+            return false;
+        };
+        let editor = parked.editor_mut();
+        let Ok(item) = editor.board().item(doc) else { return false };
+        let ItemKind::Agent { label, .. } = &item.kind else { return false };
+        let kind = ItemKind::Agent { model: encoded, label: label.clone() };
+        editor.edit(|board| Ok(board.set_kind(doc, kind)?)).is_ok()
+    }
+
+    /// [`Self::attach_ingested`] for a node on a **parked** board.
+    ///
+    /// The sibling of [`Self::write_parked_agent_model`], written against the same three
+    /// facts: the board is found by key, the item id is parsed from the node key's *item* half
+    /// alone, and the edit goes through that board's own `Editor` so its autosave and its undo
+    /// history are the ones that record it.
+    ///
+    /// ⚠ **The extract is cached in the parked board's blob store, not the hot one.** The
+    /// hash is written into that board's document, and a hash pointing into a store the board
+    /// does not own is a context source that reads as missing the moment the tab it was taken
+    /// from is closed. Both halves have to name the same board or neither is right.
+    fn attach_ingested_parked(
+        &mut self,
+        node: &crate::agent_runtime::NodeKey,
+        mut ingested: vellum_agent::ingest::Ingested,
+    ) -> bool {
+        let Some(tab) = self.parked_board_with(node) else { return false };
+        let Ok(doc) = node.item.parse::<DocId>() else { return false };
+        let Some(parked) = self.session.iter_mut().find(|parked| parked.key() == tab) else {
+            return false;
+        };
+        let editor = parked.editor_mut();
+
+        if ingested.outcome.is_text() && !ingested.text.trim().is_empty() {
+            match editor.assets().blobs().put(ingested.text.as_bytes()) {
+                Ok(hash) => ingested.source.extract = Some(hash.to_hex()),
+                Err(error) => log::warn!(
+                    "the text of {} could not be cached ({error}); the agent will be told the \
+                     file's name and not its contents",
+                    ingested.source.source
+                ),
+            }
+        }
+
+        let Ok(item) = editor.board().item(doc) else { return false };
+        let ItemKind::Agent { model, label } = &item.kind else { return false };
+        let mut config = crate::agent::decode(model);
+        config.context.push(ingested.source);
+        let kind =
+            ItemKind::Agent { model: crate::agent::encode(&config), label: label.clone() };
+        editor.edit(|board| Ok(board.set_kind(doc, kind)?)).is_ok()
     }
 
     fn spawn_agent(
@@ -1828,6 +2178,12 @@ impl ActiveState {
         // cap of five spawns without limit.
         child.spawned_by = Some(parent.wire());
         child.working_dir = boss.working_dir.clone();
+        // A spawned agent inherits the project's worktree setting exactly as a hand-placed one
+        // does — the sibling of the `Tool::Agent` arm, and the reason feature 4 says "per
+        // project" rather than "per agent". An orchestrator that split work five ways is the
+        // case isolation exists for, so it is the last place it should have to be switched on
+        // by hand.
+        child.worktree = self.shell.library.worktrees();
 
         let kind = ItemKind::Agent {
             model: crate::agent::encode(&child),
@@ -1893,30 +2249,117 @@ impl ActiveState {
 
         // What this agent can reach on the board, and therefore what it is told about.
         //
-        // `None` when nothing was shipped beside the application: an agent told about a
-        // command it has not got is worse than one told nothing, and the missing shim is
-        // reported to the user once, by `start_agent_at`, rather than being narrated by every
-        // agent that fails to use it.
+        // ⚠ **Two ways of reaching it, and telling an agent about the wrong one is worse than
+        // telling it nothing.** A delegated CLI (`claude`, ACP, PTY) has a shell and reaches
+        // Velm by running `velm-agent-cli`; that needs the shim on disk, and an agent told
+        // about a command it has not got spends a turn discovering it. An **HTTP** agent has no
+        // shell at all — it is an API call — and reaches Velm by calling the tools
+        // `transport/http.rs` advertises on the wire. It needs no shim, and the command list
+        // would be a page of instructions it cannot follow.
+        //
+        // `native` is what separates them, and the condition is the transport rather than the
+        // provider: `Transport::Http` is what Kimi, a local model and a custom endpoint all
+        // resolve to, and it is also what Claude resolves to when the user has a key but no
+        // `claude` binary.
+        let native = matches!(
+            self.resolved_provider(model).transport,
+            Some(vellum_agent::Transport::Http)
+        );
         let shim = vellum_agent::transport::shim().filter(|shim| shim.any());
-        let tools = shim.and_then(vellum_agent::transport::Shim::cli).map(|_| {
-            vellum_agent::rules::BoardTools {
+        let tools = (native || shim.and_then(vellum_agent::transport::Shim::cli).is_some()).then(
+            || vellum_agent::rules::BoardTools {
                 command: vellum_agent::transport::AGENT_CLI.to_owned(),
                 may_spawn: model.role_kind.may_spawn(),
+                // Feature 6's power, and it is asked of the same `RoleKind` the IPC boundary
+                // asks — not inferred from `may_spawn` beside it, because an orchestrator may
+                // spawn and may not configure.
+                may_configure: model.role_kind.may_configure_others(),
                 mcp: shim.is_some_and(|shim| shim.mcp().is_some()),
-            }
-        });
+                native,
+            },
+        );
 
         let mut context = resolved.system_context_with(tools.as_ref());
+        // ⚠ **Feature 7's per-agent scope, given its one behavioural consumer.**
+        // `FileTreeModel::agent` was settable in the inspector, stored in the document, drawn
+        // in a picker — and read by nothing at all, so two trees scoped to two different
+        // agents behaved identically and the "per agent" half of the feature was a label.
+        // Naming the tree in the agent's own context is what makes the scoping mean
+        // something: an agent told *"the part of this project you are working in is
+        // src/lexer"* narrows its own reading, which is what the user drew the scope to say.
+        // It is a statement rather than an enforcement, and it says so — Velm does not
+        // sandbox a coding agent's filesystem and claiming otherwise would be worse than
+        // saying nothing.
+        let mine: Vec<String> = self
+            .editor
+            .board()
+            .item_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let item = self.editor.board().item(id).ok()?;
+                let ItemKind::FileTree { model } = &item.kind else { return None };
+                let tree = crate::filetree::decode(model);
+                // Scoped to this node, or to nobody: an unscoped tree is the board's, and
+                // every agent on the board may read it.
+                let ours = tree.agent.as_deref().is_none_or(|owner| owner == key.item);
+                (ours && !tree.root.trim().is_empty()).then_some(tree.root)
+            })
+            .collect();
+        if !mine.is_empty() {
+            context.push_str("\n## The part of the project you are working in\n\n");
+            for root in &mine {
+                context.push_str(&format!("- {root}\n"));
+            }
+            context.push_str(
+                "\nThese are the folders the person put on the board for you. Prefer them \
+                 when you are looking for something; they are where your work is expected to \
+                 be. Nothing stops you reading elsewhere — this is what you were pointed at, \
+                 not a boundary Velm enforces.\n",
+            );
+        }
         if !model.context.is_empty() {
             context.push_str("\n## Context you were given\n\n");
             for source in &model.context {
                 let label = if source.label.is_empty() { &source.source } else { &source.label };
                 context.push_str(&format!("- {label} ({})\n", source.source));
             }
+            // ⚠ **The contents, not just the names.** A list of filenames is what feature 18
+            // looked like before this: an agent told that `spec.pdf` was attached, with no way
+            // to read it — the shim has no verb for a context source, and a coding agent could
+            // at best open the file itself, which is nothing for a web page or a spreadsheet.
+            //
+            // Bounded twice, per source and in total, because this text is prepended to every
+            // turn for the life of the session: an unbounded excerpt would push the user's own
+            // instructions out of the model's attention and, on a metered provider, be paid
+            // for on every message. What is cut is said out loud, so the agent knows to ask
+            // for the rest rather than answering from a truncation it thinks is the whole.
+            let mut budget = CONTEXT_TEXT_BUDGET;
+            for source in &model.context {
+                let Some(hash) = source.extract.as_deref() else { continue };
+                let Some(text) = self.context_extract(hash) else { continue };
+                if budget == 0 {
+                    break;
+                }
+                let label = if source.label.is_empty() { &source.source } else { &source.label };
+                let room = budget.min(CONTEXT_TEXT_PER_SOURCE);
+                // `chars().take` rather than a byte slice: this is arbitrary text from a
+                // user's own documents, and CLAUDE.md's feedback 30 is a whole entry about
+                // slicing one of those at a byte index.
+                let excerpt: String = text.chars().take(room).collect();
+                let cut = excerpt.chars().count() < text.chars().count();
+                budget = budget.saturating_sub(excerpt.chars().count());
+                context.push_str(&format!("\n### {label}\n\n{excerpt}\n"));
+                if cut {
+                    context.push_str(
+                        "\n*(cut off here — this is the beginning of the file, not all of \
+                         it. Say so if you need the rest.)*\n",
+                    );
+                }
+            }
         }
 
         vellum_agent::LaunchSpec {
-            provider: model.provider.clone().unwrap_or_default(),
+            provider: self.resolved_provider(model),
             command: None,
             args: Vec::new(),
             cwd: working.map(Path::to_path_buf),
@@ -1962,6 +2405,277 @@ impl ActiveState {
         }
     }
 
+    /// Confirms, then deletes one agent's git worktree — feature 4's removal half.
+    ///
+    /// # Why a confirmation, and why the refusal is not one
+    ///
+    /// This removes a directory, so it asks first: `Library::purge`'s rule, applied to the
+    /// other thing in this application that deletes something off disk. But a worktree
+    /// holding **uncommitted work** is not a stronger confirmation — it is a refusal.
+    /// `worktree::remove` checks `git status --porcelain` itself and answers
+    /// `AgentError::Refused` naming the files, and that refusal is the whole reason a
+    /// checkout is safe to hand an agent: work in it cannot be thrown away by a click here.
+    fn ask_remove_worktree(&mut self) {
+        let Some(doc) = self.selected_agent() else { return };
+        let Some((config, name)) = self.agent_model(doc) else { return };
+        let Some(path) = config.worktree_path.clone() else {
+            self.gap("that agent has no worktree of its own yet");
+            return;
+        };
+        // ⚠ **The ask and the act must share one precondition.** `remove_worktree` needs the
+        // repository as well as the checkout — `git worktree remove` is run against the repo —
+        // so gating this on the path alone put a destructive dialog naming a real directory in
+        // front of a removal that would then refuse. A confirmation for something that cannot
+        // happen is worse than no button: the user answers *Remove*, watches nothing happen,
+        // and has no idea which of the two was wrong.
+        if config.working_dir.is_none() {
+            self.gap(
+                "this agent has a worktree and no working folder, so Velm cannot reach the \
+                 repository it belongs to. Set the node's folder first.",
+            );
+            return;
+        }
+        self.shell.ask(
+            move |id| {
+                vellum_ui::Dialog::destructive(
+                    id,
+                    format!("Remove {name}’s worktree?"),
+                    // Only what it does. `worktree::remove` runs `git worktree remove` and
+                    // prunes the administrative entry; the **branch stays**, which is the
+                    // right behaviour — the work an agent committed is on it — and claiming
+                    // otherwise would have people believing their commits went with it.
+                    format!(
+                        "This deletes the checkout at {path}. The branch it was on is kept, \
+                         with any commits on it. Refused if there is uncommitted work."
+                    ),
+                    "Remove",
+                )
+            },
+            crate::shell::Ask::RemoveWorktree(doc),
+        );
+    }
+
+    /// The removal itself, once confirmed.
+    fn remove_worktree(&mut self, doc: DocId) {
+        let Some((config, _)) = self.agent_model(doc) else { return };
+        let (Some(worktree), Some(working)) =
+            (config.worktree_path.clone(), config.working_dir.clone())
+        else {
+            self.gap("that agent has no worktree of its own");
+            return;
+        };
+        match vellum_agent::worktree::remove(Path::new(&working), Path::new(&worktree)) {
+            Ok(()) => {
+                // The path is forgotten **only** on success, so a refused removal leaves the
+                // node still pointing at its checkout — a node that forgot a directory that
+                // is still there is a directory nothing can remove afterwards.
+                let mut next = config;
+                next.worktree_path = None;
+                self.write_agent_model(doc, &next);
+                self.ok(format!("Removed {worktree}"));
+            }
+            // Its own sentence, not a wrapped one: `remove` names the uncommitted files, and
+            // that list is the whole remedy.
+            Err(error) => self.gap(&error.to_string()),
+        }
+    }
+
+    /// Feature 18's last step: turn an attached recording into words, where we can.
+    ///
+    /// `ingest` hands audio and video over deliberately — its `MediaHandoff` doc states the
+    /// contract and says that whoever owns transcription fills in the text — and for a long
+    /// time nobody did, so a dropped recording reached the agent as a filename and the node
+    /// said so. This is that consumer.
+    ///
+    /// **A no-op unless a transcriber is installed on this machine**, and a *local* one:
+    /// `voice::transcribe_media` refuses a hosted one on purpose, because uploading somebody's
+    /// video because they dragged it onto a node is a decision they did not make. On a refusal
+    /// the source stays exactly as it was — attached by path, with the outcome's own sentence —
+    /// which is the state that was true before and is still true now.
+    ///
+    /// Static, and taking the `Speech` rather than reading it from `self`, so both callers can
+    /// use it from wherever they run: the user's drop is on the frame thread and an agent's
+    /// `ingest` is on the IPC worker.
+    pub(crate) fn transcribe_media(
+        speech: &vellum_agent::voice::Speech,
+        ingested: &mut vellum_agent::ingest::Ingested,
+    ) {
+        let vellum_agent::ingest::Outcome::Transcribe(handoff) = &ingested.outcome else {
+            return;
+        };
+        let path = handoff.path.clone();
+        match vellum_agent::voice::transcribe_media(speech, &path) {
+            Ok(text) if !text.trim().is_empty() => {
+                let chars = text.chars().count();
+                ingested.text = text;
+                // The outcome moves to `Extracted`, which is what makes `is_text()` true —
+                // and `is_text()` is the gate `attach_ingested` uses to decide whether there
+                // is anything to cache. Leaving the outcome alone would transcribe the file
+                // and then throw the words away, which is the worst of both.
+                ingested.outcome = vellum_agent::ingest::Outcome::Extracted { chars };
+            }
+            // A transcriber that answers nothing is not a failure worth a message: an actual
+            // silent recording is the commonest reason, and the source is still attached.
+            Ok(_) => {}
+            Err(error) => log::info!("that recording was not transcribed: {error}"),
+        }
+    }
+
+    /// Record an already-read source on one agent node.
+    ///
+    /// The tail of both attach paths: the user's (a drop, the picker, the link prompt, which
+    /// read on the frame thread because a gesture has just happened) and an agent's (read on
+    /// the IPC thread, arriving here as finished text). Sharing this is what keeps the two
+    /// from disagreeing about where the extract is cached or how the node records it.
+    pub(crate) fn attach_ingested(
+        &mut self,
+        doc: DocId,
+        mut ingested: vellum_agent::ingest::Ingested,
+    ) {
+        if ingested.outcome.is_text() && !ingested.text.trim().is_empty() {
+            match self.editor.assets().blobs().put(ingested.text.as_bytes()) {
+                Ok(hash) => ingested.source.extract = Some(hash.to_hex()),
+                Err(error) => log::warn!(
+                    "the text of {} could not be cached ({error}); the agent will be told the \
+                     file's name and not its contents",
+                    ingested.source.source
+                ),
+            }
+        }
+        let Ok(item) = self.editor.board().item(doc) else { return };
+        let ItemKind::Agent { model, label } = &item.kind else { return };
+        let mut config = crate::agent::decode(model);
+        config.context.push(ingested.source);
+        let kind = ItemKind::Agent {
+            model: crate::agent::encode(&config),
+            label: label.clone(),
+        };
+        if let Err(error) = self.editor.edit(|board| Ok(board.set_kind(doc, kind)?)) {
+            self.failed("attaching that context", &error);
+            return;
+        }
+        self.shell.invalidate_selection();
+    }
+
+    /// Move a note's `.md` into the directory its new scope names, and answer its new stored
+    /// path. `None` when nothing moved — same directory, no store, or the move failed.
+    ///
+    /// Atomic in the sense that matters here: the copy is written whole through
+    /// `write_atomically` before the old file is removed, so an agent reading either path
+    /// mid-move sees a complete note. A rename would be cheaper and is wrong across a
+    /// filesystem boundary, which `<data-dir>` and a project directory routinely are.
+    fn move_note_file(
+        &mut self,
+        note: &vellum_agent::NoteModel,
+        scope: &vellum_agent::NoteScope,
+    ) -> Option<String> {
+        let board = self.agent_board_key();
+        let store = self.agent_runtime.note_store(&board)?;
+        let from = store.resolve_stored(&note.path).ok()?;
+        let stem = from.file_stem()?.to_string_lossy().into_owned();
+        let to = store.path_for(scope, &stem);
+        if to == from {
+            return None;
+        }
+        let text = std::fs::read_to_string(&from).ok()?;
+        // A collision is not an overwrite: another note of the same name in the target scope
+        // belongs to somebody, and silently replacing it is the one outcome a move may not
+        // have. `free_stem` is the rule board files already follow.
+        let to = if to.exists() { store.path_for(scope, &store.free_stem(scope, &stem)) } else { to };
+        if let Err(error) = vellum_agent::notes::write_atomically(&to, &text) {
+            self.gap(&format!("that note could not be moved: {error}"));
+            return None;
+        }
+        let moved = store.stored_path(&to);
+        // Removed only after the new copy is on disk. A failure here leaves two files rather
+        // than none, which is the direction to fail in.
+        if let Err(error) = std::fs::remove_file(&from) {
+            log::warn!("the old copy of {} could not be removed: {error}", from.display());
+        }
+        Some(moved)
+    }
+
+    /// Asks for a web address to attach to the selected agent — feature 18's other half.
+    ///
+    /// A text prompt rather than a picker, because no file picker accepts a URL. It reuses
+    /// `Dialog::rename`'s shape, which is this application's one-field question: a title, a
+    /// field, a confirm. The verb on the button says *Attach* so it cannot read as renaming
+    /// the node.
+    fn ask_attach_link(&mut self) {
+        let Some(doc) = self.selected_agent() else {
+            self.gap("Select one agent node first — a link is attached to a node, not a board.");
+            return;
+        };
+        self.shell.ask(
+            move |id| {
+                vellum_ui::Dialog::rename(id, "Attach a link", "")
+                    .with_confirm("Attach")
+                    .with_hint("https://… or a YouTube link")
+            },
+            crate::shell::Ask::AttachLink(doc),
+        );
+    }
+
+    /// The text of one ingested context source, by the hash `ContextSource::extract` holds.
+    ///
+    /// `None` for a hash that will not parse, a blob that is gone (the store is a cache and
+    /// the file it came from may have been attached on another machine) or bytes that are not
+    /// UTF-8. Every one of those degrades to *the agent is told the file's name*, which is
+    /// what it was told before this existed — a missing extract must never fail a launch.
+    fn context_extract(&self, hash: &str) -> Option<String> {
+        let hash: vellum_store::Hash = hash.parse().ok()?;
+        let bytes = self.editor.assets().blobs().get(&hash).ok()??;
+        String::from_utf8(bytes).ok()
+    }
+
+    /// The node's provider, with one substitution: **an API key is used when the CLI it would
+    /// otherwise delegate to is not installed.**
+    ///
+    /// # Why this exists
+    ///
+    /// Feature 17 makes a delegated CLI the default wherever one exists, because that process
+    /// already holds the user's subscription and the alternative bills them again for
+    /// something they have paid for. That is right, and it left a hole feature 16 falls
+    /// straight into: `Provider::OpenAi` defaults to the `codex` CLI, so on a machine without
+    /// `codex` a user could sign in with an OpenAI key — Preferences offers it, the key is
+    /// stored, the row says *has a key* — and every run would still fail with *"codex is not
+    /// installed"*. The credential was written to a file that only [`Transport::Http`] reads,
+    /// and nothing routed the node there.
+    ///
+    /// So the rule is: the CLI wins when it is present, and the key is the fallback when it is
+    /// not. Both halves matter — preferring the key would silently start metering somebody who
+    /// has a subscription, and refusing it leaves a signed-in provider that cannot run.
+    ///
+    /// **A transport the node chose for itself is never overridden.** That field exists so a
+    /// wrong default costs one setting rather than a broken feature, and a substitution that
+    /// second-guessed an explicit choice would take that back.
+    fn resolved_provider(
+        &self,
+        model: &vellum_agent::AgentModel,
+    ) -> vellum_agent::ProviderChoice {
+        let mut choice = model.provider.clone().unwrap_or_default();
+        if choice.transport.is_some() {
+            return choice;
+        }
+        let provider = choice.provider;
+        // Only for a provider that *has* an API to fall back to. `Local` and `Custom` are
+        // already `Http`, and a provider with no hosted base has nowhere for a key to be used.
+        if provider.default_base_url().is_none()
+            || provider.default_transport() == vellum_agent::Transport::Http
+        {
+            return choice;
+        }
+        // Read from the last probe rather than spawning one: `refresh_providers` runs at
+        // startup and after a sign-in, which are the two moments this answer can change.
+        let status = self.shell.provider_status(provider);
+        let installed = status.is_some_and(|status| status.available);
+        let has_key = status.is_some_and(|status| status.has_key);
+        if !installed && has_key {
+            choice.transport = Some(vellum_agent::Transport::Http);
+        }
+        choice
+    }
+
     /// Start an agent, optionally with a first prompt.
     ///
     /// Answers with a toast either way — a missing binary is the commonest failure by a wide
@@ -1976,6 +2690,27 @@ impl ActiveState {
         let key = self.agent_key(doc);
         if !self.agent_runtime.is_running(&key) {
             self.report_shim_gap();
+            // ⚠ **Say it when the substitution costs money.** `resolved_provider` falls back
+            // to the API when the delegated CLI is missing and a key is stored, which is the
+            // right outcome — a signed-in provider that cannot run is worse — but it moves the
+            // node from *your subscription* to *per token*, and the inspector's billing line
+            // is derived from the **stored** choice and goes on saying "subscription". A user
+            // who is paying twice must be told at the moment it starts, not left to notice on
+            // an invoice.
+            let resolved = self.resolved_provider(config);
+            if resolved.effective_transport() != config
+                .provider
+                .clone()
+                .unwrap_or_default()
+                .effective_transport()
+            {
+                self.gap(&format!(
+                    "{} is not installed, so this agent runs against the {} API with the key \
+                     you stored — billed per token rather than on your subscription.",
+                    resolved.provider.default_command().unwrap_or("its CLI"),
+                    resolved.provider.label()
+                ));
+            }
             let worktree = self.ensure_worktree(doc, &key, config);
             let mut spec = self.agent_launch_spec(&key, config, role);
             // After the spec, not inside it: the *rules* are still loaded from the node's own
@@ -2069,16 +2804,42 @@ impl ActiveState {
             }
         }
 
-        // Named rather than skipped. A node with the worktree switch on and no folder is the
-        // most likely way to end up here, and its symptom — the inspector reading *"Pending"*
-        // for ever — is exactly the silence this whole method exists to end.
-        let Some(working) = config.working_dir.as_deref().map(Path::new) else {
+        // ⚠ **A node with no folder of its own falls back to the board's**, which is what the
+        // inspector has always said it does: the Folder field's placeholder is the project
+        // directory and its caption reads *"Empty runs in <the board's folder>"*.
+        //
+        // This became load-bearing the moment the worktree preference started being inherited
+        // at placement. `AgentModel::worker()` leaves `working_dir` at `None`, so *every*
+        // freshly placed agent has one — and refusing here would have meant that turning
+        // Preferences ▸ Worktree isolation on produced an agent that says *"give the node a
+        // folder"* on every run, for the whole feature, unless the user had first typed a path
+        // into a field they had no reason to open. The refusal was right when the switch was
+        // per node and reached by hand; it is wrong as the default path.
+        //
+        // The board's own folder is the same value `agent_launch_spec` gives an agent as its
+        // `cwd` fallback, so the worktree is cut from the repository the agent would have run
+        // in — not from a different one.
+        let fallback = self
+            .editor
+            .path()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+        let Some(working) = config
+            .working_dir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .or(fallback)
+        else {
+            // Still named rather than skipped: a board that has never been saved has no
+            // folder either, and the symptom this method exists to end — the inspector
+            // reading *"Pending"* for ever — is the same.
             self.gap(
-                "this agent asked for its own git worktree and has no working folder — give \
-                 the node a folder, or the board a project.",
+                "this agent asked for its own git worktree and there is no folder to cut one \
+                 from — give the node a folder, or save the board into your project.",
             );
             return None;
         };
+        let working = working.as_path();
         let state_dir = crate::editor::data_directory();
 
         let made = vellum_agent::worktree::repo_root(working).and_then(|repo| {
@@ -2199,7 +2960,240 @@ pub struct Prompting {
     pub buffer: crate::edit::TextBuffer,
 }
 
+/// A note's **body**, being typed on the canvas.
+///
+/// # Why this is not the on-canvas caret either
+///
+/// The same argument [`Prompting`] makes, from the other side. `crate::edit`'s caret edits an
+/// item's text *in the document*: every keystroke is a CRDT write and a `⌘Z` step. A note's
+/// body is not in the document at all — it is a `.md` file on disk, which is the whole of
+/// feature 8 — so routing it through the caret would put the file's contents into the board,
+/// double them, and make the two disagree the moment either was edited elsewhere.
+///
+/// So the keyboard takes a small mode of its own, the buffer lives here for the life of the
+/// session, and the **file** is what gets written when it ends. `NoteStore::save` is that
+/// write: atomic, debounced by the session rather than by a timer, and refusing to clobber a
+/// file that changed underneath — which is exactly the conflict case its own doc describes and
+/// which nothing could reach, because `save` had no caller in the workspace at all.
+#[derive(Debug)]
+pub struct NoteEditing {
+    /// The note node being typed into.
+    pub doc: DocId,
+    pub buffer: crate::edit::TextBuffer,
+}
+
 impl ActiveState {
+    /// Puts the keyboard in one note's body.
+    ///
+    /// Seeded from the text the runtime already holds — which the note poll fills from the
+    /// file and keeps fresh — so what is typed continues what is on disk rather than an empty
+    /// buffer over the top of it.
+    pub(crate) fn begin_note_editing(&mut self, doc: DocId) {
+        self.settle();
+        let key = self.agent_key(doc);
+        let existing = self.agent_runtime.note_text(&key).unwrap_or_default().to_owned();
+        self.note_editing =
+            Some(NoteEditing { doc, buffer: crate::edit::TextBuffer::at_end(existing) });
+        self.prompting_touched = Instant::now();
+    }
+
+    pub(crate) const fn is_editing_note(&self) -> bool {
+        self.note_editing.is_some()
+    }
+
+    /// Ends the session and **writes the file**.
+    ///
+    /// The one caller of `NoteStore::save` in the application, which is what makes the rest of
+    /// feature 8's file half reachable: the atomic write, the mtime stamp that stops the next
+    /// poll reporting a change the user just made, and the conflict path that keeps both
+    /// copies when the file moved underneath.
+    pub(crate) fn commit_note_editing(&mut self) {
+        let Some(session) = self.note_editing.take() else { return };
+        let text = session.buffer.text().to_owned();
+        let key = self.agent_key(session.doc);
+        // The buffer stays in the runtime either way, so a failed write does not also lose
+        // what was typed — the node goes on showing it and the next save can succeed.
+        self.agent_runtime.set_note_text(&key, text.clone());
+
+        let Ok(item) = self.editor.board().item(session.doc) else {
+            self.gap("that note is no longer on the board, so what you typed was not written");
+            return;
+        };
+        let ItemKind::AgentNote { model, title } = &item.kind else { return };
+        let mut note = crate::note::decode(model);
+        if note.path.trim().is_empty() {
+            self.gap(
+                "this note has no file yet — give it one in the properties panel and what you \
+                 typed will be written to it.",
+            );
+            return;
+        }
+        let title = title.clone();
+        let board = self.agent_board_key();
+        // Named rather than silent: a board with no note store is one Velm has not been told
+        // where to put notes for, and a save that vanished without a word is the report this
+        // house does not ship.
+        let Some(store) = self.agent_runtime.note_store(&board) else {
+            self.gap(
+                "this board has nowhere to keep notes yet — open it inside a project folder, \
+                 or save the board, and what you typed will be written.",
+            );
+            return;
+        };
+        match store.save(&mut note, &text, vellum_agent::Requester::User) {
+            // The stamps moved, so the model is written back — without it the next poll sees
+            // its own write as an external change and reloads over the user's text.
+            Ok(saved) => {
+                let kind = ItemKind::AgentNote { model: crate::note::encode(&note), title };
+                if let Err(error) = self.editor.edit(|board| Ok(board.set_kind(session.doc, kind)?))
+                {
+                    self.failed("saving that note", &error);
+                    return;
+                }
+                self.agent_runtime.set_note_model(&key, note);
+                if let vellum_agent::Save::Conflict { kept } = saved {
+                    // Both copies survive, and the user is told where the other one went —
+                    // `notes.rs` writes it rather than choosing between them.
+                    self.gap(&format!(
+                        "that note changed on disk while you were typing, so both were kept: \
+                         yours is in {}",
+                        kept.display()
+                    ));
+                }
+            }
+            Err(error) => self.failed("saving that note", &anyhow::anyhow!("{error}")),
+        }
+    }
+
+    /// A key pressed while a note body has the keyboard.
+    ///
+    /// Asked in the same place and on the same terms as `type_prompt_key`: **before**
+    /// `input.key`, or the letters of a note switch tools.
+    pub(crate) fn type_note_key(
+        &mut self,
+        key: &winit::keyboard::Key,
+        text: Option<&str>,
+    ) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+
+        if self.note_editing.is_none() {
+            return false;
+        }
+        let modifiers = self.input.modifiers();
+        let command = modifiers.super_key() || modifiers.control_key();
+        if command && self.chord_in_note(key) {
+            self.prompting_touched = Instant::now();
+            return true;
+        }
+
+        let Some(session) = self.note_editing.as_mut() else { return false };
+        let handled = match key {
+            // Enter is a **newline**, not a send: a note is prose. That is the one place this
+            // differs from the prompt row, and it is why the two are separate modes.
+            Key::Named(NamedKey::Enter) => {
+                session.buffer.insert("\n");
+                true
+            }
+            // Escape saves and leaves. Not "discard": what was typed is the note, and a mode
+            // whose exit key throws work away is one people learn to fear.
+            Key::Named(NamedKey::Escape) => {
+                self.commit_note_editing();
+                true
+            }
+            Key::Named(NamedKey::Backspace) => {
+                session.buffer.backspace();
+                true
+            }
+            Key::Named(NamedKey::Delete) => {
+                session.buffer.delete();
+                true
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                session.buffer.move_cursor(crate::edit::Motion::Left, modifiers.shift_key());
+                true
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                session.buffer.move_cursor(crate::edit::Motion::Right, modifiers.shift_key());
+                true
+            }
+            // No Up/Down: `Motion` deliberately has no vertical move, because a visual line
+            // needs the layout and this buffer has none — the same reason the on-canvas caret
+            // does without one. Home and End reach a paragraph's ends, which is what a note
+            // being typed actually needs.
+            Key::Named(NamedKey::Home) => {
+                session
+                    .buffer
+                    .move_cursor(crate::edit::Motion::ParagraphStart, modifiers.shift_key());
+                true
+            }
+            Key::Named(NamedKey::End) => {
+                session
+                    .buffer
+                    .move_cursor(crate::edit::Motion::ParagraphEnd, modifiers.shift_key());
+                true
+            }
+            Key::Named(NamedKey::Tab) => {
+                session.buffer.insert("  ");
+                true
+            }
+            _ => match text.filter(|typed| !typed.chars().any(char::is_control)) {
+                Some(typed) => {
+                    session.buffer.insert(typed);
+                    true
+                }
+                None => false,
+            },
+        };
+        if handled {
+            self.prompting_touched = Instant::now();
+        }
+        handled
+    }
+
+    /// The clipboard chords, inside a note body.
+    fn chord_in_note(&mut self, key: &winit::keyboard::Key) -> bool {
+        use winit::keyboard::Key;
+        let Some(session) = self.note_editing.as_mut() else { return false };
+        let Key::Character(character) = key else { return false };
+        match character.as_str() {
+            "a" | "A" => {
+                session.buffer.select_all();
+                true
+            }
+            "c" | "C" | "x" | "X" => {
+                let range = session.buffer.selection();
+                let selected =
+                    session.buffer.text().get(range).unwrap_or_default().to_owned();
+                if selected.is_empty() {
+                    return true;
+                }
+                let cut = matches!(character.as_str(), "x" | "X");
+                if cut {
+                    session.buffer.backspace();
+                }
+                if let Ok(mut board) = arboard::Clipboard::new() {
+                    let _ = board.set_text(selected);
+                }
+                true
+            }
+            "v" | "V" => {
+                if let Ok(mut board) = arboard::Clipboard::new()
+                    && let Ok(text) = board.get_text()
+                {
+                    session.buffer.insert(&text);
+                }
+                true
+            }
+            // Saving is what leaving does, and offering ⌘S as well costs nothing and is the
+            // chord everybody's hands already know for a file.
+            "s" | "S" => {
+                self.commit_note_editing();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Puts the keyboard in one node's prompt row.
     ///
     /// # Why this is not the on-canvas caret
@@ -2236,6 +3230,243 @@ impl ActiveState {
         let Some(session) = self.prompting.take() else { return };
         let text = session.buffer.text().to_owned();
         self.set_agent_draft(session.doc, text);
+    }
+
+    // ----- voice: feature 12 -------------------------------------------------
+    //
+    // `docs/07` §14 recorded this as the one feature with no capture path at all: 2,250
+    // tested lines in `vellum_agent::voice`, a cargo feature that forwards correctly, and
+    // **nothing in this crate calling any of it**. What follows is that join. The pieces it
+    // uses are all the module's own; nothing here re-decides what it already decided.
+
+    /// Which node a microphone press would address.
+    ///
+    /// `None` unless the selection is **exactly one** agent node that has turned voice on.
+    /// Exactly one, deliberately: an utterance is addressed to somebody, and there is no
+    /// sensible reading of one sentence spoken at three selected agents.
+    ///
+    /// The gate itself is [`crate::voice::target_for`], which cannot be satisfied for a node
+    /// with `voice` off — so the switch on the panel is load-bearing rather than decorative,
+    /// which is what this whole feature was missing.
+    fn voice_target(&self) -> Option<(DocId, vellum_agent::voice::VoiceTarget)> {
+        let stamp = self.agent_board.as_ref()?;
+        if !stamp.has_nodes {
+            return None;
+        }
+        let mut found = None;
+        for id in self.editor.unlocked_selected_ids() {
+            let Ok(item) = self.editor.board().item(id) else { continue };
+            if !matches!(item.kind, ItemKind::Agent { .. }) {
+                continue;
+            }
+            if found.is_some() {
+                // A second agent in the selection: refuse rather than pick one.
+                return None;
+            }
+            found = Some(id);
+        }
+        let doc = found?;
+        let (config, _) = self.agent_model(doc)?;
+        let key = crate::agent_runtime::NodeKey::new(&stamp.key, doc.to_string());
+        crate::voice::target_for(&key, &config).map(|target| (doc, target))
+    }
+
+    /// The microphone chord — **hold `⌥D`** on a selected agent node to talk to it.
+    ///
+    /// Returns whether the key was consumed. Asked **before** the prompt row, the note body
+    /// and the canvas caret, for the reason every one of those is asked before `input.key`:
+    /// otherwise the chord reaches a text session and types a character. It claims the key
+    /// only when [`Self::voice_target`] answers, so on every board that is not using voice
+    /// this function returns `false` on the first line and nothing about the keyboard changes.
+    ///
+    /// # Why the *physical* key
+    ///
+    /// ⚠ `event.logical_key` has the layout applied, and on macOS **Option+D is `∂`** — so
+    /// matching `Key::Character("d")` with Option held is a match that can never fire, and the
+    /// binding would have been dead on arrival on the primary target platform. Every other
+    /// chord in this application uses either a named key (arrows, Enter) or ⌘, neither of
+    /// which remaps, which is why this is the first place the question comes up. `KeyCode` is
+    /// position on the keyboard and is exactly right for a chord that is a *gesture* rather
+    /// than a character. Trap 9's lesson in a new place: a binding that never arrives is
+    /// invisible to every test that starts downstream of the key.
+    ///
+    /// # The repeat guard
+    ///
+    /// ⚠ A held key auto-repeats, and winit reports every repeat as another `Pressed`. Without
+    /// `repeat` the second one calls `press` again, which [`vellum_agent::voice::PushToTalk::press`]
+    /// correctly **refuses** — so a held key would raise *"already recording"* thirty times a
+    /// second and bury the recording indicator under toasts. This is the classic hold-to-talk
+    /// defect and it is one field.
+    ///
+    /// # Why the parts rather than the `KeyEvent`
+    ///
+    /// ⚠ `winit::event::KeyEvent` has a private `platform_specific` field, so **it cannot be
+    /// constructed outside winit** — a signature taking one is a signature no fixture can
+    /// drive, and this function would then be verifiable only by hand. That was the first
+    /// version of it. Taking the three fields it actually reads keeps the physical-key
+    /// behaviour exactly and makes `--demo agent-voice` able to enter here, which is where
+    /// `app.rs` enters. A test that cannot reach the real entry point tests something else.
+    pub(crate) fn talk_key(
+        &mut self,
+        physical: winit::keyboard::PhysicalKey,
+        pressed: bool,
+        repeat: bool,
+    ) -> bool {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+
+        let is_chord = matches!(physical, PhysicalKey::Code(KeyCode::KeyD))
+            && self.input.modifiers().alt_key();
+
+        if !pressed {
+            // **The gesture ends on the release of either of its own two keys, and on nothing
+            // else.** Both halves are load-bearing and each was wrong on its own:
+            //
+            // - Gating on `is_chord` misses the key-up entirely when `⌥` is let go before `D`,
+            //   which is the commoner way round — the chord stops matching while the finger is
+            //   still on the key, so the microphone would stay open until something else
+            //   happened to cancel it.
+            // - Claiming *any* key's release while a press is live is the other failure and it
+            //   is worse: a `V` pressed mid-hold falls through to the tool table, and then
+            //   `V`'s own key-up would end the recording and send it early. That is a
+            //   half-sentence delivered to an agent because someone touched an unrelated key.
+            //
+            // So: `D`, or either `⌥`. Other keys pass through mid-hold rather than being
+            // swallowed — voice is orthogonal to the tool, and taking the whole keyboard
+            // hostage for the length of a sentence would be a worse trade than a tool that
+            // changes under a recording that does not care.
+            let ends_gesture = matches!(
+                physical,
+                PhysicalKey::Code(KeyCode::KeyD | KeyCode::AltLeft | KeyCode::AltRight)
+            );
+            if ends_gesture && self.agent_runtime.voice_holding().is_some() {
+                self.end_talking();
+                return true;
+            }
+            return false;
+        }
+
+        if !is_chord || repeat {
+            // A repeat while holding is swallowed rather than passed on: the key is ours for
+            // the duration of the gesture, and letting the repeats through would type into
+            // whatever is behind the node.
+            return is_chord && self.agent_runtime.voice_holding().is_some();
+        }
+
+        let Some((doc, target)) = self.voice_target() else { return false };
+        self.begin_talking(doc, &target);
+        true
+    }
+
+    /// Opens the microphone for one node. The one place a press is started.
+    fn begin_talking(&mut self, doc: DocId, target: &vellum_agent::voice::VoiceTarget) {
+        let now = crate::agent_runtime::unix_now_ms();
+        match self.agent_runtime.begin_voice(target, now) {
+            Ok(()) => {
+                self.voice_node = Some(doc);
+                // The node draws *listening* from `AgentView::voice`; this is for the user who
+                // is looking at the toolbar rather than at the node they just selected.
+                self.shell.toast(Toast::info("Listening — let go of ⌥D to put it in the prompt"));
+            }
+            // Every refusal here already names what to do: the feature not being built in, a
+            // denied microphone permission, or a press that is already live.
+            Err(error) => self.shell.toast(Toast::error(error.to_string())),
+        }
+    }
+
+    /// Ends the press and sends the audio for transcription.
+    ///
+    /// The dictation itself arrives later, through [`Self::drain_voice`].
+    fn end_talking(&mut self) {
+        let now = crate::agent_runtime::unix_now_ms();
+        match self.agent_runtime.end_voice(now) {
+            Ok(backend) => self.shell.toast(Toast::info(format!("Transcribing with {backend}…"))),
+            Err(error) => {
+                self.voice_node = None;
+                self.shell.toast(Toast::error(error.to_string()));
+            }
+        }
+    }
+
+    /// Abandons a live press and throws the audio away.
+    ///
+    /// ⚠ **Every way this gesture can end without a key-up must call this.** Escape, a tab
+    /// switch, losing the window and quitting are the four, and they are exactly the four
+    /// feedback 27 named after an eraser sweep leaked an undo group by this route — then
+    /// feedback 35 recorded a prompt session violating the same rule anyway. A held microphone
+    /// that survives a tab switch is the same shape with a worse consequence: the device stays
+    /// open on a board the user is no longer looking at.
+    ///
+    /// Idempotent, so the four call sites cost nothing when nothing is being recorded.
+    pub(crate) fn cancel_talking(&mut self) {
+        if self.agent_runtime.voice_holding().is_some() {
+            self.agent_runtime.cancel_voice();
+            self.voice_node = None;
+            self.shell.toast(Toast::info("Stopped listening"));
+        }
+    }
+
+    /// Everything the transcription workers answered since the last frame.
+    ///
+    /// A transcription lands in the node's **draft**, through [`Self::set_agent_draft`] —
+    /// which is where a *typed* prompt lands. Voice deliberately adds no second way for a
+    /// prompt to reach an agent, so the undo group, the transcript and the rule cascade cannot
+    /// tell the two apart. It is left in the row rather than sent, because a transcriber
+    /// mishears and a spoken instruction you cannot correct before it runs is worse than
+    /// typing it.
+    ///
+    /// ⚠ **Routed by [`crate::agent_runtime::NodeKey`], never through the board in front.**
+    /// The first version resolved the dictation to a `DocId` with [`Self::voice_doc`] and
+    /// dropped it when that answered `None` — so speaking to an agent and then switching tabs
+    /// before the transcriber came back **silently discarded what the user had said**, with no
+    /// toast and nothing on the node. The wait is seconds long and switching tabs during it is
+    /// an ordinary thing to do. The runtime's draft store is keyed by board *and* item
+    /// precisely so it does not need the hot board, and `cancel`'s own doc already says an
+    /// answer still in flight is worth having; this is what makes that true.
+    pub(crate) fn drain_voice(&mut self) {
+        if !self.agent_runtime.voice_is_busy() && self.voice_node.is_none() {
+            return;
+        }
+        let now = crate::agent_runtime::unix_now_ms();
+        for event in self.agent_runtime.poll_voice(now) {
+            match event {
+                vellum_agent::voice::VoiceEvent::Transcribed(dictation) => {
+                    let Some(key) = crate::agent_runtime::NodeKey::from_wire(&dictation.node)
+                    else {
+                        continue;
+                    };
+                    // Appended rather than replacing: someone who typed half an instruction
+                    // and then spoke the rest meant both.
+                    let existing = self.agent_runtime.draft(&key);
+                    let joined = if existing.trim().is_empty() {
+                        dictation.text.clone()
+                    } else {
+                        format!("{} {}", existing.trim_end(), dictation.text)
+                    };
+                    self.agent_runtime.set_draft(&key, joined);
+                    self.voice_node = None;
+                }
+                vellum_agent::voice::VoiceEvent::Failed { node, message } => {
+                    if self.voice_doc(&node).is_some() {
+                        self.voice_node = None;
+                    }
+                    self.shell.toast(Toast::error(message));
+                }
+                // Emitted by nothing on this path — the *"it is on its way"* state is drawn
+                // from `AgentRuntime::voice_status`, which knows it without being told.
+                vellum_agent::voice::VoiceEvent::Transcribing { .. } => {}
+            }
+        }
+    }
+
+    /// The document id a voice event's node id names, if it is on the board in front.
+    ///
+    /// ⚠ Through [`crate::agent_runtime::NodeKey::from_wire`] and **both halves compared**,
+    /// which is [`Self::agent_doc`]'s rule and the defect feedback 37 recorded: one half of
+    /// the agent layer wrote a bare document id where the other expected a wire id, and a
+    /// private note became unreadable by the agent that owned it. One spelling, one inverse.
+    fn voice_doc(&self, wire: &str) -> Option<DocId> {
+        let key = crate::agent_runtime::NodeKey::from_wire(wire)?;
+        self.agent_doc(&key)
     }
 
     /// A key pressed while a prompt row has the keyboard.
@@ -2475,10 +3706,19 @@ impl ActiveState {
     /// Writes the node's *own* choice, so it stops following the app-wide default — which is
     /// what a toggle on the node means, and `crate::agent::display_mode` is the one place
     /// that resolution happens.
+    ///
+    /// ⚠ **The fallback has to be the app-wide default, not `DisplayMode::default()`.** A node
+    /// that has never chosen shows whatever Preferences ▸ Agents ▸ Display says, because that
+    /// is the value every *reading* surface resolves against — the view build below, the
+    /// selection's `effective_display`, the tick on the menu row. Resolving the toggle against
+    /// the enum's own default instead makes the write path disagree with the read path: with
+    /// the app-wide default set to Raw, a node inheriting it draws Raw, and the first press of
+    /// its toggle writes `Raw` again — the badge says nothing changed, because nothing did,
+    /// and it takes two presses to leave the mode you could see.
     pub(crate) fn toggle_agent_display(&mut self, doc: DocId) {
         self.settle();
         let Some((config, _)) = self.agent_model(doc) else { return };
-        let current = crate::agent::display_mode(&config, vellum_agent::DisplayMode::default());
+        let current = crate::agent::display_mode(&config, self.shell.library.default_display_mode());
         let mut next = config;
         next.display = Some(current.toggled());
         self.write_agent_model(doc, &next);
@@ -2570,6 +3810,9 @@ impl ActiveState {
                     };
                     let Some(root) = root else { continue };
                     let key = crate::agent_runtime::NodeKey::new(board, doc.to_string());
+                    // The offset travels with the rows, so the painter and the press path
+                    // read one value rather than two that could drift apart.
+                    self.agents.set_tree_scroll(scene, self.agent_runtime.tree_scroll(&key));
                     if let Some(view) = self.agent_runtime.tree_view(&key, &root, &tree, now) {
                         self.agents.set_tree(scene, view);
                     }
@@ -2603,7 +3846,10 @@ impl ActiveState {
         }
         let board = self.agent_board_key();
         let visible = self.camera.visible_world_rect();
-        let now_ms = crate::agent_runtime::unix_now().saturating_mul(1_000);
+        // The pulse's clock, and it must be the real millisecond one: this is what decides how
+        // far along the line a travelling message is drawn, sixty times a second, against a
+        // 600 ms window. See `agent_runtime::unix_now_ms`.
+        let now_ms = crate::agent_runtime::unix_now_ms();
         // The app-wide default a node with no choice of its own follows — feature 2's
         // second half, so changing it in Preferences moves every node that never chose.
         let fallback = self.shell.library.default_display_mode();
@@ -2630,6 +3876,7 @@ impl ActiveState {
         // The live prompt buffer, over the top of the stored draft. Last, because it must
         // survive the rebuild — see `AgentView::draft`.
         self.show_live_prompt();
+        self.show_live_note();
     }
 
     /// Put what is being typed into the prompt row in front of the painter.
@@ -2658,6 +3905,20 @@ impl ActiveState {
             anchor: session.buffer.anchor(),
             idle_for,
         });
+    }
+
+    /// Put what is being typed into a note in front of the painter.
+    ///
+    /// ⚠ The same rule `show_live_prompt` exists for, and the third time this codebase has
+    /// needed it: state accumulated where the painter cannot see it looks like a dead feature.
+    /// The buffer is written to the file only when the session ends, so a node drawn from the
+    /// runtime's stored text alone would show the note exactly as it was until the moment the
+    /// user pressed Escape.
+    fn show_live_note(&mut self) {
+        let Some(session) = self.note_editing.as_ref() else { return };
+        let Some(scene) = self.editor.projection().scene_id(session.doc) else { return };
+        let body = session.buffer.text().to_owned();
+        self.agents.set_note(scene, body);
     }
 
     /// Bring every native page into line with what the board says, once per frame.
@@ -2782,6 +4043,14 @@ impl ActiveState {
 
     /// The window gained or lost focus. Feature 15's app-side half.
     pub(crate) fn agent_focus_changed(&mut self, focused: bool) {
+        // ⚠ **Losing the window closes the microphone**, and this is the exit with the worst
+        // consequence of the four: a held key whose key-up goes to another application leaves
+        // the device open on a board nobody is looking at, with the recording light on. The
+        // key-up genuinely never arrives — the OS gave it to somebody else — so nothing else
+        // in this file can close it.
+        if !focused {
+            self.cancel_talking();
+        }
         let now = crate::agent_runtime::unix_now();
         let Some(since) = self.agent_runtime.focus_changed(focused, now) else {
             return;
@@ -2794,8 +4063,16 @@ impl ActiveState {
     /// `vellum_agent::summary` does all of it; the app's contribution is *when* — which is
     /// exactly why `Digest::new` takes `since` as a parameter rather than reading a clock.
     fn agent_digest(&mut self, since: vellum_agent::Timestamp, now: vellum_agent::Timestamp) {
-        let board = self.agent_board_key();
-        let nodes = self.agent_runtime.nodes_on(&board);
+        // ⚠ **Every board with agents on it, not just the one in front.** Parking a tab
+        // keeps its agents running — that is the difference between parking and closing —
+        // so a digest of the front board alone is silent about the tab where the long job
+        // was left, which is the tab a person is most likely to have walked away from.
+        let nodes: Vec<crate::agent_runtime::NodeKey> = self
+            .agent_runtime
+            .boards_with_nodes()
+            .iter()
+            .flat_map(|board| self.agent_runtime.nodes_on(board))
+            .collect();
         if nodes.is_empty() {
             return;
         }
@@ -2811,10 +4088,15 @@ impl ActiveState {
             else {
                 continue;
             };
+            // The document first — it is authoritative and reachable for the board in front —
+            // then the wiring's own copy, which is the only name a parked board has, and the
+            // raw id last so a node is never nameless.
             let name = self
                 .agent_doc(&node)
                 .and_then(|doc| self.agent_model(doc))
-                .map_or_else(|| node.item.clone(), |(_, label)| label);
+                .map(|(_, label)| label)
+                .or_else(|| self.agent_runtime.label_of(&node))
+                .unwrap_or_else(|| node.item.clone());
             let events: Vec<(vellum_agent::Timestamp, &vellum_agent::TranscriptEvent)> =
                 tail.records.iter().map(|record| (record.at, &record.event)).collect();
             digest.add(vellum_agent::AgentRef::new(node.wire(), name), events);
@@ -2825,7 +4107,29 @@ impl ActiveState {
         // The panel form goes to the log, where an unattended run can read it; the headline
         // goes on screen, because a paragraph as a toast is a paragraph nobody reads.
         log::info!("agents, while you were away:\n{}", digest.panel_text());
-        self.ok(digest.headline());
+
+        // ⚠ **A digest that needs the user is not good news, and it used to be delivered as
+        // good news.** `self.ok` is a success toast at three seconds — the same treatment as
+        // *"Saved"* — so *"Builder is waiting for permission"* appeared and vanished while the
+        // user was still turning back to the screen, and `Digest::needs_attention` (written,
+        // tested, and the one predicate that separates the two cases) was consulted by
+        // nothing. An away-mode summary exists for the moment somebody comes back to a board
+        // they left running; if the one thing it has to say is *an agent is stuck*, it must
+        // outlast a glance.
+        //
+        // The detail goes with it rather than staying in the log: `card_lines` is one short
+        // line per agent, ranked with Blocked and Failed first, so the toast says which agent
+        // and what about — the whole difference between a summary and a notification.
+        if digest.needs_attention() {
+            let mut text = digest.headline();
+            for line in digest.card_lines().into_iter().take(MAX_DIGEST_LINES) {
+                text.push('\n');
+                text.push_str(&line);
+            }
+            self.shell.toast(Toast::error(text));
+        } else {
+            self.ok(digest.headline());
+        }
     }
 
     /// Which part of an agent node a world point is over, if any.
@@ -2867,8 +4171,9 @@ impl ActiveState {
                 return true;
             }
             let choice = card.choice.clone();
+            let asked = card.prompt.clone();
             let key = self.agent_key(doc);
-            if !self.agent_runtime.choose_option(&key, &choice) {
+            if !self.agent_runtime.choose_option(&key, &asked, &choice) {
                 return true;
             }
             // **Before the draft is set**, or the prompt row's own buffer is written over the
@@ -2900,6 +4205,51 @@ impl ActiveState {
     /// for having one paint arm: the four kinds differ in *which* layout answers and in
     /// nothing else, and the item-space conversion below is the part that is easy to get
     /// backwards.
+    /// A wheel notch over a **selected** file-tree node scrolls its list instead of zooming.
+    ///
+    /// Answers whether it was consumed, so `app.rs` can fall through to the camera.
+    ///
+    /// # Why selection is the condition
+    ///
+    /// The wheel zooms this board — `docs/06-mouse-controls.md` §1 — and that file also
+    /// records that stealing the left drag was *"the single worst fault in the first
+    /// version"*. Taking the wheel over every tree would steal zoom from whatever patch of
+    /// canvas a tree happens to cover, silently, and a tree is a tall node. So the rule is
+    /// feedback 29's frame rule applied to a second gesture: **an unselected node is
+    /// backdrop, and a selected one is the thing you are working with.** Click the tree, then
+    /// scroll it; move on, and the wheel is the board's again.
+    ///
+    /// It also falls through at the ends of the list rather than swallowing the notch, so a
+    /// tree scrolled to its bottom stops being a dead patch of canvas.
+    pub(crate) fn scroll_tree_under(&mut self, at: ScreenPoint, notches: f64) -> bool {
+        if notches == 0.0 {
+            return false;
+        }
+        let world = self.camera.screen_to_world(at);
+        let Some(scene) = self.editor.projection().scene().hit_test(world) else { return false };
+        if !self.editor.selection().contains(&scene) {
+            return false;
+        }
+        let Some(projected) = self.editor.projection().get(scene) else { return false };
+        let ItemKind::FileTree { .. } = &projected.item.kind else { return false };
+        let doc = projected.doc_id;
+        let (width, height) = projected.item.placement.scaled_size();
+
+        // What can be scrolled to: the rows that exist, less the rows that fit. Read from the
+        // view the painter is drawing, so an unexpanded tree cannot be scrolled at all.
+        let fits = crate::filetree::layout(width, height).visible_rows();
+        let rows = self.agents.tree(scene).map_or(0, |view| view.rows.len());
+        let limit = rows.saturating_sub(fits);
+        if limit == 0 {
+            return false;
+        }
+        // Down the wheel is down the list. Three rows a notch, the step every list in every
+        // application uses; the sign is inverted because a positive delta is a scroll *up*.
+        let step = -(notches * 3.0).round() as i64;
+        let key = self.agent_key(doc);
+        self.agent_runtime.scroll_tree(&key, step, limit)
+    }
+
     fn node_part_under(&self, scene: SceneId, world: WorldPoint) -> Option<NodePress> {
         let projected = self.editor.projection().get(scene)?;
         let placement = projected.item.placement;
@@ -2932,11 +4282,25 @@ impl ActiveState {
                 // press path asking `row_at` alone would answer with a row that is not on
                 // screen. `NodePaint::tree_rows` is that list, recorded as it was painted.
                 let laid = crate::filetree::layout(width, height);
+                // The same offset the painter used, so a scrolled row is pressed where it
+                // is drawn. Reading the painted rectangles is not enough on its own — this
+                // call *is* the painter, run again for the press.
+                let scroll = self
+                    .agent_board
+                    .as_ref()
+                    .map(|stamp| {
+                        crate::agent_runtime::NodeKey::new(
+                            &stamp.key,
+                            projected.doc_id.to_string(),
+                        )
+                    })
+                    .map_or(0, |key| self.agent_runtime.tree_scroll(&key));
                 let paint = crate::draw::tree_paint(
                     &crate::filetree::decode(model),
                     self.agents.tree(scene),
                     &laid,
                     crate::draw::node_font_size(width),
+                    scroll,
                 );
                 let (row, on_twisty) = paint.tree_row_at(x, y)?;
                 Some(NodePress::Tree {
@@ -2961,8 +4325,10 @@ impl ActiveState {
                 self.reveal_note(doc);
                 true
             }
-            // The title takes the caret through the ordinary double-click path and the body is
-            // the note's own words; both keep selecting and dragging the node.
+            // The title takes the caret through the ordinary double-click path, and the body
+            // opens the note editor from that same path — see the `double` branch in the press
+            // site, which is where a double click is resolved. Both keep selecting and
+            // dragging the node on a single press, which is how a note is moved.
             NodePress::Note(_) => false,
             NodePress::Browser(crate::browser::BrowserPart::OpenExternal) => {
                 let url = self.browser_url(doc);
@@ -3084,7 +4450,7 @@ impl ActiveState {
         self.agent_runtime.shutdown();
     }
 
-    fn gap(&mut self, what: &str) {
+    pub(crate) fn gap(&mut self, what: &str) {
         log::info!("not implemented: {what}");
         self.shell.toast(Toast::info(what.to_owned()));
     }
@@ -3095,7 +4461,7 @@ impl ActiveState {
     /// verdict through here — so an unattended run could see a demo *fail* and could not
     /// see one *pass*. That asymmetry made "silence means it worked" the only available
     /// reading, which is the same trap as a test that passes for the wrong reason.
-    fn ok(&mut self, message: impl Into<String>) {
+    pub(crate) fn ok(&mut self, message: impl Into<String>) {
         let message = message.into();
         log::info!("{message}");
         self.shell.toast(Toast::success(message));
@@ -3156,6 +4522,8 @@ impl ActiveState {
             // Arms the sweep; the next drag on bare board sets the region. Escape and a click
             // both abandon it and keep whatever the orchestrator already owned.
             Command::SetTerritory => self.arm_territory(),
+            Command::RemoveWorktree => self.ask_remove_worktree(),
+            Command::SetChatBackground => self.attach_chat_background(),
             Command::EditAgentSchedule => self.edit_agent_schedule(),
             Command::ToggleBrowserNodes => {
                 let on = !self.shell.library.browser_nodes();
@@ -3238,7 +4606,8 @@ impl ActiveState {
             Command::Copy => self.copy(false),
             Command::Paste => self.paste(),
             Command::Duplicate => self.duplicate_selection(),
-            Command::Delete => self.delete_selection(),
+            // The answer matters only to Cut, which reports an outcome; a menu row does not.
+            Command::Delete => drop(self.delete_selection()),
             Command::SelectAll => self.editor.select_all(),
 
             // --- edit ▸ arrange ---
@@ -3434,6 +4803,8 @@ impl ActiveState {
             "kanban" => self.demo_kanban(),
             "card-drag" => self.demo_card_drag(),
             "typing" => self.demo_typing(),
+            "typing-shortcuts" => self.demo_typing_shortcuts(),
+            "shape-fill" => self.demo_shape_fill(),
             "caret" => self.demo_caret(),
             "connector" => self.demo_connector(),
             "placing" => self.demo_placing(),
@@ -3444,17 +4815,28 @@ impl ActiveState {
             "locked-arrange" => self.demo_locked_arrange(),
             "widget-edit" => self.demo_widget_edit(),
             "links" => self.demo_links(),
+            "zoom-flicker" => self.demo_zoom_flicker(),
+            "move-images" => self.demo_move_images(),
+            "leave-frame" => self.demo_leave_frame(),
             "copy-paste" => self.demo_copy_paste(),
             "context-menu" => self.demo_context_menu(),
             "edit-then-delete" => self.demo_edit_then_delete(),
+            "reproject-cost" => self.demo_reproject_cost(),
+            "paste-repeat" => self.demo_paste_repeat(),
             "frame-marquee" => self.demo_frame_marquee(),
             "grid-snap" => self.demo_grid_snap(),
             "agent" => self.demo_agent(),
             "agent-transcript" => self.demo_agent_transcript(),
             "agent-message" => self.demo_agent_message(),
+            "agent-ipc" => self.demo_agent_ipc(),
             "agent-prompt" => self.demo_agent_prompt(),
+            "agent-voice" => self.demo_agent_voice(),
+            "note-edit" => self.demo_note_edit(),
             "agent-controls" => self.demo_agent_controls(),
             "agent-launch" => self.demo_agent_launch(),
+            "ports" => self.demo_ports(),
+            "chat-themes" => self.demo_chat_themes(),
+            "connector-ends" => self.demo_connector_ends(),
             "territory" => self.demo_territory(),
             "rule-layers" => self.demo_rule_layers(),
             // Not a fixture, but the same "do it on the first frame so an unattended
@@ -3464,13 +4846,22 @@ impl ActiveState {
             "export-pdf" => self.run(Command::ExportPdf),
             "export-png" => self.run(Command::ExportPng),
             "present" => self.run(Command::PresentationMode),
+            // Every dispatched name, in the order they are matched above. It is spelled out
+            // rather than derived because the match is the only list there is — and it had
+            // drifted: fourteen fixtures, including every one added for the Agent Canvas, were
+            // dispatchable and named nowhere a person could find them, so the way to discover
+            // `--demo agent-ipc` was to read `actions.rs`. A fixture nobody can find is a
+            // fixture nobody runs.
             other => log::warn!(
-                "--demo: no fixture called `{other}` \
-                 (shapes, empty, table, chart, mindmap, kanban, card-drag, typing, caret, connector, placing, snapping, \
-                  object-eraser, group-handles, locked-arrange, widget-edit, links, copy-paste, context-menu, \
-                  edit-then-delete, frame-marquee, grid-snap, agent, agent-transcript, agent-message, \
-                  agent-prompt, agent-controls, agent-launch, territory, rule-layers, \
-                  export-svg, export-pdf, export-png, present)"
+                "--demo: no fixture called `{other}`. The board fixtures are: shapes, empty, \
+                 table, chart, mindmap, kanban, card-drag, typing, caret, connector, placing, \
+                 snapping, object-eraser, group-handles, locked-arrange, widget-edit, links, \
+                 copy-paste, context-menu, edit-then-delete, reproject-cost, paste-repeat, \
+                 frame-marquee, grid-snap, readme, ports, connector-ends. The Agent Canvas \
+                 fixtures are: agent, agent-transcript, agent-message, agent-ipc, \
+                 agent-prompt, agent-voice, agent-controls, agent-launch, note-edit, territory, \
+                 rule-layers, chat-themes. And these fire a menu row: export-svg, export-pdf, export-png, \
+                 present."
             ),
         }
     }
@@ -3715,6 +5106,141 @@ impl ActiveState {
     ///
     /// It leaves the session open so `--screenshot` catches the caret, which no assertion
     /// here can see.
+    /// Feature 12, end to end: **hold `⌥D` on an agent node and its words become its prompt.**
+    ///
+    /// This is the fixture the feature never had. `voice.rs` in `vellum-agent` is 2,250 tested
+    /// lines and every one of those tests names a concrete type inside that crate; none of them
+    /// could see that **nothing in this application called any of it**, which is how a feature
+    /// ships fully implemented and completely unreachable. What is driven here is the join:
+    ///
+    /// 1. a real `⌥D` through [`Self::talk_key`] — the function `app.rs` calls from
+    ///    `WindowEvent::KeyboardInput`, entered at the same place with the same arguments;
+    /// 2. the real [`crate::voice::VoicePool`], the real [`vellum_agent::voice::PushToTalk`],
+    ///    the real worker thread and the real channel;
+    /// 3. the real [`Self::drain_voice`] on a later frame, writing through the real
+    ///    [`Self::set_agent_draft`];
+    /// 4. the answer read back out of the **runtime's stored draft** and out of the view the
+    ///    painter is handed.
+    ///
+    /// **The substitution, stated:** the microphone is [`vellum_agent::voice::CannedCapture`]
+    /// and the transcriber is `CannedTranscriber`, because a default build's `microphone()` is
+    /// `Unavailable` by design and this machine has no whisper model. Those are the two ends
+    /// that need hardware; everything between them is production's. `--demo agent-ipc` makes
+    /// the same kind of substitution and names it the same way.
+    ///
+    /// Three things it checks that a narrower version would not:
+    /// - the key is claimed **only** when a voice-enabled agent is selected, so an ordinary
+    ///   board's `⌥D` still types `∂`;
+    /// - the painter is handed *Listening* **mid-gesture**, which is the state the whole
+    ///   feature is judged on and the one four previous features got wrong;
+    /// - a **repeat** does not start a second recording, which is the classic hold-to-talk bug.
+    fn demo_agent_voice(&mut self) {
+        use winit::keyboard::{KeyCode, PhysicalKey};
+        const MIC: PhysicalKey = PhysicalKey::Code(KeyCode::KeyD);
+        const SPOKEN: &str = "summarise the release notes";
+
+        self.place_agent(-260.0);
+        self.settle();
+        self.fit_board();
+        self.poll_agents();
+
+        let agents = self.agent_ids();
+        let [doc] = agents.as_slice() else {
+            self.gap(&format!("the agent tool placed {} node(s), not 1", agents.len()));
+            return;
+        };
+        let doc = *doc;
+
+        // **The key must do nothing before voice is turned on.** Asserted first, because a
+        // build that claimed `⌥D` unconditionally would pass every other check below while
+        // having broken the character `∂` on every board in the application.
+        self.editor.select([doc]);
+        self.input.set_modifiers(winit::keyboard::ModifiersState::ALT);
+        if self.talk_key(MIC, true, false) {
+            self.gap("⌥D was claimed on a node that has not turned voice on");
+            return;
+        }
+
+        // Turn voice on the way the panel does, through the same edit.
+        self.apply_agent_edit(&vellum_ui::AgentEdit::Voice(true));
+        self.poll_agents();
+
+        // The canned ends. Installed *before* the press, so `begin_voice`'s
+        // `get_or_insert_with` finds this pool rather than building a real one.
+        self.agent_runtime.install_canned_voice(
+            Box::new(vellum_agent::voice::CannedCapture::tone()),
+            SPOKEN,
+        );
+
+        // ----- the gesture ------------------------------------------------------------
+        if !self.talk_key(MIC, true, false) {
+            self.gap("⌥D on a selected voice-enabled agent was not claimed");
+            return;
+        }
+        // ⚠ **The repeat, which is the classic hold-to-talk defect.** A held key auto-repeats
+        // and winit reports each repeat as another `Pressed`; without the guard the second one
+        // calls `press` again, which `PushToTalk` correctly refuses — so a held key raises
+        // *"already recording"* thirty times a second and buries the node under toasts.
+        //
+        // Two observables, because neither alone says it: the repeat must be **swallowed**
+        // (so it never reaches the prompt row and types `∂`), *and* the original press must
+        // still be live afterwards with its clock unreset (so nothing restarted it). A build
+        // that let the repeat through fails the first; one that re-pressed fails the second.
+        let repeat_swallowed = self.talk_key(MIC, true, true);
+        let press_unbroken = self.agent_runtime.voice_holding().is_some();
+
+        // Mid-gesture, which is the state no screenshot could otherwise catch: the painter
+        // has to be able to see that this node is listening.
+        self.rebuild_agent_views();
+        let scene = self.editor.projection().scene_id(doc);
+        let listening = scene
+            .and_then(|scene| self.agents.get(scene))
+            .and_then(|view| view.voice.clone())
+            .is_some_and(|voice| matches!(voice, crate::voice::VoiceStatus::Listening { .. }));
+
+        // ----- the release ------------------------------------------------------------
+        self.talk_key(MIC, false, false);
+
+        // The worker answers on another thread, so pump frames until it lands rather than
+        // assuming one is enough — the same shape `--demo agent-ipc` uses while waiting on the
+        // socket. Bounded, so a broken build reports a failure instead of hanging.
+        //
+        // ⚠ **`poll_agents`, not `drain_voice`.** Calling the drain directly would enter below
+        // the thing being tested and pass on a build where nothing on the frame path ever
+        // calls it — which is this repository's signature defect and the whole reason this
+        // fixture exists. It also pins the placement: `poll_agents` returns early when the
+        // runtime is `dormant()`, and a node with voice on and no turn running *is* dormant,
+        // so a drain below that early-out would leave the transcription stranded on exactly
+        // the board where someone is using the feature. A/B'd by moving the call down.
+        let mut frames = 0;
+        while self.agent_draft(doc).is_empty() && frames < 200 {
+            self.poll_agents();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            frames += 1;
+        }
+
+        let stored = self.agent_draft(doc);
+        self.rebuild_agent_views();
+        let shown = scene
+            .and_then(|scene| self.agents.get(scene))
+            .map(|view| view.draft.clone())
+            .unwrap_or_default();
+
+        if stored == SPOKEN && shown == SPOKEN && listening && repeat_swallowed && press_unbroken {
+            self.ok(format!(
+                "held ⌥D on an agent, and what was said became its prompt: {stored:?} \
+                 — the node drew \"Listening\" mid-gesture, the key was refused on a node \
+                 with voice off, and a key repeat was swallowed without restarting the press"
+            ));
+        } else {
+            self.gap(&format!(
+                "after a held ⌥D the stored draft is {stored:?} and the painter has {shown:?} \
+                 (expected {SPOKEN:?} in both); listening-was-drawn={listening}, \
+                 repeat-swallowed={repeat_swallowed}, press-survived-the-repeat={press_unbroken}"
+            ));
+        }
+    }
+
     fn demo_agent_prompt(&mut self) {
         self.place_agent(-260.0);
         // A freshly placed agent takes the caret on its role, so the gesture leaves an
@@ -3759,13 +5285,33 @@ impl ActiveState {
             return;
         }
 
-        // Real keystrokes, through the function `app.rs` calls from `WindowEvent::KeyboardInput`.
+        // Real keystrokes, through the **whole** ladder `app.rs` runs from
+        // `WindowEvent::KeyboardInput` — the chrome first, then the sessions, then
+        // `crate::input`, then the shortcut table. Calling `type_prompt_key` alone enters
+        // below every trap in it, which is how feedback 40's three reports survived a green
+        // suite: the letters `V`, `E`, `T`, `N` and `O` are tools and shapes, and the chrome
+        // was arming them from its own copy of the key.
         let tool_before = self.shell.tool();
+        let items_before = self.editor.board().item_ids().len();
+        let placement_before =
+            self.editor.projection().get(scene).map(|projected| projected.item.placement);
         for character in "Vet NOTE".chars() {
             let text = character.to_string();
-            let key = winit::keyboard::Key::Character(text.clone().into());
-            self.type_prompt_key(&key, Some(&text));
+            self.press_like_the_window(
+                &winit::keyboard::Key::Character(text.clone().into()),
+                Some(&text),
+            );
         }
+        // The two keys a hand produces that the prompt's buffer does not implement, so both
+        // used to fall past it: Backspace reached `Command::Delete` and `↑` reached the
+        // nudge, which moved the node being typed into.
+        self.press_like_the_window(&winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp), None);
+        let items_after = self.editor.board().item_ids().len();
+        let placement_after =
+            self.editor.projection().get(scene).map(|projected| projected.item.placement);
+        let stayed_put = placement_before.zip(placement_after).is_some_and(|(a, b)| {
+            (a.x - b.x).abs() < f64::EPSILON && (a.y - b.y).abs() < f64::EPSILON
+        });
 
         // The view the painter will be handed this frame, built by the real path.
         self.rebuild_agent_views();
@@ -3780,18 +5326,174 @@ impl ActiveState {
             && stored.is_empty()
             && caret.is_some_and(|caret| caret.cursor == "Vet NOTE".len())
             && self.shell.tool() == tool_before
+            && items_after == items_before
+            && stayed_put
         {
             self.ok(format!(
-                "typed \"{shown}\" into a prompt row and the painter has it live, \
-                 with the caret at {} and nothing stored yet",
+                "typed \"{shown}\" into a prompt row through the chrome and the painter has \
+                 it live, with the caret at {} and nothing stored yet — and the node neither \
+                 moved nor armed a tool under the keys",
                 caret.map_or(0, |caret| caret.cursor)
             ));
         } else {
             self.gap(&format!(
                 "the painter was handed {shown:?} with caret {caret:?}; the stored draft is \
-                 {stored:?} and the tool is {:?} (expected \"Vet NOTE\", a caret at 8, an \
-                 empty stored draft and {tool_before:?})",
+                 {stored:?}, the tool is {:?}, the board went from {items_before} to \
+                 {items_after} items and the node stayed put {stayed_put} (expected \
+                 \"Vet NOTE\", a caret at 8, an empty stored draft and {tool_before:?})",
                 self.shell.tool()
+            ));
+        }
+    }
+
+    /// Typing into a note's **body** on the canvas, and the `.md` file it writes.
+    ///
+    /// # Why a fixture and not a unit test
+    ///
+    /// Feature 8's file half was complete and had no caller: `NoteStore::save` — the atomic
+    /// write, the mtime stamp that stops the next poll reporting the user's own change, and
+    /// the conflict path that keeps both copies — was reachable from nothing in the
+    /// application, because nothing could put text into a note. Every part of that was tested
+    /// offline and none of it had ever run.
+    ///
+    /// Four things are asserted, and each rules out a build the other three would pass:
+    ///
+    /// - **A double click on the body takes the keyboard.** A single press must not: that is
+    ///   how a note is dragged, so the gesture had to be the one the rest of the canvas uses.
+    /// - **The painter has the text while it is being typed**, which is the failure this
+    ///   codebase has now shipped three times — the pen, the frame and the prompt row — where
+    ///   state accumulates where the painter cannot see it and the feature looks dead.
+    /// - **The file on disk still says what it said**, until the session ends. A note that
+    ///   wrote on every keystroke would be a file the agents read mid-sentence.
+    /// - **Ending the session writes it**, which is `NoteStore::save`'s first real caller.
+    fn demo_note_edit(&mut self) {
+        // The real note tool, so the placement path is the one a user takes.
+        self.choose_tool(Tool::Note);
+        let at = self.camera.world_to_screen(WorldPoint::new(0.0, 0.0));
+        self.act_on(Intent::Place { at, to: at });
+        self.settle();
+        self.fit_board();
+        self.poll_agents();
+
+        let Some(doc) = self.editor.board().item_ids().into_iter().find(|id| {
+            matches!(self.editor.board().item(*id).map(|i| i.kind), Ok(ItemKind::AgentNote { .. }))
+        }) else {
+            self.gap("the note tool placed no note");
+            return;
+        };
+
+        // ⚠ **The store the app derives, not one this fixture registered.** A note's home
+        // follows the *board's* folder — `poll_agents` registers it every frame from the
+        // board's own path — so a fixture that registered a project of its own had its
+        // registration replaced on the next poll and then read a file the application was
+        // never going to write. That is what this fixture reported on its first run, and the
+        // application was right: a board saved outside a project gets the fallback store
+        // under the data directory, which `docs/07-agent-canvas.md` §8 requires precisely so
+        // that a note can be made on a board that is not a code project.
+        let board = self.agent_board_key();
+        let Some(store) = self.agent_runtime.note_store(&board) else {
+            self.gap("this board has no note store, so a note has nowhere to live");
+            return;
+        };
+        let created = store.create(
+            "Plan",
+            vellum_agent::NoteScope::Shared,
+            "# Plan\n",
+            vellum_agent::Requester::User,
+        );
+        let Ok(model) = created else {
+            self.gap("the note file could not be created");
+            return;
+        };
+        let path = model.path.clone();
+        let Ok(file) = store.resolve_stored(&path) else {
+            self.gap("the note's file could not be resolved");
+            return;
+        };
+        let title = match self.editor.board().item(doc).map(|item| item.kind) {
+            Ok(ItemKind::AgentNote { title, .. }) => title,
+            _ => return,
+        };
+        let kind = ItemKind::AgentNote { model: crate::note::encode(&model), title };
+        if self.editor.edit(|board| Ok(board.set_kind(doc, kind)?)).is_err() {
+            self.gap("the note would not take its file");
+            return;
+        }
+        let key = self.agent_key(doc);
+        self.agent_runtime.set_note_text(&key, "# Plan\n".to_owned());
+        self.poll_agents();
+
+        // A **real double click** on the body, at a world point inside it.
+        let Some(scene) = self.editor.projection().scene_id(doc) else {
+            self.gap("the note never reached the projection");
+            return;
+        };
+        let Some(projected) = self.editor.projection().get(scene) else { return };
+        let placement = projected.item.placement;
+        let (width, height) = placement.scaled_size();
+        let laid = crate::note::layout(width, height);
+        let world = WorldPoint::new(
+            placement.x - width / 2.0 + laid.body.x + laid.body.width / 2.0,
+            placement.y - height / 2.0 + laid.body.y + laid.body.height / 2.0,
+        );
+        let at = self.camera.world_to_screen(world);
+        // `press(at, additive, double)` — the second click is a **double**, not an additive
+        // one. Getting that pair the wrong way round is how this fixture first reported that
+        // a perfectly good double-click path did not take the keyboard.
+        self.press(at, false, false);
+        self.press(at, false, true);
+        if !self.is_editing_note() {
+            self.gap("a double click on a note's body did not take the keyboard");
+            return;
+        }
+
+        let tool_before = self.shell.tool();
+        // Through the **whole** window ladder, not `type_note_key` alone. A note's buffer has
+        // no layout, so it deliberately has no vertical motion — which meant `↑` fell past it
+        // to `crate::input` and then to `ActiveState::shortcut`, whose arrow arms **nudge the
+        // selection**: the node being typed into moved a world unit up. Every letter goes the
+        // same way, so a tool key in a note's body has to be claimed here too.
+        let placement_before =
+            self.editor.projection().get(scene).map(|projected| projected.item.placement);
+        for character in "Note TEXT".chars() {
+            let text = character.to_string();
+            self.press_like_the_window(&winit::keyboard::Key::Character(text.clone().into()), Some(&text));
+        }
+        self.press_like_the_window(&winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp), None);
+        let placement_after =
+            self.editor.projection().get(scene).map(|projected| projected.item.placement);
+        let stayed_put = placement_before.zip(placement_after).is_some_and(|(a, b)| {
+            (a.x - b.x).abs() < f64::EPSILON && (a.y - b.y).abs() < f64::EPSILON
+        });
+
+        // What the painter is handed this frame, and what the file still says.
+        self.rebuild_agent_views();
+        let shown = self.agents.note(scene).unwrap_or_default().to_owned();
+        let before = std::fs::read_to_string(&file).unwrap_or_default();
+
+        // Escape ends the session, which is what writes.
+        let escape = winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape);
+        self.type_note_key(&escape, None);
+        let after = std::fs::read_to_string(&file).unwrap_or_default();
+
+        let typed = shown.contains("Note TEXT");
+        let held = before == "# Plan\n";
+        let written = after.contains("Note TEXT");
+        let tool_kept = self.shell.tool() == tool_before;
+
+        if typed && held && written && tool_kept && stayed_put {
+            self.ok(format!(
+                "typed into a note on the canvas: the painter had it live, the file held \
+                 {before:?} until the session ended, {} now reads {after:?}, and neither the \
+                 tool nor the note's position moved under the keys",
+                file.display()
+            ));
+        } else {
+            self.gap(&format!(
+                "the painter was handed {shown:?}; {} said {before:?} while typing and \
+                 {after:?} after (expected the text live, \"# Plan\\n\" during, and the text \
+                 written), tool kept {tool_kept}, note stayed put {stayed_put}",
+                file.display()
             ));
         }
     }
@@ -3862,11 +5564,16 @@ impl ActiveState {
             Ok(ItemKind::FileTree { model }) => model,
             _ => return,
         };
+        let scroll = {
+            let key = self.agent_key(doc);
+            self.agent_runtime.tree_scroll(&key)
+        };
         let paint = crate::draw::tree_paint(
             &crate::filetree::decode(&model),
             self.agents.tree(scene),
             &laid,
             crate::draw::node_font_size(w),
+            scroll,
         );
         let Some((relative, twisty)) = paint
             .tree_rows()
@@ -4037,8 +5744,12 @@ impl ActiveState {
         // The operation *after* the one being tested. See the doc comment.
         self.editor.select([spare]);
         self.shell.invalidate_selection();
-        self.run(Command::Delete);
+        let confirmed = self.delete_through_the_confirmation();
         let left = self.agent_ids().len();
+        if !confirmed {
+            self.gap("deleting an agent raised no confirmation — a stray Backspace loses one");
+            return;
+        }
 
         let expected_clean = script
             .iter()
@@ -4064,6 +5775,232 @@ impl ActiveState {
                  and {left} node(s) survived the delete (expected 1)",
                 script.len()
             ));
+        }
+    }
+
+    /// ⚠ **The one hop that had never been driven: a real `velm-agent-cli` process reaching a
+    /// live Velm over the loopback socket, and Velm's handler answering.**
+    ///
+    /// `docs/07-agent-canvas.md` §14 and CLAUDE.md's feedback 36 both admit this. Six features
+    /// terminate in that chain — an agent *initiating* a message, the meta agent's configure,
+    /// orchestrator spawn, option sets, note access and web research — and every layer of it
+    /// had passing tests while the joint between them had never carried a byte. That is trap
+    /// 9's exact shape, and the reason it survived two adversarial reviews is that both
+    /// reviews read code.
+    ///
+    /// # What this drives, and what it deliberately does not
+    ///
+    /// Everything except the model: the **real** binary from disk, resolved through the same
+    /// `transport::shim()` a launch uses, with the same two environment variables a launch
+    /// sets, against the **real** `IpcServer` started by the production `ensure_ipc` inside
+    /// `AgentRuntime::launch` — over a real TCP connection to 127.0.0.1, through the real
+    /// token check, into the real `Handler`, out to the real sidecar on disk.
+    ///
+    /// No AI process is started and nothing is sent to a network. The session is an
+    /// `Http` transport pointed at a port with nothing behind it, which is the one transport
+    /// whose `start` neither probes for a binary nor opens a connection — so the server comes
+    /// up through the production path with no `claude`, no subscription and no traffic. The
+    /// substitution is named here rather than hidden because it is the only one:
+    /// `--demo agent-launch` proves what a *child* would be handed, and this proves what
+    /// happens when a child uses it.
+    fn demo_agent_ipc(&mut self) {
+        use std::process::Command as Child;
+
+        let Some(shim) = vellum_agent::transport::shim().and_then(vellum_agent::transport::Shim::cli)
+        else {
+            self.gap(
+                "no velm-agent-cli beside this executable, so nothing can reach the board. \
+                 Build it: cargo build --release -p vellum-agent --bins.",
+            );
+            return;
+        };
+        let shim = shim.to_path_buf();
+
+        self.place_agent(-900.0);
+        self.place_agent(-100.0);
+        self.settle();
+        let agents = self.agent_ids();
+        let [left, right] = agents.as_slice() else {
+            self.gap(&format!("the agent tool placed {} node(s), not 2", agents.len()));
+            return;
+        };
+        let (left, right) = (*left, *right);
+
+        self.fit_board();
+        // The real connector tool: the bus refuses a message with no link, so without this the
+        // fixture would pass its socket half and fail for the right reason at the wrong layer.
+        self.choose_tool(Tool::Connector);
+        let from = self.camera.world_to_screen(WorldPoint::new(-640.0, 200.0));
+        let to = self.camera.world_to_screen(WorldPoint::new(160.0, 200.0));
+        self.act_on(Intent::Place { at: from, to });
+        self.poll_agents();
+
+        // A provider that starts a session without starting anything else. `Transport::Http`
+        // is the only arm of `launch` that skips `probe_command`, and `HttpTransport::start`
+        // builds a config and returns — the first byte would go out on the first *prompt*,
+        // which this fixture never sends.
+        self.update_agent(left, |config| {
+            let mut choice = vellum_agent::ProviderChoice::new(vellum_agent::Provider::Local);
+            // Discard: nothing listens here, and nothing is sent.
+            choice.base_url = Some("http://127.0.0.1:9/v1".to_owned());
+            config.provider = Some(choice);
+        });
+        let Some((config, role)) = self.agent_model(left) else {
+            self.gap("the sender is not an agent node");
+            return;
+        };
+        let sender = self.agent_key(left);
+        let receiver = self.agent_key(right);
+        let spec = self.agent_launch_spec(&sender, &config, &role);
+        if let Err(error) = self.agent_runtime.start(&sender, spec) {
+            self.gap(&format!("the sender's session would not start: {error}"));
+            return;
+        }
+
+        let runtime_file = self.agent_runtime.runtime_file();
+        if !runtime_file.is_file() {
+            self.gap(&format!(
+                "a session is running and {} was not written, so no agent could find Velm",
+                runtime_file.display()
+            ));
+            self.agent_runtime.release(&sender);
+            return;
+        }
+
+        // A note for the second verb to follow, written through the **store the handler will
+        // resolve** rather than by composing a path here. Two notes, because a chain of one
+        // proves only that a file can be read — the trail is the feature.
+        let note_written = self.agent_runtime.note_store(&sender.board).and_then(|store| {
+            let scope = vellum_agent::NoteScope::Shared;
+            let leaf = store
+                .create("Lexer", scope.clone(), "# Lexer\n\nthe token table\n", vellum_agent::Requester::User)
+                .ok()?;
+            // Linked by **name**, the way a note written by hand or by an agent links to its
+            // sibling. `notes::sibling_note` refuses an absolute target on purpose — a link
+            // into the filesystem root is not a note in this store — and the fallback store
+            // (no project directory) stores paths absolute, so a link built from
+            // `leaf.path` is exactly the shape that is, correctly, not followed.
+            let leaf_name = std::path::Path::new(&leaf.path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or(leaf.path.clone());
+            let plan = store
+                .create(
+                    "Plan",
+                    scope,
+                    &format!("# Plan\n\nsee [the lexer]({leaf_name})\n"),
+                    vellum_agent::Requester::User,
+                )
+                .ok()?;
+            Some(plan.path)
+        });
+
+        // Exactly the environment `agent_launch_spec` gives a child, read back off the spec
+        // rather than composed here — a fixture that set its own would prove the socket works
+        // for a client Velm does not actually launch.
+        let run = |actions: &mut Self, args: Vec<String>| -> (Option<bool>, String) {
+            let child = Child::new(&shim)
+                .args(&args)
+                .env(vellum_agent::mcp::IPC_ENV, runtime_file.display().to_string())
+                .env(vellum_agent::mcp::AGENT_ID_ENV, sender.wire())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+            let Ok(mut child) = child else {
+                return (None, format!("{} would not run", shim.display()));
+            };
+
+            // ⚠ **The frame loop is what answers.** A request parks in `AgentRuntime::inbox`
+            // and is served by `drain_jobs` on the next drain, so a fixture that waited on the
+            // child without draining would deadlock until the shim's own two-second timeout —
+            // and would then report the socket as broken when the only thing missing was the
+            // frame.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let status = loop {
+                actions.poll_agents();
+                match child.try_wait() {
+                    Ok(Some(status)) => break Some(status.success()),
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Ok(None) => {
+                        let _ = child.kill();
+                        break None;
+                    }
+                    Err(_) => break None,
+                }
+            };
+            // One more, because the reply reaching the shim and the record reaching disk are
+            // two different moments and the child can exit between them.
+            actions.poll_agents();
+            let said = child
+                .wait_with_output()
+                .map(|out| {
+                    let mut text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                    let errors = String::from_utf8_lossy(&out.stderr);
+                    if !errors.trim().is_empty() {
+                        text.push_str(&format!(" [stderr: {}]", errors.trim()));
+                    }
+                    text
+                })
+                .unwrap_or_default();
+            (status, said)
+        };
+
+        let (status, said) = run(
+            self,
+            vec!["send".to_owned(), receiver.wire(), "the parser is done".to_owned()],
+        );
+
+        // The second verb, over the same socket: feature 8's chaining, which reaches
+        // `NoteStore::context_chain` and had no live caller of any kind. Asserted on the
+        // **linked** note appearing, not merely on a zero exit — a build that returned the
+        // starting note alone would exit 0 and have followed nothing.
+        let (chain_ok, chain_said) = match &note_written {
+            Some(path) => {
+                let (status, said) =
+                    run(self, vec!["note".to_owned(), "chain".to_owned(), path.clone()]);
+                (status == Some(true) && said.contains("the token table"), said)
+            }
+            None => (false, "no note store for this board".to_owned()),
+        };
+
+        let landed = self
+            .agent_runtime
+            .sidecar()
+            .read_all(&receiver.board, &receiver.item)
+            .map_or(0, |tail| {
+                tail.records
+                    .iter()
+                    .filter(|record| {
+                        matches!(record.event, vellum_agent::TranscriptEvent::Message { .. })
+                    })
+                    .count()
+            });
+
+        self.agent_runtime.release(&sender);
+
+        let name = shim.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        match (status, landed, chain_ok) {
+            (Some(true), 1, true) => self.ok(format!(
+                "a real {name} process reached Velm over the loopback socket: its message \
+                 landed in the target's transcript, and `note chain` followed a link to a \
+                 second note — {said}"
+            )),
+            (Some(true), 1, false) => self.gap(&format!(
+                "the message crossed, and `note chain` did not follow the link: {chain_said}"
+            )),
+            (Some(true), n, _) => self.gap(&format!(
+                "the shim reported success and {n} message(s) reached the target's transcript, \
+                 expected 1 — {said}"
+            )),
+            (Some(false), ..) => {
+                self.gap(&format!("the shim exited with an error: {said}"));
+            }
+            (None, ..) => self.gap(
+                "the shim never exited — Velm did not answer it within five seconds of \
+                 frames",
+            ),
         }
     }
 
@@ -4114,7 +6051,7 @@ impl ActiveState {
 
         let sender = self.agent_key(left);
         let receiver = self.agent_key(right);
-        let now_ms = crate::agent_runtime::unix_now().saturating_mul(1_000);
+        let now_ms = crate::agent_runtime::unix_now_ms();
         let forward = self
             .agent_runtime
             .send(&sender, &receiver.wire(), "start on the parser", now_ms);
@@ -4159,8 +6096,12 @@ impl ActiveState {
         // The operation after: a board edit, to prove nothing leaked an undo group.
         self.editor.select([right]);
         self.shell.invalidate_selection();
-        self.run(Command::Delete);
+        let confirmed = self.delete_through_the_confirmation();
         let left_standing = self.agent_ids().len();
+        if !confirmed {
+            self.gap("deleting an agent raised no confirmation — a stray Backspace loses one");
+            return;
+        }
 
         if forward.is_ok()
             && again.is_ok()
@@ -4417,7 +6358,10 @@ impl ActiveState {
         let armed = self.territory_arm == Some(doc);
         sweep(self, press, release, false);
         // Mid-drag: the tint must be the *live* rectangle, and nothing may exist yet.
-        let previewing = self.territory_preview().is_some_and(|tint| tint.pending);
+        let previewing = self
+            .territories()
+            .iter()
+            .any(|tint| tint.emphasis == crate::draw::TerritoryEmphasis::Sweeping);
         let made_nothing = items_now(self) == before;
         let up = self.input.mouse_input(
             &mut self.camera,
@@ -4430,14 +6374,36 @@ impl ActiveState {
         let written = stored.is_some_and(|region| {
             (region.width - expected.0).abs() < 0.5 && (region.height - expected.1).abs() < 0.5
         });
-        // The other half: with the node selected, the painter is handed that same rectangle.
-        let drawn = self.territory_preview().is_some_and(|tint| {
-            stored.is_some_and(|region| {
-                (tint.region[2] - region.width).abs() < 1e-6 && !tint.pending
-            })
+        // The other half: with the node selected, the painter is handed that same rectangle,
+        // and it is marked as the one the user is working on.
+        let drawn = self.territories().iter().any(|tint| {
+            stored.is_some_and(|region| (tint.region[2] - region.width).abs() < 1e-6)
+                && tint.emphasis == crate::draw::TerritoryEmphasis::Selected
         });
 
+        // --- 1a. and it is still drawn with nothing selected -----------------------------
+        //
+        // **The assertion that discriminates the change the user asked for.** Everything
+        // above passes unchanged on the build where a region was drawn only while its owner
+        // was selected — the fixture selects the node before every check, because the old
+        // behaviour required it. *"the orchestrator area should be constantly shown"* is this
+        // line and nothing else, so it is measured with the selection deliberately empty, and
+        // it is judged on the **label** as well as the rectangle: with several regions on a
+        // board, a tint nobody can attribute to a node is the half of the request that reads
+        // as not done.
+        self.editor.select([]);
+        self.shell.invalidate_selection();
+        let standing = self.territories().iter().find(|tint| tint.doc == doc).map(|tint| {
+            (tint.emphasis == crate::draw::TerritoryEmphasis::Standing, tint.label.clone())
+        });
+        let shown_unselected =
+            standing.as_ref().is_some_and(|(faint, label)| *faint && !label.trim().is_empty());
+
         // --- 2. Escape mid-sweep leaves the region alone ---------------------------------
+        // Reselected: `arm_territory` refuses a selection that is not exactly one managing
+        // node, and 1a above deliberately emptied it.
+        self.editor.select([doc]);
+        self.shell.invalidate_selection();
         self.arm_territory();
         sweep(self, at(0.4, 0.4), at(0.45, 0.45), false);
         self.cancel_drag();
@@ -4449,17 +6415,25 @@ impl ActiveState {
         sweep(self, tap, tap, true);
         let kept_after_click = region_now(self) == stored;
 
-        // Leave the stored tint on screen, which is the one thing no assertion here sees.
-        // `Editor::select` takes **document** ids, not scene ids. Both are integers, which is
-        // exactly why the mistake compiles nowhere and reads fine everywhere.
-        self.editor.select([doc]);
+        // Left **deselected** on purpose, so `--screenshot` photographs the thing the change
+        // is about: a region drawn, and named, with nothing picked. Selecting the node first
+        // would produce a PNG identical to the old build's.
+        self.editor.select([]);
         self.shell.invalidate_selection();
 
-        match (armed, written && drawn, previewing && made_nothing, kept_after_escape && kept_after_click) {
-            (true, true, true, true) => self.ok(format!(
-                "swept a {:.0} x {:.0} territory, drew it, and kept it through an Escape \
-                 and a click",
-                expected.0, expected.1
+        match (
+            armed,
+            written && drawn,
+            previewing && made_nothing,
+            kept_after_escape && kept_after_click,
+            shown_unselected,
+        ) {
+            (true, true, true, true, true) => self.ok(format!(
+                "swept a {:.0} x {:.0} territory, drew it, kept it through an Escape and a \
+                 click, and it is still drawn — labelled {:?} — with nothing selected",
+                expected.0,
+                expected.1,
+                standing.as_ref().map_or("", |(_, label)| label.as_str())
             )),
             (false, ..) => self.gap("the territory sweep could not be armed on an orchestrator"),
             (_, false, ..) => self.gap(&format!(
@@ -4469,13 +6443,17 @@ impl ActiveState {
                 expected.1,
                 if drawn { "it" } else { "nothing that matches" }
             )),
-            (_, _, false, _) => self.gap(&format!(
+            (_, _, false, ..) => self.gap(&format!(
                 "mid-drag the preview was live: {previewing}, and the board still held only \
                  what it started with: {made_nothing}"
             )),
-            (.., false) => self.gap(&format!(
+            (_, _, _, false, _) => self.gap(&format!(
                 "an abandoned sweep changed the region — after Escape {kept_after_escape}, \
                  after a click {kept_after_click}"
+            )),
+            (.., false) => self.gap(&format!(
+                "with nothing selected the region was {standing:?} — it has to stay on the \
+                 board, faintly, carrying its owner's name"
             )),
         }
     }
@@ -4555,7 +6533,28 @@ impl ActiveState {
             text: "---\ntone: blunt\nlanguage: English\n---\n\nProject house style.\n".to_owned(),
             ..AgentRules::default()
         };
-        self.save_rule_layer(Layer::Project, &written);
+        // ⚠ **Through the gesture, not through the writer.** This used to call
+        // `save_rule_layer` directly, which was honest when it was the only thing that could
+        // — there was no affordance anywhere in the application that reached it, so two of
+        // the cascade's three layers were read-only while every part of the write path was
+        // written, tested and green. Entering at `answered` proves what a user can now do:
+        // press *Edit* beside an inherited layer in the rules editor, which raises
+        // `DialogEvent::EditRuleLayer`, which opens an editor on that file, whose *Save*
+        // comes back as `RulesSet` against `Ask::RuleLayer`. A fixture that skipped to the
+        // writer would pass on a build where the button emitted nothing.
+        let opened = self.shell.pending_ask().map(|(id, _)| id);
+        let Some(rules_dialog) = opened else {
+            self.gap("Edit ▸ Agent ▸ Rules… raised no dialog");
+            return;
+        };
+        self.answered(vellum_ui::DialogEvent::EditRuleLayer(rules_dialog, Layer::Project));
+        let Some((layer_dialog, crate::shell::Ask::RuleLayer(Layer::Project))) =
+            self.shell.pending_ask().map(|(id, ask)| (id, ask.clone()))
+        else {
+            self.gap("pressing Edit on the project layer opened no editor for it");
+            return;
+        };
+        self.answered(vellum_ui::DialogEvent::RulesSet(layer_dialog, written.clone()));
 
         let target = vellum_agent::rules::project_rules_target(&project);
         let created = target.is_file();
@@ -4604,6 +6603,153 @@ impl ActiveState {
                  before this ran"
             )),
         }
+    }
+
+    /// Pasting the same thing three times in a row, through the real paste path.
+    ///
+    /// Written for a specific report — *"when i try to paste links back to back it almost
+    /// feels the application is freezing but its not, it just doesnt let me paste back to
+    /// back"* — and it exists because the two obvious explanations are indistinguishable
+    /// from the outside. Either the second paste is **refused**, or it **lands exactly on
+    /// top of the first** and the user is looking at a stack of identical cards. One is a
+    /// bug in the paste path and the other is a bug in where a repeat goes; they need
+    /// telling apart before either is fixed.
+    ///
+    /// So this reports the item count and the *distinct positions* after each press. The
+    /// positions are the whole point: a run that gained three items at one position is the
+    /// stacking answer, and a run that gained one is the refusal answer.
+    ///
+    /// Drive it with something on the pasteboard — `printf 'https://example.com/a' | pbcopy`
+    /// — because the flavour the payload takes decides which arm runs, and the arm is what
+    /// is being tested.
+    fn demo_paste_repeat(&mut self) {
+        let before = self.editor.projection().len();
+        let mut counts = Vec::new();
+        for _ in 0..3 {
+            self.paste();
+            counts.push(self.editor.projection().len());
+        }
+
+        // Distinct centres, rounded, so two items in the same place count once. Rounding
+        // rather than comparing exactly: a repeat that is nudged by a fraction of a unit is
+        // stacked as far as anyone looking at the board is concerned.
+        let mut spots: Vec<(i64, i64)> = self
+            .editor
+            .projection()
+            .iter()
+            .map(|(_, projected)| {
+                let placement = projected.item.placement;
+                #[expect(clippy::cast_possible_truncation, reason = "a board coordinate")]
+                (placement.x.round() as i64, placement.y.round() as i64)
+            })
+            .collect();
+        spots.sort_unstable();
+        spots.dedup();
+
+        let after = self.editor.projection().len();
+        log::info!(
+            "paste-repeat: {before} items before, {counts:?} after each of 3 pastes, \
+             {} gained, landing on {} distinct position(s)",
+            after.saturating_sub(before),
+            spots.len()
+        );
+        self.ok(format!(
+            "3 pastes gained {} item(s) on {} position(s)",
+            after.saturating_sub(before),
+            spots.len()
+        ));
+    }
+
+    /// What one edit costs on **the board that is actually open**, measured rather than
+    /// reasoned about.
+    ///
+    /// # Why this needs a fixture at all
+    ///
+    /// `--screenshot` photographs a *settled* frame — a second of frames have already run
+    /// by the time the PNG is written — so the thing worth seeing is over before the
+    /// camera opens. And the HUD's `REPROJ` is one sample of whichever rebuild happened
+    /// last, which on a first run is the cold one and is not the steady-state figure. Both
+    /// were tried before this was written, and both give a number that looks like evidence
+    /// and is not.
+    ///
+    /// # The two questions, and why the second one is the real one
+    ///
+    /// The cost of an edit is not the rebuild — it is what the rebuild *invalidates*.
+    /// `Projection::rebuild` stamps every item with one new generation, and every layout
+    /// cache in `crate::draw` is keyed on `Projected::generation`, so the question that
+    /// decides whether an edit is cheap is: **after changing one item, how many items have
+    /// a new generation?** Today the answer is all of them, and this says so with a number
+    /// rather than an argument.
+    ///
+    /// That also makes this the A/B harness for the fix: carrying an unchanged item's old
+    /// generation forward should take the second figure to 1 and leave the first alone.
+    /// A fixture that only timed the rebuild would report that fix as doing nothing.
+    fn demo_reproject_cost(&mut self) {
+        const SAMPLES: usize = 20;
+
+        let items = self.editor.projection().len();
+        if items == 0 {
+            self.gap("the reproject fixture needs a board with something on it");
+            return;
+        }
+
+        // Question one: what does a whole-document rebuild cost, sampled rather than
+        // guessed from one run. Reported as min/median/max because the first is always
+        // colder than the rest and a mean would hide that.
+        let mut timings: Vec<f64> = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            self.editor.reproject();
+            timings.push(self.editor.last_reproject().as_secs_f64() * 1000.0);
+        }
+        timings.sort_by(f64::total_cmp);
+        let (fastest, median, slowest) =
+            (timings[0], timings[SAMPLES / 2], timings[SAMPLES - 1]);
+
+        // Question two: the blast radius of a one-item edit.
+        let before: std::collections::HashMap<SceneId, u64> = self
+            .editor
+            .projection()
+            .iter()
+            .map(|(id, projected)| (*id, projected.generation))
+            .collect();
+        let Some(victim) = self.editor.projection().iter().next().map(|(_, p)| p.doc_id) else {
+            self.gap("the reproject fixture found no item to edit");
+            return;
+        };
+
+        // A real edit through the real chokepoint — `Editor::edit` is what all 57 of the
+        // app's editing paths use, so entering below it would measure something no user
+        // can reach. Moving by one unit rather than zero: an edit that changes nothing
+        // produces no CRDT operation, and would measure a rebuild that had nothing to do.
+        let moved = self.editor.edit(|board| {
+            let mut placement = board.item(victim)?.placement;
+            placement.x += 1.0;
+            board.set_placement(victim, placement)?;
+            Ok(())
+        });
+        if let Err(error) = moved {
+            self.gap(&format!("the reproject fixture could not move an item: {error}"));
+            return;
+        }
+
+        let restamped = self
+            .editor
+            .projection()
+            .iter()
+            .filter(|(id, projected)| {
+                before.get(*id).is_none_or(|was| *was != projected.generation)
+            })
+            .count();
+
+        log::info!(
+            "reproject: {items} items, rebuild {fastest:.2}/{median:.2}/{slowest:.2} ms \
+             (min/median/max over {SAMPLES}); one item moved and {restamped} of {items} \
+             were restamped, so {} cached layout(s) survived",
+            items.saturating_sub(restamped)
+        );
+        self.ok(format!(
+            "rebuild {median:.1} ms, {restamped}/{items} layouts invalidated by a 1-item edit"
+        ));
     }
 
     fn demo_edit_then_delete(&mut self) {
@@ -4982,6 +7128,234 @@ impl ActiveState {
         }
     }
 
+    /// Types a frame's name through **both doors a keystroke goes through**, which is the
+    /// hop `--demo typing` cannot see.
+    ///
+    /// # The bug this exists for
+    ///
+    /// Three of the user's reports in one sitting — *"press backspace while typing and it
+    /// fucking deleted the whole frame"*, *"when i start typing and try to focus out of
+    /// something it shouldnt add another random shape"*, and *"when i am typing its starts
+    /// activating all of the shortcuts and starts randomly selecting stuff"* — were one
+    /// cause. `App::window_event` hands every key to `Shell::on_window_event` **first**, so
+    /// egui has it before any of the app's three text sessions claim it; and
+    /// [`vellum_ui::Chrome`]'s shortcut table only ever knew about a focused *egui* field,
+    /// which the on-canvas caret is not. So the table ran on the letters of every word
+    /// typed on a board: `R` armed the rectangle, `S` the shape tool, `T` the text tool,
+    /// and Backspace fired [`vellum_ui::Command::Delete`] on the very item being renamed.
+    ///
+    /// # Why it has to be driven here
+    ///
+    /// `--demo typing` feeds `type_key` directly, which is *downstream of the drop*, so it
+    /// was green through the whole bug — `CLAUDE.md`'s trap 9 exactly, arrived at in a
+    /// fourth place. `vellum-ui`'s own tests are upstream of it: they synthesise a chrome
+    /// frame with no app, so nothing there can know a caret is up. Only the two together
+    /// can fail, so this drives both, per keystroke, in production's own order.
+    ///
+    /// The word is chosen so nearly every letter is a live binding: `R` and `S` and `T` and
+    /// `E` and `A` are all tools or shapes. A fixture typing "hello" would pass on the
+    /// broken build.
+    fn demo_typing_shortcuts(&mut self) {
+        use winit::keyboard::{Key, NamedKey};
+
+        let built = self.editor.edit(|board| {
+            let frame = board.add(NewItem::new(
+                ItemKind::Frame {
+                    title: StyledText::plain("Frame"),
+                    order: None,
+                    speaker_notes: None,
+                },
+                Placement::new(0.0, 0.0, 1200.0, 680.0),
+            ))?;
+            board.add(NewItem::new(
+                ItemKind::Sticky { text: StyledText::plain("keep me"), background: None },
+                Placement::new(0.0, 0.0, 199.0, 228.0),
+            ))?;
+            Ok(frame)
+        });
+        let Ok(frame) = built else {
+            self.gap("the shortcut fixture could not build its board");
+            return;
+        };
+        self.fit_board();
+        let Some(scene) = self.editor.projection().scene_id(frame) else {
+            self.gap("the placed frame is not in the projection");
+            return;
+        };
+        self.editor.select([frame]);
+        if !self.begin_editing(scene, true) {
+            self.gap("a double click on a frame did not start an edit on its title");
+            return;
+        }
+
+        // "Frame" arrives selected, so the first character replaces it.
+        let typed = "Rear Seats";
+        for character in typed.chars() {
+            let text = character.to_string();
+            if !self.press_like_the_window(&Key::Character(text.clone().into()), Some(&text)) {
+                self.gap(&format!("the caret did not claim `{character}`"));
+                return;
+            }
+        }
+        if !self.press_like_the_window(&Key::Named(NamedKey::Backspace), None) {
+            self.gap("the caret did not claim Backspace");
+            return;
+        }
+        // **The chord half**, which the ⌘/⌃ rule does not cover on its own. `⌘X` is claimed
+        // by the caret for the characters *and* was still reaching `Command::Cut`, which is
+        // in `mutates_board` — so it settled the edit and cut the item the caret was in.
+        // Nothing is selected in the buffer, so the session's own cut is a no-op and the
+        // only thing that could remove an item here is the table.
+        self.press_like_the_window_with(&Key::Character("x".into()), Some("x"), true);
+        self.commit_editing();
+
+        // Three answers, read back out of the document and the shell rather than out of the
+        // session, and **all three are checked**: a build that fixed only the Backspace
+        // would still arm a tool, and a build that fixed only the tools would still delete
+        // the frame. One report each.
+        let items = self.editor.board().item_ids().len();
+        let tool = self.shell.tool();
+        let expected = &typed[..typed.len() - 1];
+        let title = self
+            .editor
+            .board()
+            .item(frame)
+            .ok()
+            .and_then(|item| item.kind.text().map(vellum_doc::StyledText::to_plain))
+            .unwrap_or_default();
+
+        // Collected rather than reported at the first failure, because on the broken build
+        // the frame is *deleted* — and an `else if` chain would then say nothing at all
+        // about the tool, which is a different report by a different route. A fix for one
+        // that leaves the other standing has to be visible in one run.
+        let mut faults: Vec<String> = Vec::new();
+        if items != 2 {
+            faults.push(format!(
+                "typing left {items} of 2 items on the board — a keystroke reached Delete or Cut"
+            ));
+        }
+        if tool != Tool::Select {
+            faults.push(format!(
+                "typing armed the {tool:?} tool, so the click leaving the field would place one"
+            ));
+        }
+        if items == 2 && title != expected {
+            faults.push(format!("the frame is named {title:?}, not {expected:?}"));
+        }
+        if faults.is_empty() {
+            self.ok(format!(
+                "renamed a frame to {title:?} through the chrome: both items survived and the tool is still Select"
+            ));
+        } else {
+            self.gap(&faults.join("; "));
+        }
+    }
+
+    /// A shape, given a colour and a transparency through the path the bar's picker uses.
+    ///
+    /// *"wgeb u cgabge tge color or the transparency of a rectangle or a shape it doesnt take
+    /// effect"* — and it did not, for as long as a shape has had a fill swatch.
+    /// `inspect::apply_style`'s `Fill` arm matched `Sticky` and `Frame` and dropped
+    /// everything else, so the edit was discarded and answered `NotApplicable`: no error, no
+    /// toast, and a swatch that went on reporting the `None` it had never stopped holding.
+    ///
+    /// The unit test in `crate::inspect` covers the arithmetic. What only this can cover is
+    /// the **wiring**: that a `UiEvent::Style` from the bar reaches `ActiveState::style`,
+    /// survives `settle()` and the undo group, and comes back out of the *projection* — the
+    /// copy the painter actually draws from, which is a different read from the document's.
+    /// The alpha rides on the same `Color`, so both halves of the report are one write.
+    fn demo_shape_fill(&mut self) {
+        // The real shape tool, so the placement path is the one a user takes.
+        self.choose_tool(Tool::Shape);
+        let from = self.camera.world_to_screen(WorldPoint::new(-300.0, -200.0));
+        let to = self.camera.world_to_screen(WorldPoint::new(300.0, 200.0));
+        self.act_on(Intent::Place { at: from, to });
+        self.settle();
+        self.fit_board();
+
+        let Some(doc) = self.editor.board().item_ids().into_iter().find(|id| {
+            matches!(self.editor.board().item(*id).map(|i| i.kind), Ok(ItemKind::Shape { .. }))
+        }) else {
+            self.gap("the shape tool placed no shape");
+            return;
+        };
+        self.editor.select([doc]);
+
+        // Through `dispatch`, not `apply_style`: a `StyleEdit` arrives from the bar as a
+        // `UiEvent` and never as a `Command`, so this is the hop that was never driven.
+        let teal = vellum_doc::Color::rgba(0x00, 0xA3, 0x8C, 0x99);
+        self.dispatch(vellum_ui::UiEvent::Style(vellum_ui::StyleEdit::Fill(Some(teal))));
+
+        let stored = self.editor.board().item(doc).ok().and_then(|item| item.style.fill);
+        let projected = self
+            .editor
+            .projection()
+            .scene_id(doc)
+            .and_then(|scene| self.editor.projection().get(scene))
+            .and_then(|projected| projected.item.style.fill);
+
+        match (stored, projected) {
+            (Some(a), Some(b)) if a == teal && b == teal => self.ok(format!(
+                "a shape took #{:02X}{:02X}{:02X} at alpha {} — the document and the \
+                 projection the painter draws from agree",
+                a.r, a.g, a.b, a.a
+            )),
+            (None, _) => self.gap("the fill never reached the shape — the edit was dropped"),
+            (Some(a), b) => self.gap(&format!("the shape holds {a:?} and the painter sees {b:?}")),
+        }
+    }
+
+    /// One key press, down **every** path `App::window_event` sends it down, in that order.
+    ///
+    /// `WindowEvent::KeyboardInput` is offered to the chrome *first* — that ordering is the
+    /// whole defect [`Self::demo_typing_shortcuts`] exists for — and then to the three text
+    /// sessions, then to `crate::input`, then to the shortcut table. A fixture that calls
+    /// one of those directly enters downstream of every trap in the ladder, which is
+    /// precisely why `--demo typing` stayed green through three of the user's reports.
+    ///
+    /// The chrome only *acts* on what it saw when a frame is run, so the frame is run here
+    /// too. Returns whether one of the text sessions claimed the key.
+    pub(crate) fn press_like_the_window(
+        &mut self,
+        key: &winit::keyboard::Key,
+        text: Option<&str>,
+    ) -> bool {
+        self.press_like_the_window_with(key, text, false)
+    }
+
+    /// [`Self::press_like_the_window`], with ⌘ optionally held.
+    ///
+    /// Both sides have to be told: egui carries the modifiers on the event, and the app
+    /// reads `Input::modifiers`. Setting one and not the other is a chord to one half of
+    /// the application and a bare key to the other, which is a fixture that agrees with
+    /// nothing.
+    pub(crate) fn press_like_the_window_with(
+        &mut self,
+        key: &winit::keyboard::Key,
+        text: Option<&str>,
+        command: bool,
+    ) -> bool {
+        let mut state = winit::keyboard::ModifiersState::empty();
+        state.set(winit::keyboard::ModifiersState::SUPER, command);
+        self.input.set_modifiers(state);
+        let modifiers = egui::Modifiers { command, mac_cmd: command, ..egui::Modifiers::NONE };
+        if let Some(egui_key) = crate::shell::egui_key_for(key) {
+            self.shell.press_key_in_chrome(egui_key, modifiers);
+        }
+        // The same ladder, in the same order, as `App::window_event`. `talk_key` is left out
+        // because it needs a physical key and claims nothing without a voice-enabled node
+        // selected.
+        let claimed = (self.is_prompting() && self.type_prompt_key(key, text))
+            || (self.is_editing_note() && self.type_note_key(key, text))
+            || (self.editing.is_some() && self.type_key(key, text));
+        if !claimed && !self.input.key(key, winit::event::ElementState::Pressed) {
+            self.shortcut(key);
+        }
+        self.run_chrome();
+        self.input.set_modifiers(winit::keyboard::ModifiersState::empty());
+        claimed
+    }
+
     /// Types into a table cell, a kanban card and a mind-map node, through the real path.
     ///
     /// The three structured widgets went from *placeable and unchangeable* to editable, and
@@ -5203,6 +7577,267 @@ impl ActiveState {
     /// It also drives the **paste** path with a bare URL, which is how a board of links is
     /// actually built. Reads the answer back out of the document: a URL must become an
     /// `ItemKind::LinkPreview` naming its site, not a sticky with a URL written on it.
+    /// A dozen images and a real zoom sweep, counting the frames that drew a placeholder.
+    ///
+    /// **The hop nothing else drives.** A refinement is decided by one frame's draws, requested
+    /// on the next and answered several frames later by a worker thread — so the composed path
+    /// (`wants_refinement` -> `request_refinements` -> decode -> `upload_within` -> `rebind` ->
+    /// `remove`) cannot be observed by any unit test or by a single command, and every layer of
+    /// it having its own passing test says nothing about whether it runs. That is this repo's
+    /// signature defect and the reason this fixture exists.
+    ///
+    /// The verdict is in `App::tick_zoom_sweep`, which is where the frames are. It fails on a
+    /// sweep that never asked for a refinement as loudly as on one that blinked: a green run
+    /// that exercised nothing is the worse outcome, because it reads as evidence.
+    /// Twelve large images, selected together and dragged — the report that the content
+    /// disappears when a whole board is picked up and moved.
+    ///
+    /// *"when i moved the things it deleted removes the images for some reason"*, with a
+    /// before-and-after pair: every item drawn, then every item a bare selection ring with
+    /// nothing inside it. Large enough, and enough of them, to put residency at the budget,
+    /// because that is the state the user's own boards are in and the suspicion is that the
+    /// move is only the trigger.
+    /// A sticky dragged **off** its frame, which is where the content used to disappear.
+    ///
+    /// *"you didnt see it still disappears when i move these things outside of the frame"*,
+    /// with a screenshot of empty selection rings. `draw::clipped_by_frame` hides an item whose
+    /// ancestor frame no longer intersects it — Miro's behaviour, and right — but Miro also
+    /// takes an item *out* of a frame when you drag it out, and nothing here did. The item kept
+    /// its parent, kept being clipped, and stopped being drawn while staying perfectly
+    /// selectable.
+    ///
+    /// Asserts both directions, because a build that simply never parents anything would pass
+    /// the first half: out of the frame the sticky must become loose **and** be drawable, and
+    /// dragged back on it must be adopted again.
+    fn demo_leave_frame(&mut self) {
+        use winit::event::{ElementState, MouseButton};
+
+        let built = self.editor.edit(|board| {
+            board.begin_undo_group()?;
+            let frame = board.add(NewItem::new(
+                ItemKind::Frame {
+                    title: vellum_doc::StyledText::plain("Region"),
+                    order: None,
+                    speaker_notes: None,
+                },
+                Placement::new(0.0, 0.0, 1200.0, 800.0),
+            ))?;
+            let note = board.add(
+                NewItem::new(
+                    ItemKind::Sticky {
+                        text: vellum_doc::StyledText::plain("note"),
+                        background: None,
+                    },
+                    Placement::new(0.0, 0.0, 200.0, 200.0),
+                )
+                .with_parent(frame),
+            )?;
+            board.end_undo_group();
+            Ok((frame, note))
+        });
+        let Ok((frame, note)) = built else {
+            self.gap("leave-frame: could not build the fixture");
+            return;
+        };
+
+        let drag = |state: &mut Self, from: WorldPoint, to: WorldPoint| {
+            let (a, b) = (state.camera.world_to_screen(from), state.camera.world_to_screen(to));
+            state.input.cursor_moved(&mut state.camera, a);
+            let down =
+                state.input.mouse_input(&mut state.camera, MouseButton::Left, ElementState::Pressed);
+            state.act_on(down);
+            // Trap 5: the application answers the press, or this sweeps a marquee.
+            state.input.resolve_press(true);
+            let moved = state.input.cursor_moved(&mut state.camera, b);
+            state.act_on(moved);
+            let up = state.input.mouse_input(
+                &mut state.camera,
+                MouseButton::Left,
+                ElementState::Released,
+            );
+            state.act_on(up);
+        };
+
+        self.fit_board();
+        let parent_of = |state: &Self| state.editor.board().item(note).ok().and_then(|i| i.parent);
+
+        // Out, well clear of the frame's right edge.
+        drag(self, WorldPoint::new(0.0, 0.0), WorldPoint::new(1400.0, 0.0));
+        let left = parent_of(self);
+
+        // …and back onto it.
+        let here = self.editor.board().item(note).map(|i| (i.placement.x, i.placement.y));
+        if let Ok((x, y)) = here {
+            drag(self, WorldPoint::new(x, y), WorldPoint::new(0.0, 0.0));
+        }
+        let returned = parent_of(self);
+
+        match (left, returned) {
+            (None, Some(back)) if back == frame => self.ok(
+                "leave-frame: dragged off the frame it came loose, and dragged back on it was \
+                 adopted again",
+            ),
+            (Some(_), _) => self.gap(
+                "leave-frame: the sticky kept its frame after being dragged off it, so the \
+                 frame still clips it and it draws nothing",
+            ),
+            (None, other) => self.gap(&format!(
+                "leave-frame: it came loose but was not adopted back; parent is {other:?}"
+            )),
+        }
+    }
+
+    fn demo_move_images(&mut self) {
+        use winit::event::{ElementState, MouseButton};
+
+        // 2048 on a side, which is `TextureBudget::max_dimension` — so each is stored at its
+        // ceiling and twelve of them is 264 MB against a 268 MB budget. A fixture of small
+        // images would exercise none of the residency this is about.
+        const SIDE: u32 = 2048;
+        const COUNT: usize = 12;
+
+        let mut blobs = Vec::new();
+        for index in 0..COUNT {
+            let mut image = image::RgbaImage::new(SIDE, SIDE);
+            let tint = (index * 20) as u8;
+            for (x, y, pixel) in image.enumerate_pixels_mut() {
+                let shade = ((x / 8) ^ (y / 8)) as u8;
+                *pixel = image::Rgba([shade.wrapping_add(tint), shade, 255 - shade, 255]);
+            }
+            let mut png = std::io::Cursor::new(Vec::new());
+            if let Err(error) = image.write_to(&mut png, image::ImageFormat::Png) {
+                self.gap(&format!("move-images: could not encode: {error}"));
+                return;
+            }
+            match self.editor.assets().blobs().put(&png.into_inner()) {
+                Ok(hash) => blobs.push(hash),
+                Err(error) => {
+                    self.gap(&format!("move-images: could not store: {error}"));
+                    return;
+                }
+            }
+        }
+
+        let placed = self.editor.edit(|board| {
+            board.begin_undo_group()?;
+            for (index, asset_id) in blobs.iter().enumerate() {
+                let column = (index % 4) as f64;
+                let row = (index / 4) as f64;
+                board.add(NewItem::new(
+                    ItemKind::Image { asset_id: asset_id.to_string(), crop: None },
+                    Placement::new(column * 620.0, row * 620.0, 600.0, 600.0),
+                ))?;
+            }
+            board.end_undo_group();
+            Ok(())
+        });
+        if let Err(error) = placed {
+            self.failed("move-images", &error);
+            return;
+        }
+
+        self.fit_board();
+        self.editor.select_all();
+        self.shell.invalidate_selection();
+
+        // A real press-drag-release starting **on** one of the selected images, which is what
+        // picks a selection up rather than sweeping a new marquee (trap 5).
+        let from = WorldPoint::new(0.0, 0.0);
+        let to = WorldPoint::new(240.0, 160.0);
+        let (a, b) = (self.camera.world_to_screen(from), self.camera.world_to_screen(to));
+        self.input.cursor_moved(&mut self.camera, a);
+        let down =
+            self.input.mouse_input(&mut self.camera, MouseButton::Left, ElementState::Pressed);
+        self.act_on(down);
+        // Trap 5: the application answers the press, or the drag is a marquee and moves nothing.
+        self.input.resolve_press(true);
+        let moved = self.input.cursor_moved(&mut self.camera, b);
+        self.act_on(moved);
+        let up =
+            self.input.mouse_input(&mut self.camera, MouseButton::Left, ElementState::Released);
+        self.act_on(up);
+
+        self.ok(format!(
+            "move-images: {COUNT} images placed, all selected, dragged — {} still selected",
+            self.editor.selection().len()
+        ));
+    }
+
+    fn demo_zoom_flicker(&mut self) {
+        // Six hues, generated here rather than shipped: a swap that binds the wrong texture is
+        // then *visible* in a screenshot rather than merely absent.
+        const HUES: [[u8; 3]; 6] = [
+            [220, 70, 70],
+            [70, 160, 90],
+            [70, 110, 200],
+            [210, 160, 60],
+            [150, 80, 190],
+            [60, 170, 180],
+        ];
+        // Large enough to have somewhere to refine *to*: a texture already at its ceiling is
+        // never asked, so a fixture built on small images would prove nothing.
+        const SIDE: u32 = 1024;
+
+        let mut blobs = Vec::new();
+        for hue in HUES {
+            let mut image = image::RgbaImage::new(SIDE, SIDE);
+            for (x, y, pixel) in image.enumerate_pixels_mut() {
+                // A gradient rather than a flat fill, so the mip levels genuinely differ and a
+                // refinement has something to be sharper *about*.
+                let shade = ((x ^ y) % 256) as u8;
+                *pixel = image::Rgba([
+                    hue[0].saturating_add(shade / 8),
+                    hue[1].saturating_add(shade / 8),
+                    hue[2].saturating_add(shade / 8),
+                    255,
+                ]);
+            }
+            let mut png = std::io::Cursor::new(Vec::new());
+            if let Err(error) = image.write_to(&mut png, image::ImageFormat::Png) {
+                self.gap(&format!("zoom-flicker: could not encode a fixture image: {error}"));
+                return;
+            }
+            match self.editor.assets().blobs().put(&png.into_inner()) {
+                Ok(hash) => blobs.push(hash),
+                Err(error) => {
+                    self.gap(&format!("zoom-flicker: could not store a fixture image: {error}"));
+                    return;
+                }
+            }
+        }
+
+        let placed = self.editor.edit(|board| {
+            board.begin_undo_group()?;
+            for (index, asset_id) in blobs.iter().enumerate() {
+                let column = (index % 3) as f64;
+                let row = (index / 3) as f64;
+                board.add(NewItem::new(
+                    ItemKind::Image { asset_id: asset_id.to_string(), crop: None },
+                    Placement::new(column * 420.0, row * 420.0, 400.0, 400.0),
+                ))?;
+            }
+            board.end_undo_group();
+            Ok(())
+        });
+        if let Err(error) = placed {
+            self.failed("zoom-flicker", &error);
+            return;
+        }
+
+        // **Zoomed well out first, and that is not decoration.** A refinement is only ever
+        // asked for when the stored texture is below its own ceiling, so an image that has
+        // never been demoted can never refine — the first run of this fixture reported exactly
+        // that, having placed six 1024px images, uploaded them at 1024 against a 1024 ceiling
+        // and swept in over textures that were already as sharp as they could be. Starting far
+        // enough out that `resolve_detail` demotes them is what gives the sweep something to
+        // sharpen back up, which is the state a real board is in at a fitted camera.
+        self.fit_board();
+        let centre = self.canvas_centre();
+        self.camera.set_zoom_about(0.12, centre);
+        self.arm_zoom_sweep();
+        self.ok(format!("zoom-flicker: {} images placed; settling before the sweep", blobs.len()));
+    }
+
     fn demo_links(&mut self) {
         use vellum_doc::CardMode;
 
@@ -5467,6 +8102,364 @@ impl ActiveState {
                 start.target, end.target,
             )),
             None => self.gap("the drag produced no connector at all"),
+        }
+    }
+
+    /// Miro's four blue dots, driven through the real input layer and **left mid-drag**.
+    ///
+    /// *"in miro there are these 4 blue dots around the picture and there should be 4 blue
+    /// dots on images agents sticky notes and when i hold and draw i should be able to
+    /// connect it to other agents sticky notes or agents or pictures."*
+    ///
+    /// # Why a fixture and not a unit test
+    ///
+    /// `handle::ports` and `handle::port_hit` are pure and separately tested, and none of
+    /// that says the feature is *reachable*. Six hops decide that, and every one of them is
+    /// wiring: `ported_item` has to answer at all; the press path has to ask about a port
+    /// **before** `handle_under` and before the scene; the press has to `resolve_press(true)`
+    /// or trap 5 turns the drag into a marquee; the preview has to be gated on the arm rather
+    /// than on the palette's tool, or the line is invisible for the whole gesture; the
+    /// release has to reach `draw_connector_from` rather than `place`, which with Select
+    /// armed creates nothing; and the anchor the user grabbed has to survive to the document
+    /// rather than being replaced by the facing edge.
+    ///
+    /// A test calling `draw_connector_from` directly would enter below all six and pass with
+    /// every one of them removed. That is this repository's oldest lesson.
+    ///
+    /// # Three assertions, because each is satisfiable by a broken build
+    ///
+    /// The **mid-drag** state is judged first and separately: the preview must be live
+    /// *while the board still holds only its two stickies*. A build that had already
+    /// committed looks identical in a screenshot and is the worse bug — feedback 23's rule.
+    ///
+    /// Then the binding, and then the anchor. The anchor is the one that discriminates this
+    /// feature from the connector tool that already existed: the drag goes from the **top**
+    /// port of the left sticky to a sticky lying to its right, so `facing_anchor` would
+    /// answer `RIGHT` and a build that ignored the grabbed dot passes every other check here.
+    fn demo_ports(&mut self) {
+        use winit::event::{ElementState, MouseButton};
+
+        let placed = self.editor.edit(|board| {
+            board.begin_undo_group()?;
+            let left = board.add(NewItem::new(
+                ItemKind::Sticky { text: StyledText::plain("from"), background: None },
+                Placement::new(-300.0, 0.0, 199.0, 228.0),
+            ))?;
+            let right = board.add(NewItem::new(
+                ItemKind::Sticky { text: StyledText::plain("to"), background: None },
+                Placement::new(300.0, 0.0, 199.0, 228.0),
+            ))?;
+            board.end_undo_group();
+            Ok((left, right))
+        });
+        let Ok((left, right)) = placed else {
+            self.gap("the port fixture could not place its stickies");
+            return;
+        };
+        self.fit_board();
+        self.choose_tool(Tool::Select);
+        self.editor.select([left]);
+        self.shell.invalidate_selection();
+
+        // Where the dots actually are, asked of the same function the painter asks. A point
+        // chosen by arithmetic here would be a second copy of the layout, and the press
+        // would land where the paint is not.
+        let Some(scene) = self.editor.projection().scene_id(left) else {
+            self.gap("the left sticky is not in the projection");
+            return;
+        };
+        let Some(placement) = self.editor.projection().placement_of(left) else { return };
+        let zoom = self.camera.zoom();
+        let ports = handle::ports(&placement, zoom);
+        let wearing = self.ported_item() == Some(scene);
+        // The **top** port, deliberately: see the doc comment.
+        let Some((anchor, at)) = ports
+            .iter()
+            .find(|(anchor, _)| *anchor == vellum_doc::ConnectorEnd::TOP)
+            .copied()
+        else {
+            self.gap("no top port was offered");
+            return;
+        };
+        let press = self.camera.world_to_screen(at);
+        let release = self.camera.world_to_screen(WorldPoint::new(300.0, 0.0));
+
+        // Real winit events, the three a pointer produces.
+        self.input.cursor_moved(&mut self.camera, press);
+        let down = self.input.mouse_input(
+            &mut self.camera,
+            MouseButton::Left,
+            ElementState::Pressed,
+        );
+        self.act_on(down);
+        let moved = self.input.cursor_moved(&mut self.camera, release);
+        self.act_on(moved);
+
+        // Mid-drag: a line on screen, and nothing on the board yet.
+        let before = self.editor.board().item_ids().len();
+        let previewing = self.pending_connector().is_some();
+        let armed = self.port_arm.is_some();
+
+        let up = self.input.mouse_input(
+            &mut self.camera,
+            MouseButton::Left,
+            ElementState::Released,
+        );
+        self.act_on(up);
+
+        let drawn = self.editor.board().item_ids().into_iter().find_map(|id| {
+            let item = self.editor.board().item(id).ok()?;
+            match item.kind {
+                ItemKind::Connector { start, end, .. } => Some((start, end)),
+                _ => None,
+            }
+        });
+        let joined = drawn
+            .as_ref()
+            .is_some_and(|(s, e)| s.target == Some(left) && e.target == Some(right));
+        let kept_the_dot = drawn.as_ref().is_some_and(|(s, _)| s.anchor == anchor);
+
+        match (wearing, armed && previewing && before == 2, joined, kept_the_dot) {
+            (true, true, true, true) => self.ok(format!(
+                "dragged from the {:?} port onto the next sticky: previewed mid-drag with \
+                 nothing created, then bound {:?} -> {:?}",
+                anchor_name(anchor),
+                anchor_name(drawn.as_ref().map_or(anchor, |(s, _)| s.anchor)),
+                anchor_name(drawn.as_ref().map_or(anchor, |(_, e)| e.anchor)),
+            )),
+            (false, ..) => self.gap("the selected sticky is not wearing connector ports"),
+            (_, false, ..) => self.gap(&format!(
+                "mid-drag: armed {armed}, previewing {previewing}, and the board held \
+                 {before} items where it should still hold 2"
+            )),
+            (_, _, false, _) => self.gap(&format!(
+                "the drag produced {drawn:?} rather than a connector between the two stickies"
+            )),
+            (.., false) => self.gap(
+                "the connector left the sticky by its facing edge rather than by the port \
+                 that was grabbed — the four dots are decorative",
+            ),
+        }
+    }
+
+    /// Dragging a selected connector's end onto a third item, through the real input layer.
+    ///
+    /// # Why a fixture and not a unit test
+    ///
+    /// `rebind_connector` is reachable only from a release, and every hop before it is
+    /// wiring: `connector_grips` has to answer for a selected line; the press path has to
+    /// ask about a grip **before** the ports and before `handle_under`; `begin_placement`
+    /// has to convert the press or the preview never draws; and the release has to reach
+    /// `rebind_connector` rather than `place`. Calling `rebind_connector` directly would
+    /// enter below all four.
+    ///
+    /// # The assertion that discriminates
+    ///
+    /// The connector is drawn between the **left** and **middle** stickies, then its end is
+    /// dragged onto a **third** one. A build that drew grips and did nothing on release
+    /// leaves the binding on the middle sticky and passes every check about grips existing;
+    /// only *"the end is now on the third sticky"* fails on it. The start binding is checked
+    /// too, because a rebind that rewrote both ends would otherwise look like a success.
+    fn demo_connector_ends(&mut self) {
+        use winit::event::{ElementState, MouseButton};
+
+        let placed = self.editor.edit(|board| {
+            board.begin_undo_group()?;
+            let mut sticky = |x: f64, word: &str| {
+                board.add(NewItem::new(
+                    ItemKind::Sticky { text: StyledText::plain(word), background: None },
+                    Placement::new(x, 0.0, 199.0, 228.0),
+                ))
+            };
+            let a = sticky(-500.0, "a")?;
+            let b = sticky(0.0, "b")?;
+            let c = sticky(500.0, "c")?;
+            board.end_undo_group();
+            Ok((a, b, c))
+        });
+        let Ok((a, b, c)) = placed else {
+            self.gap("the endpoint fixture could not place its stickies");
+            return;
+        };
+        self.fit_board();
+
+        // A real connector, drawn with the real tool, from a to b.
+        self.choose_tool(Tool::Connector);
+        let from = self.camera.world_to_screen(WorldPoint::new(-500.0, 0.0));
+        let to = self.camera.world_to_screen(WorldPoint::new(0.0, 0.0));
+        self.act_on(Intent::Place { at: from, to });
+        let Some(line) = self.editor.board().item_ids().into_iter().find(|id| {
+            self.editor
+                .board()
+                .item(*id)
+                .is_ok_and(|item| matches!(item.kind, ItemKind::Connector { .. }))
+        }) else {
+            self.gap("the connector tool produced nothing to drag the end of");
+            return;
+        };
+        self.choose_tool(Tool::Select);
+        self.editor.select([line]);
+        self.shell.invalidate_selection();
+
+        // Where the grips are, from the same function the painter asks.
+        let Some((doc, _, end_at)) = self.connector_grips() else {
+            self.gap("a selected connector offers no grips to drag");
+            return;
+        };
+        let press = self.camera.world_to_screen(WorldPoint::new(end_at.0, end_at.1));
+        let release = self.camera.world_to_screen(WorldPoint::new(500.0, 0.0));
+
+        self.input.cursor_moved(&mut self.camera, press);
+        let down =
+            self.input.mouse_input(&mut self.camera, MouseButton::Left, ElementState::Pressed);
+        self.act_on(down);
+        let moved = self.input.cursor_moved(&mut self.camera, release);
+        self.act_on(moved);
+
+        // Mid-drag: the preview runs from the end that is **staying**, not from the press.
+        let armed = self.endpoint_arm == Some((doc, true));
+        let previewing = self
+            .pending_connector()
+            .is_some_and(|(fixed, _)| (fixed.x - (-500.0 + 199.0 / 2.0)).abs() < 1.0);
+        let before = self.editor.board().item_ids().len();
+
+        let up =
+            self.input.mouse_input(&mut self.camera, MouseButton::Left, ElementState::Released);
+        self.act_on(up);
+
+        let bound = self.editor.board().item(line).ok().and_then(|item| match item.kind {
+            ItemKind::Connector { start, end, .. } => Some((start.target, end.target)),
+            _ => None,
+        });
+        let moved_end = bound == Some((Some(a), Some(c)));
+        let made_nothing = self.editor.board().item_ids().len() == before;
+
+        match (armed, previewing, moved_end && made_nothing) {
+            (true, true, true) => self.ok(
+                "dragged a selected connector's end off one sticky and onto another; the \
+                 other end stayed put and no second connector was made",
+            ),
+            (false, ..) => self.gap("pressing the end grip armed nothing"),
+            (_, false, _) => self.gap(
+                "mid-drag the preview did not run from the end that is staying put",
+            ),
+            (.., false) => self.gap(&format!(
+                "the drag left the connector bound to {bound:?}, wanted ({a:?}, {c:?}), and \
+                 the board went from {before} items to {}",
+                self.editor.board().item_ids().len()
+            )),
+        }
+        let _ = b;
+    }
+
+    /// One agent node per chat theme, side by side, with a transcript in each.
+    ///
+    /// # Why a fixture and not a unit test
+    ///
+    /// `Theme::for_chat` is pure and `ChatTheme::colours` is a table — neither says whether
+    /// the **painter** ever asks. The substitution happens in one line inside the four-kind
+    /// arm of `push_item`, and everything downstream of it resolves colour through a
+    /// `&Theme` it is handed; miss that line and every node draws in the board's palette
+    /// while every test about themes still passes. That is this repository's signature
+    /// defect, and it has now been found nine times.
+    ///
+    /// So the assertion is on the **painted colours**: the four nodes are read back through
+    /// `Theme::for_chat` and required to differ from each other and from the board's own
+    /// paper. A build where the painter ignored the theme gives four identical palettes.
+    ///
+    /// The screenshot is the other half, and it is the half no assertion covers: whether the
+    /// result is *legible*. Four transcripts of real text, at four opacities, is what a
+    /// person has to look at.
+    fn demo_chat_themes(&mut self) {
+        let themes = vellum_agent::ChatTheme::ALL;
+        let placed = self.editor.edit(|board| {
+            board.begin_undo_group()?;
+            let mut out = Vec::new();
+            for (index, theme) in themes.into_iter().enumerate() {
+                let mut model = vellum_agent::AgentModel::worker();
+                model.chat_theme = Some(theme);
+                // A different transparency on each, so the slider's effect is in the same
+                // photograph as the palettes. Above `MIN_CHAT_OPACITY`, or the floor would
+                // be what is being photographed rather than the value.
+                model.chat_opacity = Some(255 - (index as u8) * 40);
+                let x = -900.0 + (index as f64) * 600.0;
+                out.push((
+                    board.add(NewItem::new(
+                        ItemKind::Agent {
+                            model: crate::agent::encode(&model),
+                            label: StyledText::plain(theme.label()),
+                        },
+                        Placement::new(x, 0.0, 520.0, 400.0),
+                    ))?,
+                    theme,
+                ));
+            }
+            board.end_undo_group();
+            Ok(out)
+        });
+        let made: Vec<(DocId, vellum_agent::ChatTheme)> = match placed {
+            Ok(out) => out,
+            Err(error) => {
+                self.failed("building the chat-theme demo", &error);
+                return;
+            }
+        };
+        self.fit_board();
+        self.settle();
+
+        // Read back through the same function the painter uses, from the tokens actually on
+        // the board rather than from the models built above — a token that failed to encode
+        // would otherwise be invisible here.
+        let base = crate::theme::Theme::LIGHT;
+        let mut papers: Vec<(String, [u8; 4])> = Vec::new();
+        for (doc, theme) in &made {
+            let Ok(item) = self.editor.board().item(*doc) else { continue };
+            let ItemKind::Agent { model, .. } = &item.kind else { continue };
+            let config = crate::agent::decode(model);
+            let resolved = crate::agent::chat_theme(&config, vellum_agent::ChatTheme::Velm);
+            if resolved != *theme {
+                self.gap(&format!(
+                    "a node written as {:?} came back as {resolved:?}",
+                    theme.label()
+                ));
+                return;
+            }
+            papers.push((theme.label().to_owned(), base.for_chat(resolved).surface.pack()));
+        }
+
+        let distinct: std::collections::HashSet<[u8; 4]> =
+            papers.iter().map(|(_, paper)| *paper).collect();
+        let opacities: Vec<f32> = made
+            .iter()
+            .filter_map(|(doc, _)| self.editor.board().item(*doc).ok())
+            .filter_map(|item| match &item.kind {
+                ItemKind::Agent { model, .. } => {
+                    Some(crate::agent::chat_opacity(&crate::agent::decode(model)))
+                }
+                _ => None,
+            })
+            .collect();
+        let faded = opacities.iter().any(|a| *a < 1.0);
+
+        if papers.len() == themes.len() && distinct.len() == themes.len() && faded {
+            self.ok(format!(
+                "four agent nodes, one per chat theme, each on its own paper: {}",
+                papers
+                    .iter()
+                    .map(|(name, paper)| format!(
+                        "{name} #{:02X}{:02X}{:02X}",
+                        paper[0], paper[1], paper[2]
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        } else {
+            self.gap(&format!(
+                "{} node(s) drew {} distinct papers, wanted {}; transparency varied: {faded}",
+                papers.len(),
+                distinct.len(),
+                themes.len()
+            ));
         }
     }
 
@@ -6164,8 +9157,11 @@ impl ActiveState {
         self.finish_erase();
         // A territory sweep is armed on the *input* tool, so picking a real tool would leave
         // the arm set and turn the next sticky placement into a region. Cleared without
-        // restoring anything, because the line below sets the input tool anyway.
+        // restoring anything, because the line below sets the input tool anyway. A port drag
+        // borrows the same tool and needs the same clearing, for the same reason — this is
+        // the sibling of the line above rather than a second thought.
         self.territory_arm = None;
+        self.port_arm = None;
         self.shell.set_tool(tool);
         self.input.set_tool(match tool {
             Tool::Hand => crate::input::Tool::Hand,
@@ -6232,7 +9228,10 @@ impl ActiveState {
                 // asked about a pen or an eraser that is not in this gesture at all. Guarded
                 // by the arm rather than by the tool, which is the state that actually says
                 // what the button is doing.
-                if self.territory_arm.is_some() {
+                if self.territory_arm.is_some()
+                    || self.port_arm.is_some()
+                    || self.endpoint_arm.is_some()
+                {
                     return;
                 }
                 // The eraser is in the same gesture bucket as the pen and has always
@@ -6276,6 +9275,31 @@ impl ActiveState {
                 // thrown away.
                 if self.territory_arm.is_some() {
                     self.commit_territory(from, to);
+                } else if let Some((doc, is_end)) = self.endpoint_arm.take() {
+                    let tool = self.shell.tool();
+                    self.choose_tool(tool);
+                    self.rebind_connector(doc, is_end, to);
+                } else if let Some((doc, anchor)) = self.port_arm.take() {
+                    // A drag that began on one of Miro's blue dots. The palette's tool is
+                    // still Select, so `place` would create nothing at all and the line
+                    // would simply have been drawn and thrown away — the same trap the
+                    // territory arm above exists to avoid.
+                    //
+                    // The start is the **port**, not the press: a press within `PORT_SLOP`
+                    // of a dot arms it, so the raw point is up to ten screen pixels off, and
+                    // it is what the far end's facing anchor is measured from. One
+                    // derivation with the preview's — see `pending_connector`.
+                    let from = self
+                        .editor
+                        .projection()
+                        .placement_of(doc)
+                        .map_or(from, |placement| {
+                            let (x, y) = crate::connector::anchor_point(&placement, anchor);
+                            WorldPoint::new(x, y)
+                        });
+                    let tool = self.shell.tool();
+                    self.choose_tool(tool);
+                    self.draw_connector_from(from, to, Some((doc, anchor)));
                 } else {
                     self.place(from, to);
                 }
@@ -6368,6 +9392,43 @@ impl ActiveState {
                 return;
             }
             self.commit_editing();
+        }
+
+        // A connector port, before the handles and before the scene. It has to come first
+        // for the resize handles' own reason and one more of its own: a port sits *outside*
+        // the item, so `Scene::hit_test` never finds it — and on a small item at a fitted
+        // zoom a port's grab circle overlaps the corner handle's, where whichever is asked
+        // first wins. Ports win deliberately. A press outside the outline is unambiguously
+        // aimed away from the item, which is what drawing a line from it means; a press on
+        // the outline still resizes, because `handle::hit`'s radius reaches inward from
+        // there and this one does not.
+        // A selected connector's own two grips, **before** the ports. A connector wears no
+        // ports of its own (`ported_item` refuses one), so the two can never both answer for
+        // the same line — but a grip routinely sits on top of another item's port ring,
+        // because that is exactly where a bound end lives. Asking the grip first is what
+        // makes "drag the end of the line I have selected" win over "start a new line from
+        // the box it is attached to", which is what the hand meant.
+        if !double
+            && let Some((doc, is_end)) = self.connector_grip_under(world)
+        {
+            self.input.begin_placement();
+            self.settle();
+            self.endpoint_arm = Some((doc, is_end));
+            self.input.set_tool(crate::input::Tool::Place);
+            return;
+        }
+
+        if !double
+            && let Some((_, doc, anchor)) = self.port_under(world)
+        {
+            // **`begin_placement`, not `resolve_press`** — trap 5 answered, and then some.
+            // `resolve_press` only ever produces a move or a marquee, so the gesture in
+            // flight would not be a placement and `Input::placement` would answer `None` for
+            // the whole drag: the line drew nothing until the button came up. Measured
+            // exactly that before this line existed.
+            self.input.begin_placement();
+            self.begin_port_drag(doc, anchor);
+            return;
         }
 
         // Handles first, before the scene is asked anything. Two reasons they cannot
@@ -6586,10 +9647,42 @@ impl ActiveState {
             // map lands in the *cell, card or node* under it rather than on the item as a
             // whole — which is what makes those three editable at all, since none of them
             // has words of its own for a caret to sit in.
+            // ⚠ **A double click in a note's body opens the note editor**, which is what
+            // gives `NoteStore::save` its first caller in the application and makes feature
+            // 8's file half writable from the canvas rather than only from a text editor.
+            // Asked before `begin_editing_at`, because a note's *title* is ordinary item text
+            // and the generic path would claim the whole node otherwise.
+            if double && self.note_body_under(id, world) {
+                let doc = self.editor.projection().get(id).map(|projected| projected.doc_id);
+                if let Some(doc) = doc {
+                    self.begin_note_editing(doc);
+                    self.input.resolve_press(true);
+                    return;
+                }
+            }
             if double && !self.begin_editing_at(id, false, Some(world)) {
                 self.shell.focus_text();
             }
         }
+    }
+
+    /// Whether a world point is inside a note node's **body** — its words, not its title or
+    /// its footer.
+    ///
+    /// Answered from `crate::note::layout`, the same function the painter lays the node out
+    /// with, so the region that opens the editor is the region the text is drawn in.
+    fn note_body_under(&self, scene: SceneId, world: WorldPoint) -> bool {
+        let Some(projected) = self.editor.projection().get(scene) else { return false };
+        let ItemKind::AgentNote { .. } = &projected.item.kind else { return false };
+        let (width, height) = projected.item.placement.scaled_size();
+        let (x, y) = (
+            world.x - projected.item.placement.x + width / 2.0,
+            world.y - projected.item.placement.y + height / 2.0,
+        );
+        matches!(
+            crate::note::layout(width, height).hit(x, y),
+            Some(crate::note::NotePart::Body)
+        )
     }
 
     /// Records where everything in the selection was when the drag began.
@@ -7294,10 +10387,10 @@ impl ActiveState {
         let (doc, text, part) = (session.doc, session.buffer.text().to_owned(), session.part);
         if !session.opened() {
             session.mark_opened();
-            let _ = self.editor.edit(|board| {
-                board.begin_undo_group()?;
-                Ok(())
-            });
+            // `begin_group`, not `edit`: opening a group changes no item, and going
+            // through `edit` reprojected the whole board and invalidated every cached
+            // layout on it — on the first keystroke of every edit.
+            self.editor.begin_group();
         }
         // A structured widget's words are one field inside an opaque token, so they are
         // written by decoding it, changing that field and re-encoding — not by `set_text`,
@@ -7330,11 +10423,28 @@ impl ActiveState {
     /// group, which is the only thing that made the session one undo step.
     pub(crate) fn commit_editing(&mut self) {
         let Some(session) = self.editing.take() else { return };
+        // ⚠ **The canvas caret is how a role is normally renamed, so the notice belongs here
+        // too.** A running agent keeps the role it started with, and the panel's field says
+        // so — but double-clicking the label on the node is the gesture feature 5 advertises
+        // ("roles must be fully editable at any time, directly on the node"), and it went
+        // through this path instead, silently. A warning that fires on the rarer of two
+        // gestures is a warning most people never see.
+        let is_agent = self
+            .editor
+            .board()
+            .item(session.doc)
+            .is_ok_and(|item| crate::agent::is_agent(&item.kind));
+        let key = self.agent_key(session.doc);
+        if is_agent && self.agent_runtime.is_running(&key) {
+            self.ok("Renamed. This agent keeps the role it started with until you stop it.");
+        }
         if session.opened() {
-            let _ = self.editor.edit(|board| {
-                board.end_undo_group();
-                Ok(())
-            });
+            // `end_group`, not `edit`. The comment above is the argument: nothing is
+            // written here, so there is nothing to project — and routing it through `edit`
+            // meant every click away from a sticky rebuilt the whole document and threw
+            // away every laid-out block on the board. There are ~14 call sites for this
+            // function.
+            self.editor.end_group();
         }
         self.shell.invalidate_selection();
     }
@@ -7672,7 +10782,7 @@ impl ActiveState {
         let key = crate::text::BlockKey::new(session.scene, session.slot);
         let text = session.buffer.text().to_owned();
         let (scene, slot) = (session.scene, session.slot);
-        let Some(origin) = self.text_block_origin(scene, slot) else {
+        let Some((origin, scale)) = self.text_block_origin(scene, slot) else {
             // No layout: the item is selected and being edited but has never been
             // painted. The click still belongs to the session — swallowing it beats
             // ending an edit the user cannot see the caret of.
@@ -7681,12 +10791,17 @@ impl ActiveState {
         let Some(layout) = self.painter.text_mut().layout_of(key) else { return true };
         // Screen space, because that is where the layout's own coordinates were placed.
         let at = self.camera.world_to_screen(world);
-        let zoom = self.camera.zoom();
+        // **The scale the block was painted at, not the camera's.** They agree for every kind
+        // but a frame's title, which floors its magnification so the name of a region stays
+        // legible on a zoomed-out board — undoing the camera's zoom there would resolve the
+        // click against glyphs half the size of the ones on screen, and the caret would land
+        // in the wrong character. `Block::scale`, carried through `edited_origin`.
+        let scale = f64::from(scale);
         #[expect(clippy::cast_possible_truncation, reason = "a block's extent is screen-scale")]
         let byte = layout.byte_at(
             &text,
-            ((at.x - origin.x) / zoom) as f32,
-            ((at.y - origin.y) / zoom) as f32,
+            ((at.x - origin.x) / scale) as f32,
+            ((at.y - origin.y) / scale) as f32,
         );
         if let Some(session) = self.editing.as_mut() {
             // One click places the caret, two select the word, three take everything — the
@@ -7712,7 +10827,7 @@ impl ActiveState {
     /// what the user actually saw, and recomputing would need a `DrawContext` built
     /// outside the paint loop and would answer about a frame not yet drawn. See
     /// `Painter::edited_origin`.
-    fn text_block_origin(&self, scene: SceneId, slot: u16) -> Option<ScreenPoint> {
+    fn text_block_origin(&self, scene: SceneId, slot: u16) -> Option<(ScreenPoint, f32)> {
         self.painter.edited_origin(crate::text::BlockKey::new(scene, slot))
     }
 
@@ -7794,6 +10909,10 @@ impl ActiveState {
             crate::draw::has_favicon(kind),
             true,
             crate::draw::is_video(kind),
+            // The same count the painter reserves lines from, or the press path decides the
+            // badge is somewhere the paint is not — `draw::kanban_runs`' rule, and the reason
+            // this calls the layout instead of repeating its arithmetic.
+            crate::draw::drawn_title_chars(kind),
         );
         // `placement.x`/`y` are the item's **centre**, so the top-left corner is half its
         // size back from there. Getting this backwards puts the badge's hitbox a whole card
@@ -7938,9 +11057,329 @@ impl ActiveState {
         if self.is_locked(scene) {
             return None;
         }
-        let placement = self.editor.projection().get(scene)?.item.placement;
+        let projected = self.editor.projection().get(scene)?;
+        // A connector has grips, not handles — `connector_grips` says why, and the press
+        // path asks about those first. Refusing here as well is what stops the *painter* and
+        // the *press* disagreeing: without it a connector drew two round grips and still
+        // resized from eight invisible ones, so a press near a line's bounding box would
+        // reshape a rectangle nobody can see.
+        if matches!(projected.item.kind, ItemKind::Connector { .. }) {
+            return None;
+        }
+        let placement = projected.item.placement;
         let handle = handle::hit(&placement, world, self.camera.zoom())?;
         Some((scene, handle))
+    }
+
+    // ----- connector ports ---------------------------------------------------
+    //
+    // Miro's four blue dots, and the gesture they exist for. `crate::handle::ports` is the
+    // geometry; this is *which item wears them* and *what a press on one starts*.
+
+    /// The item whose four connector ports are on screen, if any.
+    ///
+    /// **Hover first, then a lone selection**, which is Miro's rule and is not arbitrary:
+    /// the dots are an invitation, so they belong on the thing you are pointing at, and they
+    /// stay on a selected item because that is the one you have just finished placing and
+    /// are most likely to want to join to something.
+    ///
+    /// Four refusals, each for its own reason:
+    ///
+    /// - **Not on a multi-selection.** The shared box already carries the group's own
+    ///   handles, and a connector binds to *one* item — four dots on a box that is not an
+    ///   item would promise a line from something the document cannot name.
+    /// - **Not on a connector.** `ConnectorEnd::target` names an item and routing a line to
+    ///   another line would need a point on a path rather than on a box. `draw_connector`
+    ///   already refuses it at the far end; refusing it here means the invitation is never
+    ///   made in the first place.
+    /// - **Not on a locked item.** A lock means *"I did not mean to touch this"*, and every
+    ///   other grip already honours it.
+    /// - **Not while a gesture is in flight.** Ports drawn during a drag are chrome that
+    ///   moves under the pointer for a reason unrelated to what the hand is doing.
+    pub(crate) fn ported_item(&self) -> Option<SceneId> {
+        if self.drag.is_some() || self.card_drag.is_some() || self.input.placement().is_some() {
+            return None;
+        }
+        // A create tool is armed to make something, not to join two things. Leaving the
+        // dots up under a sticky tool would put a second meaning on a press that is about
+        // to place a note.
+        if !matches!(self.shell.tool(), Tool::Select | Tool::Hand) {
+            return None;
+        }
+        let scene = self.hovered_ports.or_else(|| match self.editor.selection() {
+            [only] => Some(*only),
+            _ => None,
+        })?;
+        let projected = self.editor.projection().get(scene)?;
+        if projected.item.style.locked
+            || matches!(projected.item.kind, ItemKind::Connector { .. })
+        {
+            return None;
+        }
+        Some(scene)
+    }
+
+    /// Which item the pointer is over for the purpose of drawing ports.
+    ///
+    /// Recomputed per frame beside `badge_under_pointer`, and for its reason: the board pans
+    /// and zooms under a stationary pointer, so *"what is under the cursor"* changes without
+    /// the cursor moving at all.
+    ///
+    /// **The hit test is widened by the port ring**, which is the part that would otherwise
+    /// be wrong: a port sits `PORT_OFFSET` *outside* the item, so an item whose ports the
+    /// pointer is on is an item `Scene::hit_test` has already stopped answering for. Without
+    /// this the dots vanish at the moment you reach for them.
+    pub(crate) fn ports_under_pointer(&self) -> Option<SceneId> {
+        let world = self.camera.screen_to_world(self.input.cursor(&self.camera));
+        if let Some(scene) = self.editor.projection().scene().hit_test(world) {
+            return Some(scene);
+        }
+        // Just outside: keep the item whose ports are within reach. Only the item the ports
+        // are *already* being drawn for, so moving the pointer into open board does not
+        // light up whichever neighbour happens to be nearest.
+        let scene = self.hovered_ports.or_else(|| match self.editor.selection() {
+            [only] => Some(*only),
+            _ => None,
+        })?;
+        let placement = self.editor.projection().get(scene)?.item.placement;
+        handle::port_hit(&placement, world, self.camera.zoom()).map(|_| scene)
+    }
+
+    /// The port under a world point: which item, and which of its four anchors.
+    fn port_under(&self, world: WorldPoint) -> Option<(SceneId, DocId, (f64, f64))> {
+        let scene = self.ported_item()?;
+        let projected = self.editor.projection().get(scene)?;
+        let anchor = handle::port_hit(&projected.item.placement, world, self.camera.zoom())?;
+        Some((scene, projected.doc_id, anchor))
+    }
+
+    /// Arms a connector drag from one port, and hands the gesture to the placing path.
+    ///
+    /// `input::Tool::Place` is borrowed rather than a mode of its own — the territory
+    /// sweep's trade, for the same reason: the press, the samples and the release are the
+    /// three events a create tool already produces, they are already tested, and
+    /// `Input::placement` already reports the live pair the preview draws from. `Shell`'s
+    /// tool is left alone, so the palette does not lie about what is armed and Select comes
+    /// back by itself when the gesture ends.
+    fn begin_port_drag(&mut self, from: DocId, anchor: (f64, f64)) {
+        // A caret or an eraser sweep holds an undo group open and the commit at the end of
+        // this opens its own — trap 11, closed at the arm rather than discovered later.
+        self.settle();
+        self.port_arm = Some((from, anchor));
+        self.input.set_tool(crate::input::Tool::Place);
+    }
+
+    // ----- a selected connector's two ends -----------------------------------
+
+    /// Where the selected connector's grips are, if exactly one connector is selected.
+    ///
+    /// `(start, end)` in world space, from [`crate::connector::endpoints`] — the same
+    /// resolution the painter routes with, so a grip cannot sit where the line does not
+    /// begin.
+    ///
+    /// # Why a connector gets these instead of resize handles
+    ///
+    /// *"when i click on it should have its own small menu where i can adjust it."* The bar
+    /// was already right — colour, width, dash, routing, arrowhead. What was wrong is that a
+    /// selected connector drew the same eight resize handles and a rotate grip every other
+    /// item gets, on its **bounding box**, which is not a thing a connector has: its
+    /// geometry is two bindings, its box is derived from them (`connector::placement_for`),
+    /// and resizing that box moves nothing a user can see. Miro gives a line two round grips
+    /// at its ends, and they re-attach it. So does this.
+    pub(crate) fn connector_grips(&self) -> Option<ConnectorGrips> {
+        let [scene] = self.editor.selection()[..] else { return None };
+        let projected = self.editor.projection().get(scene)?;
+        if projected.item.style.locked {
+            return None;
+        }
+        let projection = self.editor.projection();
+        let (from, to) = crate::connector::endpoints(
+            &projected.item.kind,
+            &projected.item.placement,
+            |id| projection.placement_of(id),
+        )?;
+        Some((projected.doc_id, from, to))
+    }
+
+    /// The grip under a world point: which connector, and whether it is the *end* rather
+    /// than the start.
+    ///
+    /// The start wins an exact tie, which only happens on a zero-length connector — one the
+    /// document should not hold and `draw_connector_from` refuses to make.
+    fn connector_grip_under(&self, world: WorldPoint) -> Option<(DocId, bool)> {
+        let (doc, from, to) = self.connector_grips()?;
+        let radius = f64::from(handle::PORT_RADIUS + handle::PORT_SLOP) / self.camera.zoom();
+        let reach = |p: (f64, f64)| (p.0 - world.x).hypot(p.1 - world.y);
+        let (near, far) = (reach(from), reach(to));
+        if near <= radius && near <= far {
+            Some((doc, false))
+        } else if far <= radius {
+            Some((doc, true))
+        } else {
+            None
+        }
+    }
+
+    /// Rebinds one end of a connector to whatever the drag was released over.
+    ///
+    /// Released over **an item**: the end binds to it, at the edge midpoint facing the other
+    /// end — `facing_anchor`'s own case, unchanged. Released over **bare board**: the end
+    /// comes free and is pinned to the connector's own rectangle, which is what
+    /// `ConnectorEnd::free` means and what a detached end has always been.
+    ///
+    /// The connector's own box is rewritten at the same time, and it has to be: a free end
+    /// is stored as a *fraction* of that box, so leaving a stale rectangle behind would put
+    /// the detached end somewhere neither the drag nor the document meant.
+    fn rebind_connector(&mut self, doc: DocId, is_end: bool, at: WorldPoint) {
+        // Everything read before the edit, so a failed lookup cannot leave a half-rebound
+        // connector — `draw_connector_from`'s rule.
+        let Ok(item) = self.editor.board().item(doc) else { return };
+        let ItemKind::Connector { start, end, .. } = &item.kind else { return };
+        let (mut start, mut end) = (*start, *end);
+
+        let projection = self.editor.projection();
+        let Some((from_at, to_at)) =
+            crate::connector::endpoints(&item.kind, &item.placement, |id| projection.placement_of(id))
+        else {
+            return;
+        };
+        // The end that is *not* moving keeps its position, and it is what the moving end's
+        // anchor faces.
+        let anchored = if is_end { from_at } else { to_at };
+
+        // What the release landed on. A connector cannot attach to another connector, and it
+        // cannot attach to itself — both would need a point on a path rather than on a box.
+        let target = self
+            .editor
+            .projection()
+            .scene()
+            .hit_test(at)
+            .and_then(|scene| self.editor.projection().get(scene))
+            .filter(|p| !matches!(p.item.kind, ItemKind::Connector { .. }))
+            .map(|p| (p.doc_id, p.item.placement));
+
+        let own = crate::connector::placement_for(
+            if is_end { from_at } else { (at.x, at.y) },
+            if is_end { (at.x, at.y) } else { to_at },
+        );
+        let rebound = match target {
+            Some((id, placement)) => {
+                let anchor = crate::connector::facing_anchor(&placement, anchored);
+                ConnectorEnd::bound(id, anchor)
+            }
+            None => ConnectorEnd::free(crate::connector::free_anchor(&own, (at.x, at.y))),
+        };
+        // The arrowhead travels with the end it is on. Dropping it would silently reverse
+        // what an agent link means — `crate::agent::link_kind` reads exactly this — so a
+        // re-attach would change a message wire into a context one.
+        let rebound =
+            rebound.with_arrowhead(if is_end { end.arrowhead } else { start.arrowhead });
+        if is_end {
+            end = rebound;
+        } else {
+            start = rebound;
+        }
+
+        let result = self.editor.edit(|board| {
+            let mut item = board.item(doc)?;
+            if let ItemKind::Connector { start: s, end: e, .. } = &mut item.kind {
+                *s = start;
+                *e = end;
+            }
+            board.set_kind(doc, item.kind)?;
+            board.set_placement(doc, own)?;
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                self.shell.invalidate_selection();
+                self.ok(if target.is_some() {
+                    "Connector re-attached"
+                } else {
+                    "Connector end detached"
+                });
+            }
+            Err(error) => self.failed("moving the connector's end", &error),
+        }
+    }
+
+    /// The connector being drawn right now, as two world points, or `None`.
+    ///
+    /// # Two ways in, one preview
+    ///
+    /// The connector tool, and a drag begun on one of the four ports. Gating on the
+    /// *palette's* tool alone — which is what this was — leaves the commonest route to a
+    /// connector drawing nothing at all until the button comes up, because a port drag
+    /// borrows `input::Tool::Place` while the palette still says Select. That is feedback 7
+    /// (the pen), 23 (the frame) and 34 (the prompt row) a fourth time: state accumulated
+    /// where the painter cannot see it.
+    ///
+    /// # The start is the port, not the press
+    ///
+    /// A press within `PORT_SLOP` of a dot arms that dot, so the raw press point is up to
+    /// ten screen pixels off the anchor the connector will actually be bound to. Drawing
+    /// from the press would make the preview visibly miss the dot it came out of, and then
+    /// jump on release — the *"a preview that disagrees with what it previews is worse than
+    /// none, because it is believed"* rule feedback 23 states.
+    pub(crate) fn pending_connector(&self) -> Option<(WorldPoint, WorldPoint)> {
+        let armed = self.shell.tool() == Tool::Connector
+            || self.port_arm.is_some()
+            || self.endpoint_arm.is_some();
+        if !armed {
+            return None;
+        }
+        let (press, now) = self.input.placement()?;
+        let to = self.camera.screen_to_world(now);
+
+        // An endpoint being re-attached: the line runs from the end that is **staying put**
+        // to the pointer, which is the only reading of the gesture that matches what the
+        // hand is doing. Drawing from the press point would put a second line beside the
+        // real one, both of them wrong.
+        if let Some((doc, is_end)) = self.endpoint_arm {
+            let projection = self.editor.projection();
+            if let Ok(item) = self.editor.board().item(doc)
+                && let Some((from_at, to_at)) = crate::connector::endpoints(
+                    &item.kind,
+                    &item.placement,
+                    |id| projection.placement_of(id),
+                )
+            {
+                let fixed = if is_end { from_at } else { to_at };
+                return Some((WorldPoint::new(fixed.0, fixed.1), to));
+            }
+        }
+        let from = self
+            .port_arm
+            .and_then(|(doc, anchor)| {
+                let placement = self.editor.projection().placement_of(doc)?;
+                let (x, y) = crate::connector::anchor_point(&placement, anchor);
+                Some(WorldPoint::new(x, y))
+            })
+            .unwrap_or_else(|| self.camera.screen_to_world(press));
+        Some((from, to))
+    }
+
+    /// Forgets an armed port drag, answering whether there was one.
+    ///
+    /// The same contract [`Self::disarm_territory`] has, and it is what keeps the Escape
+    /// ladder from spending two rungs on one press.
+    pub(crate) fn disarm_port(&mut self) -> bool {
+        // Both borrowers of `Tool::Place` on the connector side, cleared together — feedback
+        // 35's sibling rule, since they end by exactly the same routes (Escape, a tab
+        // switch, quitting, a change of tool) and one of them left armed would draw a line
+        // from a grip pressed a minute ago.
+        let endpoint = self.endpoint_arm.take().is_some();
+        if self.port_arm.take().is_none() {
+            if endpoint {
+                let tool = self.shell.tool();
+                self.choose_tool(tool);
+                return true;
+            }
+            return false;
+        }
+        let tool = self.shell.tool();
+        self.choose_tool(tool);
+        true
     }
 
     /// One frame of a drag. Nothing is written to the document — see
@@ -8254,9 +11693,16 @@ impl ActiveState {
         // had the keyboard. It costs nothing: `end_prompting` keeps the draft, which is the
         // whole reason the runtime holds it rather than this transient session.
         self.end_prompting();
+        // **And a note body**, which unlike a prompt has somewhere to be written: leaving one
+        // open across a command would leave the file behind the buffer, so a command that
+        // then read the note — or an agent that did — would see the version before the user
+        // started typing. Feedback 27's rule, applied to the third off-document session.
+        self.commit_note_editing();
     }
 
     // ----- an orchestrator's territory ---------------------------------------
+    //
+    // (`TerritoryCache` is below the `impl`, beside the other plain data this module owns.)
     //
     // `docs/07-agent-canvas.md` §9: *"an orchestrator holds a world-space rectangle. It may
     // only spawn inside it, and the region is drawn as a labelled tint while the
@@ -8405,65 +11851,141 @@ impl ActiveState {
         }
     }
 
-    /// The tint the painter draws for a selected orchestrator's region.
+    /// Every orchestrator's region, plus the one being swept right now.
     ///
     /// Resolved here rather than in the painter, for `guides`' and `card_drop`'s reason: the
-    /// question *"which node's region, and is one being drawn right now"* is about the
-    /// selection and a gesture, and `draw.rs` is given the answer rather than the state it
-    /// would have to re-derive to reach one.
+    /// question *"whose region, and is one being drawn right now"* is about the selection and
+    /// a gesture, and `draw.rs` is given the answer rather than the state it would have to
+    /// re-derive to reach one.
     ///
-    /// The **live sweep wins over the stored region**, and only one is ever drawn. Showing
-    /// both would put two rectangles on the board during the one gesture where it matters
-    /// most which is which; the stored one comes straight back if Escape is pressed.
+    /// # It used to draw one, only while its owner was selected
     ///
-    /// # What this costs on a board with no agents on it
+    /// That is what `docs/07-agent-canvas.md` §9 specified and the user overruled it after
+    /// living with it: *"the orchestrator area should be constantly shown and the orchestrator
+    /// for that area should somehow be visible"*. The reasoning that wins is about what the
+    /// region is *for*. A territory is a standing fact about the board — it decides where a
+    /// spawn is allowed to land — so a boundary you can only see by first selecting the thing
+    /// that owns it is one you will place work across without ever knowing it was there. The
+    /// refusal then arrives at the far end of a run, which is exactly the failure
+    /// `commit_territory` already argues against for a region too small to hold a node.
     ///
-    /// One `selection().first()` and one `projection().get`. The `ItemKind::Agent` match is
-    /// **before** `crate::agent::decode`, deliberately: this runs once per frame, `decode`
-    /// parses JSON, and putting it above the match would put a parse behind every frame of
-    /// every board — which is exactly the idle cost `docs/07-agent-canvas.md` §0 forbids.
-    /// A token is only parsed while exactly one agent node is selected.
-    pub(crate) fn territory_preview(&self) -> Option<crate::draw::TerritoryTint> {
-        let scene = self.editor.selection().first().copied()?;
-        if self.editor.selection().len() != 1 {
-            return None;
-        }
-        let projected = self.editor.projection().get(scene)?;
-        let ItemKind::Agent { model, label } = &projected.item.kind else { return None };
-        let config = crate::agent::decode(model);
-        if !config.role_kind.may_spawn() {
-            return None;
+    /// **The owner is visible because the label was always the owner's own name.**
+    /// `TerritoryLabel` is keyed per-`SceneId`, so several chips coexist with no slot
+    /// collision and each one names the node it belongs to — which is the second half of the
+    /// user's sentence, and it needed no new paint.
+    ///
+    /// # Three strengths, and they are load-bearing
+    ///
+    /// A live sweep is strongest, a selected owner's region next, and every other region
+    /// faintest. `TerritoryTint::emphasis` is the one definition. Without the middle rung,
+    /// asking *"which of these four is the one I am editing"* has no answer on screen — and
+    /// that was the whole argument for drawing only one.
+    ///
+    /// # What this costs
+    ///
+    /// A `has_agents()` compare on a board with no agent nodes, which is the early-out
+    /// `AgentViews` already uses. Beyond that the walk and its `serde_json` parses are behind
+    /// [`TerritoryCache`], keyed on the projection's generation: a pan, a zoom, a hover or a
+    /// change of selection reuses it. Only the sweep is recomposed per frame, and only while
+    /// one is in progress.
+    pub(crate) fn territories(&mut self) -> Vec<crate::draw::TerritoryTint> {
+        // ⚠ **There is deliberately no `agents.has_agents()` early-out here, and there was
+        // one.** `AgentViews::has_agents` is a *runtime* flag, set by the per-frame agent
+        // poll — so it answers "the runtime has noticed agents on this board", not "this
+        // board has agents on it". Between placing an orchestrator and the next poll it is
+        // false, and the region drew nothing. Measured by `--demo territory`, which reported
+        // the document holding a 481 × 275 region while *"the painter was handed nothing
+        // that matches"*.
+        //
+        // Nothing is lost by dropping it. The cost this function has to avoid is the
+        // `serde_json` parse per agent node per frame, and [`TerritoryCache`] is what avoids
+        // it: the walk runs once per **document change**, which is once per edit, immediately
+        // after a full projection rebuild of the same board. The compare below is what an
+        // idle frame pays.
+        let generation = self.editor.projection().generation();
+        if self.territories.generation != Some(generation) {
+            let mut stored = Vec::new();
+            for (scene, projected) in self.editor.projection().iter() {
+                // The `ItemKind::Agent` match is **before** `crate::agent::decode`,
+                // deliberately: `decode` parses JSON, and a walk that parsed every item's
+                // token would put a parse behind every sticky on the board.
+                let ItemKind::Agent { model, label } = &projected.item.kind else { continue };
+                let config = crate::agent::decode(model);
+                if !config.role_kind.may_spawn() {
+                    continue;
+                }
+                let Some(region) = config.territory.filter(|r| !r.is_empty()) else { continue };
+                stored.push(crate::draw::TerritoryTint {
+                    region: [region.x, region.y, region.width, region.height],
+                    label: node_name(label, config.role_kind),
+                    scene: *scene,
+                    doc: projected.doc_id,
+                    generation: projected.generation,
+                    emphasis: crate::draw::TerritoryEmphasis::Standing,
+                });
+            }
+            self.territories.generation = Some(generation);
+            self.territories.tints = stored;
         }
 
-        // Mid-sweep, and it is *this* node being redrawn: the rectangle under the pointer.
-        // `Input::placement` is the same pair a frame's preview reads, so the tint and the
-        // committed region come from one source and cannot be a rectangle apart.
-        let sweeping = (self.territory_arm == Some(projected.doc_id))
-            .then(|| self.input.placement())
-            .flatten()
-            .map(|(press, now)| {
-                let (a, b) =
-                    (self.camera.screen_to_world(press), self.camera.screen_to_world(now));
-                vellum_agent::Territory::new(
-                    (a.x + b.x) / 2.0,
-                    (a.y + b.y) / 2.0,
-                    (b.x - a.x).abs(),
-                    (b.y - a.y).abs(),
-                )
-            });
-        let pending = sweeping.is_some();
-        let region = sweeping.or(config.territory)?;
-        if region.is_empty() {
-            return None;
+        let mut out = self.territories.tints.clone();
+
+        // Which one the user is working on. A cheap pass over a list that is one entry long
+        // on every board anybody has, and it must not go in the cache: the cache is keyed on
+        // the *document*, and a change of selection does not change the document.
+        let selected = (self.editor.selection().len() == 1)
+            .then(|| self.editor.selection().first().copied())
+            .flatten();
+        if let Some(scene) = selected
+            && let Some(tint) = out.iter_mut().find(|tint| tint.scene == scene)
+        {
+            tint.emphasis = crate::draw::TerritoryEmphasis::Selected;
         }
 
-        Some(crate::draw::TerritoryTint {
-            region: [region.x, region.y, region.width, region.height],
-            label: node_name(label, config.role_kind),
-            scene,
-            generation: projected.generation,
-            pending,
-        })
+        // Mid-sweep: the rectangle under the pointer, replacing that node's stored region for
+        // as long as the button is down. `Input::placement` is the same pair a frame's preview
+        // reads, so the tint and the committed region come from one source and cannot be a
+        // rectangle apart. **Replacing rather than drawing beside** — showing both would put
+        // two rectangles on the board during the one gesture where it matters most which is
+        // which, and the stored one comes straight back if Escape is pressed.
+        if let Some(doc) = self.territory_arm
+            && let Some((press, now)) = self.input.placement()
+        {
+            let (a, b) = (self.camera.screen_to_world(press), self.camera.screen_to_world(now));
+            let region = [
+                (a.x + b.x) / 2.0,
+                (a.y + b.y) / 2.0,
+                (b.x - a.x).abs(),
+                (b.y - a.y).abs(),
+            ];
+            match out.iter_mut().find(|tint| tint.doc == doc) {
+                Some(tint) => {
+                    tint.region = region;
+                    tint.emphasis = crate::draw::TerritoryEmphasis::Sweeping;
+                }
+                // An orchestrator drawing its *first* region has nothing stored, so it is not
+                // in the cache at all — and that is the one gesture where the feedback matters
+                // most. Composed from the projection rather than skipped.
+                None => {
+                    if let Some(scene) = self.editor.projection().scene_id(doc)
+                        && let Some(projected) = self.editor.projection().get(scene)
+                        && let ItemKind::Agent { model, label } = &projected.item.kind
+                    {
+                        let config = crate::agent::decode(model);
+                        out.push(crate::draw::TerritoryTint {
+                            region,
+                            label: node_name(label, config.role_kind),
+                            scene,
+                            doc,
+                            generation: projected.generation,
+                            emphasis: crate::draw::TerritoryEmphasis::Sweeping,
+                        });
+                    }
+                }
+            }
+        }
+
+        out
     }
 
     /// Writes a schedule onto one agent node, or clears it.
@@ -8675,6 +12197,110 @@ impl ActiveState {
         );
     }
 
+    /// Opens the rules editor on one of the two **inherited** layers, seeded with what that
+    /// file says today.
+    ///
+    /// # Why the same editor, and what it means for the four settings
+    ///
+    /// A layer is a markdown file with a small front-matter block, and that is true of all
+    /// three layers — `AgentRules::text` is the whole file, which is why
+    /// [`Self::save_rule_layer`] can take an `AgentRules` and hand it to `RuleFile::parse`.
+    /// So the editor that already knows how to put *tone* and *verbosity* into front matter is
+    /// the right editor for a file made of exactly that, and the alternative — a second,
+    /// plain-text editor for the top two layers — would be a second answer to a question this
+    /// one already answers, with its own opinion about how a setting is spelled.
+    ///
+    /// The resolution shown beside the form is deliberately **the selected agent's**: it is
+    /// what makes an edit here legible as a cause. Changing the global tone while looking at
+    /// *"Tone — inherited from Global"* on the node you are thinking about is the whole point
+    /// of the cascade being visible.
+    fn edit_rule_layer(&mut self, layer: vellum_agent::Layer) {
+        let Some(path) = self.rule_layer_path(layer) else {
+            self.gap(
+                "there is nowhere to put project rules until this agent has a working \
+                 directory — set one in the properties panel first",
+            );
+            return;
+        };
+        // Read from where the cascade *reads*, which for a project is whichever of
+        // `.velm/rules.md`, `AGENTS.md`, `CLAUDE.md` or `.cursorrules` was found — not from
+        // the file a save would write. Seeding the editor with an empty buffer when the
+        // project has a `CLAUDE.md` in force would invite the user to replace rules they
+        // cannot see with rules they just typed.
+        let source = self.rule_layer_source(layer).unwrap_or(path);
+        let file = vellum_agent::RuleFile::read(&source);
+        let own = vellum_agent::AgentRules {
+            text: file.to_markdown(),
+            ..vellum_agent::AgentRules::default()
+        };
+        // The freshness snapshot, taken now, exactly as `edit_agent_rules` takes it: this is
+        // what a later Save measures against, and reading the file again at save time would
+        // compare it with itself.
+        // ⚠ **The snapshot is of the file that will be WRITTEN, never of the one being read.**
+        // These are the same file for the global layer and for a project already using
+        // `.velm/rules.md`, and they differ for a project whose rules are in `AGENTS.md`,
+        // `CLAUDE.md` or `.cursorrules` — which Velm reads and never writes (§7). The seed
+        // above deliberately comes from the *read* source, so the user starts from the rules
+        // actually in force; snapshotting that same file here would hand `save_rule_layer` a
+        // baseline for a different path than the one it compares, and its freshness check
+        // would see a mismatch on the very first save and refuse **every** save, for ever,
+        // with *"changed since this editor was opened"* about a file the user never touched.
+        self.rules_opened_on = Some(RulesSnapshot {
+            global: self
+                .rule_layer_path(vellum_agent::Layer::Global)
+                .as_deref()
+                .map_or_else(vellum_agent::RuleFile::default, vellum_agent::RuleFile::read),
+            project: self
+                .rule_layer_path(vellum_agent::Layer::Project)
+                .as_deref()
+                .map_or_else(vellum_agent::RuleFile::default, vellum_agent::RuleFile::read),
+        });
+        let resolved = self
+            .selected_agent()
+            .and_then(|doc| self.agent_model(doc))
+            .map_or_else(
+                || {
+                    vellum_agent::rules::resolve(
+                        &vellum_agent::RuleFile::default(),
+                        &vellum_agent::RuleFile::default(),
+                        &vellum_agent::AgentRules::default(),
+                        "",
+                    )
+                },
+                |(config, _)| self.resolve_rules(&config),
+            );
+        let title = match layer {
+            vellum_agent::Layer::Global => "Global rules — every agent, every board".to_owned(),
+            _ => "Project rules — every agent on this project".to_owned(),
+        };
+        let files = self.rule_files();
+        self.shell.ask(
+            move |id| vellum_ui::Dialog::rules(id, title, &own, resolved, files),
+            crate::shell::Ask::RuleLayer(layer),
+        );
+    }
+
+    /// Where a layer is **read** from, which is not always where it is written.
+    ///
+    /// `None` for a project with no working directory and for a layer that is not a file.
+    fn rule_layer_source(&self, layer: vellum_agent::Layer) -> Option<std::path::PathBuf> {
+        match layer {
+            vellum_agent::Layer::Global => self.rule_layer_path(layer),
+            vellum_agent::Layer::Project => {
+                let project = self
+                    .selected_agent()
+                    .and_then(|doc| self.agent_model(doc))
+                    .and_then(|(config, _)| config.working_dir.clone())
+                    .map(std::path::PathBuf::from)?;
+                Some(
+                    vellum_agent::rules::project_rules_path(&project)
+                        .unwrap_or_else(|| vellum_agent::rules::project_rules_target(&project)),
+                )
+            }
+            vellum_agent::Layer::Agent | vellum_agent::Layer::Default => None,
+        }
+    }
+
     /// Opens the schedule editor. The hand-off targets are the agents this one is actually
     /// connected to — a hand-off with no connector is refused when the schedule is *saved*,
     /// not silently at six in the evening.
@@ -8703,6 +12329,7 @@ impl ActiveState {
         let described = |path: std::path::PathBuf| vellum_ui::RuleFilePath {
             exists: path.exists(),
             path: path.display().to_string(),
+            writes_to: None,
         };
         let data_dir = self.agent_runtime.data_dir();
         vellum_ui::RuleFiles {
@@ -8711,13 +12338,34 @@ impl ActiveState {
             // which is where `agent_launch_spec` loads it from — not from the board's folder.
             // Reading it from a second place is how the editor comes to show a `CLAUDE.md`
             // the agent never saw and miss the one it did.
+            //
+            // ⚠ **A project with no rules file still gets a row.** `project_rules_path` is a
+            // `find(is_file)`, so it answers `None` until one of the four candidates exists —
+            // and the row vanishing is exactly the state where the row is most useful, since
+            // "create this file" is the thing the user came here to do. It also contradicted
+            // this editor's own documented contract, which promises a row for a layer with no
+            // file yet, showing the path it *would* be at. That promise was honoured for the
+            // global layer, whose path is unconditional, and quietly broken for this one.
             project: self
                 .selected_agent()
                 .and_then(|doc| self.agent_model(doc))
                 .and_then(|(config, _)| config.working_dir.clone())
                 .map(std::path::PathBuf::from)
-                .and_then(|project| vellum_agent::rules::project_rules_path(&project))
-                .map(described),
+                .map(|project| {
+                    let target = vellum_agent::rules::project_rules_target(&project);
+                    let read_from = vellum_agent::rules::project_rules_path(&project);
+                    let path = read_from.clone().unwrap_or_else(|| target.clone());
+                    vellum_ui::RuleFilePath {
+                        exists: path.exists(),
+                        // Named only when the two differ — Velm reads a `CLAUDE.md` and would
+                        // write its own file beside it. See `RuleFilePath::writes_to`: the
+                        // file it writes sorts *first* in discovery order, so saving changes
+                        // which file is in force, and that has to be said before the save
+                        // rather than discovered afterwards.
+                        writes_to: (path != target).then(|| target.display().to_string()),
+                        path: path.display().to_string(),
+                    }
+                }),
         }
     }
 
@@ -8878,6 +12526,12 @@ impl ActiveState {
             self.attach_context_from_picker();
             return;
         }
+        // The same shape, and here for the same reason: it raises a dialog and then reads
+        // something off the network, neither of which is a token write.
+        if matches!(edit, E::AttachLink) {
+            self.ask_attach_link();
+            return;
+        }
 
         let Some(projected) = self.editor.projection().get(scene) else { return };
         let doc = projected.doc_id;
@@ -8887,8 +12541,23 @@ impl ActiveState {
         // it searchable and editable on the canvas. So it takes the ordinary text path and
         // never touches the model.
         if let E::Role(role) = edit {
-            let _ = doc;
             self.set_text(role);
+            // ⚠ **A role is folded into the system context at launch, and only at launch.**
+            // `agent_launch_spec` runs once per session and `Session`'s context is fixed at
+            // construction, so renaming a *running* agent changes every surface in the
+            // application except the one that matters — the instructions the agent is
+            // actually working under. Nothing said so, which made the panel's own promise
+            // ("this role genuinely shapes how the agent behaves") false for exactly the case
+            // where somebody is watching an agent misbehave and correcting it.
+            //
+            // Said rather than solved: restarting the session on a rename would throw away
+            // the turn in flight, and pushing a context update mid-conversation is a
+            // per-transport feature that not all three have. The sentence costs nothing and
+            // removes the surprise.
+            let key = self.agent_key(doc);
+            if self.agent_runtime.is_running(&key) {
+                self.ok("Renamed. This agent keeps the role it started with until you stop it.");
+            }
             return;
         }
 
@@ -8897,6 +12566,13 @@ impl ActiveState {
                 let mut config = crate::agent::decode(&model);
                 match edit {
                     E::Role(_) => unreachable!("handled above"),
+                    // `None` means *follow the preference*, which is why all three are
+                    // `Option` on the model and why the painter is handed the resolved
+                    // default separately — a node that never chose must move when the
+                    // preference does.
+                    E::ChatTheme(theme) => config.chat_theme = *theme,
+                    E::ChatOpacity(opacity) => config.chat_opacity = Some(*opacity),
+                    E::ChatBackground(background) => config.chat_background = background.clone(),
                     E::Kind(role_kind) => {
                         config.role_kind = *role_kind;
                         // Promoting a worker to a role that may spawn gives it somewhere to
@@ -8927,7 +12603,7 @@ impl ActiveState {
                         }
                         config.context.remove(*index);
                     }
-                    E::AttachContext => unreachable!("handled above"),
+                    E::AttachContext | E::AttachLink => unreachable!("handled above"),
                     E::NoteScope(_)
                     | E::ShowIgnored(_)
                     | E::BrowserUrl(_)
@@ -8941,7 +12617,28 @@ impl ActiveState {
             ItemKind::AgentNote { model, title } => {
                 let mut note = crate::note::decode(&model);
                 match edit {
-                    E::NoteScope(scope) => note.scope = scope.clone(),
+                    // ⚠ **The scope is where the file lives, so changing it is a MOVE.**
+                    // `NoteStore::dir_for` and `may_read_path` are the two halves of one
+                    // encoding — a note directly in the notes root is shared, one a directory
+                    // down is private to the agent that directory is named for — and the
+                    // enforcement reads the *position*, never the token. So writing the token
+                    // alone made the two disagree in both directions at once: a note switched
+                    // to Private went on being readable and writable by every agent on the
+                    // board while the inspector said *private*, and one switched back to
+                    // Shared stayed unreachable to everyone but its former owner.
+                    //
+                    // The token is still updated when the move fails, and that is deliberate:
+                    // the failure is reported, and leaving the two fields disagreeing about a
+                    // file that did not move would be worse than a node that says what the
+                    // user asked for and a toast that says it did not happen.
+                    E::NoteScope(scope) => {
+                        note.scope = scope.clone();
+                        if !note.path.is_empty()
+                            && let Some(moved) = self.move_note_file(&note, scope)
+                        {
+                            note.path = moved;
+                        }
+                    }
                     // **Feature 8 starts here.** An empty path addresses no file, so until
                     // this runs nothing is ever written to disk and the node says "not
                     // written yet" for ever. Never a rename: the row only offers this while
@@ -9207,10 +12904,103 @@ impl ActiveState {
             DragMode::Resize(_) => "resizing",
             DragMode::Rotate => "rotating",
         };
-        match self.editor.commit_placements(&placements) {
+        // Only a *move* changes what an item belongs to. Resizing or rotating a sticky that
+        // sits on a frame does not take it off the frame, and treating it as though it did
+        // would make a rotate handle a filing gesture.
+        let reparents = match drag.mode {
+            DragMode::Move => self.reframe(&placements),
+            DragMode::Resize(_) | DragMode::Rotate => Vec::new(),
+        };
+        match self.editor.commit_move(&placements, &reparents) {
             Ok(_) => self.shell.invalidate_selection(),
             Err(error) => self.failed(what, &error),
         }
+    }
+
+    /// Which frame each moved item belongs to now.
+    ///
+    /// **A frame clips its contents, so an item dragged off one and left parented to it simply
+    /// stops being drawn.** `draw::clipped_by_frame` hides any item whose ancestor frame no
+    /// longer intersects it — which is Miro's behaviour and right — but Miro also *removes* an
+    /// item from a frame when you drag it out, and nothing here did. The result was an item
+    /// that still existed, was still selectable and still drew a selection ring around
+    /// nothing: *"it still disappears when i move these things outside of the frame"*, with a
+    /// screenshot of exactly that, empty rings and all.
+    ///
+    /// Four rules, each of which is a case that went wrong when it was written the other way:
+    ///
+    /// - **The item's centre decides**, not its overlap. Overlap makes an item that straddles
+    ///   two frames belong to both and an item hanging off an edge belong to one it is mostly
+    ///   outside of; containment means a sticky wider than its frame can never be on one.
+    /// - **The innermost frame wins**, by area, so nesting resolves the way the eye reads it.
+    /// - **A frame is never adopted.** Frames are backdrops; a frame dragged over another
+    ///   would otherwise become its child and inherit its clipping, taking every item on it
+    ///   out of the drawing at once.
+    /// - **Only items already loose or already on a frame are considered.** An item inside a
+    ///   *group* keeps its group: re-filing it under a frame would silently dismantle the
+    ///   group, and grouping is the user's arrangement rather than a consequence of geometry.
+    fn reframe(&self, placements: &[(DocId, Placement)]) -> Vec<(DocId, Option<DocId>)> {
+        let Ok(items) = self.editor.board().items() else { return Vec::new() };
+        // Where everything is *after* the drag: a dragged frame has moved too, and deciding
+        // against its old bounds would file items into where it used to be.
+        let moved: std::collections::HashMap<DocId, Placement> =
+            placements.iter().copied().collect();
+        let placement_of = |item: &vellum_doc::Item| -> Placement {
+            moved.get(&item.id).copied().unwrap_or(item.placement)
+        };
+
+        let frames: Vec<(DocId, Placement)> = items
+            .iter()
+            .filter(|item| matches!(item.kind, ItemKind::Frame { .. }))
+            .map(|item| (item.id, placement_of(item)))
+            .collect();
+        if frames.is_empty() {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        for item in &items {
+            if !moved.contains_key(&item.id) || matches!(item.kind, ItemKind::Frame { .. }) {
+                continue;
+            }
+            // Loose, or already on a frame. Anything else — a group's member, a table's
+            // cell — is somebody else's child and stays one.
+            let on_a_frame = item.parent.is_some_and(|parent| {
+                items.iter().any(|other| {
+                    other.id == parent && matches!(other.kind, ItemKind::Frame { .. })
+                })
+            });
+            if item.parent.is_some() && !on_a_frame {
+                continue;
+            }
+
+            let placement = placement_of(item);
+            let (cx, cy) = (placement.x, placement.y);
+            let home = frames
+                .iter()
+                .filter(|(id, frame)| {
+                    *id != item.id && {
+                        let (w, h) = frame.scaled_size();
+                        cx >= frame.x - w / 2.0
+                            && cx <= frame.x + w / 2.0
+                            && cy >= frame.y - h / 2.0
+                            && cy <= frame.y + h / 2.0
+                    }
+                })
+                .min_by(|(_, a), (_, b)| {
+                    let area = |p: &Placement| {
+                        let (w, h) = p.scaled_size();
+                        w * h
+                    };
+                    area(a).total_cmp(&area(b))
+                })
+                .map(|(id, _)| *id);
+
+            if home != item.parent {
+                out.push((item.id, home));
+            }
+        }
+        out
     }
 
     /// Escape during a drag: put everything back where it was. Returns whether there
@@ -9232,17 +13022,28 @@ impl ActiveState {
         // otherwise, and it still reports what the sweep took.
         let erasing = self.erasing;
         self.finish_erase();
+        // ⚠ And an open microphone, which is the fourth gesture that can end without the
+        // thing that normally ends it. Escape while holding `⌥D` must close the device and
+        // throw the audio away — feedback 27's rule, which names Escape first precisely
+        // because it is the exit everybody forgets. `cancel_talking` is idempotent.
+        self.cancel_talking();
         // An armed territory sweep is the same shape again, and this is the *only* thing
         // that ends one without a release: Escape, a tab switch and quitting all arrive
         // here. Left armed, the pointer would still be in `Tool::Place` and the next click
         // anywhere on the board would try to redraw a region. Nothing is written, so the
         // orchestrator keeps the territory it had — see `disarm_territory`.
         let arming = self.disarm_territory();
+        // A connector drag from one of the four ports, and it is the **sibling** of the line
+        // above rather than a separate thought — feedback 35's rule, applied at the moment
+        // the second borrower of `Tool::Place` was written rather than after somebody
+        // reported the pointer being stuck. Left armed, the next press anywhere on the board
+        // would draw a line from a dot the user pressed a minute ago.
+        let wiring = self.disarm_port();
         // A card drag writes nothing until the button comes up, so abandoning it is just
         // forgetting it — there is no preview placement to put back.
         let carrying = self.card_drag.take().is_some();
         let Some(drag) = self.drag.take() else {
-            return cancelled || drawing || carrying || erasing || arming;
+            return cancelled || drawing || carrying || erasing || arming || wiring;
         };
         for (scene, _, original) in &drag.items {
             self.editor.preview_placement(*scene, *original);
@@ -9485,6 +13286,15 @@ impl ActiveState {
             Tool::Agent => {
                 let mut model = vellum_agent::AgentModel::worker();
                 model.role_kind = self.shell.agent_role();
+                // ⚠ **Feature 4's setting is a project setting, so a new agent inherits it.**
+                // Without this line `Command::ToggleWorktrees` writes a value nothing ever
+                // reads: the only other writer of `worktree` is the per-node switch in the
+                // inspector, which is precisely the *"enabled per-agent inconsistently"*
+                // arrangement the feature's specification forbids. Read at placement rather
+                // than at launch so that turning the setting off later leaves agents that
+                // already have a worktree alone — a checkout with work in it is not something
+                // a preference toggle may silently abandon.
+                model.worktree = self.shell.library.worktrees();
                 Some(ItemKind::Agent {
                     model: crate::agent::encode(&model),
                     label: StyledText::plain(model.role_kind.label()),
@@ -9919,6 +13729,30 @@ impl ActiveState {
     /// drag from one sticky to another produces a connector that re-routes when either is
     /// moved, which is the entire point of the binding the document stores.
     fn draw_connector(&mut self, from: WorldPoint, to: WorldPoint) {
+        self.draw_connector_from(from, to, None);
+    }
+
+    /// The same, with the start end optionally **pinned** to a port the user grabbed.
+    ///
+    /// # Why the pin exists
+    ///
+    /// `facing_anchor` picks the edge that faces the other end, which is the right answer
+    /// for a drag with the connector tool — there the user aimed at two *items* and the
+    /// edges are ours to choose. It is the wrong answer for a drag that began on one of
+    /// Miro's four dots: there the user aimed at a specific edge, and silently moving the
+    /// line to the other side of the box would make the four dots decorative. So a pinned
+    /// start is used exactly as given.
+    ///
+    /// The **far** end still faces, because the release lands on a box rather than on a
+    /// port — that is `facing_anchor`'s own case, and the reasoning in its doc comment
+    /// (a release lands *inside* the shape roughly always) is unchanged by how the drag
+    /// started.
+    fn draw_connector_from(
+        &mut self,
+        from: WorldPoint,
+        to: WorldPoint,
+        pinned: Option<(DocId, (f64, f64))>,
+    ) {
         // A tap rather than a drag: two ends in the same place is not a connector, and
         // silently making a one-unit one would leave an invisible item on the board.
         if (to.x - from.x).hypot(to.y - from.y) < DRAG_TO_SIZE {
@@ -9939,7 +13773,22 @@ impl ActiveState {
             }
             Some((projected.doc_id, projected.item.placement))
         };
-        let (start_item, end_item) = (under(from), under(to));
+        // A pinned start wins over the hit test, and it has to: the press that armed it
+        // landed **outside** the item — a port sits past the edge — so `under(from)` answers
+        // for whatever is behind the dot, which is usually bare board. Looked up rather than
+        // trusted, so a node deleted mid-drag degrades to a free end instead of writing a
+        // binding to nothing.
+        let start_item = pinned
+            .and_then(|(doc, _)| {
+                Some((doc, self.editor.projection().placement_of(doc)?))
+            })
+            .or_else(|| under(from));
+        let end_item = under(to);
+        // The far end must not bind to the item the drag started on. A port sits outside its
+        // own item, so a short drag that curls back lands inside it — and a connector from a
+        // sticky to itself is a line the router draws through the box, which reads as a
+        // rendering fault rather than as a loop anybody asked for.
+        let end_item = end_item.filter(|(doc, _)| start_item.is_none_or(|(from, _)| *doc != from));
 
         // The anchor faces the *other* end, so two boxes are joined by their facing edges.
         // Measured against the other item's centre when there is one, and against the raw
@@ -9948,6 +13797,11 @@ impl ActiveState {
             item.map_or((fallback.x, fallback.y), |(_, p)| (p.x, p.y))
         };
         let start = match &start_item {
+            // The port the user grabbed, used exactly as given. See the doc comment: moving
+            // it to the facing edge would make Miro's four dots decorative.
+            Some((doc, _)) if pinned.is_some_and(|(id, _)| id == *doc) => {
+                ConnectorEnd::bound(*doc, pinned.map_or(ConnectorEnd::CENTER, |(_, a)| a))
+            }
             Some((doc, placement)) => {
                 let anchor = crate::connector::facing_anchor(placement, toward(end_item.as_ref(), to));
                 ConnectorEnd::bound(*doc, anchor)
@@ -10100,11 +13954,135 @@ impl ActiveState {
         }
     }
 
-    fn delete_selection(&mut self) {
+    /// Returns whether the deletion happened **now**, so a caller that reports an outcome can
+    /// wait for the answer.
+    ///
+    /// ⚠ Cut is the caller that needs this: it toasted *"Cut N items"* the moment it asked,
+    /// while the agent confirmation was still on the screen — and said the same thing when the
+    /// user pressed Cancel, over a selection that was still on the board with its text now on
+    /// the pasteboard. A confirmation whose refusal is reported as success is worse than no
+    /// confirmation, because the user believes the thing they just prevented.
+    fn delete_selection(&mut self) -> bool {
+        // An agent node is asked about first, and it has to be **clicked** away.
+        //
+        // *"there should be manual clicking to delete option so when i accidentally press
+        // backspace i should have to press it with the mouse."* Backspace and Delete are two
+        // keys away from every other key, and an agent node is the one thing on a Velm board
+        // whose deletion loses something ⌘Z cannot bring back: the process dies, and the
+        // transcript sidecar goes with the node. Everything else on a board is a rectangle
+        // that comes straight back.
+        //
+        // `Dialog::destructive` is what makes "with the mouse" true rather than a hope —
+        // feedback 16 established that Enter confirms a *non*-destructive dialog and
+        // deliberately not a destructive one, precisely because Enter is what somebody
+        // presses to dismiss a dialog they have not read. So a stray Backspace raises this,
+        // and a second stray keystroke cannot answer it.
+        if let Some(prompt) = self.agents_in_selection() {
+            self.shell.ask(
+                move |id| {
+                    Dialog::destructive(id, "Delete agent", prompt.clone(), "Delete")
+                },
+                crate::shell::Ask::DeleteAgentNodes,
+            );
+            return false;
+        }
+        self.delete_selection_now();
+        true
+    }
+
+    /// The delete itself, with nothing asked. Reached directly for a selection holding no
+    /// agent node, and from the confirmation's *Delete* button for one that does.
+    fn delete_selection_now(&mut self) {
         match self.editor.delete_selection() {
             Ok(0) => {}
             Ok(_) => self.shell.invalidate_selection(),
             Err(error) => self.failed("deleting", &error),
+        }
+    }
+
+    /// Runs `Command::Delete` over an agent selection and clicks *Delete* on what it raises.
+    ///
+    /// Answers whether the confirmation actually appeared, which is the half worth asserting:
+    /// a fixture that simply called `delete_selection_now` would enter below the guard and
+    /// would pass on a build where a stray Backspace silently killed a session — this
+    /// repository's oldest lesson, and the reason `--demo frame-marquee` enters where it
+    /// does.
+    ///
+    /// It goes through [`Self::answered`], not through the button, because the button is
+    /// egui's and `ActiveState` owns the window. What that leaves unproven is the one hop
+    /// from *Delete* to `DialogEvent::Confirmed`, which `Dialog::destructive` shares with
+    /// every other destructive dialog in the application.
+    fn delete_through_the_confirmation(&mut self) -> bool {
+        self.run(Command::Delete);
+        let Some((id, crate::shell::Ask::DeleteAgentNodes)) = self.shell.pending_ask() else {
+            return false;
+        };
+        self.answered(vellum_ui::DialogEvent::Confirmed(id));
+        true
+    }
+
+    /// The sentence to put in front of a delete, or `None` if nothing selected is an agent.
+    ///
+    /// # It counts what will actually go, not what is selected
+    ///
+    /// `Editor::delete_selection` takes a container's subtree and skips a locked item, so a
+    /// count taken off the selection would promise a number the delete does not deliver.
+    /// More importantly it would **miss** the case worth warning about: a frame with three
+    /// agents on it, selected alone, is one item on screen and four deletions.
+    ///
+    /// # The early-out reads the *stamp*, not the views
+    ///
+    /// ⚠ Both answer "does this board have agent nodes", and only one of them is true before
+    /// the first paint. `AgentViews::has_agents` is a **painter-facing** copy, written by
+    /// `rebuild_agent_views` — which runs once a frame, after this can be called. So a Delete
+    /// pressed on a board whose views had not been built yet found no agents in the selection,
+    /// skipped the confirmation entirely, and removed the nodes and their sessions with no
+    /// question asked. `BoardStamp::has_nodes` is the value that copy is made *from*, it is
+    /// maintained by `sync_agent_wiring` on the same per-frame drain, and it is exactly as
+    /// cheap: one `Option` compare on a board that has never had an agent on it.
+    ///
+    /// Measured by `--demo agent-message`, which deletes an agent through the real command
+    /// path and reported *"deleting an agent raised no confirmation — a stray Backspace loses
+    /// one"* against the views' copy.
+    fn agents_in_selection(&self) -> Option<String> {
+        if !self.agent_board.as_ref().is_some_and(|stamp| stamp.has_nodes) {
+            return None;
+        }
+        let board = self.editor.board();
+        let mut going: Vec<DocId> = Vec::new();
+        let mut seen: HashSet<DocId> = HashSet::new();
+        for id in self.editor.unlocked_selected_ids() {
+            if seen.insert(id) {
+                going.push(id);
+            }
+            for child in board.descendants(id) {
+                if seen.insert(child) {
+                    going.push(child);
+                }
+            }
+        }
+
+        let mut names: Vec<String> = Vec::new();
+        for id in going {
+            let Ok(item) = board.item(id) else { continue };
+            let ItemKind::Agent { model, label } = &item.kind else { continue };
+            names.push(node_name(label, crate::agent::decode(model).role_kind));
+        }
+
+        match names.len() {
+            0 => None,
+            1 => Some(format!(
+                "“{}” will be removed from the board and its session ends. Undo brings the \
+                 node back; whether it can still read its old transcript depends on the \
+                 sidecar file, which is not deleted here.",
+                names[0]
+            )),
+            n => Some(format!(
+                "{n} agents will be removed from the board — {}. Their sessions end and \
+                 everything they have said is discarded; undo brings the nodes back, not \
+                 the conversations.",
+                names.join(", ")
+            )),
         }
     }
 
@@ -10201,8 +14179,15 @@ impl ActiveState {
 
         let count = self.clipboard.len();
         if cut {
-            self.delete_selection();
-            self.ok(format!("Cut {count} item{}", plural(count)));
+            // Only when it actually went. A selection holding an agent node raises a
+            // confirmation and deletes nothing until it is answered, so reporting here
+            // unconditionally announced a cut that had not happened — and announced it again,
+            // identically, when the user cancelled. The copy half has already run either way,
+            // which is right: the items are on the clipboard and the board is untouched, which
+            // is a *copy*, and saying "Cut" over it is the lie.
+            if self.delete_selection() {
+                self.ok(format!("Cut {count} item{}", plural(count)));
+            }
         } else {
             self.ok(format!("Copied {count} item{}", plural(count)));
         }
@@ -10247,11 +14232,215 @@ impl ActiveState {
     /// on a `⌘V` throws away the view the user was working in.
     fn paste_aimed(&mut self, aim: PasteAim) {
         self.recorder.event("paste");
+        // ⚠ Diagnostic, and it is the *first* line of the function on purpose.
+        //
+        // Three different faults present as "⌘V does nothing", and only the position of
+        // this line tells them apart: the keystroke never arriving (no line at all — trap
+        // 9's family, and `Chrome::shortcuts` returns early on any focused field), the item
+        // landing under a panel (line, fast return, nothing visible), and the import
+        // freezing the window (line, then a long gap before the toast). Logging on entry
+        // rather than on success is the whole point — a success-only log cannot distinguish
+        // the first case from a paste that was never pressed.
+        let paste_started = Instant::now();
+        log::info!("paste: entered, aim {aim:?}");
+
+        // ⚠ **There is deliberately no "a paste is already running" guard here.**
+        //
+        // One was written and removed the same day. The reasoning for it was that a slow
+        // Miro import holds the frame, so the queued `⌘V` presses each run another whole
+        // import — but `paste_aimed` is *synchronous within one frame*, and winit has
+        // finished delivering one keystroke before the next is dispatched. A re-entrancy
+        // flag therefore can never be true on entry: it was dead code.
+        //
+        // Worse than useless, in fact. A latch that some path failed to clear would refuse
+        // every later paste for the life of the process, which is precisely the report it
+        // was meant to help with — *"it just doesnt let me paste"*. If repeated pastes need
+        // rate-limiting, it belongs where the cost is (the import), not on the keystroke.
+        self.paste_now(aim, paste_started, None);
+    }
+
+    /// Runs an import that [`Self::paste_aimed`] deferred so its toast could paint.
+    ///
+    /// Called once per frame from the app loop, and it takes the pending state before doing
+    /// anything — a paired set/clear with a long operation between them, which is trap 11's
+    /// shape, and taking it up front means the slot is empty however this returns.
+    pub(crate) fn run_pending_import(&mut self) {
+        match self.pending_import.take() {
+            // Frame two: decode, work out which assets are wanted, and hand the slow part
+            // to a thread. Both steps here are cheap — 5.5 ms to decode 596 widgets and
+            // 2 ms to probe them — so this frame still lands well inside its budget.
+            Some(PendingImport::Announced { aim, at, html }) => {
+                let decoded = match vellum_import::import_clipboard(&html) {
+                    Ok(Some(decoded)) => decoded,
+                    Ok(None) => return,
+                    Err(error) => {
+                        self.failed("reading the Miro payload", &error);
+                        return;
+                    }
+                };
+                let (ids, paths, blobs) =
+                    self.editor.prefetch_plan(&decoded, self.archive.as_ref());
+                let (sender, answers) = std::sync::mpsc::channel();
+                // Detached: nothing joins it. If the board is closed while it runs, the
+                // send fails, the thread ends, and the blobs it managed to write are simply
+                // already in the store — which is content-addressed, so they cost nothing
+                // and help the next import.
+                std::thread::Builder::new()
+                    .name("velm-import-assets".to_owned())
+                    .spawn(move || {
+                        let started = Instant::now();
+                        let ready = vellum_import::prefetch_assets(&ids, &paths, &blobs);
+                        log::info!(
+                            "import: {} asset(s) fetched off the frame in {:.0} ms",
+                            ready.len(),
+                            started.elapsed().as_secs_f64() * 1000.0
+                        );
+                        let _ = sender.send(ready);
+                    })
+                    .map_or_else(
+                        |error| log::error!("spawning the asset fetcher: {error}"),
+                        |_handle| {
+                            self.pending_import = Some(PendingImport::Fetching {
+                                aim,
+                                at,
+                                source: Box::new(decoded),
+                                answers,
+                                since: Instant::now(),
+                            });
+                        },
+                    );
+            }
+            // Every frame after: has the worker finished? `try_recv` never blocks, so a
+            // board whose assets are still coming keeps painting at full rate.
+            Some(PendingImport::Fetching { aim, at, source, answers, since }) => {
+                match answers.try_recv() {
+                    Ok(ready) => self.finish_import(aim, at, &source, ready, since),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // Put it back and look again next frame.
+                        self.pending_import = Some(PendingImport::Fetching {
+                            aim,
+                            at,
+                            source,
+                            answers,
+                            since,
+                        });
+                    }
+                    // The worker died without answering. Import anyway rather than losing
+                    // the paste: `import_widgets_with(None)` fetches the assets itself, on
+                    // this thread, which is the old behaviour and still correct.
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        log::warn!("import: the asset fetcher stopped; importing inline");
+                        self.finish_import(aim, at, &source, HashMap::new(), since);
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Creates the items, once the assets are in hand. ~50 ms on a 596-widget board.
+    fn finish_import(
+        &mut self,
+        aim: PasteAim,
+        at: WorldPoint,
+        source: &vellum_import::ImportedBoard,
+        ready: vellum_import::PrefetchedAssets,
+        since: Instant,
+    ) {
+        let ready = if ready.is_empty() { None } else { Some(ready) };
+        let outcome = self.editor.import_decoded(
+            source,
+            self.archive.as_mut(),
+            crate::editor::AfterImport::SelectPasted,
+            ready,
+        );
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.failed("importing from Miro", &error);
+                return;
+            }
+        };
+        log::info!("{outcome}");
+        let missing = outcome.missing_assets.len();
+        let mut summary = format!("imported {} items from Miro", outcome.total());
+        if missing > 0 {
+            summary.push_str(&format!(", {missing} without their assets"));
+        }
+        self.status = Some((summary.clone(), Instant::now()));
+        self.ok(summary);
+        match aim {
+            PasteAim::KeepMiroCoordinates => self.fit_board(),
+            PasteAim::Pointer => self.shift_imported_onto(&outcome.items, at),
+        }
+        self.editor.select(outcome.items.iter().copied());
+        self.shell.invalidate_selection();
+        log::info!(
+            "paste: finished in {:.0} ms (miro, assets off the frame)",
+            since.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    /// The paste itself. See [`Self::paste_aimed`] for the re-entry guard that wraps it.
+    fn paste_now(&mut self, aim: PasteAim, paste_started: Instant, aimed: Option<WorldPoint>) {
         // Read *before* the clipboard is touched. `take_clipboard_payload` and the Miro
         // import can both take long enough for the pointer to have moved on, and every
         // flavour below has to agree on one anchor or a paste would land in two places
         // depending on which arm claimed it.
-        let at = self.camera.screen_to_world(self.input.cursor(&self.camera));
+        //
+        // ⚠ **The pointer is not used when it is over the chrome.** `Input::cursor` keeps
+        // tracking while a panel owns the pointer — deliberately, and `app.rs` says so:
+        // *"a paste, a placement and the cursor icon all ask"*. The consequence nobody
+        // wrote down is that pasting with the mouse parked over the tool palette, the
+        // properties panel or the tab strip creates the item in world space **underneath
+        // that panel**, where it cannot be seen: a paste that worked and looks exactly
+        // like one that did nothing. The canvas centre is the honest answer there, and it
+        // is the same fallback `Input::cursor` already uses when the pointer has left the
+        // window entirely.
+        // A deferred import carries the point it was aimed at when the key was pressed. The
+        // pointer has had a frame to move, and a paste that landed somewhere else because
+        // the hand drifted would be a worse bug than the freeze this deferral fixes.
+        let at = if let Some(aimed) = aimed {
+            aimed
+        } else if self.shell.pointer_over_ui() {
+            self.camera.screen_to_world(self.canvas_centre())
+        } else {
+            self.camera.screen_to_world(self.input.cursor(&self.camera))
+        };
+
+        // ⚠ **A repeat at the same point is cascaded, or it is invisible.**
+        //
+        // Every flavour centres what it pastes on `at`, so pasting twice without moving
+        // the mouse puts the second item exactly on top of the first — pixel for pixel,
+        // same size, same content. Measured with `--demo paste-repeat`: three presses
+        // gained three items on **one** distinct position. From the outside that is
+        // indistinguishable from a paste that did nothing, and it was reported as one —
+        // *"when i try to paste links back to back ... it just doesnt let me paste back to
+        // back"*. Nothing was refusing anything; the evidence was underneath.
+        //
+        // `OFFSET` is the step `Duplicate` already cascades by, so a repeated paste and a
+        // repeated duplicate step the same way rather than being two conventions.
+        //
+        // **Reset when the aim moves**, which is what keeps this from drifting: move the
+        // mouse and the next paste lands under it exactly, because that is a new place and
+        // the user has said where they want it. The comparison is on the rounded point for
+        // the same reason `--demo paste-repeat` counts positions that way — a sub-unit
+        // difference is the same place to anyone looking at the board.
+        #[expect(clippy::cast_possible_truncation, reason = "a board coordinate")]
+        let spot = (at.x.round() as i64, at.y.round() as i64);
+        let at = if aimed.is_some() {
+            // Already cascaded on the frame the key was pressed; doing it again would step
+            // a deferred import twice for one press.
+            at
+        } else if self.last_paste_at == Some(spot) {
+            self.paste_repeats = self.paste_repeats.saturating_add(1);
+            let step = OFFSET * f64::from(self.paste_repeats);
+            WorldPoint::new(at.x + step, at.y + step)
+        } else {
+            self.last_paste_at = Some(spot);
+            self.paste_repeats = 0;
+            at
+        };
         // Opened on the first paste and kept for the session. Borrowed out of the
         // field here rather than through a helper so `editor` and `archive` stay
         // independently borrowable alongside it.
@@ -10267,8 +14456,52 @@ impl ActiveState {
             }
         };
 
+        // ⚠ **A Miro payload is announced before it is imported, and imported next frame.**
+        //
+        // Measured on the reference board with a cold blob store: 596 widgets and a 110.5 MB
+        // backup take **2,076 ms**, of which 2,012 ms is pulling 205 assets out of the ZIP
+        // and into the blob store. That is not waste to be optimised away — the store fsyncs
+        // every blob and then its directory, 410 syncs, which is what stops a blob name ever
+        // resolving to unwritten bytes. Parallelising it across four threads bought 19%
+        // because fsyncs serialise at the device, not at the CPU.
+        //
+        // So the two seconds are real, and the defect was never their length: it was that
+        // they happened inside one frame with **nothing on screen**. The window did not
+        // repaint, no toast appeared, and the user pressed `⌘V` again — reasonably, since
+        // nothing had acknowledged the first press. Handing the frame back before starting
+        // lets the toast paint, so the wait is something the app is visibly doing rather
+        // than something that has gone wrong.
+        //
+        // The peek is a substring scan (`looks_like_miro`), so an ordinary paste — a URL, an
+        // image, a sticky — is unaffected and still lands in the same frame it was asked for.
+        // ⚠ `aimed.is_none()` is what stops this deferring **itself**, for ever. The runner
+        // takes the pending slot before calling in, so without this the slot is empty when
+        // the peek runs again, the payload is still on the pasteboard, and the import
+        // re-queues itself every frame and never happens. Driving one real paste found it
+        // on the first try; nothing about reading the code would have.
+        if aimed.is_none()
+            && self.pending_import.is_none()
+            && clipboard.get().html().is_ok_and(|html| vellum_import::clipboard::looks_like_miro(&html))
+        {
+            let html = clipboard.get().html().unwrap_or_default();
+            self.pending_import = Some(PendingImport::Announced { aim, at, html });
+            self.shell.toast(Toast::info("Importing from Miro…"));
+            log::info!("paste: miro payload seen, importing on the next frame");
+            return;
+        }
+
+        let miro_started = Instant::now();
         match self.editor.paste_from_clipboard(clipboard, self.archive.as_mut()) {
             Ok(Some(outcome)) => {
+                // The import proper: decode, per-asset ZIP extraction and blob write, one
+                // `Board::add` per widget, then a full reproject. All of it inside this
+                // frame, so this figure *is* the freeze the user sees.
+                log::info!(
+                    "paste: miro import took {:.0} ms ({:.0} ms of it assets) for {} items",
+                    miro_started.elapsed().as_secs_f64() * 1000.0,
+                    outcome.asset_time.as_secs_f64() * 1000.0,
+                    outcome.total()
+                );
                 // The whole report goes to the log — it names every substitution and
                 // every missing asset — while the canvas gets the one line that fits.
                 log::info!("{outcome}");
@@ -10286,7 +14519,18 @@ impl ActiveState {
                     // like every other flavour, and leave the camera where it was.
                     PasteAim::Pointer => self.shift_imported_onto(&outcome.items, at),
                 }
+                // **Select what arrived**, as every other paste flavour does
+                // (`place_pasted_text`, `place_pasted_image`, `paste_internal`). This arm
+                // was the exception, so the one paste that most needs confirmation — 596
+                // items landing on a board that already had content — gave the least: no
+                // ring, nothing to nudge, and no way to tell it apart from a paste that
+                // had done nothing. It also makes ⌘Z's target visible before it is used.
+                self.editor.select(outcome.items.iter().copied());
                 self.shell.invalidate_selection();
+                log::info!(
+                    "paste: finished in {:.0} ms (miro)",
+                    paste_started.elapsed().as_secs_f64() * 1000.0
+                );
                 return;
             }
             Ok(None) => {}
@@ -10301,6 +14545,17 @@ impl ActiveState {
             Some(Payload::Text(text)) => self.place_pasted_text(&text, at),
             None => self.paste_internal(at),
         }
+        // `at` is reported because a paste that lands under a panel is invisible and
+        // otherwise indistinguishable from one that never happened — the pointer is
+        // tracked over the chrome on purpose (`app::note_cursor`), so this is a real
+        // outcome rather than a hypothetical one.
+        log::info!(
+            "paste: finished in {:.0} ms at world ({:.0}, {:.0}), pointer over chrome: {}",
+            paste_started.elapsed().as_secs_f64() * 1000.0,
+            at.x,
+            at.y,
+            self.shell.pointer_over_ui()
+        );
     }
 
     /// Moves a just-imported Miro board so its bounding box is centred on `at`.
@@ -11367,6 +15622,15 @@ impl ActiveState {
         // a third gesture — give every way one can end without a release a call to the thing
         // that closes it.
         self.settle();
+        // ⚠ **And the microphone, which is the fourth.** Not in `settle`, deliberately: that
+        // function's job is closing long-lived *undo groups* before a board mutation, and
+        // voice holds no group — so calling it from there would close the device on every
+        // command dispatched while dictating, which is the ordinary case rather than a
+        // hazard. A tab switch is different in kind: the node being spoken to is about to
+        // stop being on the board in front, and `voice_doc` would then refuse the
+        // transcription when it landed. Above the `mem::replace` for the same reason
+        // `settle` is.
+        self.cancel_talking();
         // **A native view belongs to the window, not to the board.** Nothing about parking a
         // board removes a `WKWebView` from the window it is a child of, so a page left running
         // stays composited over whatever board comes forward — showing the parked board's site
@@ -11596,6 +15860,7 @@ impl ActiveState {
                     Err(error) => self.failed("renaming the board", &error),
                 }
             }
+            (Ask::DeleteAgentNodes, DialogEvent::Confirmed(_)) => self.delete_selection_now(),
             (Ask::DeleteBoard(path), DialogEvent::Confirmed(_)) => {
                 self.flush_board(&path);
                 if let Some(texture) = self.shell.drop_thumbnail(&path) {
@@ -11677,6 +15942,29 @@ impl ActiveState {
             }
             (Ask::AgentRules(doc), DialogEvent::RulesSet(_, rules)) => {
                 self.set_agent_rules(doc, rules);
+            }
+            // ⚠ **The other two thirds of the cascade.** An *Edit* on an inherited layer
+            // closes the node's editor and opens one on that layer's file; saving that one
+            // writes the file. Both arms are needed and neither is enough alone: without the
+            // first there is no gesture, and without the second `save_rule_layer` — path
+            // resolution, freshness check, atomic write, conflict refusal, all of it already
+            // written and fixture-proven — keeps the one caller it had, which was a `--demo`.
+            (Ask::AgentRules(_) | Ask::RuleLayer(_), DialogEvent::EditRuleLayer(_, layer)) => {
+                self.edit_rule_layer(layer);
+            }
+            (Ask::RuleLayer(layer), DialogEvent::RulesSet(_, rules)) => {
+                self.save_rule_layer(layer, &rules);
+            }
+            (Ask::RemoveWorktree(doc), DialogEvent::Confirmed(_)) => self.remove_worktree(doc),
+            (Ask::AttachLink(doc), DialogEvent::Renamed(_, address)) => {
+                let address = address.trim().to_owned();
+                if address.is_empty() {
+                    return;
+                }
+                // Straight to the same function a dropped file and the picker reach:
+                // `ingest` is what decides whether a string is a path, a page or a video,
+                // and a second opinion here would be a second answer to that question.
+                self.attach_context_to(doc, &address);
             }
             (Ask::SignIn(provider), DialogEvent::SignedIn(_, key)) => {
                 self.store_provider_key(provider, key.expose());
@@ -11932,6 +16220,13 @@ impl ActiveState {
                 theme,
                 // A thumbnail is rendered with nobody's pointer in it.
                 hovered_badge: None,
+                default_chat_theme: self.shell.library.default_chat_theme(),
+                default_display: self.shell.library.default_display_mode(),
+                // And so no item is wearing connector ports: they are an invitation to a
+                // hand that is not here, and one frozen into a board preview would read as
+                // part of the board.
+                ports: None,
+            connector_grips: None,
                 // A preview shows the board, not what happened to be selected when it
                 // was taken.
                 selection: &[],
@@ -11945,7 +16240,7 @@ impl ActiveState {
                 card_drop: None,
                 pattern,
                 grid_color,
-                territory: None,
+                territories: Vec::new(),
                 minimap: None,
             };
             let (device, queue, renderer) = self.surface.parts();
@@ -12226,6 +16521,19 @@ fn shortcut_reference() -> Vec<ReferenceSection> {
                     format!(
                         "{} then drag; Escape keeps the old one",
                         if is_mac { "Shift + Cmd + T" } else { "Shift + Ctrl + T" }
+                    ),
+                ),
+                // Voice, for the same reason the three widget-shape keys above are here:
+                // nothing on the canvas announces it. The node's Voice switch is in the
+                // inspector, which is off by default, so without this row the whole of the
+                // feature's discoverability is a hover text on a panel most people never open.
+                // It says **hold**, because a tap does nothing and a key that has to be held
+                // is the half a shortcut list usually gets wrong.
+                (
+                    "Talk to the selected agent".to_owned(),
+                    format!(
+                        "Hold {} (turn Voice on for the node first)",
+                        if is_mac { "Option + D" } else { "Alt + D" }
                     ),
                 ),
             ],

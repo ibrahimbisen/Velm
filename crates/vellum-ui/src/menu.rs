@@ -154,8 +154,34 @@ pub struct MenuHeader<'a> {
     pub accent: crate::theme::Accent,
     /// The mode a **new** agent node inherits, for Preferences ▸ Agent output's tick.
     pub default_display: vellum_agent::DisplayMode,
+    /// The chat theme new nodes, and every node still inheriting, draw in.
+    pub default_chat_theme: vellum_agent::ChatTheme,
+    /// The **selected** node's own choice, or `None` when it is inheriting. Drives the tick
+    /// in Edit ▸ Agent ▸ Chat theme, which is the only thing that tells *this node's look*
+    /// from *the default it happens to match*.
+    pub node_theme: Option<vellum_agent::ChatTheme>,
+    /// The selected node's paper opacity, 0-255, for the slider that sets it.
+    pub node_opacity: u8,
+    /// Whether that node already has a picture behind it, so *No picture* is offered only
+    /// when there is one to take off.
+    pub node_has_background: bool,
     /// Which providers this machine can reach, and how each is paid for. Never a key.
     pub providers: &'a [ProviderStatus],
+    /// Which provider a node that has not chosen one runs on — the thing *Inherit* inherits.
+    pub default_provider: vellum_agent::Provider,
+    /// Which transcriber a spoken prompt goes to, for Preferences ▸ Voice's tick.
+    pub speech: vellum_agent::voice::Preference,
+    /// The whisper binary found on this machine, if any.
+    ///
+    /// A *status*, exactly as `providers` is one, and for the same reason: the chrome must be
+    /// able to say which way **Automatic** will actually go rather than leaving the user to
+    /// guess, and it cannot probe a `PATH` itself.
+    pub local_transcriber: Option<&'a str>,
+    /// The model file that has been named, if any. `None` is what makes local transcription
+    /// refuse, so the menu says so rather than letting the user find out by speaking.
+    pub speech_model: Option<&'a str>,
+    /// Whether an API has been configured to transcribe through.
+    pub speech_hosted: bool,
     pub flags: MenuFlags,
 }
 
@@ -319,7 +345,13 @@ pub(crate) fn show(
                 });
             });
             pill = inner.response.rect;
-            crate::theme::paint_glass_edge(ui.painter(), pill, palette, crate::theme::Backing::Canvas);
+            crate::theme::paint_glass_edge(
+                ui.painter(),
+                pill,
+                palette,
+                crate::theme::Backing::Canvas,
+                f32::from(crate::theme::radius::LARGE),
+            );
         });
 
     if let Some(spec) = palette.glass(crate::theme::Backing::Canvas)
@@ -471,8 +503,31 @@ pub(crate) fn entries(
             }
             Entry::Item(command) => menu_item(ui, palette, *command, cmd_ctx, header, events),
             Entry::Sub(sub) => submenu(ui, palette, *sub, cmd_ctx, header, events),
+            Entry::Heading(title) => section_heading(ui, palette, title),
         }
     }
+}
+
+/// A band's name, above the rows it introduces.
+///
+/// **A label, deliberately not a disabled row.** A greyed-out `Button` is what this interface
+/// uses for *"a verb you cannot use right now"*, and it carries a tooltip saying why —
+/// spelling a heading that way would put an unreachable command in a menu whose whole
+/// contract is that everything in it is a command. So: no frame, no tick column, no hover.
+///
+/// Indented to the tick column's own left edge rather than to the label column, so the
+/// heading reads as belonging to the band rather than as a row that has lost its tick.
+pub(crate) fn section_heading(ui: &mut Ui, palette: Palette, title: &str) {
+    ui.add_space(space::UNIT);
+    ui.horizontal(|ui| {
+        ui.add_space(space::UNIT);
+        ui.label(
+            egui::RichText::new(title)
+                .size(crate::theme::text::LABEL)
+                .color(palette.muted)
+                .strong(),
+        );
+    });
 }
 
 pub(crate) fn submenu(
@@ -502,13 +557,26 @@ pub(crate) fn submenu(
                     Submenu::Transparency => transparency(ui, palette, header, events),
                     Submenu::Accent => accent(ui, palette, header, events),
                     Submenu::AgentDisplay => agent_display(ui, palette, header, events),
+                    Submenu::AgentTheme => chat_theme(ui, palette, header, events, None),
+                    Submenu::NodeTheme => {
+                        chat_theme(ui, palette, header, events, Some(header.node_theme));
+                    }
                     Submenu::Providers => providers(ui, palette, header, events),
+                    Submenu::Voice => voice(ui, palette, header, events),
                     Submenu::Export | Submenu::Arrange | Submenu::Agent => {
                         entries(ui, palette, sub.entries(), cmd_ctx, header, events);
                     }
                 })
                 .0
         }
+    };
+
+    // What the submenu is *for*, on the row that opens it — `Command::note`'s rule applied
+    // to a nested menu. On an enabled row only, so it never competes with the disabled
+    // reason above, which is the same split `menu_item` makes.
+    let response = match sub.note() {
+        Some(note) if available.is_enabled() => response.on_hover_text(note),
+        _ => response,
     };
 
     // The disclosure arrow, drawn rather than set as text: egui's default is the `⏵`
@@ -957,6 +1025,89 @@ fn accent(ui: &mut Ui, palette: Palette, header: &MenuHeader<'_>, events: &mut E
 /// moves every node that never chose for itself, and leaves the ones that did. The line
 /// underneath says so, because "default" on its own does not distinguish a setting that
 /// applies from here on from one that applies to everything.
+/// Preferences ▸ Voice — feature 12's second half.
+///
+/// **This menu exists because six refusals named a page that did not.** `voice::Speech` was
+/// reachable only by hand-editing `library.json`, and the strings that told you so said
+/// *"Preferences ▸ Voice"* — the prohibited shape, in the settings for the one feature that
+/// opens a microphone. `voice::WHERE_TO_CONFIGURE` was reworded to name the file honestly;
+/// this is the other half of that fix, and the wording can go back to naming this menu.
+///
+/// It covers the **local** path completely: which transcriber, and the model file it needs.
+/// That is deliberate rather than partial — it is the private one, it needs no key, and it is
+/// the one `Preference::Auto` prefers. A hosted transcriber needs a provider *and* a model
+/// name Velm refuses to guess (`Speech::hosted_model`'s doc says why a pinned constant is
+/// wrong), so it stays in the sidecar and the footer says which state you are in.
+fn voice(ui: &mut Ui, palette: Palette, header: &MenuHeader<'_>, events: &mut EventSink) {
+    ui.set_min_width(space::of(46));
+    for preference in vellum_agent::voice::Preference::ALL {
+        let response = ui.add(row_button(preference.label()).min_size(vec2(row_width(ui), 0.0)));
+        if preference == header.speech {
+            tick(ui, palette, &response);
+        }
+        if response.clicked() {
+            events.push(UiEvent::SpeechPreferenceChanged(preference));
+        }
+    }
+
+    ui.add_space(space::UNIT);
+    // Named by its file, not by "Choose…", once one is set: the whole question a person has
+    // here is *which* model, and a row that says "Choose a model file…" over a configured one
+    // makes you open a picker to find out what you already chose.
+    let label = match header.speech_model {
+        Some(path) => {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map_or(path, |name| name.to_str().unwrap_or(path));
+            format!("Model: {name}")
+        }
+        None => "Choose a model file…".to_owned(),
+    };
+    let picked = ui
+        .add(row_button(&label).min_size(vec2(row_width(ui), 0.0)))
+        .on_hover_text(
+            "A whisper model — a `ggml-*.bin`. The transcriber on this machine needs one and \
+             there is nothing sensible to guess: the file is gigabytes and lives wherever you \
+             put it.",
+        );
+    if picked.clicked() {
+        events.push(UiEvent::ChooseSpeechModel);
+    }
+
+    ui.add_space(space::UNIT);
+    // What will actually happen, said in one line. `Preference::Auto` is the default and its
+    // answer depends on the machine, so a menu that only ticked a row would leave the
+    // commonest configuration unexplained.
+    let state = match (header.speech, header.local_transcriber, header.speech_hosted) {
+        (vellum_agent::voice::Preference::Hosted, _, false)
+        | (vellum_agent::voice::Preference::Auto, None, false) => {
+            "Nothing can transcribe yet. Install a whisper binary, or configure an API in \
+             library.json."
+                .to_owned()
+        }
+        (vellum_agent::voice::Preference::Local, None, _) => {
+            "No whisper binary was found on this machine, so nothing will transcribe."
+                .to_owned()
+        }
+        (vellum_agent::voice::Preference::Local | vellum_agent::voice::Preference::Auto, Some(command), _)
+            if header.speech_model.is_none() =>
+        {
+            format!("`{command}` is installed but has no model file, so it will refuse.")
+        }
+        (vellum_agent::voice::Preference::Local | vellum_agent::voice::Preference::Auto, Some(command), _) => {
+            format!("`{command}`, on this machine. Nothing you say leaves it.")
+        }
+        (vellum_agent::voice::Preference::Auto, None, true)
+        | (vellum_agent::voice::Preference::Hosted, _, true) => {
+            "Through the API configured in library.json. What you say leaves this machine."
+                .to_owned()
+        }
+    };
+    ui.label(
+        egui::RichText::new(state).color(palette.faint).size(crate::theme::text::LABEL),
+    );
+}
+
 fn agent_display(ui: &mut Ui, palette: Palette, header: &MenuHeader<'_>, events: &mut EventSink) {
     ui.set_min_width(space::of(40));
     for mode in vellum_agent::DisplayMode::ALL {
@@ -964,6 +1115,11 @@ fn agent_display(ui: &mut Ui, palette: Palette, header: &MenuHeader<'_>, events:
         if mode == header.default_display {
             tick(ui, palette, &response);
         }
+        // These rows are built from `DisplayMode`'s own values rather than from the command
+        // table, so `Command::note` cannot reach them and the sentence has to be written
+        // here. `DisplayMode::note` keeps it beside the variant it describes, which is what
+        // stops a fourth mode arriving with no explanation.
+        let response = response.on_hover_text(mode.note());
         if response.clicked() {
             events.push(UiEvent::DefaultDisplayModeChanged(mode));
         }
@@ -980,6 +1136,108 @@ fn agent_display(ui: &mut Ui, palette: Palette, header: &MenuHeader<'_>, events:
     );
 }
 
+/// The four chat themes, with a tick on the one in force.
+///
+/// One function for both menus. `node` is `Some` on the per-node one — `Some(None)` meaning
+/// *that node is inheriting* — and `None` on the app-wide one, which is what decides whether
+/// an **Inherit** row is offered and which event a click emits. Two functions would be two
+/// copies of a list built from `ChatTheme::ALL`, and the copy is what goes stale when a fifth
+/// theme lands.
+fn chat_theme(
+    ui: &mut Ui,
+    palette: Palette,
+    header: &MenuHeader<'_>,
+    events: &mut EventSink,
+    node: Option<Option<vellum_agent::ChatTheme>>,
+) {
+    ui.set_min_width(space::of(42));
+
+    if let Some(chosen) = node {
+        let response = ui
+            .add(row_button("Inherit").min_size(vec2(row_width(ui), 0.0)))
+            .on_hover_text(format!(
+                "Follow Preferences ▸ Agents ▸ Chat theme, which is {} right now. A node set \
+                 this way moves when you change that default.",
+                header.default_chat_theme.label()
+            ));
+        if chosen.is_none() {
+            tick(ui, palette, &response);
+        }
+        if response.clicked() {
+            events.push(UiEvent::Agent(crate::AgentEdit::ChatTheme(None)));
+        }
+        ui.add_space(space::UNIT);
+        crate::widgets::hairline(ui, palette);
+        ui.add_space(space::UNIT);
+    }
+
+    for theme in vellum_agent::ChatTheme::ALL {
+        let response = ui.add(row_button(theme.label()).min_size(vec2(row_width(ui), 0.0)));
+        let on = match node {
+            Some(chosen) => chosen == Some(theme),
+            None => theme == header.default_chat_theme,
+        };
+        if on {
+            tick(ui, palette, &response);
+        }
+        // Written beside the variant rather than here — these rows are built from `ALL`, so
+        // a fifth theme would otherwise arrive with nothing explaining it.
+        let response = response.on_hover_text(theme.note());
+        if response.clicked() {
+            events.push(match node {
+                Some(_) => UiEvent::Agent(crate::AgentEdit::ChatTheme(Some(theme))),
+                None => UiEvent::DefaultChatThemeChanged(theme),
+            });
+        }
+    }
+
+    // The two controls a preset cannot carry: how see-through this node's paper is, and a
+    // picture of your own behind it. **Per node only** — both are tuned against what is
+    // behind that particular node, and an app-wide answer to "how transparent" is an answer
+    // to the wrong question.
+    if node.is_some() {
+        ui.add_space(space::UNIT);
+        crate::widgets::hairline(ui, palette);
+        ui.add_space(space::UNIT);
+
+        let mut opacity = header.node_opacity;
+        let slider = ui
+            .add(
+                egui::Slider::new(&mut opacity, 51..=255)
+                    .show_value(false)
+                    .text("Transparency"),
+            )
+            .on_hover_text(
+                "How see-through this node's paper is. The words are never faded — a \
+                 transcript you cannot read is not a transparency setting.",
+            );
+        // On release, not per frame: the value is written into the document and every
+        // intermediate one would be an undo step and a save.
+        if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+            events.push(UiEvent::Agent(crate::AgentEdit::ChatOpacity(opacity)));
+        }
+
+        let picture = ui
+            .add(row_button("Picture…").min_size(vec2(row_width(ui), 0.0)))
+            .on_hover_text(
+                "Put an image of your own behind this transcript. It is stored in the \
+                 board, not linked from your disk, so the board still looks right on \
+                 another machine.",
+            );
+        if picture.clicked() {
+            events.command(Command::SetChatBackground);
+        }
+        if header.node_has_background {
+            let clear = ui
+                .add(row_button("No picture").min_size(vec2(row_width(ui), 0.0)))
+                .on_hover_text("Take the picture off, keeping the colours.");
+            if clear.clicked() {
+                events.push(UiEvent::Agent(crate::AgentEdit::ChatBackground(None)));
+            }
+        }
+    }
+}
+
 /// Preferences ▸ Providers — which models this machine can reach, and who pays for each.
 ///
 /// **Nothing here is a key and nothing here shows one.** `docs/07-agent-canvas.md` §8a puts
@@ -993,8 +1251,47 @@ fn agent_display(ui: &mut Ui, palette: Palette, header: &MenuHeader<'_>, events:
 fn providers(ui: &mut Ui, palette: Palette, header: &MenuHeader<'_>, events: &mut EventSink) {
     ui.set_min_width(space::of(52));
     ui.set_max_width(space::of(80));
+    provider_rows(ui, palette, header.providers, events);
 
-    if header.providers.is_empty() {
+    // Which provider an *inheriting* node runs on. Below the sign-in rows and under its own
+    // heading, because the two questions are different: those rows are "can Velm reach this
+    // provider", and this one is "which of them does a node get when it has not chosen".
+    // Until this existed, `Inherit` followed a compile-time constant and the panel's promise
+    // that an inheriting node moves with the default described something that could not move.
+    ui.add_space(space::of(1));
+    crate::widgets::hairline(ui, palette);
+    crate::widgets::section_header(ui, palette, "New agents use");
+    for status in header.providers {
+        let chosen = status.provider == header.default_provider;
+        let response = ui
+            .add(row_button(status.provider.label()).min_size(vec2(row_width(ui), 0.0)))
+            .on_hover_text(format!(
+                "Run agents on {} unless the node says otherwise. Every node still set to \
+                 *Inherit* moves with this.",
+                status.provider.label()
+            ));
+        if response.clicked() {
+            events.push(UiEvent::DefaultProviderChanged(status.provider));
+        }
+        if chosen {
+            tick(ui, palette, &response);
+        }
+    }
+}
+
+/// The rows themselves, so the settings page draws the **same** list rather than a second
+/// one that would go stale the day a provider is added.
+///
+/// Split out of [`providers`] rather than duplicated: the sign-in rule below is the whole
+/// content of feature 17 made visible, and two copies of it is two places to get *"runs on
+/// your subscription, so it needs no key"* wrong.
+pub(crate) fn provider_rows(
+    ui: &mut Ui,
+    palette: Palette,
+    providers: &[ProviderStatus],
+    events: &mut EventSink,
+) {
+    if providers.is_empty() {
         ui.label(
             egui::RichText::new("No providers have been looked for yet.")
                 .color(palette.faint)
@@ -1003,7 +1300,7 @@ fn providers(ui: &mut Ui, palette: Palette, header: &MenuHeader<'_>, events: &mu
         return;
     }
 
-    for status in header.providers {
+    for status in providers {
         // The billing word is the second column, in the same right-hand slot a shortcut
         // takes elsewhere in this bar — so the eye reads name, then cost, down the list.
         let button = row_button(status.provider.label())
@@ -1039,11 +1336,11 @@ fn providers(ui: &mut Ui, palette: Palette, header: &MenuHeader<'_>, events: &mu
         }
     }
 
-    if header.providers.iter().any(|status| status.has_key) {
+    if providers.iter().any(|status| status.has_key) {
         ui.add_space(space::UNIT);
         crate::widgets::hairline(ui, palette);
         ui.add_space(space::UNIT);
-        for status in header.providers.iter().filter(|status| status.has_key) {
+        for status in providers.iter().filter(|status| status.has_key) {
             let label = format!("Forget the {} key", status.provider.label());
             if ui.add(row_button(&label).min_size(vec2(row_width(ui), 0.0))).clicked() {
                 events.push(UiEvent::ProviderForget(status.provider));
@@ -1229,6 +1526,15 @@ mod tests {
 
         let spaces = [Space::new("Cars", ["/boards/site-plan.vellum".into()]).pinned()];
         let header = MenuHeader {
+            default_provider: vellum_agent::Provider::default(),
+            default_chat_theme: vellum_agent::ChatTheme::Velm,
+            speech: vellum_agent::voice::Preference::default(),
+            local_transcriber: None,
+            speech_model: None,
+            speech_hosted: false,
+            node_theme: None,
+            node_opacity: 255,
+            node_has_background: false,
             grid: GridSettings::default(),
             title: "Engine bay",
             path: Some(Path::new("/boards/site-plan.vellum")),

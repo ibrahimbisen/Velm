@@ -49,8 +49,8 @@ pub mod voice;
 pub mod worktree;
 
 pub use model::{
-    AgentModel, AgentRules, BrowserModel, ContextSource, DisplayMode, FileTreeModel, NoteModel,
-    NoteScope, RoleKind, Territory,
+    AgentModel, AgentRules, BrowserModel, ChatTheme, ContextSource, DisplayMode, FileTreeModel,
+    NoteModel, NoteScope, RoleKind, Territory,
 };
 pub use bus::{Bus, Delivery, LinkDirection, LinkPulse, Message, Topology};
 pub use ipc::{IpcHandler, IpcServer};

@@ -163,6 +163,10 @@ pub enum Icon {
     ChevronUp,
     ChevronDown,
     ChevronRight,
+    /// The mirror of [`Self::ChevronRight`], for a control that points the other way — the
+    /// arrowhead at a connector's *start*, which on an agent link is the direction messages
+    /// travel in.
+    ChevronLeft,
     Import,
     Duplicate,
     Trash,
@@ -517,6 +521,7 @@ impl Icon {
             Self::ChevronUp => const { &[line(&[(0.30, 0.60), (0.50, 0.40), (0.70, 0.60)])] },
             Self::ChevronDown => const { &[line(&[(0.30, 0.40), (0.50, 0.60), (0.70, 0.40)])] },
             Self::ChevronRight => const { &[line(&[(0.40, 0.30), (0.60, 0.50), (0.40, 0.70)])] },
+            Self::ChevronLeft => const { &[line(&[(0.60, 0.30), (0.40, 0.50), (0.60, 0.70)])] },
             Self::Import => const { &[
                 line(&[(0.50, 0.14), (0.50, 0.54)]),
                 solid(&[(0.50, 0.66), (0.35, 0.46), (0.65, 0.46)]),
@@ -701,6 +706,7 @@ mod tests {
         Icon::ChevronUp,
         Icon::ChevronDown,
         Icon::ChevronRight,
+        Icon::ChevronLeft,
         Icon::Import,
         Icon::Duplicate,
         Icon::Trash,

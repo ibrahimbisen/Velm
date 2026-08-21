@@ -77,6 +77,21 @@ pub struct RuleFilePath {
     /// Whether it is on disk. A file that is not there cannot be revealed, and a button that
     /// opens nothing is the inert control this house does not ship.
     pub exists: bool,
+    /// Where an *edit* of this layer would actually be written, when that is a different file
+    /// from the one being read.
+    ///
+    /// **This is `Some` exactly when Velm is reading somebody else's file.** The project
+    /// layer is discovered in the order `.velm/rules.md` → `AGENTS.md` → `CLAUDE.md` →
+    /// `.cursorrules`, and `docs/07-agent-canvas.md` §7 settles that Velm **writes only its
+    /// own**: a tool that rewrites the `CLAUDE.md` a person maintains by hand has overstepped,
+    /// however convenient. But the honest consequence has to be *said*, because the file it
+    /// writes sorts first in that same discovery order — so saving here creates a file that
+    /// takes precedence over the one shown above, and a user who was not told would be left
+    /// with two rule files and a mystery about which one is in force.
+    ///
+    /// `None` when the file read and the file written are the same, which is every global
+    /// layer and any project already using `.velm/rules.md`.
+    pub writes_to: Option<String>,
 }
 
 /// The two layers above the node's own, as files.
@@ -251,6 +266,11 @@ fn one_line(value: &str) -> String {
 }
 
 /// The rules editor's body — the resolved cascade, then the node's own layer.
+// Eight arguments, one over the lint's threshold, and grouping them would be worse: every one
+// is a distinct thing the caller owns — the form being edited, the resolution to display
+// against it, the two files above it, and two out-parameters for the buttons that do not
+// answer the dialog. A struct here would exist only to be destructured on the next line.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rules_editor(
     ui: &mut Ui,
     palette: Palette,
@@ -262,6 +282,10 @@ pub(crate) fn rules_editor(
     // and because this editor emits exactly one kind of event, so a whole sink would be a
     // channel carrying one message.
     reveal: &mut Option<std::path::PathBuf>,
+    // `edit` is set when an *Edit* button was pressed, naming which inherited layer. The same
+    // out-parameter shape as `reveal` and for the same reason — though unlike a reveal, this
+    // one does end the dialog: the app closes this editor and opens one on that layer.
+    edit: &mut Option<Layer>,
     confirm: &str,
 ) -> Option<Answer> {
     let mut answer = None;
@@ -298,7 +322,7 @@ pub(crate) fn rules_editor(
         });
     }
 
-    rule_files(ui, palette, files, reveal);
+    rule_files(ui, palette, files, reveal, edit);
 
     ui.add_space(space::of(2));
     hairline(ui, palette);
@@ -415,11 +439,26 @@ pub(crate) fn rules_editor(
 /// **Absent is a state, not an omission.** A layer with no file yet still gets its row, with
 /// the path it *would* be at, because "create this file" is only actionable if you are told
 /// what to create and where. The button is disabled and says so rather than opening nothing.
+///
+/// # Edit, and why it is enabled when *Show* is not
+///
+/// *Show* needs a file; **Edit does not, and that is the point of it.** The commonest state of
+/// the global layer is *not written yet* — a person who has never opened a text editor at
+/// `~/Library/Application Support/Vellum/rules/global.md` has no global rules — so a button
+/// that waited for the file to exist would be greyed out in exactly the case it is for.
+/// `RuleFile::save` creates the file and its directories.
+///
+/// This is the front half of a write path whose every other part already existed and was
+/// exercised by a fixture: path resolution, the freshness check against what the editor was
+/// opened on, the atomic write, the conflict refusal. `ActiveState::save_rule_layer` had no
+/// caller outside `--demo rule-layers`, so two thirds of a three-layer cascade were read-only
+/// — the repo's signature defect, in the feature whose whole subject is layering.
 fn rule_files(
     ui: &mut Ui,
     palette: Palette,
     files: &RuleFiles,
     reveal: &mut Option<std::path::PathBuf>,
+    edit: &mut Option<Layer>,
 ) {
     if files.global.is_none() && files.project.is_none() {
         return;
@@ -468,6 +507,27 @@ fn rule_files(
                         file.path
                     ));
                 }
+
+                // Left of *Show* — right-to-left layout, so it is pushed second. Editing is
+                // the stronger verb of the two and sits inboard of the weaker one, which is
+                // the order the rest of this interface uses.
+                let edit_button = ui.add(egui::Button::new("Edit").frame(true));
+                let hover = match (&file.writes_to, file.exists) {
+                    // Reading somebody else's file. Say both halves: what is being read now,
+                    // and what a save would create instead.
+                    (Some(target), _) => format!(
+                        "Edit these {} rules. Velm never writes {} — it reads it. Saving \
+                         creates {}, which takes precedence over it.",
+                        layer.heading().to_lowercase(),
+                        file.path,
+                        target
+                    ),
+                    (None, true) => format!("Edit {}", file.path),
+                    (None, false) => format!("Create {}", file.path),
+                };
+                if edit_button.on_hover_text(hover).clicked() {
+                    *edit = Some(layer);
+                }
             });
         });
     }
@@ -494,14 +554,19 @@ enum Shape {
     Interval,
     Daily,
     Weekly,
+    /// A cron expression, for people who already think in them. Last of the four on purpose:
+    /// the three before it cover what most schedules are, and a segment offering syntax
+    /// should not be the first thing a person choosing "every day at six" has to step past.
+    Cron,
 }
 
 impl Shape {
-    const fn of(recurrence: Recurrence) -> Self {
+    const fn of(recurrence: &Recurrence) -> Self {
         match recurrence {
             Recurrence::Interval { .. } => Self::Interval,
             Recurrence::Daily { .. } => Self::Daily,
             Recurrence::Weekly { .. } => Self::Weekly,
+            Recurrence::Cron { .. } => Self::Cron,
         }
     }
 }
@@ -546,6 +611,21 @@ impl TriggerShape {
 /// set for, where nobody is looking. So it is refused here, at the moment the schedule is
 /// saved, with the target named.
 pub fn schedule_problem(schedule: &Schedule, targets: &[AgentLink]) -> Option<String> {
+    // An expression that cannot be parsed would be a schedule that never fires, and the place
+    // to find that out is here — while the person is looking at the field — rather than at six
+    // in the evening in a transcript nobody is watching. That is the same argument the
+    // hand-off check below is made of.
+    if let Recurrence::Cron { expression, .. } = &schedule.recurrence
+        && Recurrence::parse_cron(expression).is_none()
+    {
+        return Some(
+            "That is not a cron expression Velm can read. It takes five fields — minute, \
+             hour, day of month, month, day of week — each one `*`, a number, `a,b`, `a-b` \
+             or `*/n`."
+                .to_owned(),
+        );
+    }
+
     let Completion::HandOff { agent } = &schedule.completion else { return None };
 
     if targets.iter().any(|link| &link.id == agent) {
@@ -591,13 +671,13 @@ pub(crate) fn schedule_editor(
             Segment::text(Shape::Daily, "Daily"),
             Segment::text(Shape::Weekly, "Weekly"),
         ];
-        let current = Shape::of(schedule.recurrence);
+        let current = Shape::of(&schedule.recurrence);
         if let Some(shape) = segmented(ui, palette, &Field::Uniform(current), &options)
             && shape != current
         {
             // Carry the time of day across a shape change, so switching from Daily to
             // Weekly and back does not lose the hour that was chosen.
-            let seconds = time_of_day(schedule.recurrence).unwrap_or(18 * 3600);
+            let seconds = time_of_day(&schedule.recurrence).unwrap_or(18 * 3600);
             schedule.recurrence = match shape {
                 Shape::Interval => Recurrence::Interval { minutes: 60 },
                 Shape::Daily => {
@@ -606,6 +686,13 @@ pub(crate) fn schedule_editor(
                 Shape::Weekly => Recurrence::Weekly {
                     weekday: 0,
                     seconds_after_midnight: seconds,
+                    utc_offset,
+                },
+                // Seeded with the time already chosen rather than with an empty field: an
+                // empty expression cannot be saved, and the commonest thing anybody wants
+                // here is the daily job they were just looking at, on weekdays.
+                Shape::Cron => Recurrence::Cron {
+                    expression: format!("{} {} * * 1-5", (seconds % 3600) / 60, seconds / 3600),
                     utc_offset,
                 },
             };
@@ -632,6 +719,29 @@ pub(crate) fn schedule_editor(
         Recurrence::Weekly { weekday, seconds_after_midnight, .. } => {
             weekday_row(ui, palette, weekday);
             clock_row(ui, palette, seconds_after_midnight);
+        }
+        Recurrence::Cron { expression, .. } => {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(expression)
+                        .desired_width(crate::widgets::CONTROL_WIDTH)
+                        .hint_text("30 7 * * 1-5"),
+                );
+            });
+            // What it means, read back from the same parser the save is gated on — so the
+            // line under the field cannot claim an expression is valid when Save disagrees.
+            let (text, colour) = match Recurrence::parse_cron(expression) {
+                Some(_) => (
+                    "minute hour day-of-month month day-of-week, in your local time"
+                        .to_owned(),
+                    palette.muted,
+                ),
+                None => (
+                    "Five fields, each `*`, a number, `a,b`, `a-b` or `*/n`.".to_owned(),
+                    palette.danger,
+                ),
+            };
+            ui.label(egui::RichText::new(text).color(colour).size(crate::theme::text::LABEL));
         }
     }
 
@@ -721,9 +831,9 @@ pub(crate) fn schedule_editor(
 }
 
 /// The time of day a recurrence carries, if it carries one.
-const fn time_of_day(recurrence: Recurrence) -> Option<u32> {
-    match recurrence {
-        Recurrence::Interval { .. } => None,
+const fn time_of_day(recurrence: &Recurrence) -> Option<u32> {
+    match *recurrence {
+        Recurrence::Interval { .. } | Recurrence::Cron { .. } => None,
         Recurrence::Daily { seconds_after_midnight, .. }
         | Recurrence::Weekly { seconds_after_midnight, .. } => Some(seconds_after_midnight),
     }
@@ -1079,13 +1189,13 @@ mod tests {
     #[test]
     fn the_time_of_day_survives_a_change_of_shape() {
         let daily = Recurrence::Daily { seconds_after_midnight: 18 * 3600, utc_offset: 3600 };
-        assert_eq!(time_of_day(daily), Some(18 * 3600));
+        assert_eq!(time_of_day(&daily), Some(18 * 3600));
 
         let weekly =
             Recurrence::Weekly { weekday: 4, seconds_after_midnight: 9 * 3600, utc_offset: 0 };
-        assert_eq!(time_of_day(weekly), Some(9 * 3600));
+        assert_eq!(time_of_day(&weekly), Some(9 * 3600));
 
-        assert_eq!(time_of_day(Recurrence::Interval { minutes: 30 }), None);
+        assert_eq!(time_of_day(&Recurrence::Interval { minutes: 30 }), None);
     }
 
     /// Every form has to survive being drawn, in each of its shapes.
@@ -1099,6 +1209,9 @@ mod tests {
             Recurrence::Interval { minutes: 15 },
             Recurrence::Daily { seconds_after_midnight: 18 * 3600, utc_offset: 0 },
             Recurrence::Weekly { weekday: 2, seconds_after_midnight: 9 * 3600, utc_offset: 0 },
+            // The fourth shape draws a text field and a validity line rather than steppers,
+            // so it is the one most likely to panic on a layout nobody exercised.
+            Recurrence::Cron { expression: "30 7 * * 1-5".to_owned(), utc_offset: 0 },
         ] {
             for completion in [
                 Completion::Report,
@@ -1108,7 +1221,9 @@ mod tests {
             ] {
                 let mut schedule = Schedule {
                     enabled: true,
-                    recurrence,
+                    // Cloned: `Recurrence` stopped being `Copy` when it gained an expression,
+                    // and the inner loop builds a schedule per completion.
+                    recurrence: recurrence.clone(),
                     trigger: Trigger::NoteChanged { path: "notes/plan.md".to_owned() },
                     completion,
                     ..Schedule::default()
@@ -1147,10 +1262,12 @@ mod tests {
                 global: Some(RuleFilePath {
                     path: "/tmp/velm/rules/global.md".to_owned(),
                     exists: true,
+                    writes_to: None,
                 }),
                 project: Some(RuleFilePath {
                     path: "/tmp/project/rules.md".to_owned(),
                     exists: false,
+                    writes_to: None,
                 }),
             },
         ] {
@@ -1163,6 +1280,7 @@ mod tests {
                     &resolved,
                     &files,
                     &mut reveal,
+                    &mut None,
                     "Save",
                 );
             });
@@ -1213,11 +1331,13 @@ mod tests {
             global: Some(RuleFilePath {
                 path: "/tmp/velm/rules/global.md".to_owned(),
                 exists: true,
+                writes_to: None,
             }),
             // Absent on disk, and still named.
             project: Some(RuleFilePath {
                 path: "/tmp/project/rules.md".to_owned(),
                 exists: false,
+                writes_to: None,
             }),
         };
 
@@ -1230,6 +1350,7 @@ mod tests {
                 &resolved,
                 &files,
                 &mut reveal,
+                &mut None,
                 "Save",
             );
         });
@@ -1257,6 +1378,7 @@ mod tests {
                 &resolved,
                 &bare,
                 &mut reveal,
+                &mut None,
                 "Save",
             );
         });

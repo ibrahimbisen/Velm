@@ -159,13 +159,24 @@ impl DecodePool {
     }
 
     /// Everything decoded since the last call. Never blocks.
-    pub fn drain(&mut self) -> Vec<Decoded> {
-        let mut out = Vec::new();
-        while let Ok(decoded) = self.inbound.try_recv() {
-            self.in_flight.remove(&decoded.asset_id);
-            out.push(decoded);
-        }
-        out
+    /// One decoded image, if a worker has finished one.
+    ///
+    /// **Peeled off one at a time so a caller out of upload budget simply stops asking.** The
+    /// pixels then stay in the channel, the worker stays blocked behind them, and the next
+    /// frame picks up where this one left off.
+    ///
+    /// This replaced a `drain` that pulled the whole channel, because the caller could only
+    /// afford to upload one or two of them — a 2048px texture is ~22 MB and takes longer than
+    /// the 4 ms budget on its own — and **threw the rest away**, clearing `in_flight` so the
+    /// same files were read and decoded again on the next frame, and the next. Measured: on a
+    /// board of twelve large images the same asset was decoded and discarded repeatedly while
+    /// its item drew a placeholder, which is *"when i moved the things it removes the images"*.
+    /// `sync_channel(READY_QUEUE)` was already the memory bound, so the discard was fighting a
+    /// limit that was doing its job.
+    pub fn next_ready(&mut self) -> Option<Decoded> {
+        let decoded = self.inbound.try_recv().ok()?;
+        self.in_flight.remove(&decoded.asset_id);
+        Some(decoded)
     }
 
     /// How many assets are being decoded right now.
@@ -295,16 +306,16 @@ mod tests {
         assert!(pool.request(&hash));
 
         // The worker is a real thread, so this polls rather than assuming one scheduling.
-        let mut answers = Vec::new();
+        let mut answer = None;
         for _ in 0..200 {
-            answers = pool.drain();
-            if !answers.is_empty() {
+            answer = pool.next_ready();
+            if answer.is_some() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let decoded = answers.pop().expect("the worker never answered");
+        let decoded = answer.expect("the worker never answered");
         assert_eq!(decoded.asset_id, hash);
         let image = decoded.image.expect("a valid PNG would not decode").expect("blob was absent");
         assert_eq!((image.width, image.height), (7, 3));

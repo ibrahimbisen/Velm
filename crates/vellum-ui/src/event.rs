@@ -16,7 +16,8 @@ use crate::theme::{Theme, ThemePreference};
 use crate::tool::{CustomShapeId, EraserMode, PenPreset, ShapeColors, ShapeGroup, Tool};
 use std::path::PathBuf;
 use vellum_agent::{
-    AgentRules, DisplayMode, NoteScope, Provider, ProviderChoice, RoleKind, Schedule, Territory,
+    AgentRules, DisplayMode, Layer, NoteScope, Provider, ProviderChoice, RoleKind, Schedule,
+    Territory,
 };
 use vellum_connect::{AnchorSide, Arrowhead, LineStyle, RoutingMode};
 use vellum_doc::{Align, Color, Pattern};
@@ -199,6 +200,20 @@ pub enum UiEvent {
     /// and every node that never chose a mode of its own moves with it. Nodes that named
     /// one do not, which is the whole reason `AgentModel::display` is an `Option`.
     DefaultDisplayModeChanged(DisplayMode),
+    /// Which provider a node that has not chosen one runs on — feature 16's *Inherit*.
+    DefaultProviderChanged(Provider),
+    /// Preferences ▸ Voice: which transcriber a spoken prompt goes to — feature 12's second
+    /// half. App-wide, because it names *this machine's* transcriber; whether a given node
+    /// listens at all is per node, on `AgentModel::voice`.
+    SpeechPreferenceChanged(vellum_agent::voice::Preference),
+    /// *Choose a model file…* was picked in Preferences ▸ Voice.
+    ///
+    /// The chrome opens no file dialog — this crate touches no files and knows nothing about
+    /// `rfd`, exactly as it knows nothing about `credentials.json`. It asks; the app picks and
+    /// stores. Same division as [`Self::ProviderSignIn`].
+    ChooseSpeechModel,
+    /// Preferences ▸ Agents ▸ Chat theme: what a node with no choice of its own draws in.
+    DefaultChatThemeChanged(vellum_agent::ChatTheme),
     /// *Sign in* was chosen for a provider in Preferences ▸ Providers.
     ///
     /// The chrome does not read or write a credential — it cannot; this crate touches no
@@ -243,6 +258,19 @@ pub enum AgentEdit {
     Provider(Option<ProviderChoice>),
     /// `None` inherits the app-wide default.
     Display(Option<DisplayMode>),
+    /// How this one transcript is dressed. `None` inherits the app-wide default, exactly as
+    /// [`Self::Display`] does — *"i should be able to set individual chats with individual
+    /// themes"*.
+    ChatTheme(Option<vellum_agent::ChatTheme>),
+    /// How see-through this node's paper is, 0–255. The **paper**, not the words: see
+    /// `vellum_agent::AgentModel::chat_opacity`.
+    ChatOpacity(u8),
+    /// A picture behind this node's transcript, by blob hash. `None` clears it.
+    ///
+    /// A hash rather than a path, because the app has already read the file and put its
+    /// bytes in the content-addressed store — the chrome never touches the filesystem, and a
+    /// path here would be a second way for a board to depend on one machine.
+    ChatBackground(Option<String>),
     /// `None` is the board's project root.
     WorkingDir(Option<String>),
     /// Whether this node gets a git worktree of its own.
@@ -282,6 +310,14 @@ pub enum AgentEdit {
     /// The other way in is a **file dropped on the node**, which never reaches this crate at
     /// all — a drop is a window event. Two gestures, one code path behind them.
     AttachContext,
+    /// Attach a **web page or a YouTube link** as context, through the app's own small prompt.
+    ///
+    /// Payload-free for the same reason as [`Self::AttachContext`], and a separate verb rather
+    /// than a mode of it because the two need different chrome: a file needs a picker and a
+    /// link needs a text field, and no picker on any platform will accept a URL. Both end at
+    /// the same `ingest` call, which decides from the string itself whether it is looking at a
+    /// path, a page or a video.
+    AttachLink,
     /// Write the `.md` file a note has never had, under the stem the user accepted.
     ///
     /// A **stem**, not a path: the directory a note belongs in is decided by its scope
@@ -516,6 +552,15 @@ pub enum DialogEvent {
     ScheduleSet(DialogId, Option<Schedule>),
     /// A rules editor was saved, carrying the node's whole own layer.
     RulesSet(DialogId, AgentRules),
+    /// An *Edit* button on one of the two **inherited** rule layers was pressed.
+    ///
+    /// Not an answer to the editor that raised it — nothing was saved and nothing was
+    /// cancelled — but it does close it, because what the app does next is open an editor on
+    /// that layer, and two rules editors stacked over each other is a modal the user cannot
+    /// tell apart from the one underneath. The reopened editor carries the same
+    /// [`crate::Dialog::rules`] shape, so the layer's file is edited by the control that
+    /// already knows how to write the four structured settings into front matter.
+    EditRuleLayer(DialogId, Layer),
     /// A provider sign-in was completed. The key has **never** been printed and is not
     /// printable — see [`SecretKey`].
     SignedIn(DialogId, SecretKey),
@@ -529,6 +574,7 @@ impl DialogEvent {
             | Self::Renamed(id, _)
             | Self::ScheduleSet(id, _)
             | Self::RulesSet(id, _)
+            | Self::EditRuleLayer(id, _)
             | Self::SignedIn(id, _) => *id,
         }
     }

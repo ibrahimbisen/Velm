@@ -177,6 +177,12 @@ pub struct AgentPanelState {
     /// [`NoteSummary::proposed_stem`]: crate::NoteSummary::proposed_stem
     note_stem: Option<(ItemId, String)>,
     tree_root: Option<(ItemId, String)>,
+    /// Where a local or custom model is listening — feature 16's other half.
+    ///
+    /// Its own buffer rather than sharing [`Self::model_name`]'s: they are two fields of one
+    /// row group and a user types into both, so one buffer would put the endpoint into the
+    /// model name the moment focus moved between them.
+    endpoint: Option<(ItemId, String)>,
 }
 
 impl AgentPanelState {
@@ -337,32 +343,43 @@ fn draw(
                         format!("{:.0} × {:.0}", region.width, region.height),
                     );
                     if icon_button(ui, palette, Icon::Close, space::of(5), false)
-                        .on_hover_text("Clear the region")
+                        // **The consequence, not the mechanic.** This said *"Clear the
+                        // region"*, which describes the click and hides what it does: a
+                        // manager with no region is refused **every** spawn
+                        // (`orchestrator.rs`'s `Refusal::NoTerritory`), so this button is not
+                        // "unrestrict it" — it is "stop it working until you draw a new one".
+                        .on_hover_text(
+                            "Clear the region — this manager is then refused every spawn \
+                             until a new one is drawn.",
+                        )
                         .clicked()
                     {
                         events.agent(AgentEdit::Territory(None));
                     }
                 }
-                // Reported rather than offered. A rectangle is drawn on the board, not
-                // typed into a panel — four number fields for a region you can see is the
-                // control nobody uses.
+                // Reported rather than typed. A rectangle is drawn on the board, not entered
+                // as four numbers — a numeric editor for a region you can see is the control
+                // nobody uses.
                 //
-                // **The words say what happens, not what to do.** They used to read
-                // *"Drag a region on the board while this orchestrator is selected"*, and
-                // there is no such gesture: nothing in `input.rs` sweeps a territory and
-                // nothing in `draw.rs` tints one. An instruction the app cannot honour is
-                // worse than none, because the user tries it and concludes the app is
-                // broken. Restore the sentence only alongside the gesture.
+                // **The copy here was correct when written and is now stale, which is the
+                // more dangerous of the two failures.** It said a territory could only be
+                // made by *"switching it back to Worker and to Manager again"* and that a
+                // node without one *"may spawn anywhere on the board"*. The first is a
+                // workaround for a gesture that now exists — `Command::SetTerritory` arms it
+                // and the next drag sweeps it — and the second is the exact opposite of what
+                // `orchestrator.rs` does, which is to refuse every spawn. Two sentences, one
+                // obsolete and one inverted, in the row that explains a manager's whole scope.
                 _ => {
                     ui.add_enabled(false, egui::Button::new("Not set").frame(true))
                         .on_disabled_hover_text(
-                            "A region is given to a node when it is made a manager, from the \
-                             area around it. This one has none, so it may spawn anywhere on \
-                             the board — switching it back to Worker and to Manager again is \
-                             what makes one.",
+                            "This manager has no region, so every spawn it asks for is \
+                             refused. Draw one with the button below.",
                         );
                 }
             });
+            // In both states: with a region, to redraw it; without one, because that is the
+            // only way out of the state above.
+            command_row(ui, palette, Command::SetTerritory, cmd_ctx, events);
         }
 
         AgentRow::SpawnCap => {
@@ -420,11 +437,22 @@ fn draw(
                 let response = ui.add_enabled(built_in, button);
                 if built_in {
                     if response
+                        // **The gesture is named again, because it now exists.** This text
+                        // used to promise *"hold the key on this node to talk to it"* against
+                        // no key at all — nothing in `vellum-app` called `vellum_agent::voice`
+                        // — and it was rewritten to say so, under this file's rule that a
+                        // string must never describe a gesture the user cannot perform.
+                        //
+                        // `ActiveState::talk_key` is that key, driven end to end by
+                        // `--demo agent-voice`, so the promise is restored **alongside the
+                        // thing that performs it and not before**, which is exactly the
+                        // condition the old comment set for restoring it.
                         .on_hover_text(if on {
-                            "Hold the key on this node to talk to it."
+                            "Listening is on for this node. Select it and hold ⌥D to talk; \
+                             what you say becomes its prompt, to check before you send it."
                         } else {
-                            "Offer push-to-talk on this node. The microphone opens while the \
-                             key is held and at no other time."
+                            "Let this node be spoken to. With it on, select the node and hold \
+                             ⌥D to talk — what you say is transcribed into its prompt row."
                         })
                         .clicked()
                     {
@@ -596,12 +624,27 @@ fn provider(
                         // The model name is kept when only the provider moved, because the
                         // two are usually changed together and losing a typed model id on
                         // every provider click would be a control that punishes exploring.
-                        let model_name = match &chosen {
-                            Some(Some(c)) => c.model.clone(),
+                        //
+                        // **The endpoint is kept only between the two providers that have
+                        // one.** `Provider::default_base_url` answers `None` for `Local` and
+                        // `Custom` precisely because those *are* their address, so dropping
+                        // it while moving between them would silently unconfigure a node that
+                        // still looks configured. Carrying it onto a hosted provider would be
+                        // the opposite and worse mistake: an address typed for a server on
+                        // this machine must never become where Velm sends a hosted request.
+                        //
+                        // The transport is deliberately **not** carried: it is a per-provider
+                        // fact — `ClaudeCli` is not a way of reaching Kimi — so it goes back
+                        // to the new provider's own default.
+                        let previous = match &chosen {
+                            Some(Some(c)) => Some(c.clone()),
                             _ => None,
                         };
                         let mut choice = ProviderChoice::new(provider);
-                        choice.model = model_name;
+                        choice.model = previous.as_ref().and_then(|c| c.model.clone());
+                        if provider.default_base_url().is_none() {
+                            choice.base_url = previous.and_then(|c| c.base_url);
+                        }
                         events.agent(AgentEdit::Provider(Some(choice)));
                     }
                 }
@@ -633,6 +676,49 @@ fn provider(
             events.agent(AgentEdit::Provider(Some(choice)));
         }
     });
+
+    // **Where a local model is listening — and without this row there was nowhere to say
+    // it.** `Provider::{Local, Custom}` answer `None` from `default_base_url` on purpose:
+    // guessing `localhost:11434` would talk to whichever of llama.cpp, LM Studio, Ollama and
+    // vLLM happened to be up. That is right, and until this field was drawn it also meant the
+    // two providers whose entire configuration *is* an address had no way to be given one —
+    // so "connect a model you run on your own GPU", which feature 16 asks for by name, was
+    // reachable only by hand-editing a board file or over the machine-facing IPC verb.
+    //
+    // Shown only for those two, because for a hosted provider the endpoint is not the user's
+    // to choose and a box offering to change it invites a node that silently talks to nothing.
+    if effective.provider.default_base_url().is_none() {
+        let current = effective.base_url.clone().unwrap_or_default();
+        let buffer = AgentPanelState::buffer(&mut state.endpoint, id, &current);
+        row(ui, palette, "Endpoint", |ui| {
+            let field = ui
+                .add(
+                    egui::TextEdit::singleline(buffer)
+                        .desired_width(CONTROL_WIDTH)
+                        .hint_text("http://localhost:11434/v1"),
+                )
+                .on_hover_text(
+                    "The OpenAI-compatible address this node talks to — llama.cpp, LM Studio, \
+                     Ollama and vLLM all speak it. Per node, so one board can hold an agent \
+                     on a model served from this machine and another on a model served from \
+                     somewhere else.",
+                );
+            if field.lost_focus() {
+                let typed = buffer.trim();
+                let mut choice = effective.clone();
+                choice.base_url = (!typed.is_empty()).then(|| typed.to_owned());
+                events.agent(AgentEdit::Provider(Some(choice)));
+            }
+        });
+        if effective.base_url.is_none() {
+            caption(
+                ui,
+                palette,
+                "This node has no endpoint yet, so starting it will fail. Velm does not guess \
+                 one: four local servers use four different ports.",
+            );
+        }
+    }
 }
 
 /// Raw, clean, or inherit — and *inherit* is a third state rather than a way of spelling one
@@ -988,6 +1074,27 @@ fn attach(ui: &mut Ui, palette: Palette, events: &mut EventSink) {
     {
         events.agent(AgentEdit::AttachContext);
     }
+
+    // **The other half of feature 18, which had no door at all.** `ingest` has always known
+    // `Kind::Web` and `Kind::YouTube` — it fetches a page, or a transcript — and both entry
+    // points into it were filesystem-only: a dropped file and a file picker. So *"websites and
+    // YouTube links"*, named in the feature's own sentence, could not be attached by any
+    // gesture. A file picker cannot open a URL, so this is a second button rather than a
+    // cleverer first one.
+    if ui
+        .add(
+            egui::Button::new(egui::RichText::new("Attach a link…").color(palette.text))
+                .frame(true)
+                .min_size(egui::vec2(CONTROL_WIDTH, 0.0)),
+        )
+        .on_hover_text(
+            "A web page or a YouTube link. Velm fetches it and gives this agent the readable \
+             text — for a video, its transcript if there is one.",
+        )
+        .clicked()
+    {
+        events.agent(AgentEdit::AttachLink);
+    }
 }
 
 /// The three-layer cascade, per field, with **where each value came from** — feature 11.
@@ -1120,6 +1227,9 @@ mod tests {
         let own = AgentRules::default();
         SelectionItem {
             agent: Some(AgentSummary {
+                chat_theme: None,
+                chat_opacity: 255,
+                has_chat_background: false,
                 role: "Reviewer".to_owned(),
                 role_kind: kind,
                 provider: None,

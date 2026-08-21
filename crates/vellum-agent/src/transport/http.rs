@@ -40,7 +40,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::provider::{Provider, Transport as TransportKind};
-use crate::transcript::{TranscriptEvent, TurnId, TurnOutcome};
+use crate::transcript::{ToolCallId, TranscriptEvent, TurnId, TurnOutcome};
 use crate::transport::{AgentTransport, LaunchSpec};
 use crate::{AgentError, Result};
 
@@ -76,6 +76,17 @@ const FLUSH_BYTES: usize = 240;
 /// `thinking_delta` unbounded — the cap was on whichever half was in mind when it was written,
 /// and both halves cross the same channel into the same transcript.
 const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many rounds of tool calls one turn may make before Velm stops it.
+///
+/// A model with tools can loop — call, read the result, call again — and on a metered provider
+/// every round is paid for. Eight is `bus.rs`'s hop default, chosen here for the same reason it
+/// was chosen there: deep enough that no honest piece of work hits it (a research task is two
+/// or three searches and a fetch), shallow enough that a model stuck in a cycle costs a few
+/// seconds rather than a bill.
+///
+/// **Reaching it is reported, never silent.** See the arm in [`run_turn`].
+const MAX_TOOL_ROUNDS: usize = 8;
 
 /// The longest single line the body reader will hold.
 ///
@@ -344,12 +355,73 @@ pub enum Wire {
     OpenAi,
 }
 
+/// One tool call a model asked for.
+///
+/// The three fields both wires agree on. `arguments` is kept as the **raw JSON string** the
+/// provider sent rather than a parsed `Value`: it arrives in fragments that only parse once
+/// the last one has landed, and re-serialising a parsed copy back into the history would hand
+/// the provider a different string from the one it produced — which Anthropic rejects, because
+/// its `tool_use` block has to go back byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl ToolCall {
+    /// The arguments as JSON, or an empty object.
+    ///
+    /// A model that calls a no-argument tool sends `""` on the OpenAI wire and `{}` on
+    /// Anthropic's; both mean the same thing and neither should be an error.
+    fn parsed(&self) -> Value {
+        let trimmed = self.arguments.trim();
+        if trimmed.is_empty() {
+            return json!({});
+        }
+        serde_json::from_str(trimmed).unwrap_or_else(|_| json!({}))
+    }
+}
+
 /// One turn of the conversation, as this module keeps it.
+///
+/// ⚠ **Generalised beyond `{role, content}` for the tool loop, and it had to be.** A tool
+/// exchange is three things neither wire lets you spell as a plain string: the assistant's
+/// request to call something, the result, and the identity linking them. Anthropic wants
+/// content *blocks* (`tool_use`, then a `user` turn holding `tool_result`); OpenAI wants an
+/// assistant message carrying `tool_calls` and then `role: "tool"` messages carrying
+/// `tool_call_id`. Keeping the history as strings and re-deriving that at request time is not
+/// possible — the ids do not survive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Message {
-    /// `"user"` or `"assistant"`; the system context is not a message on either wire.
+    /// `"user"`, `"assistant"` or `"tool"`; the system context is not a message on either wire.
     role: &'static str,
     content: String,
+    /// Tool calls this assistant turn asked for. Empty for every ordinary message.
+    calls: Vec<ToolCall>,
+    /// For a tool result: the id of the call it answers.
+    answers: Option<String>,
+}
+
+impl Message {
+    fn user(content: impl Into<String>) -> Self {
+        Self { role: "user", content: content.into(), calls: Vec::new(), answers: None }
+    }
+
+    fn assistant(content: impl Into<String>, calls: Vec<ToolCall>) -> Self {
+        Self { role: "assistant", content: content.into(), calls, answers: None }
+    }
+
+    /// One tool's answer. `role` is `"tool"` on both wires here and is **translated** for
+    /// Anthropic in `request_body`, which spells a result as a `user` turn.
+    fn result(id: &str, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool",
+            content: content.into(),
+            calls: Vec::new(),
+            answers: Some(id.to_owned()),
+        }
+    }
 }
 
 /// Everything a worker needs, resolved once at start.
@@ -362,6 +434,14 @@ struct Config {
     key: Option<String>,
     system: String,
     model: Option<String>,
+    /// Velm's own tools, when this node can reach the board.
+    ///
+    /// `None` when the launch spec carried no `VELM_IPC` — which is every test, and every
+    /// session started before the IPC server exists. With `None` no `tools` field is sent at
+    /// all, so a provider that has never heard of function calling sees byte-identical
+    /// requests to the ones it saw before this existed. That is the compatibility guarantee:
+    /// **advertising is opt-in on the spec, not on the provider.**
+    tools: Option<crate::mcp::Server>,
 }
 
 impl Config {
@@ -407,6 +487,18 @@ impl Config {
             });
         }
 
+        // ⚠ **Resolved from the spec's environment, not the process's.** These variables were
+        // written to be handed to a *child*; an HTTP agent has no child, which is precisely why
+        // feature 19 could not reach one. `Endpoint::from_pairs` is the constructor that reads
+        // them from here — see its doc.
+        let endpoint = crate::mcp::Endpoint::from_pairs(&spec.env);
+        let tools = endpoint.is_available().then(|| {
+            crate::mcp::Server::with(
+                crate::research::Research::new(crate::research::ResearchConfig::from_env()),
+                endpoint,
+            )
+        });
+
         Ok(Self {
             wire,
             provider,
@@ -414,6 +506,7 @@ impl Config {
             key,
             system: spec.system_context.clone(),
             model: spec.provider.model.clone(),
+            tools,
         })
     }
 
@@ -430,14 +523,17 @@ impl Config {
 /// Pure, so the shape of what goes on the wire is a unit test rather than a network call —
 /// which is the half most likely to be wrong and the half no offline test could otherwise
 /// reach.
-fn request_body(wire: Wire, model: &str, system: &str, history: &[Message], stream: bool) -> Value {
-    let turns: Vec<Value> = history
-        .iter()
-        .map(|message| json!({ "role": message.role, "content": message.content }))
-        .collect();
-
+fn request_body(
+    wire: Wire,
+    model: &str,
+    system: &str,
+    history: &[Message],
+    stream: bool,
+    tools: &[Value],
+) -> Value {
     match wire {
         Wire::Anthropic => {
+            let turns: Vec<Value> = history.iter().map(anthropic_turn).collect();
             let mut body = json!({
                 "model": model,
                 "max_tokens": MAX_TOKENS,
@@ -449,17 +545,128 @@ fn request_body(wire: Wire, model: &str, system: &str, history: &[Message], stre
             if !system.is_empty() {
                 body["system"] = json!(system);
             }
+            if !tools.is_empty() {
+                body["tools"] = json!(tools);
+            }
             body
         }
         Wire::OpenAi => {
-            let mut messages = Vec::with_capacity(turns.len() + 1);
+            let mut messages = Vec::with_capacity(history.len() + 1);
             if !system.is_empty() {
                 messages.push(json!({ "role": "system", "content": system }));
             }
-            messages.extend(turns);
-            json!({ "model": model, "messages": messages, "stream": stream })
+            messages.extend(history.iter().map(openai_turn));
+            let mut body = json!({ "model": model, "messages": messages, "stream": stream });
+            if !tools.is_empty() {
+                body["tools"] = json!(tools);
+            }
+            body
         }
     }
+}
+
+/// One history entry as Anthropic spells it.
+///
+/// A tool **result** is a `user` turn holding a `tool_result` block — not a `"tool"` role,
+/// which this API does not have. Getting that wrong is a 400 that reads like a malformed
+/// request rather than like a role name.
+fn anthropic_turn(message: &Message) -> Value {
+    if let Some(id) = &message.answers {
+        return json!({
+            "role": "user",
+            "content": [{ "type": "tool_result", "tool_use_id": id, "content": message.content }],
+        });
+    }
+    if message.calls.is_empty() {
+        return json!({ "role": message.role, "content": message.content });
+    }
+    // An assistant turn that called tools: its prose first (when it said any), then one
+    // `tool_use` block per call, in the order they were asked for.
+    let mut blocks: Vec<Value> = Vec::with_capacity(message.calls.len() + 1);
+    if !message.content.is_empty() {
+        blocks.push(json!({ "type": "text", "text": message.content }));
+    }
+    for call in &message.calls {
+        blocks.push(json!({
+            "type": "tool_use",
+            "id": call.id,
+            "name": call.name,
+            "input": call.parsed(),
+        }));
+    }
+    json!({ "role": "assistant", "content": blocks })
+}
+
+/// One history entry as the OpenAI wire spells it.
+fn openai_turn(message: &Message) -> Value {
+    if let Some(id) = &message.answers {
+        return json!({ "role": "tool", "tool_call_id": id, "content": message.content });
+    }
+    if message.calls.is_empty() {
+        return json!({ "role": message.role, "content": message.content });
+    }
+    let calls: Vec<Value> = message
+        .calls
+        .iter()
+        .map(|call| {
+            json!({
+                "id": call.id,
+                "type": "function",
+                "function": { "name": call.name, "arguments": call.arguments },
+            })
+        })
+        .collect();
+    // ⚠ `content` is **null**, not `""`, when the assistant only called tools. Several
+    // OpenAI-compatible servers reject an empty string here, and the spec's own examples use
+    // null — this is the commonest way a hand-rolled tool loop 400s.
+    json!({
+        "role": "assistant",
+        "content": if message.content.is_empty() { Value::Null } else { json!(message.content) },
+        "tool_calls": calls,
+    })
+}
+
+/// Velm's tool table in the shape this wire wants.
+///
+/// One source — [`crate::mcp::tool_definitions`] — reshaped, never a second list. The
+/// descriptions in it are the only documentation the calling model ever sees, and an HTTP
+/// agent must read exactly what an MCP agent reads.
+fn tools_for(wire: Wire) -> Vec<Value> {
+    crate::mcp::tool_definitions()
+        .into_iter()
+        .filter_map(|tool| {
+            let name = tool.get("name")?.as_str()?.to_owned();
+            let description = tool.get("description")?.as_str()?.to_owned();
+            let schema = tool.get("inputSchema")?.clone();
+            Some(match wire {
+                Wire::Anthropic => {
+                    json!({ "name": name, "description": description, "input_schema": schema })
+                }
+                Wire::OpenAi => json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": schema,
+                    },
+                }),
+            })
+        })
+        .collect()
+}
+
+/// A piece of one tool call, as it arrives on either wire.
+///
+/// `index` is the only thing both wires give you to reassemble with — Anthropic numbers
+/// content blocks, OpenAI numbers `tool_calls` entries — and in a multi-call turn the fragments
+/// of two calls are interleaved, so reassembly is keyed by it rather than by arrival order.
+/// `id` and `name` arrive **once**, on the opening fragment; everything after is argument text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolFragment {
+    index: usize,
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
 }
 
 /// One thing an SSE line meant.
@@ -493,6 +700,14 @@ enum Piece {
     ThoughtThenStop(String, TurnOutcome),
     /// The provider reported an error mid-stream.
     Failed(String),
+    /// Tool-call fragments from **one frame**, in the order they appeared.
+    ///
+    /// ⚠ A `Vec`, and not a single `{index, id, name}` variant, because the OpenAI wire can put
+    /// **several `tool_calls` entries in one delta** — a model asking for two tools at once
+    /// sends both in the same frame. A one-fragment variant would return the first and
+    /// silently drop the rest, which is a tool call the model believes it made and will wait
+    /// for. Anthropic emits one per frame and simply produces a one-element vector.
+    Tools(Vec<ToolFragment>),
     /// End of stream.
     Done,
     /// A keepalive, a block boundary, a usage report — nothing to show.
@@ -518,6 +733,19 @@ fn parse_event(wire: Wire, data: &str) -> Piece {
 
     match wire {
         Wire::Anthropic => match value["type"].as_str().unwrap_or_default() {
+            // A `tool_use` block opening. The id and the name are here and nowhere else — the
+            // deltas that follow carry only argument text — so missing this frame produces a
+            // call that can never be dispatched or answered.
+            "content_block_start"
+                if value["content_block"]["type"].as_str() == Some("tool_use") =>
+            {
+                Piece::Tools(vec![ToolFragment {
+                    index: value["index"].as_u64().unwrap_or_default() as usize,
+                    id: value["content_block"]["id"].as_str().map(str::to_owned),
+                    name: value["content_block"]["name"].as_str().map(str::to_owned),
+                    arguments: String::new(),
+                }])
+            }
             "content_block_delta" => {
                 let delta = &value["delta"];
                 match delta["type"].as_str().unwrap_or_default() {
@@ -525,6 +753,12 @@ fn parse_event(wire: Wire, data: &str) -> Piece {
                     "thinking_delta" => {
                         Piece::Thought(delta["thinking"].as_str().unwrap_or("").to_owned())
                     }
+                    "input_json_delta" => Piece::Tools(vec![ToolFragment {
+                        index: value["index"].as_u64().unwrap_or_default() as usize,
+                        id: None,
+                        name: None,
+                        arguments: delta["partial_json"].as_str().unwrap_or("").to_owned(),
+                    }]),
                     _ => Piece::Ignore,
                 }
             }
@@ -551,6 +785,16 @@ fn parse_event(wire: Wire, data: &str) -> Piece {
             }
             let choice = &value["choices"][0];
             let stop = choice["finish_reason"].as_str().map(openai_outcome);
+            // ⚠ **Tool fragments first, and before the `content` arm below.** A frame carrying
+            // `tool_calls` usually carries `content: null` beside them, so the ordering happens
+            // not to matter today — but a server that sent a word of prose in the same frame as
+            // a call would have the call dropped, which is the silent half of the failure. The
+            // sibling of the Anthropic arm above, written in the same edit deliberately:
+            // `TextThenStop` was added to one branch and not the other six lines away, and this
+            // file's own comment records what that cost.
+            if let Some(fragments) = openai_tool_fragments(choice) {
+                return Piece::Tools(fragments);
+            }
             if let Some(text) = choice["delta"]["content"].as_str()
                 && !text.is_empty()
             {
@@ -576,6 +820,68 @@ fn parse_event(wire: Wire, data: &str) -> Piece {
             }
         }
     }
+}
+
+/// Folds one frame's fragments into the calls being reassembled, and reports how many bytes
+/// of argument text arrived.
+///
+/// ⚠ **Shared by `consume_stream` and its tests, rather than reimplemented in each.** The first
+/// version of the tests carried their own copy of this loop — which is a test that agrees with
+/// itself and with nothing that ships, and it showed: removing the set-once guards below left
+/// every one of them green. `newest_id`'s own test in this file says the same thing in a
+/// comment; this is that rule applied.
+///
+/// **Set once, never overwritten.** `id` and `name` arrive on the opening fragment and the
+/// continuations carry them as absent, `null` or `""` depending on the server. Assigning
+/// whatever the newest fragment holds erases both after the first delta, leaving a call with
+/// arguments and no name — which the filter at the end of the stream then drops, so the model
+/// waits for a result that is never coming.
+fn absorb(building: &mut std::collections::BTreeMap<usize, ToolCall>, fragments: Vec<ToolFragment>) -> usize {
+    let mut arrived = 0;
+    for fragment in fragments {
+        arrived += fragment.arguments.len();
+        let call = building.entry(fragment.index).or_default();
+        if let Some(id) = fragment.id
+            && call.id.is_empty()
+        {
+            call.id = id;
+        }
+        if let Some(name) = fragment.name
+            && call.name.is_empty()
+        {
+            call.name = name;
+        }
+        call.arguments.push_str(&fragment.arguments);
+    }
+    arrived
+}
+
+/// Every tool fragment in one OpenAI delta, or `None` when there are none.
+///
+/// The `index` is taken from the entry itself and **defaults to its position** when absent:
+/// some OpenAI-compatible servers omit it for a single call, and defaulting to zero for every
+/// entry would collapse two simultaneous calls into one with both their arguments concatenated
+/// into unparseable JSON.
+fn openai_tool_fragments(choice: &Value) -> Option<Vec<ToolFragment>> {
+    let calls = choice["delta"]["tool_calls"].as_array()?;
+    if calls.is_empty() {
+        return None;
+    }
+    Some(
+        calls
+            .iter()
+            .enumerate()
+            .map(|(position, call)| ToolFragment {
+                index: call["index"].as_u64().map_or(position, |index| index as usize),
+                // Not filtered for emptiness here: [`absorb`]'s set-once rule is the single
+                // place that decides what a blank continuation means, and a second guard here
+                // made that one unreachable — and therefore untestable.
+                id: call["id"].as_str().map(str::to_owned),
+                name: call["function"]["name"].as_str().map(str::to_owned),
+                arguments: call["function"]["arguments"].as_str().unwrap_or("").to_owned(),
+            })
+            .collect(),
+    )
 }
 
 /// The provider's own error message, in **either** shape it arrives in.
@@ -646,14 +952,15 @@ fn empty_answer(value: &Value) -> TurnOutcome {
 ///
 /// The fallback for a server that ignores `stream` — several local ones do — and for one
 /// that refuses it outright.
-fn parse_complete(wire: Wire, value: &Value) -> (String, Option<String>, TurnOutcome) {
+fn parse_complete(wire: Wire, value: &Value) -> (String, Option<String>, TurnOutcome, Vec<ToolCall>) {
     match wire {
         Wire::Anthropic => {
             if let Some(message) = error_message(value) {
-                return (String::new(), None, TurnOutcome::Failed { message });
+                return (String::new(), None, TurnOutcome::Failed { message }, Vec::new());
             }
             let mut text = String::new();
             let mut thinking = String::new();
+            let mut calls = Vec::new();
             if let Some(blocks) = value["content"].as_array() {
                 for block in blocks {
                     match block["type"].as_str().unwrap_or_default() {
@@ -661,6 +968,14 @@ fn parse_complete(wire: Wire, value: &Value) -> (String, Option<String>, TurnOut
                         "thinking" => {
                             thinking.push_str(block["thinking"].as_str().unwrap_or_default());
                         }
+                        // The whole-response form of a `tool_use` block: `input` is already
+                        // an object here rather than a string of fragments, so it is
+                        // re-serialised into the same field the streamed path fills.
+                        "tool_use" => calls.push(ToolCall {
+                            id: block["id"].as_str().unwrap_or_default().to_owned(),
+                            name: block["name"].as_str().unwrap_or_default().to_owned(),
+                            arguments: block["input"].to_string(),
+                        }),
                         _ => {}
                     }
                 }
@@ -670,30 +985,53 @@ fn parse_complete(wire: Wire, value: &Value) -> (String, Option<String>, TurnOut
             // OpenAI-ish server answering an Anthropic-ish request — all three used to arrive
             // here as an empty string and `Completed`.
             let Some(reason) = value["stop_reason"].as_str() else {
-                if text.is_empty() && thinking.is_empty() {
-                    return (String::new(), None, empty_answer(value));
+                // A tool call **is** content, so a body carrying one is not an empty answer
+                // even with no prose and no stop reason beside it.
+                if text.is_empty() && thinking.is_empty() && calls.is_empty() {
+                    return (String::new(), None, empty_answer(value), Vec::new());
                 }
-                return (text, (!thinking.is_empty()).then_some(thinking), TurnOutcome::Completed);
+                return (
+                    text,
+                    (!thinking.is_empty()).then_some(thinking),
+                    TurnOutcome::Completed,
+                    calls,
+                );
             };
-            (text, (!thinking.is_empty()).then_some(thinking), anthropic_outcome(reason))
+            (text, (!thinking.is_empty()).then_some(thinking), anthropic_outcome(reason), calls)
         }
         Wire::OpenAi => {
             if let Some(message) = error_message(value) {
-                return (String::new(), None, TurnOutcome::Failed { message });
+                return (String::new(), None, TurnOutcome::Failed { message }, Vec::new());
             }
             let choice = &value["choices"][0];
             let text = choice["message"]["content"].as_str().unwrap_or_default().to_owned();
+            let calls: Vec<ToolCall> = choice["message"]["tool_calls"]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|call| ToolCall {
+                            id: call["id"].as_str().unwrap_or_default().to_owned(),
+                            name: call["function"]["name"].as_str().unwrap_or_default().to_owned(),
+                            arguments: call["function"]["arguments"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let thinking = choice["message"]["reasoning_content"]
                 .as_str()
                 .filter(|text| !text.is_empty())
                 .map(str::to_owned);
             let Some(reason) = choice["finish_reason"].as_str() else {
-                if text.is_empty() && thinking.is_none() {
-                    return (String::new(), None, empty_answer(value));
+                if text.is_empty() && thinking.is_none() && calls.is_empty() {
+                    return (String::new(), None, empty_answer(value), Vec::new());
                 }
-                return (text, thinking, TurnOutcome::Completed);
+                return (text, thinking, TurnOutcome::Completed, calls);
             };
-            (text, thinking, openai_outcome(reason))
+            (text, thinking, openai_outcome(reason), calls)
         }
     }
 }
@@ -810,7 +1148,7 @@ impl AgentTransport for HttpTransport {
             .name("velm-agent-http".into())
             .spawn(move || {
                 let _ = events.send(TranscriptEvent::TurnStarted { turn, prompt: asked.clone() });
-                lock(&history).push(Message { role: "user", content: asked });
+                lock(&history).push(Message::user(asked));
                 let outcome = run_turn(&config, &history, &model, &cancel, &events);
                 let _ = events.send(TranscriptEvent::TurnEnded { turn, outcome });
             })
@@ -863,25 +1201,100 @@ fn run_turn(
         }
     };
 
-    let turns = lock(history).clone();
-    let answer = match exchange(config, &named, &turns, cancel, events) {
-        Ok(answer) => answer,
-        Err(error) => return TurnOutcome::Failed { message: error.to_string() },
-    };
+    // The tool loop. One pass for an ordinary turn; another for each round of tool calls the
+    // model makes, up to `MAX_TOOL_ROUNDS`.
+    for round in 0..=MAX_TOOL_ROUNDS {
+        let turns = lock(history).clone();
+        let answer = match exchange(config, &named, &turns, cancel, events) {
+            Ok(answer) => answer,
+            Err(error) => return TurnOutcome::Failed { message: error.to_string() },
+        };
 
-    // The answer joins the history **whatever the outcome**, including a cancelled or
-    // exhausted one: the provider has already said it, so a follow-up question that pretended
-    // otherwise would be answering against a conversation that never happened.
-    if !answer.text.is_empty() {
-        lock(history).push(Message { role: "assistant", content: answer.text });
+        // The answer joins the history **whatever the outcome**, including a cancelled or
+        // exhausted one: the provider has already said it, so a follow-up question that
+        // pretended otherwise would be answering against a conversation that never happened.
+        if !answer.text.is_empty() || !answer.calls.is_empty() {
+            lock(history).push(Message::assistant(answer.text, answer.calls.clone()));
+        }
+
+        if answer.calls.is_empty() {
+            return answer.outcome;
+        }
+
+        // ⚠ **Bounded, and the refusal is a tool result rather than a silent stop.** A model
+        // that can call tools can loop: call, read, call again. Ending the turn quietly at the
+        // cap would leave the node idle mid-task with no explanation; telling the model it has
+        // run out lets it answer with what it has. `bus.rs`'s hop count is the precedent.
+        if round == MAX_TOOL_ROUNDS {
+            // The refusals go into the history even though this turn is over, so that a
+            // follow-up prompt shows the model why its last calls were never answered rather
+            // than leaving a turn that looks like it simply stopped.
+            for call in &answer.calls {
+                lock(history).push(Message::result(
+                    &call.id,
+                    format!(
+                        "Velm stopped running tools for this turn: {MAX_TOOL_ROUNDS} rounds is \
+                         the limit and this one would have been past it. Ask again if you \
+                         still need this."
+                    ),
+                ));
+            }
+            return TurnOutcome::Exhausted {
+                message: format!(
+                    "this turn called tools {MAX_TOOL_ROUNDS} times and was still going, so \
+                     Velm stopped it. Ask again to carry on."
+                ),
+            };
+        }
+
+        for call in &answer.calls {
+            if cancel.load(Ordering::Relaxed) {
+                return TurnOutcome::Cancelled;
+            }
+            let arguments = call.parsed();
+            // Raw mode shows the call and its result, exactly as it does for every other
+            // transport — this is the whole of what feature 2's raw mode is for, and a tool
+            // loop the user cannot watch is the one they cannot trust.
+            let _ = events.send(TranscriptEvent::ToolCall {
+                name: call.name.clone(),
+                input: arguments.to_string(),
+                id: ToolCallId(call.id.clone()),
+            });
+
+            let (output, ok) = match config.tools.as_ref() {
+                // Unreachable in practice — nothing advertises tools without a server — and
+                // answered rather than panicked, because a model that called a tool is owed a
+                // result of some kind or it waits for one for ever.
+                None => ("this agent has no tools".to_owned(), false),
+                Some(server) => match server.run_tool(&call.name, &arguments) {
+                    Ok(text) => (text, true),
+                    Err(text) => (text, false),
+                },
+            };
+
+            let _ = events.send(TranscriptEvent::ToolResult {
+                id: ToolCallId(call.id.clone()),
+                output: output.clone(),
+                ok,
+            });
+            // A refusal goes back as the tool's *result*, not as a failed turn: it is the
+            // sentence the model reads and adapts to, which is the distinction `mcp::Server`'s
+            // own `handle_line` doc spells out at length.
+            lock(history).push(Message::result(&call.id, output));
+        }
     }
-    answer.outcome
+
+    // Every path above returns; the range is inclusive of the cap, which returns on its own
+    // arm. This is here because the compiler cannot see that and never because it can happen.
+    unreachable!("the tool loop returns from inside")
 }
 
 /// What one exchange produced.
 struct Answer {
     text: String,
     outcome: TurnOutcome,
+    /// Tool calls the model asked for, reassembled. Empty on every ordinary turn.
+    calls: Vec<ToolCall>,
 }
 
 /// Makes the request and turns the response into events.
@@ -892,7 +1305,11 @@ fn exchange(
     cancel: &AtomicBool,
     events: &Sender<TranscriptEvent>,
 ) -> Result<Answer> {
-    let body = request_body(config.wire, model, &config.system, history, true);
+    // The tool table, when this node can reach the board. Empty otherwise, and an empty table
+    // sends no `tools` field at all — so a provider that has never heard of function calling
+    // gets byte-identical requests to the ones it got before any of this existed.
+    let tools = config.tools.as_ref().map(|_| tools_for(config.wire)).unwrap_or_default();
+    let body = request_body(config.wire, model, &config.system, history, true, &tools);
     let response = post(config, &config.endpoint(match config.wire {
         Wire::Anthropic => "messages",
         Wire::OpenAi => "chat/completions",
@@ -920,19 +1337,19 @@ fn exchange(
         // wedges a streamed one, and `read_to_string` has no clock of its own.
         let lines = spawn_line_reader(response);
         let Some(text) = read_body(&lines, cancel, STALL_TIMEOUT)? else {
-            return Ok(Answer { text: String::new(), outcome: TurnOutcome::Cancelled });
+            return Ok(Answer { text: String::new(), outcome: TurnOutcome::Cancelled, calls: Vec::new() });
         };
         let value: Value = serde_json::from_str(&text).map_err(|_| {
             transport_error("the provider's answer was neither a stream nor JSON")
         })?;
-        let (answer, thinking, outcome) = parse_complete(config.wire, &value);
+        let (answer, thinking, outcome, calls) = parse_complete(config.wire, &value);
         if let Some(thinking) = thinking {
             let _ = events.send(TranscriptEvent::Thought { text: thinking });
         }
         if !answer.is_empty() {
             let _ = events.send(TranscriptEvent::Text { text: answer.clone() });
         }
-        return Ok(Answer { text: answer, outcome });
+        return Ok(Answer { text: answer, outcome, calls });
     }
 
     read_stream(config.wire, response, cancel, events)
@@ -1122,6 +1539,11 @@ fn consume_stream(
     // happened to be in mind when it was written.
     let mut produced = 0usize;
     let mut idle = Duration::ZERO;
+    // Reassembly, keyed by the wire's own index. A `BTreeMap` rather than a `Vec` because the
+    // indices are the provider's and need not start at zero or be contiguous — Anthropic
+    // numbers *content blocks*, so a turn that says a sentence and then calls one tool numbers
+    // that tool `1`. Ordered, so the calls come out in the order the model asked for them.
+    let mut building: std::collections::BTreeMap<usize, ToolCall> = std::collections::BTreeMap::new();
 
     loop {
         let line = match next_line(lines, cancel, stall, &mut idle)? {
@@ -1129,13 +1551,22 @@ fn consume_stream(
             Next::Ended => break,
             Next::Cancelled => {
                 flush(events, &mut pending);
-                return Ok(Answer { text: answer, outcome: TurnOutcome::Cancelled });
+                // ⚠ **No calls, deliberately.** A turn that was cancelled, stalled or failed did not
+                // finish announcing them: arguments arrive in fragments and a partial one is
+                // unparseable, so dispatching here would call a tool with `{}` and hand the model
+                // an answer to a question it never finished asking.
+                return Ok(Answer {
+                    text: answer,
+                    outcome: TurnOutcome::Cancelled,
+                    calls: Vec::new(),
+                });
             }
             Next::Stalled => {
                 flush(events, &mut pending);
                 return Ok(Answer {
                     text: answer,
                     outcome: TurnOutcome::Failed { message: stalled_message(stall) },
+                    calls: Vec::new(),
                 });
             }
         };
@@ -1196,9 +1627,23 @@ fn consume_stream(
                 terminator = true;
                 outcome = reported;
             }
+            Piece::Tools(fragments) => {
+                // `produced` counts argument text too: a model that emits nothing but an
+                // enormous tool argument must still reach `MAX_ANSWER_BYTES`, which is the
+                // bound `Thought` was given for exactly this reason.
+                produced += absorb(&mut building, fragments);
+                if produced > MAX_ANSWER_BYTES {
+                    exhausted = true;
+                    break;
+                }
+            }
             Piece::Failed(message) => {
                 flush(events, &mut pending);
-                return Ok(Answer { text: answer, outcome: TurnOutcome::Failed { message } });
+                return Ok(Answer {
+                    text: answer,
+                    outcome: TurnOutcome::Failed { message },
+                    calls: Vec::new(),
+                });
             }
             Piece::Done => {
                 terminator = true;
@@ -1209,6 +1654,11 @@ fn consume_stream(
     }
 
     flush(events, &mut pending);
+    // A call with no name was never fully announced — a stream cut off between the opening
+    // fragment and the rest. Dispatching one would call the empty string; dropping it lets the
+    // no-terminator check below report the truncation, which is the honest failure.
+    let calls: Vec<ToolCall> =
+        building.into_values().filter(|call| !call.name.is_empty()).collect();
     if exhausted {
         // Our own stop, and a legitimate end: the turn says how far it got.
         return Ok(Answer {
@@ -1216,6 +1666,9 @@ fn consume_stream(
             outcome: TurnOutcome::Exhausted {
                 message: "the answer grew past what one turn will hold".into(),
             },
+            // Same rule as the three early returns: a turn we stopped is not one whose calls
+            // were finished being described.
+            calls: Vec::new(),
         });
     }
     if !terminator {
@@ -1229,9 +1682,10 @@ fn consume_stream(
                 ),
             },
             text: answer,
+            calls,
         });
     }
-    Ok(Answer { text: answer, outcome })
+    Ok(Answer { text: answer, outcome, calls })
 }
 
 fn stalled_message(stall: Duration) -> String {
@@ -1375,9 +1829,9 @@ mod tests {
 
     fn history() -> Vec<Message> {
         vec![
-            Message { role: "user", content: "hello".into() },
-            Message { role: "assistant", content: "hi".into() },
-            Message { role: "user", content: "again".into() },
+            Message::user("hello"),
+            Message::assistant("hi", Vec::new()),
+            Message::user("again"),
         ]
     }
 
@@ -1386,14 +1840,14 @@ mod tests {
     /// takes it as the first message and rejects `max_tokens`-less requests happily.
     #[test]
     fn each_wire_puts_the_system_context_where_that_api_wants_it() {
-        let anthropic = request_body(Wire::Anthropic, "a-model", "be terse", &history(), true);
+        let anthropic = request_body(Wire::Anthropic, "a-model", "be terse", &history(), true, &[]);
         assert_eq!(anthropic["system"], "be terse");
         assert_eq!(anthropic["max_tokens"], MAX_TOKENS);
         assert_eq!(anthropic["messages"].as_array().unwrap().len(), 3, "a system turn leaked in");
         assert_eq!(anthropic["messages"][0]["role"], "user");
         assert_eq!(anthropic["stream"], true);
 
-        let openai = request_body(Wire::OpenAi, "a-model", "be terse", &history(), false);
+        let openai = request_body(Wire::OpenAi, "a-model", "be terse", &history(), false, &[]);
         assert!(openai.get("system").is_none(), "a top-level system field 400s on this API");
         assert_eq!(openai["messages"].as_array().unwrap().len(), 4);
         assert_eq!(openai["messages"][0]["role"], "system");
@@ -1402,9 +1856,9 @@ mod tests {
 
         // An empty context adds nothing at all rather than an empty string, which some
         // OpenAI-compatible servers reject outright.
-        let bare = request_body(Wire::OpenAi, "m", "", &history(), true);
+        let bare = request_body(Wire::OpenAi, "m", "", &history(), true, &[]);
         assert_eq!(bare["messages"].as_array().unwrap().len(), 3);
-        assert!(request_body(Wire::Anthropic, "m", "", &history(), true).get("system").is_none());
+        assert!(request_body(Wire::Anthropic, "m", "", &history(), true, &[]).get("system").is_none());
     }
 
     /// The framing, against real event lines. This is the part most likely to be wrong and
@@ -1500,7 +1954,7 @@ mod tests {
                  {"type":"text","text":"the answer"}],"stop_reason":"end_turn"}"#,
         )
         .unwrap();
-        let (text, thinking, outcome) = parse_complete(Wire::Anthropic, &anthropic);
+        let (text, thinking, outcome, _) = parse_complete(Wire::Anthropic, &anthropic);
         assert_eq!(text, "the answer");
         assert_eq!(thinking.as_deref(), Some("weighing"));
         assert_eq!(outcome, TurnOutcome::Completed);
@@ -1510,13 +1964,13 @@ mod tests {
                  "finish_reason":"length"}]}"#,
         )
         .unwrap();
-        let (text, _, outcome) = parse_complete(Wire::OpenAi, &openai);
+        let (text, _, outcome, _) = parse_complete(Wire::OpenAi, &openai);
         assert_eq!(text, "local answer");
         assert!(matches!(outcome, TurnOutcome::Exhausted { .. }));
 
         let refused: Value =
             serde_json::from_str(r#"{"error":{"message":"model not found"}}"#).unwrap();
-        let (text, _, outcome) = parse_complete(Wire::OpenAi, &refused);
+        let (text, _, outcome, _) = parse_complete(Wire::OpenAi, &refused);
         assert!(text.is_empty());
         assert!(matches!(outcome, TurnOutcome::Failed { .. }));
     }
@@ -1537,7 +1991,7 @@ mod tests {
         let ollama: Value =
             serde_json::from_str(r#"{"error":"model 'llama9' not found, try pulling it"}"#)
                 .unwrap();
-        let (text, _, outcome) = parse_complete(Wire::OpenAi, &ollama);
+        let (text, _, outcome, _) = parse_complete(Wire::OpenAi, &ollama);
         assert!(text.is_empty());
         let TurnOutcome::Failed { message } = outcome else {
             panic!("a string-shaped error was not a failure");
@@ -1545,7 +1999,7 @@ mod tests {
         assert!(message.contains("llama9"), "the provider's own words were dropped: {message}");
 
         // The same string shape on the Anthropic wire, and mid-stream.
-        let (_, _, outcome) = parse_complete(Wire::Anthropic, &ollama);
+        let (_, _, outcome, _) = parse_complete(Wire::Anthropic, &ollama);
         assert!(matches!(outcome, TurnOutcome::Failed { .. }));
         assert_eq!(
             parse_event(Wire::OpenAi, r#"{"error":"no such model"}"#),
@@ -1555,7 +2009,7 @@ mod tests {
 
         // No content and no finish reason. Nothing said, nothing explaining why.
         let empty: Value = serde_json::from_str(r#"{"choices":[]}"#).unwrap();
-        let (text, _, outcome) = parse_complete(Wire::OpenAi, &empty);
+        let (text, _, outcome, _) = parse_complete(Wire::OpenAi, &empty);
         assert!(text.is_empty());
         let TurnOutcome::Failed { message } = outcome else {
             panic!("an empty choices list was reported as a completed turn");
@@ -1564,7 +2018,7 @@ mod tests {
 
         let foreign: Value =
             serde_json::from_str(r#"{"model":"x","done":true,"response":""}"#).unwrap();
-        let (_, _, outcome) = parse_complete(Wire::Anthropic, &foreign);
+        let (_, _, outcome, _) = parse_complete(Wire::Anthropic, &foreign);
         let TurnOutcome::Failed { message } = outcome else {
             panic!("a body from another API was reported as a completed turn");
         };
@@ -1577,7 +2031,7 @@ mod tests {
             r#"{"choices":[{"message":{"content":null},"finish_reason":"tool_calls"}]}"#,
         )
         .unwrap();
-        let (_, _, outcome) = parse_complete(Wire::OpenAi, &tools);
+        let (_, _, outcome, _) = parse_complete(Wire::OpenAi, &tools);
         assert_eq!(outcome, TurnOutcome::Completed, "a stop reason was ignored");
     }
 
@@ -1929,5 +2383,285 @@ mod tests {
         );
         assert_eq!(pick(r#"{"data":[{"id":"only-one"},{"id":"second"}]}"#), Some("only-one".into()));
         assert_eq!(pick(r#"{"data":[]}"#), None);
+    }
+
+    // -- the tool loop -------------------------------------------------------------------
+
+    /// Reassembles a stream the way `consume_stream` does, so the test exercises the real
+    /// `parse_event` and the real accumulation rule rather than a second copy of them.
+    fn reassemble(wire: Wire, frames: &[&str]) -> Vec<ToolCall> {
+        let mut building: std::collections::BTreeMap<usize, ToolCall> = Default::default();
+        for frame in frames {
+            // The **real** `parse_event` and the **real** `absorb`, never a copy of either —
+            // the first version of this helper reimplemented the accumulation and stayed green
+            // with the production guards deleted, which is the shape feedback 35 records.
+            if let Piece::Tools(fragments) = parse_event(wire, frame) {
+                absorb(&mut building, fragments);
+            }
+        }
+        building.into_values().filter(|call| !call.name.is_empty()).collect()
+    }
+
+    /// ⚠ **Both wires in one test, deliberately.** `TextThenStop` was added to one branch and
+    /// missed on its sibling six lines away, and this file's own comment records what that
+    /// cost. A tool call reassembles from fragments on both wires and neither is the "real"
+    /// one — Anthropic is Claude, OpenAI is Kimi, every local model and every custom endpoint.
+    #[test]
+    fn a_streamed_tool_call_reassembles_on_both_wires() {
+        let anthropic = reassemble(
+            Wire::Anthropic,
+            &[
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"research_search"}}"#,
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":"}}"#,
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"bmw m5\"}"}}"#,
+            ],
+        );
+        assert_eq!(anthropic.len(), 1, "one call");
+        assert_eq!(anthropic[0].name, "research_search");
+        assert_eq!(anthropic[0].id, "toolu_1");
+        assert_eq!(anthropic[0].parsed()["query"], "bmw m5", "the fragments only parse joined");
+
+        let openai = reassemble(
+            Wire::OpenAi,
+            &[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"research_search","arguments":""}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"bmw m5\"}"}}]}}]}"#,
+            ],
+        );
+        assert_eq!(openai.len(), 1, "one call");
+        assert_eq!(openai[0].name, "research_search");
+        assert_eq!(openai[0].id, "call_1");
+        assert_eq!(openai[0].parsed()["query"], "bmw m5");
+    }
+
+    /// ⚠ The continuation fragments carry a **null id and no name**, and taking whatever the
+    /// newest fragment holds erases both after the first delta — leaving a call with arguments
+    /// and nothing to dispatch. A/B: with the `is_empty` guards removed, the name is `""` and
+    /// the call is dropped by the filter, so the model waits for a result that never comes.
+    #[test]
+    fn a_continuation_fragment_does_not_erase_the_id_or_the_name() {
+        let calls = reassemble(
+            Wire::OpenAi,
+            &[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"velm_list_notes","arguments":""}}]}}]}"#,
+                // An **empty string**, not null: this is what several OpenAI-compatible
+                // servers send on continuations, and it is the case the set-once rule exists
+                // for. A/B: delete the `is_empty()` guards in `absorb` and this fails with an
+                // empty name, so the call is dropped and the model waits for ever.
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":"","arguments":"{}"}}]}}]}"#,
+            ],
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_9", "the id survived the continuation");
+        assert_eq!(calls[0].name, "velm_list_notes", "and so did the name");
+    }
+
+    /// Two tools asked for at once, interleaved on the wire — which is why reassembly is keyed
+    /// by the provider's index and not by arrival order. A single-fragment `Piece` would have
+    /// returned the first and dropped the second silently.
+    #[test]
+    fn two_calls_in_one_turn_do_not_have_their_arguments_run_together() {
+        let calls = reassemble(
+            Wire::OpenAi,
+            &[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"research_fetch","arguments":"{\"url\":"}},{"index":1,"id":"b","function":{"name":"research_search","arguments":"{\"query\":"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"two\"}"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"one\"}"}}]}}]}"#,
+            ],
+        );
+        assert_eq!(calls.len(), 2, "both calls survived one frame carrying two entries");
+        assert_eq!(calls[0].parsed()["url"], "one");
+        assert_eq!(calls[1].parsed()["query"], "two");
+    }
+
+    /// A tool exchange has to go back on the wire in the shape that wire wants, and the two
+    /// shapes share nothing: Anthropic spells a result as a **`user` turn holding a
+    /// `tool_result` block**, OpenAI as a `role:"tool"` message carrying `tool_call_id`.
+    #[test]
+    fn a_tool_exchange_is_rendered_in_each_wires_own_shape() {
+        let history = vec![
+            Message::user("find something"),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "t1".into(),
+                    name: "research_search".into(),
+                    arguments: r#"{"query":"x"}"#.into(),
+                }],
+            ),
+            Message::result("t1", "1 result"),
+        ];
+
+        let anthropic = request_body(Wire::Anthropic, "m", "", &history, false, &[]);
+        let turns = anthropic["messages"].as_array().unwrap();
+        assert_eq!(turns[1]["content"][0]["type"], "tool_use");
+        assert_eq!(turns[1]["content"][0]["input"]["query"], "x", "input is an object, not a string");
+        assert_eq!(turns[2]["role"], "user", "Anthropic has no `tool` role");
+        assert_eq!(turns[2]["content"][0]["tool_use_id"], "t1");
+
+        let openai = request_body(Wire::OpenAi, "m", "", &history, false, &[]);
+        let turns = openai["messages"].as_array().unwrap();
+        assert_eq!(turns[1]["tool_calls"][0]["function"]["name"], "research_search");
+        assert!(
+            turns[1]["content"].is_null(),
+            "content must be null and not \"\" — several servers 400 on the empty string",
+        );
+        assert_eq!(turns[2]["role"], "tool");
+        assert_eq!(turns[2]["tool_call_id"], "t1");
+    }
+
+    /// The table is Velm's one tool list, reshaped — never a second list that can drift from
+    /// what an MCP agent is offered.
+    #[test]
+    fn the_advertised_tools_are_the_mcp_tools_in_each_wires_shape() {
+        let expected = crate::mcp::TOOL_NAMES.len();
+
+        let anthropic = tools_for(Wire::Anthropic);
+        assert_eq!(anthropic.len(), expected, "every MCP tool is advertised");
+        assert!(anthropic[0].get("input_schema").is_some(), "Anthropic spells it input_schema");
+
+        let openai = tools_for(Wire::OpenAi);
+        assert_eq!(openai.len(), expected);
+        assert_eq!(openai[0]["type"], "function");
+        assert!(openai[0]["function"].get("parameters").is_some(), "OpenAI nests it under function");
+    }
+
+    /// **No tools configured means no `tools` field at all**, which is the compatibility
+    /// promise: a provider that has never heard of function calling sees the request it saw
+    /// before any of this existed.
+    #[test]
+    fn a_node_that_cannot_reach_the_board_advertises_nothing() {
+        for wire in [Wire::Anthropic, Wire::OpenAi] {
+            let body = request_body(wire, "m", "", &[Message::user("hi")], true, &[]);
+            assert!(body.get("tools").is_none(), "{wire:?} sent a tools field with none to send");
+        }
+    }
+
+    // -- the loop itself -----------------------------------------------------------------
+
+    /// A loopback server that answers a fixed script and keeps every request body it was sent.
+    ///
+    /// Non-streaming JSON, which `exchange` handles through its *"a server that ignored
+    /// `stream`"* branch — several local servers really do this, so it is a production path
+    /// rather than a test-only one.
+    fn scripted_server(bodies: Vec<String>) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let (sent, seen) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            for body in bodies {
+                let Ok((stream, _)) = listener.accept() else { return };
+                let mut reader = BufReader::new(stream);
+                // Headers, then exactly `Content-Length` bytes of body.
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut request = vec![0u8; length];
+                std::io::Read::read_exact(&mut reader, &mut request).ok();
+                let _ = sent.send(String::from_utf8_lossy(&request).into_owned());
+
+                let mut stream = reader.into_inner();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        (format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    /// ⚠ **The composed path, which no unit test above reaches.** The six tests around this one
+    /// cover reassembly, rendering and advertising — every *part* of the tool loop and not the
+    /// loop. That is the shape `--demo zoom-flicker` exists for: every layer had passing tests
+    /// and the whole had never run once.
+    ///
+    /// Driven here end to end, offline: a scripted server answers a tool call, `run_turn`
+    /// dispatches it through the real `mcp::Server`, pushes the real `Message::result`, asks
+    /// again, and the second answer is prose that ends the turn.
+    ///
+    /// Four things are asserted that only the composed run can show:
+    /// 1. the loop **iterates** — two requests, not one;
+    /// 2. the tool actually **ran**, and its answer went back as a `tool_result` in the second
+    ///    request's body (the model's own history, which is what the next turn reasons from);
+    /// 3. a refusal is a **result**, not a failed turn — `mcp::Server`'s stated rule;
+    /// 4. the turn ends `Completed` on the prose, rather than on the tool call.
+    #[test]
+    fn a_tool_call_is_dispatched_and_the_turn_carries_on_from_its_answer() {
+        let first = r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"velm_list_notes","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let second = r#"{"choices":[{"message":{"content":"There are no notes I can reach."},"finish_reason":"stop"}]}"#;
+        let (base, seen) = scripted_server(vec![first.to_owned(), second.to_owned()]);
+
+        // A server whose Velm half is **known absent**, so `velm_list_notes` refuses by name
+        // without a board — which is the refusal path, and it still has to come back as a
+        // tool *result*. `Endpoint::unavailable` is public for exactly this.
+        let tools = crate::mcp::Server::with(
+            crate::research::Research::new(crate::research::ResearchConfig::default()),
+            crate::mcp::Endpoint::unavailable("no board in this test"),
+        );
+        let config = Config {
+            wire: Wire::OpenAi,
+            provider: Provider::Local,
+            base,
+            key: None,
+            system: String::new(),
+            model: Some("a-model".into()),
+            tools: Some(tools),
+        };
+
+        let history = Mutex::new(vec![Message::user("what notes are there?")]);
+        // Pre-seeded, so `resolve_model` never asks the scripted server for a model list —
+        // which would consume the first scripted answer and desynchronise everything after it.
+        let model = Mutex::new(Some("a-model".into()));
+        let cancel = AtomicBool::new(false);
+        let (events, drained) = std::sync::mpsc::channel();
+
+        let outcome = run_turn(&config, &history, &model, &cancel, &events);
+
+        assert_eq!(outcome, TurnOutcome::Completed, "the prose ends the turn, not the tool call");
+
+        let asked: Vec<String> = seen.try_iter().collect();
+        assert_eq!(asked.len(), 2, "the loop asked twice: once for the call, once after it");
+        assert!(
+            asked[1].contains("call_1") && asked[1].contains(r#""role":"tool""#),
+            "the tool's answer was not sent back as a tool result:\n{}",
+            asked[1]
+        );
+
+        // The tool genuinely ran: its refusal is in the transcript as a result, and the turn
+        // did not fail because of it.
+        let seen_events: Vec<TranscriptEvent> = drained.try_iter().collect();
+        assert!(
+            seen_events.iter().any(|event| matches!(
+                event,
+                TranscriptEvent::ToolCall { name, .. } if name == "velm_list_notes"
+            )),
+            "the call was never shown in the transcript: {seen_events:?}"
+        );
+        assert!(
+            seen_events
+                .iter()
+                .any(|event| matches!(event, TranscriptEvent::ToolResult { ok: false, .. })),
+            "a refusal must arrive as a tool result, not as a failed turn: {seen_events:?}"
+        );
+        assert!(
+            seen_events.iter().any(|event| matches!(
+                event,
+                TranscriptEvent::Text { text } if text.contains("no notes")
+            )),
+            "the second answer never reached the node: {seen_events:?}"
+        );
     }
 }

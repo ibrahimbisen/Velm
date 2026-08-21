@@ -205,6 +205,16 @@ impl ArchiveSet {
         Self::default()
     }
 
+    /// Where each archive in the set lives.
+    ///
+    /// For reopening the same backups on a worker thread. A `.rtb` reader owns a seek
+    /// position, so one cannot be shared across threads — but the file can be opened again,
+    /// and parsing a ZIP's central directory is trivial beside inflating 110 MB out of it.
+    #[must_use]
+    pub fn paths(&self) -> Vec<std::path::PathBuf> {
+        self.archives.iter().map(|archive| archive.path().to_path_buf()).collect()
+    }
+
     /// Opens a `.rtb`, or **every `.rtb` in a directory**.
     ///
     /// The directory form is the one that matters: it is how a user points the app at a

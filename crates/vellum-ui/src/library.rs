@@ -122,6 +122,27 @@ pub enum Scope {
     /// not one of the user's folders: nothing can be filed *into* it by hand, everything in
     /// it is filed out of every other scope, and it is the one place `Purge` is offered.
     Trash,
+    /// The settings page — every preference in the application, on one screen.
+    ///
+    /// *"add a settings page in the home page so that we can put all of the settings that
+    /// are needed to live in the dedicated settings page there."*
+    ///
+    /// # Why a scope rather than a dialog
+    ///
+    /// Preferences reach the interface through the `⋮` menu, which is a **menu**: it shows
+    /// one thing at a time, closes when you click anything, and cannot say *why* a switch is
+    /// off next to the switch. That is right for a verb and wrong for a page of settings you
+    /// are reading rather than firing. A scope also gets the sidebar for free, which is the
+    /// thing that makes settings findable at all — the menu required knowing they were
+    /// behind a `⋮` beside a board's name.
+    ///
+    /// **The menu rows stay.** This is a second route, not a replacement: `⌘,` habits and
+    /// the menu bar both still work, and every control here emits the *same event* its menu
+    /// row does, so the two cannot come to disagree about what a setting means.
+    ///
+    /// It holds no boards, so [`LibraryState::in_scope`] answers `false` for every card and
+    /// the grid is never drawn.
+    Settings,
     /// One [`Space`], **by name**.
     ///
     /// By name and not by its index in [`LibraryState::spaces`], for exactly the
@@ -131,6 +152,63 @@ pub enum Scope {
     /// events. Held by index, pinning the space you were looking at silently moved the
     /// filter onto a different one, and creating a space moved it again.
     Space(String),
+}
+
+/// Which page of the settings you are on.
+///
+/// *"make different tabs in that settings page for the purpose of different tabs — one for
+/// application settings, one for ai playground settings."*
+///
+/// # Why tabs rather than one long page
+///
+/// The page had four bands and was already taller than the window, and the bands answer to
+/// different people at different moments: how the application *looks* is set once, and what
+/// the agents do is tuned while working. A scroll makes those one thing you have to travel
+/// through; a tab makes each of them a place you go.
+///
+/// The split is by **who is asking**, not by subsystem. [`Self::General`] is everything that
+/// is true of Velm whatever board you have open; [`Self::Agents`] is the whole AI layer,
+/// matching the *Agents* band the menus already use; [`Self::Providers`] is separate from it
+/// because it is about this **machine** — which binaries are installed, which keys are held —
+/// rather than about how agents behave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsTab {
+    /// Appearance and board behaviour: the application's own settings.
+    #[default]
+    General,
+    /// The Agent Canvas: output, themes, worktrees, browser nodes.
+    Agents,
+    /// Which models this machine can reach, and how each is paid for.
+    Providers,
+}
+
+impl SettingsTab {
+    pub const ALL: [Self; 3] = [Self::General, Self::Agents, Self::Providers];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            // The same word the menus use for this band, from one constant, so the layer is
+            // not called two things in two places.
+            Self::Agents => crate::command::AGENT_SECTION,
+            Self::Providers => "Providers",
+        }
+    }
+
+    /// One line under the tab strip saying what this page is for.
+    pub const fn subtitle(self) -> &'static str {
+        match self {
+            Self::General => "How Velm looks, and how a board behaves as you work on it.",
+            Self::Agents => {
+                "The AI layer: what a new agent shows, how a transcript is dressed, and the \
+                 two switches that cost memory and disk."
+            }
+            Self::Providers => {
+                "Which models this machine can reach. No key is ever shown here, and one is \
+                 never written into a board."
+            }
+        }
+    }
 }
 
 /// Grid of cards or a dense list. Both are in Miro; the list is the one that scales
@@ -170,6 +248,8 @@ pub struct LibraryState {
     /// [`Chrome::set_spaces`](crate::Chrome::set_spaces).
     pub spaces: Vec<Space>,
     pub scope: Scope,
+    /// Which page of the settings is open. Ignored on every other scope.
+    pub settings_tab: SettingsTab,
     pub layout: LayoutMode,
     /// How **All boards** is arranged. Ignored by every other scope.
     pub grouping: Grouping,
@@ -190,7 +270,7 @@ impl LibraryState {
     pub fn selected_space(&self) -> Option<&Space> {
         match &self.scope {
             Scope::Space(name) => self.spaces.iter().find(|s| &s.name == name),
-            Scope::Recent | Scope::All | Scope::Starred | Scope::Trash => None,
+            Scope::Recent | Scope::All | Scope::Starred | Scope::Trash | Scope::Settings => None,
         }
     }
 
@@ -210,7 +290,9 @@ impl LibraryState {
             return self.scope == Scope::Trash;
         }
         match &self.scope {
-            Scope::Trash => false,
+            // Neither holds boards. The trash holds only *deleted* ones, caught above; the
+            // settings page holds none at all.
+            Scope::Trash | Scope::Settings => false,
             Scope::Recent | Scope::All => true,
             Scope::Starred => card.starred,
             // A scope naming a space that has been deleted shows nothing rather than
@@ -231,6 +313,7 @@ impl LibraryState {
             Scope::All => "All boards",
             Scope::Starred => "Starred",
             Scope::Trash => "Recently deleted",
+            Scope::Settings => "Settings",
             // The name the user clicked, whether or not the space still exists: a
             // heading that changed to "Space" the instant one was deleted would read
             // as a rendering fault rather than as the deletion.
@@ -249,6 +332,9 @@ impl LibraryState {
                 // being empty is good news, and where the user's question is not "where are
                 // my boards" but "is the one I deleted still here".
                 Scope::Trash => "Nothing deleted — boards you delete wait here until you empty it",
+                // Never reached: the settings page draws its own body and never falls
+                // through to the empty-grid message.
+                Scope::Settings => "",
                 Scope::Space(_) => "Nothing in this folder yet",
                 Scope::Recent | Scope::All => "No boards here",
             }
@@ -456,6 +542,7 @@ pub(crate) fn show(
     state: &mut LibraryState,
     boards: &[BoardCard],
     now: SystemTime,
+    settings_view: &SettingsView<'_>,
     events: &mut EventSink,
 ) {
     sidebar(ui, palette, state, boards, events);
@@ -467,6 +554,13 @@ pub(crate) fn show(
     egui::CentralPanel::default_margins().frame(frame).show(ui, |ui| {
         header(ui, palette, state, events);
         ui.add_space(space::of(4));
+
+        // The settings page holds no boards, so it returns before the grid is built at all
+        // rather than filtering an empty list through it and landing on *"No boards here"*.
+        if state.scope == Scope::Settings {
+            settings(ui, palette, &mut state.settings_tab, settings_view, events);
+            return;
+        }
 
         let mut visible: Vec<&BoardCard> = boards
             .iter()
@@ -769,16 +863,16 @@ fn sidebar(
             let starred =
                 boards.iter().filter(|b| b.starred && b.deleted.is_none()).count();
             let deleted = boards.iter().filter(|b| b.deleted.is_some()).count();
-            scope_row(ui, palette, state, &Scope::Recent, "Recent", total);
+            scope_row(ui, palette, state, &Scope::Recent, "Recent", Some(total));
             // *All boards* always shows everything, whatever is filed where: it is the
             // scope a user falls back to when they cannot remember where they put
             // something, so it is the one that must never filter.
-            scope_row(ui, palette, state, &Scope::All, "All boards", total);
-            scope_row(ui, palette, state, &Scope::Starred, "Starred", starred);
+            scope_row(ui, palette, state, &Scope::All, "All boards", Some(total));
+            scope_row(ui, palette, state, &Scope::Starred, "Starred", Some(starred));
             // Last of the standing scopes, and **always shown** rather than appearing when
             // something is in it: a trash you can only find once you have lost something is
             // one nobody knows exists at the moment they need it.
-            scope_row(ui, palette, state, &Scope::Trash, "Recently deleted", deleted);
+            scope_row(ui, palette, state, &Scope::Trash, "Recently deleted", Some(deleted));
 
             ui.add_space(space::of(2));
             hairline(ui, palette);
@@ -800,6 +894,32 @@ fn sidebar(
                         .color(palette.faint),
                 );
             }
+
+            // **Pinned to the foot of the panel**, not merely last in the list.
+            //
+            // Two readings of *"move the settings to the bottom"*, and the first one was
+            // wrong: putting it under the folders left it floating in the middle of a tall
+            // empty sidebar, still reading as one more row in a list. The bottom of the
+            // *panel* is where an application's settings live — the place your eye goes
+            // last and always finds the same thing — and that is what was asked for.
+            //
+            // `bottom_up` over the space the folders left, so the row sits on the panel's
+            // floor however many folders there are, rather than at a measured offset that
+            // would be wrong for every count but one. Note the reversed order: in a
+            // bottom-up layout the **first** thing added is the lowest, so this reads
+            // gap, row, gap, rule and paints rule, gap, row, gap.
+            //
+            // The comment this replaced already argued for being below the folders and the
+            // code had never done it — it is not a way of looking at boards, it is the one
+            // row here that changes the application, and the rule above it says so.
+            //
+            // A count of zero would read as *"no settings"*, so it carries none.
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                ui.add_space(space::of(2));
+                scope_row(ui, palette, state, &Scope::Settings, "Settings", None);
+                ui.add_space(space::of(2));
+                hairline(ui, palette);
+            });
         });
 }
 
@@ -828,7 +948,9 @@ fn scope_row(
     state: &mut LibraryState,
     scope: &Scope,
     label: &str,
-    count: usize,
+    // `None` for a row that counts nothing. Settings is the only one: a **0** beside it
+    // would read as "no settings", which is the opposite of true.
+    count: Option<usize>,
 ) {
     let selected = &state.scope == scope;
     let (rect, response) =
@@ -844,13 +966,15 @@ fn scope_row(
             egui::FontId::proportional(crate::theme::text::BODY),
             color,
         );
-        ui.painter().text(
-            inner.right_center(),
-            egui::Align2::RIGHT_CENTER,
-            count.to_string(),
-            egui::FontId::monospace(crate::theme::text::NUMERIC),
-            palette.faint,
-        );
+        if let Some(count) = count {
+            ui.painter().text(
+                inner.right_center(),
+                egui::Align2::RIGHT_CENTER,
+                count.to_string(),
+                egui::FontId::monospace(crate::theme::text::NUMERIC),
+                palette.faint,
+            );
+        }
     }
     if response.clicked() {
         state.scope = scope.clone();
@@ -1154,6 +1278,13 @@ fn header(ui: &mut Ui, palette: Palette, state: &mut LibraryState, events: &mut 
         ui.label(screen_title(state.title()).color(palette.text));
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // Nothing on the right at all on the settings page. *New board*, *Import from
+            // Miro* and the grid/list toggle are three answers to "what do I do with my
+            // boards", and this is the one page in the library that is not about boards —
+            // the trash makes the same swap two arms down for the same reason.
+            if state.scope == Scope::Settings {
+                return;
+            }
             if ui
                 .add(
                     egui::Button::new(
@@ -2086,9 +2217,80 @@ mod tests {
         let mut events = EventSink::default();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000);
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            show(ui, Palette::LIGHT, state, boards, now, &mut events);
+            let settings = SettingsView {
+                accent: crate::theme::Accent::Teal,
+                glass_opacity: 160,
+                transparency_blocked: false,
+                link_previews: true,
+                align_objects: true,
+                snap_to_grid: false,
+                default_display: vellum_agent::DisplayMode::Clean,
+                default_chat_theme: vellum_agent::ChatTheme::Velm,
+                browser_nodes: false,
+                worktrees: false,
+                providers: &[],
+            };
+            show(ui, Palette::LIGHT, state, boards, now, &settings, &mut events);
         });
         events.take()
+    }
+
+    /// The settings page holds **no boards**, whatever is on disk.
+    ///
+    /// The half that would fail silently: a scope that fell through to the grid would show
+    /// every board in the library under a heading reading *Settings*, which looks like a
+    /// filter that did not work rather than like a page that is missing. `in_scope` is the
+    /// one place that is decided, so it is where it is asked.
+    #[test]
+    fn the_settings_page_holds_no_boards() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000);
+        let mut starred = card_at("Site plan", 900, now);
+        starred.starred = true;
+        let boards = [starred, card_at("Roadmap", 200_000, now)];
+
+        let settings = LibraryState { scope: Scope::Settings, ..LibraryState::default() };
+        for board in &boards {
+            assert!(!settings.in_scope(board), "a board reached the settings page");
+        }
+        // And it is not simply refusing everything: the same boards are in Recent.
+        let recent = LibraryState::default();
+        assert!(boards.iter().all(|board| recent.in_scope(board)));
+
+        assert_eq!(settings.title(), "Settings");
+        assert!(settings.selected_space().is_none(), "settings is not a folder");
+    }
+
+    /// Every tab of the settings page draws, and none of them emits anything untouched.
+    ///
+    /// Per tab rather than once: each is a different set of live controls — a slider and
+    /// painted swatches on General, two choice rows on Agents, a list built from the
+    /// machine's own `PATH` on Providers — and a control that fired on its own would rewrite
+    /// a preference every frame the page was up.
+    #[test]
+    fn every_settings_tab_draws_and_emits_nothing_untouched() {
+        for tab in SettingsTab::ALL {
+            let mut state = LibraryState {
+                scope: Scope::Settings,
+                settings_tab: tab,
+                ..LibraryState::default()
+            };
+            let events = run(&[], &mut state);
+            assert!(events.is_empty(), "the {tab:?} tab emitted {events:?} on its own");
+            assert_eq!(state.settings_tab, tab, "the {tab:?} tab switched by itself");
+            assert!(!tab.label().is_empty() && !tab.subtitle().is_empty(), "{tab:?}");
+        }
+    }
+
+    /// It draws, and it emits nothing untouched.
+    ///
+    /// Worth its own test beyond `every_scope_and_layout_draws`: this page is the only one
+    /// in the library built out of live controls — a slider, swatches, toggles — and a
+    /// control that fired on its own would rewrite a preference every frame the page is up.
+    #[test]
+    fn the_settings_page_draws_and_emits_nothing_untouched() {
+        let mut state = LibraryState { scope: Scope::Settings, ..LibraryState::default() };
+        let events = run(&[], &mut state);
+        assert!(events.is_empty(), "the settings page emitted {events:?} on its own");
     }
 
     fn with_search(search: &str) -> LibraryState {
@@ -2123,6 +2325,10 @@ mod tests {
             Scope::Space("Cars".to_owned()),
             Scope::Space("Archive".to_owned()),
             Scope::Space("Deleted".to_owned()),
+            // The settings page draws its own body and never reaches the grid. In this list
+            // because it is a scope, and a scope that panicked on one layout would otherwise
+            // be found by a user rather than by a test.
+            Scope::Settings,
         ] {
             for layout in [LayoutMode::Grid, LayoutMode::List] {
                 let mut state = LibraryState {
@@ -2162,5 +2368,352 @@ mod tests {
             "the last step must name the folder: {}",
             IMPORT_STEPS[3]
         );
+    }
+}
+
+// ----- the settings page ---------------------------------------------------------
+//
+// *"add a settings page in the home page so that we can do and put all of the settings that
+// are needed to live in the dedicated settings page there."*
+
+/// Everything the settings page reads.
+///
+/// # Why its own struct rather than [`crate::menu::MenuHeader`]
+///
+/// `MenuHeader` borrows `Chrome::library.spaces`, and the library panel needs
+/// `&mut Chrome::library` — the two cannot overlap, which is exactly what the comment above
+/// `library::show`'s call site already records. Every field here is `Copy` or borrows
+/// `ChromeState` instead, so the settings page can be drawn inside the library's own borrow
+/// without cloning the spaces into a header sixty times a second to get around it.
+#[derive(Debug, Clone, Copy)]
+pub struct SettingsView<'a> {
+    pub accent: crate::theme::Accent,
+    /// How see-through the floating chrome is, 0–255.
+    pub glass_opacity: u8,
+    /// Whether the OS's Reduce Transparency is on, in which case the slider is disabled
+    /// rather than silently doing nothing.
+    pub transparency_blocked: bool,
+    pub link_previews: bool,
+    pub align_objects: bool,
+    pub snap_to_grid: bool,
+    pub default_display: vellum_agent::DisplayMode,
+    pub default_chat_theme: vellum_agent::ChatTheme,
+    pub browser_nodes: bool,
+    pub worktrees: bool,
+    pub providers: &'a [crate::menu::ProviderStatus],
+}
+
+/// The settings page: every preference in the application, on one screen.
+///
+/// # Every control emits the same event its menu row does
+///
+/// That is the rule that makes a second route safe. Preferences ▸ Transparency and the
+/// slider here both push `UiEvent::TransparencyChanged`; the accent rows here and there both
+/// push `AccentChanged`. Nothing on this page knows how a setting is *stored*, so the two
+/// routes cannot come to disagree about what a setting means — which is the failure a second
+/// copy of a control normally produces.
+///
+/// # It says why, not just what
+///
+/// Each switch carries the sentence its menu row carries as a tooltip, drawn **under** the
+/// control rather than behind a hover. A page you are reading has room for the reason; a
+/// menu row does not, which is why the menu keeps the hover. Two of these switches cost
+/// memory or disk in ways the switch cannot show, and `docs/07-agent-canvas.md` §0's third
+/// rule asks for a legible explanation rather than a bare toggle.
+fn settings(
+    ui: &mut Ui,
+    palette: Palette,
+    tab: &mut SettingsTab,
+    view: &SettingsView<'_>,
+    events: &mut EventSink,
+) {
+    // The strip, then one line saying what this page is for. Above the scroll area, so it
+    // stays put while a long page moves under it — a tab strip that scrolls away is one you
+    // have to go back up to use.
+    ui.horizontal(|ui| {
+        for page in SettingsTab::ALL {
+            if ui.selectable_label(*tab == page, page.label()).clicked() {
+                *tab = page;
+            }
+        }
+    });
+    ui.add_space(space::UNIT);
+    ui.label(
+        egui::RichText::new(tab.subtitle())
+            .color(palette.muted)
+            .size(crate::theme::text::LABEL),
+    );
+    ui.add_space(space::of(2));
+    hairline(ui, palette);
+
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui.set_max_width(space::of(140));
+        match tab {
+            SettingsTab::General => general_settings(ui, palette, view, events),
+            SettingsTab::Agents => agent_settings(ui, palette, view, events),
+            SettingsTab::Providers => {
+                section(ui, palette, "Providers");
+                crate::menu::provider_rows(ui, palette, view.providers, events);
+                ui.add_space(space::of(8));
+            }
+        }
+    });
+}
+
+/// Appearance and board behaviour — the application's own settings.
+fn general_settings(
+    ui: &mut Ui,
+    palette: Palette,
+    view: &SettingsView<'_>,
+    events: &mut EventSink,
+) {
+    {
+        section(ui, palette, "Appearance");
+        setting(
+            ui,
+            palette,
+            "Accent colour",
+            "Selection, the active tool and the app's own mark. Each has been checked for \
+             contrast against the two surfaces it lands on.",
+            |ui| {
+                // Reversed for `choices`' reason — the enclosing layout runs right to left,
+                // so Teal · Red · Blue was drawn Blue · Red · Teal. Not routed through
+                // `choices` because a swatch is painted rather than labelled.
+                ui.horizontal(|ui| {
+                    for accent in crate::theme::Accent::ALL.into_iter().rev() {
+                        // A swatch drawn in the colour it names: "Teal" and "Blue" are two
+                        // words to somebody who has not seen either.
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(space::of(9), space::of(5)),
+                            egui::Sense::click(),
+                        );
+                        ui.painter().rect_filled(
+                            rect,
+                            CornerRadius::same(radius::SMALL),
+                            accent.swatch(),
+                        );
+                        if accent == view.accent {
+                            ui.painter().rect_stroke(
+                                rect.expand(2.0),
+                                CornerRadius::same(radius::SMALL + 2),
+                                egui::Stroke::new(2.0, palette.text),
+                                egui::StrokeKind::Middle,
+                            );
+                        }
+                        if response.on_hover_text(accent.label()).clicked() {
+                            events.push(UiEvent::AccentChanged(accent));
+                        }
+                    }
+                });
+            },
+        );
+        setting(
+            ui,
+            palette,
+            "Transparency",
+            "How see-through the floating panels are. It never beats the system's own \
+             Reduce Transparency, and it stops short of invisible.",
+            |ui| {
+                let mut opacity = view.glass_opacity;
+                let slider = ui.add_enabled(
+                    !view.transparency_blocked,
+                    egui::Slider::new(&mut opacity, 90..=255).show_value(false),
+                );
+                if view.transparency_blocked {
+                    slider.on_disabled_hover_text(
+                        "Your system has Reduce Transparency turned on, which wins.",
+                    );
+                // On release, not per frame: `Library::persist` writes the sidecar
+                // synchronously, and a drag would write it sixty times a second.
+                } else if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                    events.push(UiEvent::GlassOpacityChanged(opacity));
+                }
+            },
+        );
+
+        section(ui, palette, "Board");
+        switch(
+            ui,
+            palette,
+            "Align objects",
+            "Miro's relative snapping: blue guides that suggest alignments and equal \
+             spacing as you drag. Loose rather than strict — hold ⌘ to suspend it \
+             mid-drag.",
+            view.align_objects,
+            |_| events.command(crate::command::Command::ToggleAlignObjects),
+        );
+        switch(
+            ui,
+            palette,
+            "Snap to grid",
+            "Lands moves, resizes and new items on the grid lines you can actually see. \
+             Strict, which is why it is a separate switch and off by default.",
+            view.snap_to_grid,
+            |_| events.command(crate::command::Command::SnapToGrid),
+        );
+        switch(
+            ui,
+            palette,
+            "Fetch link previews",
+            "Pasted links fetch their title, icon and picture. Only the cards on screen, \
+             three requests a frame, and never a card you have edited by hand.",
+            view.link_previews,
+            |_| events.command(crate::command::Command::ToggleLinkPreviews),
+        );
+
+        ui.add_space(space::of(8));
+    }
+}
+
+/// The Agent Canvas's own settings — the AI playground.
+fn agent_settings(
+    ui: &mut Ui,
+    palette: Palette,
+    view: &SettingsView<'_>,
+    events: &mut EventSink,
+) {
+    {
+        section(ui, palette, "Every agent");
+        setting(
+            ui,
+            palette,
+            "Agent output",
+            "What a new agent node shows by default. A node you have switched by hand \
+             keeps its own setting and ignores this.",
+            |ui| {
+                choices(
+                    ui,
+                    &vellum_agent::DisplayMode::ALL,
+                    view.default_display,
+                    vellum_agent::DisplayMode::label,
+                    vellum_agent::DisplayMode::note,
+                    |mode| events.push(UiEvent::DefaultDisplayModeChanged(mode)),
+                );
+            },
+        );
+        setting(
+            ui,
+            palette,
+            "Chat theme",
+            "How every agent transcript is dressed, unless a node has been given a look of \
+             its own. Set one node's theme by right-clicking it.",
+            |ui| {
+                choices(
+                    ui,
+                    &vellum_agent::ChatTheme::ALL,
+                    view.default_chat_theme,
+                    vellum_agent::ChatTheme::label,
+                    vellum_agent::ChatTheme::note,
+                    |theme| events.push(UiEvent::DefaultChatThemeChanged(theme)),
+                );
+            },
+        );
+        section(ui, palette, "What they may use");
+        switch(
+            ui,
+            palette,
+            "Worktree isolation",
+            crate::command::Command::ToggleWorktrees.note().unwrap_or_default(),
+            view.worktrees,
+            |_| events.command(crate::command::Command::ToggleWorktrees),
+        );
+        switch(
+            ui,
+            palette,
+            "Browser nodes",
+            crate::command::Command::ToggleBrowserNodes.note().unwrap_or_default(),
+            view.browser_nodes,
+            |_| events.command(crate::command::Command::ToggleBrowserNodes),
+        );
+
+        ui.add_space(space::of(8));
+    }
+}
+
+/// A row of mutually exclusive choices, in **reading order**.
+///
+/// **The reversal is the whole point of this existing, and it is not cosmetic.** [`setting`] puts its control in a
+/// `Layout::right_to_left` so the control hangs off the right edge whatever its width — and
+/// that layout also reverses the order things are *added* in. A plain loop over
+/// `ChatTheme::ALL` therefore drew *Kimi · ChatGPT · Claude · Velm*, and `DisplayMode::ALL`
+/// drew *Raw · Clean*: every list on the page backwards, silently, while every test about
+/// which rows exist still passed. Found in a screenshot, not by a test.
+///
+/// Reversed here, once, rather than at each of the three call sites — a `.rev()` somebody
+/// has to remember is the same trap by a shorter route.
+fn choices<T: Copy + PartialEq>(
+    ui: &mut Ui,
+    items: &[T],
+    current: T,
+    label: impl Fn(T) -> &'static str,
+    note: impl Fn(T) -> &'static str,
+    mut chosen: impl FnMut(T),
+) {
+    for item in items.iter().rev() {
+        if ui
+            .selectable_label(*item == current, label(*item))
+            .on_hover_text(note(*item))
+            .clicked()
+        {
+            chosen(*item);
+        }
+    }
+}
+
+/// A settings band's name.
+fn section(ui: &mut Ui, palette: Palette, title: &str) {
+    ui.add_space(space::of(5));
+    ui.label(
+        egui::RichText::new(title)
+            .size(crate::theme::text::LABEL)
+            .color(palette.muted)
+            .strong(),
+    );
+    ui.add_space(space::UNIT);
+    hairline(ui, palette);
+    ui.add_space(space::of(2));
+}
+
+/// One setting: its name, its control, and the sentence saying what it does.
+///
+/// The sentence is **drawn**, not hovered. A menu row has no room for it and hides it behind
+/// a hover; a page has room, and the whole reason this page exists is that a switch whose
+/// consequence is invisible is one people turn on and then report as a defect.
+fn setting(
+    ui: &mut Ui,
+    palette: Palette,
+    name: &str,
+    why: &str,
+    control: impl FnOnce(&mut Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(name).color(palette.text).strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), control);
+    });
+    ui.label(
+        egui::RichText::new(why).color(palette.muted).size(crate::theme::text::LABEL),
+    );
+    ui.add_space(space::of(3));
+}
+
+/// A setting whose control is one switch.
+fn switch(
+    ui: &mut Ui,
+    palette: Palette,
+    name: &str,
+    why: &str,
+    on: bool,
+    toggle: impl FnOnce(bool),
+) {
+    let mut value = on;
+    setting(ui, palette, name, why, |ui| {
+        // A labelled toggle rather than a bare checkbox: the label says which state the
+        // switch is *in*, which a tick does not on a page where several sit together.
+        if ui.selectable_label(value, if value { "On" } else { "Off" }).clicked() {
+            value = !value;
+        }
+    });
+    if value != on {
+        toggle(value);
     }
 }

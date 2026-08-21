@@ -291,8 +291,22 @@ impl Outcome {
             | Self::NeedsTool { message, .. }
             | Self::Unsupported { message }
             | Self::Failed { message } => message.clone(),
+            // ⚠ **This used to say "queued for transcription", and nothing queued it.**
+            // `Outcome::Transcribe` is produced here and consumed nowhere: `voice`'s
+            // transcribers take an [`crate::voice::Utterance`] — captured samples — and a
+            // media file is a container that has to be decoded first, which nothing in this
+            // workspace does. So the honest sentence names the file, says what the agent gets,
+            // and says what it does not. The house rule is that a known gap is fine and a
+            // false claim is not; *"queued"* was the second, and it was the kind a user only
+            // discovers by waiting for a transcript that was never coming.
+            // ⚠ **This sentence is what is left when transcription did *not* happen**, and it
+            // used to say Velm cannot transcribe media at all. It can now, with a transcriber
+            // installed on this machine — `voice::transcribe_media`, called by the app, turns
+            // this outcome into `Extracted` and this message is never reached. So the honest
+            // wording is conditional on the machine rather than on the product.
             Self::Transcribe(handoff) => format!(
-                "Attached as {} and queued for transcription",
+                "Attached as {}. Nothing on this machine could turn it into words, so the \
+                 agent is given the file's path rather than what was said.",
                 if handoff.kind == Kind::Video { "video" } else { "audio" }
             ),
         }
@@ -2356,7 +2370,13 @@ mod tests {
             }
             other => panic!("audio was not handed off: {other:?}"),
         }
-        assert!(handed.outcome.message().contains("transcription"));
+        // ⚠ The message must **not** promise a transcription. Nothing consumes
+        // `Outcome::Transcribe`, so the old wording — *"queued for transcription"* — described
+        // a queue that does not exist, and the user would only find out by waiting. It says
+        // what the agent actually gets instead.
+        let said = handed.outcome.message();
+        assert!(!said.contains("queued"), "the message promised a queue that does not exist: {said}");
+        assert!(said.contains("path"), "the message did not say what the agent gets: {said}");
         assert!(handed.text.is_empty());
     }
 

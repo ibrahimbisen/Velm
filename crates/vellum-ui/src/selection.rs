@@ -285,6 +285,14 @@ pub enum WorktreeState {
     Pending,
     /// Created, at this path.
     At(String),
+    /// The switch is off and a checkout is still on disk at this path.
+    ///
+    /// The fourth combination, which used to be dismissed as meaningless — and it is the one
+    /// state in which a worktree most needs removing. Turning the per-node switch off does
+    /// not delete a directory (a checkout is not something a toggle may throw away), so
+    /// without this state the recorded path became invisible the moment the switch flipped
+    /// and *Remove worktree...* greyed itself out over a directory that was still there.
+    Orphaned(String),
 }
 
 impl WorktreeState {
@@ -295,6 +303,7 @@ impl WorktreeState {
     pub fn label(&self) -> String {
         match self {
             Self::Off => "Works in the project directory".to_owned(),
+            Self::Orphaned(path) => format!("Switched off; its checkout is still at {path}"),
             Self::Pending => "Requested — created on the first run".to_owned(),
             Self::At(path) => path.clone(),
         }
@@ -323,6 +332,17 @@ pub struct AgentSummary {
     /// `None` inherits the app-wide default — feature 2's second half.
     pub display: Option<DisplayMode>,
     pub inherited_display: DisplayMode,
+    /// This node's own chat theme, or `None` when it inherits the app-wide default.
+    ///
+    /// The **stored** value, not the resolved one: a tick has to tell *"this node is set to
+    /// Claude"* from *"this node inherits, and the default happens to be Claude"*, and only
+    /// the stored value can.
+    pub chat_theme: Option<vellum_agent::ChatTheme>,
+    /// How see-through its paper is, 0-255, resolved so the slider always has a value.
+    pub chat_opacity: u8,
+    /// Whether it already has a picture behind it, so *No picture* is offered only when
+    /// there is one to take off.
+    pub has_chat_background: bool,
     /// `None` is the board's project root.
     pub working_dir: Option<String>,
     /// What that root is, for the same reason [`Self::inherited_provider`] is here.
@@ -1023,6 +1043,9 @@ mod tests {
     /// A worker with everything inherited, which is what the agent tool places.
     fn agent_summary(role: &str) -> AgentSummary {
         AgentSummary {
+            chat_theme: None,
+            chat_opacity: u8::MAX,
+            has_chat_background: false,
             role: role.to_owned(),
             role_kind: RoleKind::Worker,
             provider: None,

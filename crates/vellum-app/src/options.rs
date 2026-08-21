@@ -67,6 +67,9 @@ DIAGNOSTICS:
                                  object-eraser, group-handles, locked-arrange,
                                  widget-edit, copy-paste, context-menu,
                                  edit-then-delete
+                       Cost:     reproject-cost — what one edit does to the open
+                                 board: the rebuild, sampled, and how many of its
+                                 cached layouts a one-item change throws away.
                        Menu rows with no other unattended path:
                                  export-svg, export-pdf, export-png, present
     --screenshot PATH  Write one composited frame — board, glass and chrome — to a

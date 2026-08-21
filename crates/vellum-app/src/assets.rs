@@ -84,6 +84,32 @@ impl<T: Copy + Eq + std::hash::Hash> Bindings<T> {
         }
     }
 
+    /// The asset a handle belongs to, if it is still bound.
+    fn hash_of(&self, texture: T) -> Option<String> {
+        self.by_texture.get(&texture).cloned()
+    }
+
+    /// Points `asset_id` at a new handle and hands back the one it displaced.
+    ///
+    /// **Atomic, and the return is the point.** [`Self::set`] inserts into the reverse map and
+    /// does not remove the previous handle's entry — harmless today only because every rebind
+    /// is preceded by a `forget` (which is what
+    /// `rebinding_after_a_forget_leaves_no_stale_reverse_entry` was written about). A
+    /// refinement swap has no `forget` in front of it, so doing this by hand would leave
+    /// `by_texture[old]` pointing at a live asset, and the next `evicted(&[old])` would
+    /// unbind the texture that is currently drawing.
+    fn rebind(&mut self, asset_id: &str, state: State<T>) -> Option<T> {
+        let previous = match self.by_hash.get(asset_id) {
+            Some(State::Resident { texture, .. }) => Some(*texture),
+            _ => None,
+        };
+        if let Some(old) = previous {
+            self.by_texture.remove(&old);
+        }
+        self.set(asset_id, state);
+        previous
+    }
+
     /// Drops the mappings for handles the renderer evicted.
     fn evicted(&mut self, textures: &[T]) {
         for texture in textures {
@@ -107,7 +133,26 @@ pub struct Assets {
     spent: Duration,
     decoded: u64,
     bytes_decoded: u64,
+    /// Refinements asked for and not yet landed: asset id → the size to upload at.
+    ///
+    /// Held here rather than read from the renderer each frame because the renderer's answer
+    /// is a *per-frame observation* that vanishes on any frame the image is not drawn, while
+    /// the decode takes several frames to come back.
+    refining: HashMap<String, (u32, u32)>,
 }
+
+/// Refinement decodes outstanding at once.
+///
+/// Four, matching `DetailPolicy::refinements_per_frame` — but this is the binding constraint,
+/// not that one: the renderer bounds what it *exposes* per frame and this bounds what is
+/// actually *decoding*, and the two worker threads are the scarce resource.
+///
+/// It also bounds the memory the whole fix costs. A superseded texture is kept alive until its
+/// replacement lands, and a texture at its ceiling never refines, so each is at most one
+/// halving below the 2048 cap — four of those is about 21 MB, on a machine with 8 GB that has
+/// kernel-panicked during compilation twice. Against that, the old path uploaded 21 MB *per
+/// refinement* and threw it away in the same frame, so the peak goes down.
+const MAX_REFINEMENTS_IN_FLIGHT: usize = 4;
 
 impl std::fmt::Debug for Assets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -127,6 +172,7 @@ impl Assets {
             spent: Duration::ZERO,
             decoded: 0,
             bytes_decoded: 0,
+            refining: HashMap::new(),
         }
     }
 
@@ -237,55 +283,125 @@ impl Assets {
         queue: &wgpu::Queue,
         textures: &mut TextureManager,
     ) {
-        for answer in self.pool.drain() {
-            if self.spent >= DECODE_BUDGET {
-                // Out of budget with pixels in hand. Forget that it was in flight so the
-                // next frame asks again rather than dropping the image on the floor —
-                // `texture` only requests assets it has no binding for, so without this
-                // the asset would never be asked for again and would never appear.
-                self.pool.forget(&answer.asset_id);
-                continue;
-            }
+        self.request_refinements(textures);
+
+        // **Take answers only while there is budget to upload them**, and leave the rest in
+        // the channel. This used to drain the whole channel and *discard* everything past the
+        // budget — clearing `in_flight` so the same file was read and decoded again next
+        // frame, and again, while its item drew a placeholder throughout. One 2048px upload
+        // costs more than the whole 4 ms on its own, so on a board of large images that was
+        // every answer but the first, every frame.
+        while self.spent < DECODE_BUDGET {
+            let Some(answer) = self.pool.next_ready() else { break };
+            // `Some` iff this answer is a *refinement* of something already on screen, which
+            // is what makes the two failure paths below different from a first load's.
+            let refine_target = self.refining.remove(&answer.asset_id);
             let started = Instant::now();
-            let state = match answer.image {
+            match answer.image {
                 Ok(Some(image)) => {
                     self.decoded += 1;
                     self.bytes_decoded += image.rgba.len() as u64;
                     let source = ImageSource::new(image.width, image.height, &image.rgba);
-                    match textures.upload(device, queue, &source) {
+                    let cap = refine_target
+                        .map_or(textures.budget().max_dimension, |(w, h)| w.max(h));
+                    match textures.upload_within(device, queue, &source, cap) {
                         Ok(texture) => {
+                            let state =
+                                State::Resident { texture, size: (image.width, image.height) };
+                            // **The swap.** The old texture is freed in the same statement it
+                            // is replaced, which is safe on both sides: `collect` runs at the
+                            // top of `Painter::paint`, before this frame's list is built, so
+                            // no list that will be drawn references it; and wgpu keeps the
+                            // allocation alive until the command buffers using it retire.
+                            if let Some(old) = self.bindings.rebind(&answer.asset_id, state) {
+                                textures.remove(old);
+                            }
                             // `upload` deliberately ignores the budget so a caller is
                             // never left holding an image it cannot draw; enforcing it is
-                            // the caller's job, here.
-                            let evicted = textures.evict_to_budget();
-                            self.bindings.evicted(&evicted);
-                            State::Resident { texture, size: (image.width, image.height) }
+                            // the caller's job — see `enforce_budget`, which now runs after
+                            // the frame's marks rather than here, before any of them.
                         }
                         Err(error) => {
                             log::warn!("asset {}: {error}", answer.asset_id);
-                            State::Undecodable
+                            // A refinement that fails keeps what is already on screen. Writing
+                            // `Undecodable` here would turn an image that has been drawing for
+                            // minutes into a permanent placeholder because one re-read failed.
+                            if refine_target.is_none() {
+                                self.bindings.set(&answer.asset_id, State::Undecodable);
+                            }
                         }
                     }
                 }
-                Ok(None) => State::Absent,
+                // Same rule for both: on a *first* load these are the real answer; on a
+                // refinement the pixels already on the GPU are the last copy, and throwing
+                // them away because the blob moved is strictly worse than keeping them.
+                Ok(None) => {
+                    if refine_target.is_none() {
+                        self.bindings.set(&answer.asset_id, State::Absent);
+                    }
+                }
                 Err(error) => {
                     log::warn!("asset {}: {error}", answer.asset_id);
-                    State::Undecodable
+                    if refine_target.is_none() {
+                        self.bindings.set(&answer.asset_id, State::Undecodable);
+                    }
                 }
-            };
-            self.bindings.set(&answer.asset_id, state);
+            }
             self.spent += started.elapsed();
         }
     }
 
-    /// Drops the mapping for textures the renderer evicted.
+    /// Asks the decode pool for the finer uploads the renderer wants.
     ///
-    /// The bytes are gone from the GPU; the hash is still in the document, so the
-    /// entry becomes *unknown* rather than *absent* — the next time the image is on
-    /// screen it is uploaded again from the blob store, which is exactly the
-    /// contract [`TextureManager::evict_to_budget`] documents.
-    pub fn evicted(&mut self, textures: &[TextureId]) {
-        self.bindings.evicted(textures);
+    /// The texture stays resident and drawing throughout — that is the whole difference from
+    /// what this replaced, where the renderer signalled by *destroying* the texture and the
+    /// image fell back to a flat placeholder for the several frames the decode took.
+    fn request_refinements(&mut self, textures: &TextureManager) {
+        let wanted: Vec<vellum_render::Refinement> = textures.wants_refinement().to_vec();
+        for want in wanted {
+            // Decided last frame; the budget sweep may have evicted it since. With no reverse
+            // entry this is not a refinement any more, and `texture`'s ordinary miss path will
+            // request it from scratch.
+            let Some(asset_id) = self.bindings.hash_of(want.texture) else { continue };
+            // The zoom is still moving, so last frame's target is stale. Always take the newest
+            // one, even for a job already in flight: one map write against a second decode.
+            if let Some(target) = self.refining.get_mut(&asset_id) {
+                *target = want.target;
+                continue;
+            }
+            if self.refining.len() >= MAX_REFINEMENTS_IN_FLIGHT {
+                continue;
+            }
+            // Refinement never queues ahead of a first load. An image being refined is on
+            // screen at a slightly soft resolution; one being loaded is a grey rectangle.
+            if self.pool.in_flight() > self.refining.len() {
+                continue;
+            }
+            if self.pool.request(&asset_id) {
+                self.refining.insert(asset_id, want.target);
+            }
+        }
+    }
+
+    /// Brings texture residency back inside its budget, with this frame's visibility in hand.
+    ///
+    /// **Strictly after the last `TextureManager::mark` of the frame.** It used to run inside
+    /// `collect`, which runs at the top of `Painter::paint` — *before* every one of this
+    /// frame's marks — so `evict_to_budget`'s `last_marked < frame` guard was vacuously true
+    /// for every texture and eviction could take an image out from under the list about to be
+    /// built. That is the reference board at a fitted zoom, where the genuinely stale set is
+    /// empty and eviction reaches straight into what is on screen.
+    ///
+    /// Safe to run after the list is built: anything in it was marked this frame, so the guard
+    /// refuses it, and `Renderer::prepare` already tolerates a bind group that has gone.
+    pub fn enforce_budget(&mut self, textures: &mut TextureManager) {
+        let evicted = textures.evict_to_budget();
+        for id in &evicted {
+            if let Some(hash) = self.bindings.hash_of(*id) {
+                self.refining.remove(&hash);
+            }
+        }
+        self.bindings.evicted(&evicted);
     }
 
 }

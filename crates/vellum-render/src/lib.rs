@@ -129,5 +129,5 @@ pub use quad::QuadInstance;
 pub use renderer::Renderer;
 pub use shape::{PolygonArena, ShapeInstance, ShapeStyle};
 pub use text::GlyphInstance;
-pub use texture::{ImageSource, TextureBudget, TextureId, TextureManager, UvRect};
+pub use texture::{ImageSource, Refinement, TextureBudget, TextureId, TextureManager, UvRect};
 pub use view::View;
