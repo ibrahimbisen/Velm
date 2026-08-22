@@ -47,6 +47,7 @@ const FIT_MARGIN: f64 = 0.02;
 
 mod board;
 mod images;
+mod layout;
 mod input;
 mod strokes;
 mod text;
@@ -223,6 +224,11 @@ async fn boot(
 
     let (width, height) = size_of(&canvas, &window);
     let mut camera = Camera::new(ScreenSize::new(width as f64, height as f64));
+    // A camera from the URL, for comparing this against the desktop app at a matched view.
+    // `?zoom=1&cx=…&cy=…` is the browser's `--zoom` and it exists for the same reason: two
+    // screenshots of the same board at different cameras cannot be compared, and eyeballing
+    // "about the same place" is how an hour goes into a difference that was never there.
+    let override_camera = camera_from_url(&window);
     if let Some(bounds) = projection.content_bounds() {
         // ⚠ **A fraction of the rect, not a margin in pixels.** This shipped as `40.0`,
         // meaning eighty-one times the board's own size, which drove the fit below
@@ -230,6 +236,13 @@ async fn boot(
         // in a small clump in the middle, and the round number is the tell. Native's
         // `FIT_MARGIN` is 0.02 and this matches it, so a board opens the same way in both.
         camera.fit_to_rect(bounds, FIT_MARGIN);
+    }
+    if let Some((zoom, centre)) = override_camera {
+        let middle = vellum_scene::ScreenPoint::new(width as f64 / 2.0, height as f64 / 2.0);
+        camera.set_zoom_about(zoom, middle);
+        if let Some((x, y)) = centre {
+            camera.set_center(vellum_scene::WorldPoint::new(x, y));
+        }
     }
 
     let format = surface
@@ -338,6 +351,23 @@ fn make_msaa(
             view_formats: &[],
         })
         .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// `?zoom=`, `?cx=`, `?cy=` — a camera, for comparing against the desktop app.
+fn camera_from_url(window: &web_sys::Window) -> Option<(f64, Option<(f64, f64)>)> {
+    let search = window.location().search().ok()?;
+    let get = |name: &str| -> Option<f64> {
+        search
+            .trim_start_matches('?')
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name)?.parse::<f64>().ok())
+    };
+    let zoom = get("zoom=")?;
+    let centre = match (get("cx="), get("cy=")) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => None,
+    };
+    Some((zoom, centre))
 }
 
 /// The canvas in physical pixels.
@@ -639,28 +669,39 @@ impl Viewer {
                 }
                 _ => {
                     list.push_scene_item(item, &self.camera);
-                    let hash = match &projected.item.kind {
-                        vellum_doc::ItemKind::Image { asset_id, .. } => Some(asset_id.as_str()),
-                        vellum_doc::ItemKind::LinkPreview { thumbnail: Some(h), .. } => {
-                            Some(h.as_str())
-                        }
-                        _ => None,
-                    };
-                    if let Some(hash) = hash
-                        && let Some(texture) = self.images.texture(hash)
+                    // A picture goes in the box `layout` gives it, which for a link card is a
+                    // band at the top rather than the whole card. Drawing it over the card was
+                    // both the stretch and most of the blur: a landscape photo squeezed into a
+                    // portrait rectangle is smeared on one axis by however far the two aspects
+                    // are apart.
+                    if let Some(slot) = layout::picture(projected)
+                        && let Some((texture, source)) = self.images.texture(&slot.hash)
                     {
-                        let origin = self.camera.to_camera_relative(projected.bounds.min);
-                        let size = [
-                            (projected.bounds.width() as f32) * zoom,
-                            (projected.bounds.height() as f32) * zoom,
-                        ];
+                        let origin = self.camera.to_camera_relative(slot.rect.min);
+                        // ⚠ **World units, not screen pixels.** The board view already
+                        // carries the zoom in its clip transform, so multiplying here applies
+                        // it twice: at a fitted 6% every picture was drawn at 6% of its own
+                        // box, which is a handful of pixels and reads as "the images do not
+                        // load". It is also why they were *blurry* rather than merely small —
+                        // `Renderer::observe_detail` derives the demanded texels from
+                        // `size / units_per_pixel`, and the board view's `units_per_pixel` is
+                        // `1/zoom`, so a size already multiplied by the zoom asks for zoom²
+                        // times too few texels and `resolve_detail` dutifully demotes the
+                        // texture to its floor. One wrong multiplication, both symptoms.
+                        let size = [slot.rect.width() as f32, slot.rect.height() as f32];
+                        let uv = if slot.cover {
+                            layout::cover_uv(source, (slot.rect.width(), slot.rect.height()))
+                        } else {
+                            vellum_render::UvRect::FULL
+                        };
+                        // Marked so the renderer's own residency knows it is on screen. The
+                        // budget's eviction guard is `last_marked < frame`, so an unmarked
+                        // texture is indistinguishable from one nobody has looked at in
+                        // minutes.
+                        self.renderer.textures_mut().mark(texture, 0.0);
                         list.push_image(
                             texture,
-                            vellum_render::ImageInstance::new(
-                                origin,
-                                size,
-                                vellum_render::UvRect::FULL,
-                            ),
+                            vellum_render::ImageInstance::new(origin, size, uv),
                         );
                     }
                 }
@@ -674,10 +715,17 @@ impl Viewer {
         // the board. It is the one deliberate departure from `draw.rs`'s ordering, and it is
         // the cheap half of a trade: glyphs live in the **screen** view while quads live in
         // the board view, so drawing text in place ends the quad batch twice per item.
+        let text_colour = vellum_project::theme::Theme::LIGHT.text;
+        let muted = vellum_project::theme::Theme::LIGHT.text_muted;
         for item in &visible {
             let Some(projected) = self.projection.get(item.id) else { continue };
             let Some(styled) = projected.item.kind.text() else { continue };
-            let top_left = self.camera.world_to_screen(projected.bounds.min);
+            // ⚠ **Not the item's own rectangle.** A sticky's words are inset by Miro's own
+            // 8% and centred; a frame's name is small and sits *above* the frame; a card's
+            // words start under its picture band. Using the box for all of them is what put a
+            // sticky's text against its edges and a frame's name enormous across its middle.
+            let Some(slot) = layout::text_slot(projected, text_colour, muted) else { continue };
+            let top_left = self.camera.world_to_screen(slot.rect.min);
             // ⚠ The box is in **world** units, not screen pixels, and this is the whole bug
             // the first version had. Shaping with a world-unit font size against a
             // screen-pixel wrap width means the wrap width moves with the zoom while the
@@ -685,14 +733,7 @@ impl Viewer {
             // visibly changes size and position as you scroll. Shape once in world space;
             // `push_layout`'s `scale` then magnifies the finished layout uniformly, which is
             // how `vellum-app` has always done it.
-            let size = [
-                projected.bounds.width() as f32,
-                projected.bounds.height() as f32,
-            ];
-            // `None` means auto-fit, which the text layer resolves. It is deliberately not
-            // defaulted here: see `TextLayer::queue`.
-            let font_size = projected.item.style.font_size.map(|s| s as f32);
-            let colour = vellum_project::theme::Theme::LIGHT.text;
+            let size = [slot.rect.width() as f32, slot.rect.height() as f32];
             // ⚠ `vellum_doc::StyledText` and `vellum_text::StyledText` are different types:
             // the document's spans carry Miro's rich-text model, the engine's carry what
             // cosmic-text needs. Flattening to plain here is a **known loss** -- bold, links
@@ -708,9 +749,10 @@ impl Viewer {
                 &flattened,
                 [top_left.x as f32, top_left.y as f32],
                 size,
-                font_size,
+                slot.font_size,
                 zoom,
-                colour,
+                slot.color,
+                slot.anchor,
             );
         }
         list.use_view(screen);

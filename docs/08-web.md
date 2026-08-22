@@ -189,17 +189,94 @@ is the whole point of `expect` over `allow` — and trading that for silence on 
 lint does not ship to would be optimising the wrong build. **So do not lint the wasm target
 with `-D warnings`, and do not "fix" this by weakening the native annotation.**
 
-## 7. Still unproven
+## 7. The server, and what it will and will not answer
+
+`velmd serve` puts the three exports behind HTTP. Five routes, every one a `GET`:
+
+    /api/v1/health                    version and liveness — deliberately ungated
+    /api/v1/boards                    id, title, item count
+    /api/v1/boards/{id}/snapshot      Loro bytes, straight into `Board::from_bytes`
+    /api/v1/blobs/{hash}              one picture
+    /                                 the client itself
+
+Four decisions worth not re-deriving:
+
+- **A board is named by its file stem and found by *scanning*, never by joining.** A joined
+  path needs a traversal check that has to be right; a comparison against stems that came out
+  of a directory listing cannot reach anything not already in that directory. `BoardIndex::path`
+  is an absolute server path and is never sent.
+- **A blob's hash is the traversal defence, and it is total.** `Hash: FromStr` decodes exactly
+  64 hex characters, so no spelling of `..` or `/` survives it.
+- **⚠ The token gates the boards, not the client.** Getting this wrong cost a build: with the
+  gate over everything, the page answered `401` to its own `<script type="module">` import and
+  sat on *"Starting…"* for ever. A module fetch and `WebAssembly.instantiateStreaming` fetch
+  their own URLs and cannot be handed a header, so a client behind the gate cannot load
+  itself. The bundle is the same public wasm anyone can build from the repository; the boards
+  are not. It is also why a token may ride in the query string, and why a blob's URL is a base
+  **and a suffix** — the token has to land after the hash.
+- **A public bind with no token is refused before the socket is bound**, so there is no window
+  in which the boards are exposed. The token comes from `$VELMD_TOKEN` and never from a flag,
+  which would put it in `ps` and in shell history; it is compared in constant time; and CORS
+  names one origin and never `*`, since a wildcard beside `Authorization` means any page on
+  the internet can read this person's boards.
+
+**`refuse_live_data` refuses the desktop app's own board directory by name.** `BoardDb::open`
+writes a `-wal` sidecar, so serving a directory is not a passive act, and two live SQLite
+writers over one board is the one thing that actually corrupts one. Prose has said this in
+three places for a while; prose does not stop anybody at one in the morning.
+
+## 8. Measured, on real hardware
+
+Everything below replaces a line that used to read *"unmeasured"*. The board is the user's
+own `products` board — 1,306 items, 26,989 × 15,750 world units — served by `velmd` from a
+copy, opened in Brave on an M2.
+
+| | |
+|---|---|
+| Cold start to a drawn frame | **155 ms**, GPU handshake and board fetch included |
+| Fitted board, 119 frames | median **9.4 ms (106 fps)**, 95th 36.5 ms, worst 63.4 ms |
+| First ten frames | worst **30.9 ms** — shaping and auto-fit, then it settles |
+| Steady-state median | **9.4 ms** |
+| Bundle | 4.6 MB of wasm, 681 KB brotli'd on the first spike |
+| `maxStorageBuffersInVertexStage` | **44** on the user's iPad, 10 on this Mac, against a need of 1 |
+
+`?selftest=perf` produced the frame numbers and reports the **opening** frames separately on
+purpose: that is when every visible block is shaped and every auto-fitted sticky is binary
+searched, and an average over a hundred frames hides exactly the stall a person notices when
+a board opens.
+
+`?selftest=touch` drives five gestures through the page's own listeners and reports what the
+camera did — to the status line *and* back to the serving HTTP server, which is what makes it
+runnable on the iPad by the person holding it. Measured on the fixed build: one finger 4895.7
+world units against 4895.7 wanted, pinch out exactly 3.000×, pinch back in exactly 0.3333×,
+two-finger pan 50.0 px with 0.0 px of sideways lurch, a second finger landing mid-drag 1.5 px.
+A/B'd against the build before it: **4 of 5 fail**.
+
+**⚠ Two of those five only became discriminating on the second attempt**, and that is the more
+useful half. The first version passed the two-finger pan on the broken build, because a shared
+drag slot cancels out over a matched pair of moves — the board lands in the right place having
+lurched half the fingers' separation and back on every event in between. Sampling *between*
+the two moves reports 200.0 px of lurch, the separation exactly. And the second-finger case
+passed because it moved the finger that had just landed, which computes against its own
+position on either build; moving the *other* finger reports a 284.5 px jump.
+
+## 9. Still unproven
 
 Treat these as unknown rather than done:
 
-- **Nothing has yet rendered a board in a browser.** `vellum-render` compiling is not
-  `vellum-render` drawing. The probe page and the `vellum-web` spike are what settle it.
-- **`maxStorageBuffersInVertexStage` on WebKit is unmeasured.** `vellum-render/src/mesh.rs:270`
-  binds a storage buffer to the vertex stage. Core WebGPU allows 8; WebGL2 allows 0; WebGPU
-  *compatibility mode* defaults to 0. If Safari answers 0, `mesh.wgsl` and `shape.wgsl` need
-  rewriting onto uniform buffers and the estimate roughly doubles.
-- **No touch input exists anywhere.** winit's web backend emits `WindowEvent::Touch` and
-  nothing else for a finger, so until that arm is written the iPad shows a board that ignores
-  being touched.
-- **Fitted-board fps, bundle size and iPad jetsam survival are all unmeasured.**
+- **iPad jetsam survival is unmeasured.** wasm linear memory never returns to the OS, so peak
+  becomes permanent, and Safari can kill a background tab with no warning.
+- **The client is a reader.** No editing, no sync, so a board changed on the Mac has to be
+  copied across again for the server to see it. That is the RULE ZERO posture and not a gap to
+  close casually — a tab the OS can kill with no flush, holding the only recent copy of an
+  irreplaceable board, is exactly what RULE ZERO forbids.
+- **Per-run text styling is flattened.** `vellum_doc::StyledText` becomes one plain run, so
+  bold, links and per-run colour do not survive. `draw.rs` does the real conversion per item
+  kind, and that work belongs with the painter rather than here.
+- **Only two item kinds are drawn with their own geometry** — ink and connectors. Everything
+  else falls to `push_scene_item`'s one solid quad plus its picture and its words, which is
+  close for a sticky and a frame and wrong for the 41 SDF shapes and for a link card's real
+  three-voice layout.
+- **The Agent Canvas is absent**, deferred by the user's own direction.
+- **`velmd` has been run on macOS only.** Nothing in it is platform-specific and it is meant
+  for Linux, but "meant for" is not "measured on".

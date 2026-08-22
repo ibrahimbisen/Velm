@@ -5731,7 +5731,9 @@ dependencies = [
  "futures-channel",
  "js-sys",
  "log",
+ "vellum-connect",
  "vellum-doc",
+ "vellum-ink",
  "vellum-project",
  "vellum-render",
  "vellum-scene",
@@ -5749,6 +5751,7 @@ version = "1.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "httparse",
  "serde",
  "serde_json",
  "vellum-doc",

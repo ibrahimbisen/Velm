@@ -104,6 +104,7 @@ struct Greek {
     /// What one character costs, on average, at this size.
     advance: f32,
     color: Rgba,
+    anchor: crate::layout::Anchor,
 }
 
 /// Line height as a multiple of the font size, and average advance as a fraction of it.
@@ -166,6 +167,7 @@ impl TextLayer {
         font_size: Option<f32>,
         zoom: f32,
         color: Rgba,
+        anchor: crate::layout::Anchor,
     ) -> bool {
         if text.is_empty() {
             return false;
@@ -181,6 +183,7 @@ impl TextLayer {
                 characters: text.char_len(),
                 advance: font_size * AVERAGE_ADVANCE * zoom,
                 color,
+                anchor,
             });
             return false;
         }
@@ -202,9 +205,20 @@ impl TextLayer {
         });
         // Rasterised at the size it will actually be drawn, which is what keeps a zoomed-in
         // glyph sharp rather than a magnified small one.
+        // ⚠ The anchor is applied **after** shaping, because centring needs the laid-out
+        // extent and the extent is what shaping produces. Guessing it from the box — which is
+        // the version that does not need a second pass — puts a one-line sticky's words in
+        // the middle of a box sized for four.
+        let placed = match anchor {
+            crate::layout::Anchor::TopLeft => origin,
+            crate::layout::Anchor::Centred => [
+                origin[0] + (size[0] - layout.extent.width).max(0.0) * 0.5 * zoom,
+                origin[1] + (size[1] - layout.extent.height).max(0.0) * 0.5 * zoom,
+            ],
+        };
         self.glyphs
-            .extend(self.engine.atlas_entries(layout, (origin[0], origin[1]), zoom));
-        self.pending.push((key, origin, zoom, color));
+            .extend(self.engine.atlas_entries(layout, (placed[0], placed[1]), zoom));
+        self.pending.push((key, placed, zoom, color));
         true
     }
 
@@ -292,12 +306,28 @@ impl TextLayer {
             // Greeked text is lighter than set text: the bars stand for words, and at full
             // strength a paragraph of them is a black slab where the real thing is grey.
             let ink = block.color.with_alpha(block.color.a * 0.55);
+            // Centred blocks stack their bars from the middle, like the words they stand in
+            // for — a stack pinned to the top of a sticky reads as a different layout, which
+            // makes the board change shape at the zoom where greeking starts.
+            let stack = lines as f32 * block.line_height;
+            let top = match block.anchor {
+                crate::layout::Anchor::TopLeft => block.origin[1],
+                crate::layout::Anchor::Centred => {
+                    block.origin[1] + (block.size[1] - stack).max(0.0) * 0.5
+                }
+            };
             for line in 0..lines {
-                let y = block.origin[1] + line as f32 * block.line_height;
+                let y = top + line as f32 * block.line_height;
                 let last = line + 1 == lines && lines > 1;
                 let width = if last { block.size[0] * GREEK_LAST_LINE } else { block.size[0] };
+                let x = match block.anchor {
+                    crate::layout::Anchor::TopLeft => block.origin[0],
+                    crate::layout::Anchor::Centred => {
+                        block.origin[0] + (block.size[0] - width).max(0.0) * 0.5
+                    }
+                };
                 list.push_quad(vellum_render::QuadInstance::solid(
-                    [block.origin[0], y],
+                    [x, y],
                     [width.max(1.0), height],
                     ink,
                 ));

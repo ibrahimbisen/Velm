@@ -46,7 +46,7 @@ web-time = "1"
 version = "0.3"
 features = [
   "Document", "Window", "Element", "HtmlCanvasElement", "HtmlElement",
-  "Request", "RequestInit", "Response", "Performance",
+  "Request", "RequestInit", "Response", "Performance", "Location",
   "WheelEvent", "PointerEvent", "DomRect", "CssStyleDeclaration",
   "Blob", "ImageBitmap", "OffscreenCanvas", "OffscreenCanvasRenderingContext2d", "ImageData",
 ]

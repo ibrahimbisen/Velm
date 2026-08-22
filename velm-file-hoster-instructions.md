@@ -17,20 +17,27 @@ and the Mac's copy stays exactly as it is afterwards as a permanent fallback.
 ## How the pieces fit
 
 ```
-   the app                              your server
-   https://velm.<your-app-domain>       https://boards.<your-domain>
-   ┌───────────────────────┐            ┌──────────────────────────────┐
-   │  velm.wasm            │            │  velmd                       │
-   │  velm.js              │  ───────►  │  your boards (SQLite)        │
-   │  index.html           │   HTTPS    │  your images (blob store)    │
-   │  holds no data, ever  │            │  only you can sign in        │
-   └───────────────────────┘            └──────────────────────────────┘
-         ▲          ▲          ▲
-      iPad      Windows     any computer
+                       your server
+                       https://boards.<your-domain>
+                       ┌──────────────────────────────────┐
+                       │  velmd                           │
+                       │    the Velm app  (velm.wasm)     │
+        ──── HTTPS ──► │    your boards   (SQLite)        │
+                       │    your images   (blob store)    │
+                       │  one token guards the last two   │
+                       └──────────────────────────────────┘
+    ▲          ▲          ▲
+  iPad      Windows     any computer
 ```
 
-The app is just a program. Your boards never touch it — they go straight from your server to
-whichever browser you are sitting in front of.
+**One address, serving both the app and the boards** — that is the whole hosting decision,
+and it is worth understanding because it removes three separate problems at once. When the
+page and the data come from the same place, the browser never treats one as reaching across
+to the other: no CORS to configure, no mixed-content block, and none of Chrome's new rules
+about public pages talking to private machines.
+
+It also means there is nothing to trust but your own server. The app is not hosted by anyone
+else; your boards are not copied anywhere else.
 
 ---
 
@@ -71,7 +78,7 @@ Both are free. Part 4 does it.
 - You own a domain, or can get a free subdomain.
 
 If your server is a NAS, a Mac or a Windows box, tell us — the shape is identical but steps
-12 and 24 (starting things automatically) are different.
+12 and 25 (starting things automatically) are different.
 
 ---
 
@@ -87,8 +94,8 @@ ssh <you>@<your-server>
 
 ```
 sudo apt update
-sudo apt install -y build-essential curl git pkg-config
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo apt install -y build-essential curl git pkg-config openssl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
 ```
 
@@ -131,20 +138,37 @@ Force-quitting skips that.
 ls ~/Library/Application\ Support/Vellum/boards/*.vellum-wal
 ```
 
-You want **"No such file or directory."** If you see filenames instead, open Velm again and
+You want either **"no matches found"** (which is what Terminal's own shell says) or **"No such
+file or directory."** Both mean the same thing: there are none, and Velm shut down cleanly. If
+you see filenames instead, open Velm again and quit it from the menu, then check again — and if
+they are still there, carry on anyway, because the next steps copy them too and nothing is
+lost either way. If you see filenames instead, open Velm again and
 quit it properly, then check again. If they are still there, carry on — the next steps copy
 them too, so nothing is lost either way.
 
 **7. AUTOMATIC — on the Mac.** Take a fingerprint of every file, so we can prove later that
 the copy arrived intact. This only reads; it does not open a single board:
 
+> **First, build the tool on the Mac.** `~/velm` was created *on the server* in step 4; the
+> Mac has nothing yet, and a Linux binary could not be copied back anyway. From your Velm
+> checkout on the Mac:
+>
+> ```
+> cargo build --release -p velmd
+> ```
+>
+> Every command below that says `velmd` on the Mac means `./target/release/velmd`, run from
+> that checkout.
+
 ```
-~/velm/target/release/velmd manifest \
+./target/release/velmd manifest \
   --data "$HOME/Library/Application Support/Vellum" \
   --out "$HOME/Desktop/velm-manifest.json"
 ```
 
-It prints something like `58 boards, 1,842 files, fingerprinted`.
+It prints something like `45 boards, 3519 files, 1.5 GB, fingerprinted`. **The counts are
+whatever you actually have** — they are for comparing against the next step, not a target to
+hit.
 
 **8. YOU — on the Mac.** Copy everything to the server:
 
@@ -171,7 +195,13 @@ again; it picks up where it left off.
   --manifest /srv/velm/velm-manifest.json
 ```
 
-You want: `58 boards · 1,842 files · 0 mismatches · 0 missing`.
+You want the **last two numbers to be zero**: `… · 0 mismatches · 0 missing`. The board and
+file counts will be whatever step 7 printed; only mismatches and missing files matter here.
+
+> If the only mismatch named is `.DS_Store`, that is a Finder bookkeeping file rather than
+> board content — Finder rewrites it whenever the folder's view changes. Re-run the manifest
+> and the check and it will settle. **A mismatch on anything under `boards/` or `blobs/` is
+> real: stop.**
 
 > **If any number is not zero, stop here and tell us.** Do not continue. Nothing is broken
 > yet at this point, and continuing is how it would become broken.
@@ -195,27 +225,65 @@ things are on it. **Compare a few names against what you see in Velm on the Mac.
 
 ## Part 3 — Run the server
 
-**12. YOU** — install it as a service, so it starts on boot and restarts if it stops.
+**12. YOU** — build the browser client, make the access token, and install the server as a
+service so it starts on boot.
 Replace `<you>` with your username on the server:
+
+First build the browser client, once — the server serves it, but it is not part of the
+server binary:
+
+```
+cd ~/velm
+cargo install wasm-bindgen-cli --version "$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/[",]/,""); print $3; exit}' Cargo.lock)"
+rustup target add wasm32-unknown-unknown
+./scripts/build-web.sh
+```
+
+Then make the secret that stands between a stranger and every board you own. It is a long
+random string rather than a passphrase you invent, because you will never type it — the token
+lives in the bookmark you save in step 19, and opening the address without it shows an empty
+list rather than your boards:
+
+```
+mkdir -p /srv/velm/secret && chmod 700 /srv/velm/secret
+openssl rand -hex 32 > /srv/velm/secret/token
+chmod 600 /srv/velm/secret/token
+cat /srv/velm/secret/token          # copy this; you need it in step 19
+```
+
+Now install the service. Replace `<you>` with your username on the server:
 
 ```
 sudo tee /etc/systemd/system/velmd.service >/dev/null <<'EOF'
 [Unit]
 Description=Velm board server
+Wants=network-online.target
 After=network-online.target
 
 [Service]
+# The token is read from a file rather than written here, so it is not in the unit,
+# not in `systemctl show`, and not in `ps`.
+EnvironmentFile=/srv/velm/secret/velmd.env
 ExecStart=/home/<you>/velm/target/release/velmd serve \
-  --data /srv/velm/data --bind 127.0.0.1:8787
+  --data /srv/velm/data/boards \
+  --blobs /srv/velm/data/blobs \
+  --web /home/<you>/velm/web/dist \
+  --addr 127.0.0.1:8787
 User=<you>
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/srv/velm
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+printf 'VELMD_TOKEN=%s\n' "$(cat /srv/velm/secret/token)" | sudo tee /srv/velm/secret/velmd.env >/dev/null
+sudo chmod 600 /srv/velm/secret/velmd.env
+sudo chown <you> /srv/velm/secret/velmd.env
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now velmd
@@ -226,24 +294,31 @@ sudo systemctl enable --now velmd
 ```
 systemctl status velmd
 curl -s http://127.0.0.1:8787/api/v1/health
+curl -s -H "Authorization: Bearer $(cat /srv/velm/secret/token)" \
+     http://127.0.0.1:8787/api/v1/boards
 ```
 
-You should get a line of JSON with a version and an uptime.
+The first answers `{"velmd":"…","ok":true}` — health is deliberately outside the token, so
+"the server is not running" and "my token is wrong" are two different answers rather than one.
+The second lists your boards. Without the token it answers `401`, which is the point.
 
-`--bind 127.0.0.1` means it currently answers **only on the server itself**. That is
-deliberate. Part 4 is how it becomes reachable, with a certificate and a login in front.
+`--addr 127.0.0.1` means it currently answers **only on the server itself**. That is
+deliberate. Part 4 is how it becomes reachable, with a certificate in front.
 
-**14. YOU** — set the passphrase you will type to sign in. Choose something you can type on a
-touch keyboard but nobody would guess:
+**14. AUTOMATIC** — the server will not let you skip the secret. Bound to anything but
+`127.0.0.1` with no `VELMD_TOKEN` set, it refuses to start and says so, **before the socket is
+open** — so there is no window, however short, in which your boards are on the internet with
+no gate at all. Try it if you like:
 
 ```
-~/velm/target/release/velmd set-passphrase --data /srv/velm/data
-sudo systemctl restart velmd
+~/velm/target/release/velmd serve --data /srv/velm/data/boards --blobs /srv/velm/data/blobs --addr 0.0.0.0:8787
 ```
 
-> ⚠️ **Do not skip this step and do not go to Part 4 without it.** After Part 4 the server is
-> reachable from the internet, and the passphrase is what stands between a stranger and every
-> board you own.
+> ⚠️ **The token guards the boards, not the app.** Anyone who reaches your address can load
+> the Velm client itself, which is the same open-source code as the public repository. What
+> they cannot get without the token is a board, a board's name, a picture, or even the fact
+> that you have any boards. That split is not a compromise: a web page cannot attach a header
+> to its own script and wasm requests, so a client behind the gate could not load itself.
 
 ---
 
@@ -266,7 +341,8 @@ curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
 sudo apt update && sudo apt install -y caddy
 ```
 
-**17. YOU** — tell Caddy about Velm. Replace both placeholder names:
+**17. YOU** — tell Caddy about Velm. Replace `boards.<your-domain>` with the name you
+set up in step 15:
 
 ```
 sudo tee /etc/caddy/Caddyfile >/dev/null <<'EOF'
@@ -286,29 +362,41 @@ curl -s https://boards.<your-domain>/api/v1/health
 
 Seeing JSON here, over `https://`, means the hard part is done.
 
-**18. YOU** — tell velmd which app site is allowed to talk to it. Edit the service file from
-step 12 and add this to the `ExecStart` line:
+**18. AUTOMATIC — there is nothing to configure here, and that is the point.** velmd serves
+the Velm app *and* your boards from the same address, so the browser never treats one as
+talking to the other. That single decision is what makes CORS, mixed content and Chrome's
+Private Network Access rules all stop applying at once. There is an `--app-origin` flag for
+the day you want to host the app somewhere else; you do not need it.
 
-```
---app-origin https://velm.<your-app-domain>
-```
+**19. YOU** — open `https://boards.<your-domain>/?token=<the token from step 12>` on any
+computer. You will see **Your boards**. Click one.
 
-Then:
+The list is every board *file* on the server, so it includes anything sitting in the desktop
+app's **Recently deleted** — nothing is ever removed from disk, which is deliberate. Empty
+Recently deleted on the Mac first if you would rather not see them, then re-run Part 2.
 
-```
-sudo systemctl daemon-reload && sudo systemctl restart velmd
-```
+Then bookmark that link. There is no login form and no session to expire: the link *is* the
+key, and the browser remembers it. Anyone you send that link to can read your boards, so send
+it the way you would send a house key.
 
-Without this, the browser will refuse to let the app read your boards. This is the browser
-protecting you, not a fault.
+**20. YOU** — open the same link on the iPad, in Safari. **iPadOS must be 26 or newer** —
+Safari only gained WebGPU in 26, and on anything older the page loads and the board does not
+draw. One finger pans, two fingers pinch to zoom.
 
-**19. YOU** — open the app site on any computer, enter `https://boards.<your-domain>` as your
-server address, and sign in with the passphrase from step 14. Your boards should be listed.
+> To check the touch handling on your own device rather than taking this document's word for
+> it, add `&selftest=touch` to the link. It drives five gestures through the page's own event
+> handlers and prints a PASS or FAIL line with the numbers it measured.
 
-**20. YOU** — do the same on the iPad, in Safari.
+**21. AUTOMATIC — what you will and will not be able to do.** The browser client is a
+**reader**. You can open any board from any computer, pan, zoom, and see your stickies, frames,
+pictures, pen strokes and connectors. You **cannot yet edit a board in a browser** — the
+desktop app is still the only place a board changes, and until two-way syncing is built, a
+board edited on the Mac has to be copied across again (Part 2) for the server to see the
+change.
 
-**21. YOU — the test that proves it.** Open the same board on both. Move something on the
-iPad. Within about a second it moves on the other computer too.
+That is deliberate rather than unfinished. A browser tab can be killed by the operating system
+with no warning and no chance to save; a client that could edit would, at that moment, be
+holding the only recent copy of a board that cannot be re-imported.
 
 ### Part 4b — Hardening, now that it is reachable from anywhere
 
@@ -327,8 +415,15 @@ sudo ufw allow 443/tcp
 sudo ufw --force enable
 ```
 
-velmd throttles failed sign-in attempts by itself, and it has **no delete route at all** —
-there is no request anyone can send it, signed in or not, that removes a board file.
+velmd has **no delete route at all** — there is no request anyone can send it, with or without
+the token, that removes or changes a board file. Every route that returns anything is a `GET` — it also
+answers a browser's `OPTIONS` preflight with an empty 204 — and a test in its own source tree
+fails the build if code that could unlink or move a file is ever added to it.
+
+It does **not** rate-limit wrong tokens, and it does not need to: the token is 32 random bytes
+and it is compared in constant time, so there is nothing to guess at and nothing to learn from
+how long a wrong guess takes. If you would rather have a limiter anyway, Caddy can do it in
+front — but do not tell yourself you have one when you have not.
 
 ---
 
@@ -343,15 +438,34 @@ properly, because it now holds your newest work.
 **25. YOU** — turn on a nightly backup. Replace `<you>` and the disk path:
 
 ```
+sudo tee /usr/local/bin/velm-backup >/dev/null <<'EOF'
+#!/bin/bash
+# Copy, then prove the copy. Never --delete: one flag is the only way this could
+# destroy something, and there is no version of "tidying up" worth that risk.
+set -euo pipefail
+NIGHT=/mnt/<your-backup-disk>/velm/$(date +%F)
+mkdir -p "$NIGHT"
+# ⚠ velmd is stopped for the copy, and that is not politeness — it opens boards with SQLite,
+# which writes a -wal sidecar, so a file that changes between the copy and the check below
+# reports as a mismatch. A backup that cries wolf teaches you to ignore backup failures,
+# which is worse than having none.
+sudo systemctl stop velmd
+trap 'sudo systemctl start velmd' EXIT
+rsync -a /srv/velm/data/ "$NIGHT/"
+/home/<you>/velm/target/release/velmd manifest --data /srv/velm/data --out /tmp/velm-live.json
+/home/<you>/velm/target/release/velmd verify   --data "$NIGHT" --manifest /tmp/velm-live.json
+EOF
+sudo chmod +x /usr/local/bin/velm-backup
+
 sudo tee /etc/systemd/system/velmd-backup.service >/dev/null <<'EOF'
 [Unit]
 Description=Velm nightly backup
 
 [Service]
 Type=oneshot
-ExecStart=/home/<you>/velm/target/release/velmd backup \
-  --data /srv/velm/data --to /mnt/<your-backup-disk>/velm --verify
-User=<you>
+ExecStart=/usr/local/bin/velm-backup
+# root, because the script stops and starts velmd around the copy.
+User=root
 EOF
 
 sudo tee /etc/systemd/system/velmd-backup.timer >/dev/null <<'EOF'
@@ -377,19 +491,39 @@ sudo systemctl start velmd-backup.service
 journalctl -u velmd-backup.service -n 40
 ```
 
-It reopens every backed-up board and compares it against the live one. You want `0 mismatches`.
+`velmd verify` recomputes the BLAKE3 hash of every file in the backup and compares it against
+a manifest taken from the live directory a moment earlier. You want **`0 mismatches · 0
+missing`**. Anything else: stop and ask, before touching anything.
 
 **27. YOU — the drill. Do this once, now.** A backup nobody has ever restored is a guess, not
 a backup. Restore last night's copy into a scratch folder and open a board from it:
 
 ```
-~/velm/target/release/velmd serve \
-  --data /mnt/<your-backup-disk>/velm/<latest-date> \
-  --bind 127.0.0.1:8788 --read-only
+VELMD_TOKEN=$(cat /srv/velm/secret/token) ~/velm/target/release/velmd serve \
+  --data /mnt/<your-backup-disk>/velm/<latest-date>/boards \
+  --blobs /mnt/<your-backup-disk>/velm/<latest-date>/blobs \
+  --web ~/velm/web/dist \
+  --addr 127.0.0.1:8788
 ```
 
-Point a browser at it and open a board. If it opens and looks right, your backups work. Stop
-that second server with Ctrl-C afterwards.
+Then, **from your own machine**, open a tunnel to the server and point a browser at it. Use
+whatever address you normally `ssh` to — if the server is at home that is its address on your
+local network, **not** `boards.<your-domain>`: step 15 deliberately forwards port 443 only, so
+port 22 is not reachable from outside.
+
+```
+ssh -N -L 8788:127.0.0.1:8788 <you>@<your-server>
+# then open http://127.0.0.1:8788/?token=<your token> in a browser on your own machine
+# `http` on 127.0.0.1 is the one exception browsers make to the rule in the box near the top:
+# a page served from your own machine is always treated as secure.
+```
+
+If a board opens and looks right, your backups work. Stop the second server with Ctrl-C
+afterwards.
+
+> ⚠️ **A restore drill reads the backup; it must never write to it.** `velmd serve` opens
+> boards with SQLite, which writes a small `-wal` file beside each one — harmless on a copy
+> you are testing, and the reason this drill points at the *backup* and never at the Mac.
 
 **28. YOU — offsite, when you are ready.** A fire or a burglary takes both disks in the same
 minute. An encrypted weekly copy to cheap online storage covers that. Ask and we will write
@@ -401,19 +535,42 @@ that step for whichever provider you pick.
 
 - **The Mac's boards are never touched by any of this.** Keep them. Forever.
 - **Never add `--delete` to an rsync involving your boards.**
-- **Never run `velmd` on the Mac pointed at the Mac's own boards folder** while Velm is open.
-  Two programs writing one board file at the same time is the one thing that genuinely
-  corrupts one.
-- **Never expose the server without setting the passphrase** (step 14).
+- **Only `velmd manifest` and `velmd verify` may ever be pointed at the Mac's own folder.**
+  Step 7 does, and it is safe: neither opens a database, they only read and hash. **Never
+  point `velmd serve` or `velmd import` at it.** Those open boards with SQLite, and two
+  programs writing one board file at the same time is the one thing that genuinely corrupts
+  one. `velmd serve` refuses that directory by name rather than trusting this sentence.
+- **Never expose the server without `VELMD_TOKEN` set** (step 12). velmd refuses to start
+  that way, before the socket opens — but know why the refusal is there.
 - If something looks wrong, **stop and ask before tidying anything up.** Nothing here is
   urgent enough to risk a board over.
 
 ## Where things live on the server
 
 ```
-/srv/velm/data/boards/       your boards, one file each
+/srv/velm/data/              the data directory copied from the Mac
+/srv/velm/data/boards/       your boards, one .vellum file each  ← --data points HERE
 /srv/velm/data/blobs/        your images, stored once each by content
-/srv/velm/data/runtime/      the server's lock file and sign-in token
+/srv/velm/data/archives/     your Miro .rtb backups, carried across with everything else
+/srv/velm/secret/token       the 32 random bytes that guard all of it
+/srv/velm/secret/velmd.env   the same value, in the form systemd reads
 /srv/velm/incoming/          the untouched copy that came from the Mac
-/mnt/<your-backup-disk>/     nightly backups
+~/velm/web/dist/             the browser client, built by scripts/build-web.sh
+/mnt/<your-backup-disk>/     nightly backups, one dated folder each
 ```
+
+## What is built, and what is not
+
+Written down so nothing above reads as a promise it does not keep:
+
+| | |
+|---|---|
+| Open your boards from any computer, over HTTPS | **built** |
+| iPad, Safari, one finger to pan and two to pinch | **built** (iPadOS 26+) |
+| Stickies, frames, text, pictures, pen strokes, connectors | **built** |
+| Shapes | **partly** — a filled box in the right colour and the right place; an ellipse or a flowchart form is not yet drawn as its own outline |
+| Bold, links and per-run text colour | **not built** — text draws in one weight and one colour |
+| Editing a board in a browser | **not built** — the desktop app only |
+| Two-way syncing between the Mac and the server | **not built** — Part 2 is how a change crosses today |
+| The Agent Canvas in a browser | **not built**, and deferred by choice |
+| Miro import in a browser | **not built** — it needs the desktop app's importer |

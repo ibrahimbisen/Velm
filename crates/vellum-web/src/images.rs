@@ -46,7 +46,7 @@ struct Decoded {
 enum State {
     /// Fetch or decode is running.
     Pending,
-    Ready(TextureId),
+    Ready(TextureId, (u32, u32)),
     /// Tried and cannot be drawn. **Never retried**: a hash that does not decode this second
     /// will not decode next second either, and asking again once a frame for the life of the
     /// tab is how a missing picture becomes a performance bug.
@@ -83,9 +83,9 @@ impl ImageLayer {
     ///
     /// `None` means "not this frame, ask again" — the same contract `vellum_app::Assets`
     /// offers, which is what lets every caller stay synchronous.
-    pub fn texture(&mut self, hash: &str) -> Option<TextureId> {
+    pub fn texture(&mut self, hash: &str) -> Option<(TextureId, (u32, u32))> {
         match self.states.get(hash) {
-            Some(State::Ready(id)) => return Some(*id),
+            Some(State::Ready(id, source)) => return Some((*id, *source)),
             Some(State::Pending | State::Undecodable) => return None,
             None => {}
         }
@@ -132,9 +132,10 @@ impl ImageLayer {
                 continue;
             }
             let source = ImageSource::new(decoded.width, decoded.height, &decoded.rgba);
+            let dimensions = (decoded.width, decoded.height);
             match textures.upload(device, queue, &source) {
                 Ok(id) => {
-                    self.states.insert(decoded.hash, State::Ready(id));
+                    self.states.insert(decoded.hash, State::Ready(id, dimensions));
                 }
                 Err(error) => {
                     log::warn!("could not upload {}: {error}", decoded.hash);
