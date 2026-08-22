@@ -38,6 +38,7 @@ use vellum_project::project::Projection;
 use vellum_render::{DrawList, Renderer, Rgba, View};
 use vellum_scene::{Camera, ScreenSize, SceneItem};
 
+mod images;
 mod input;
 mod text;
 
@@ -59,6 +60,7 @@ struct Viewer {
     camera: Camera,
     clear: Rgba,
     text: text::TextLayer,
+    images: images::ImageLayer,
 }
 
 thread_local! {
@@ -190,6 +192,7 @@ async fn boot(canvas_id: &str, board_url: &str) -> Result<(), String> {
         camera,
         clear,
         text: text::TextLayer::new()?,
+        images: images::ImageLayer::new("./blobs/"),
     }));
 
     // Prove the board actually drew, rather than trusting that it did.
@@ -441,6 +444,11 @@ impl Viewer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Upload whatever finished decoding since the last frame, before the list is built,
+        // so a picture that arrived is drawn this frame rather than the next one.
+        self.images
+            .drain(&self.device, &self.queue, self.renderer.textures_mut());
+
         let mut list = DrawList::new();
         // Both views are registered up front and flipped between, exactly as `draw.rs` does.
         // Quads live in camera-relative world pixels; **glyphs live in physical screen
@@ -466,6 +474,26 @@ impl Viewer {
         for item in &visible {
             list.push_scene_item(item, &self.camera);
             on_screen.push(item.id);
+        }
+
+        // Pictures, in the board view with the quads.
+        for item in &visible {
+            let Some(projected) = self.projection.get(item.id) else { continue };
+            let hash = match &projected.item.kind {
+                vellum_doc::ItemKind::Image { asset_id, .. } => asset_id.as_str(),
+                vellum_doc::ItemKind::LinkPreview { thumbnail: Some(hash), .. } => hash.as_str(),
+                _ => continue,
+            };
+            let Some(texture) = self.images.texture(hash) else { continue };
+            let origin = self.camera.to_camera_relative(projected.bounds.min);
+            let size = [
+                (projected.bounds.width() as f32) * zoom,
+                (projected.bounds.height() as f32) * zoom,
+            ];
+            list.push_image(
+                texture,
+                vellum_render::ImageInstance::new(origin, size, vellum_render::UvRect::FULL),
+            );
         }
 
         // Shape and queue every visible item's words.

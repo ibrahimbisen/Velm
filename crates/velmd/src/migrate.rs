@@ -154,6 +154,63 @@ pub fn snapshot(board_path: &Path, out: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Copy just the assets one board references, into a directory a client can fetch from.
+///
+/// This is `velmd serve`'s `/blobs/{hash}` route with the HTTP taken off. The blob store is
+/// shared across every board and runs to gigabytes; a client viewing one board needs the
+/// handful it actually names.
+///
+/// The **match has no `_` arm on purpose.** Adding an `ItemKind` that carries an asset hash
+/// then becomes a compile error rather than a board whose pictures silently do not travel —
+/// which is the same rule the blob garbage collector will need and the reason to establish it
+/// here, where getting it wrong costs nothing.
+pub fn export_blobs(board_path: &Path, blobs: &Path, out: &Path) -> anyhow::Result<()> {
+    use vellum_doc::ItemKind;
+
+    let mut db = vellum_store::BoardDb::open(board_path)?;
+    let board = db
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("{} holds no snapshot", board_path.display()))?;
+
+    let mut wanted: BTreeMap<String, ()> = BTreeMap::new();
+    for item in board.items()? {
+        match &item.kind {
+            ItemKind::Image { asset_id, .. } => {
+                wanted.insert(asset_id.clone(), ());
+            }
+            ItemKind::LinkPreview { thumbnail, favicon, .. } => {
+                for hash in [thumbnail, favicon].into_iter().flatten() {
+                    wanted.insert(hash.clone(), ());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    std::fs::create_dir_all(out)?;
+    let (mut copied, mut absent) = (0usize, 0usize);
+    for hash in wanted.keys() {
+        // The store's own layout: two hex characters of shard, then the full hash.
+        let Some(shard) = hash.get(..2) else { continue };
+        let source = blobs.join(shard).join(hash);
+        if !source.is_file() {
+            absent += 1;
+            continue;
+        }
+        let target = out.join(hash);
+        if target.exists() {
+            continue;
+        }
+        std::fs::copy(&source, &target)?;
+        copied += 1;
+    }
+    println!(
+        "{} asset(s) referenced · {copied} copied · {absent} not in the store",
+        wanted.len()
+    );
+    Ok(())
+}
+
 /// Open every board **in the server's own directory** and report what it holds.
 ///
 /// This is the first point in the whole migration where SQLite touches anything, and it is

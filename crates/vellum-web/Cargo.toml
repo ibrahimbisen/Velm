@@ -43,4 +43,5 @@ features = [
   "Document", "Window", "Element", "HtmlCanvasElement", "HtmlElement",
   "Request", "RequestInit", "Response", "Performance",
   "WheelEvent", "PointerEvent", "DomRect", "CssStyleDeclaration",
+  "Blob", "ImageBitmap", "OffscreenCanvas", "OffscreenCanvasRenderingContext2d", "ImageData",
 ]
