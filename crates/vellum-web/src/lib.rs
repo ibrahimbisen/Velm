@@ -112,6 +112,38 @@ fn report(message: &str) {
     }
 }
 
+/// The camera, as a string, for a fixture to read.
+///
+/// The one hop a test outside the wasm module cannot otherwise see. `input.rs` is driven by
+/// DOM events, so the only honest way to check a gesture is to dispatch real events at the
+/// real listeners and then ask what the camera did — which needs a reader, and this is it.
+/// Trap 9's lesson in a second place: a fixture that calls the handler directly starts
+/// downstream of everything that can go wrong between the browser and the handler.
+#[wasm_bindgen]
+pub fn camera_report() -> String {
+    VIEWER.with(|slot| match slot.borrow().as_ref() {
+        Some(viewer) => match viewer.try_borrow() {
+            Ok(viewer) => {
+                let centre = viewer.camera.center();
+                format!("{:.6} {:.3} {:.3}", viewer.camera.zoom(), centre.x, centre.y)
+            }
+            Err(_) => "busy".to_owned(),
+        },
+        None => "none".to_owned(),
+    })
+}
+
+/// Post a fixture's verdict back to whatever served the page.
+///
+/// Same channel as [`report`], and for the same reason: reading a verdict out of the DOM of
+/// a headless browser is a race, and a request either arrives in the server's log or it does
+/// not. A fixture running on the user's own iPad reports through this too.
+#[wasm_bindgen]
+pub fn verdict(line: &str) {
+    log::info!("velm fixture: {line}");
+    report(line);
+}
+
 async fn boot(canvas_id: &str, board_url: &str) -> Result<(), String> {
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;

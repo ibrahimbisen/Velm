@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Velm</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #F2F2F2;
+    /* Stops Safari's rubber-band bounce carrying the whole page while a finger pans. */
+    overscroll-behavior: none;
+  }
+  #canvas {
+    display: block; width: 100vw; height: 100vh;
+    /* The board owns every gesture on it. Without this the browser pans the page instead,
+       and a drag on an iPad scrolls the document out from under the board. */
+    touch-action: none;
+    /* A long press on iOS otherwise raises the system callout — "Copy / Look Up" over a
+       canvas that has no text to copy — and a two-finger pinch otherwise selects. */
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  #velm-status {
+    position: fixed; left: 12px; bottom: 12px;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #656D73; background: rgba(255,255,255,.9);
+    padding: 6px 10px; border-radius: 6px; border: 1px solid #E2E7EA;
+    max-width: calc(100vw - 24px);
+  }
+</style>
+<canvas id="canvas"></canvas>
+<div id="velm-status">Starting…</div>
+<script type="module">
+  import init, * as velm from './vellum_web.js';
+  const status = document.getElementById('velm-status');
+  const params = new URLSearchParams(location.search);
+  try {
+    await init();
+    velm.start('canvas', params.get('board') || './board.bin');
+
+    // A gesture fixture, on request. `?selftest=touch` drives real PointerEvents at the real
+    // canvas and reports what the camera did — the only honest check of an input path, and
+    // the only one that can be run on the iPad by the person holding it.
+    if (params.get('selftest') === 'touch') {
+      const { runTouchFixture } = await import('./selftest.js');
+      // Wait for the board: the fixture reads the camera, and before boot resolves there
+      // is not one. Polling beats a fixed delay — a slow first paint would make a fixed
+      // delay report a failure that is really a race.
+      for (let i = 0; i < 200 && velm.camera_report() === 'none'; i++) {
+        await new Promise(r => setTimeout(r, 50));
+      }
+      runTouchFixture(velm, document.getElementById('canvas'));
+    }
+  } catch (e) {
+    // A wasm failure that only reaches the console is invisible to anyone on a tablet.
+    status.textContent = String(e);
+    console.error(e);
+  }
+</script>
