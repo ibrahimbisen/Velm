@@ -44,6 +44,7 @@ USAGE:
     velmd manifest --data <DIR> --out <FILE>
     velmd verify   --data <DIR> --manifest <FILE>
     velmd import   --from <DIR> --data <DIR>
+    velmd snapshot --board <FILE> --out <FILE>
     velmd --version
 
 Nothing in this program removes a file. Migration copies; it never moves.
@@ -83,6 +84,11 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             let data = flag(args, "--data")?;
             let file = flag(args, "--manifest")?;
             migrate::verify(&data, &file)
+        }
+        "snapshot" => {
+            let board = flag(args, "--board")?;
+            let out = flag(args, "--out")?;
+            migrate::snapshot(&board, &out)
         }
         "import" => {
             let from = flag(args, "--from")?;

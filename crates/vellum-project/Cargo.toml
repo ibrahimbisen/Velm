@@ -1,0 +1,29 @@
+[package]
+name = "vellum-project"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Turning a Velm document into a drawable scene: projection, connector routing, canvas palette."
+
+# Extracted from `vellum-app` so a browser can reach it.
+#
+# These three modules were always pure -- `project.rs` names no application type at all, and
+# `theme.rs`'s only mentions of the app are in comments -- but they lived inside a 60,000-line
+# crate that pulls in winit, a clipboard, a native menu bar and SQLite. A wasm client needs
+# exactly this layer and none of that.
+#
+# Moved rather than copied, and `vellum-app` re-exports the modules under their old paths, so
+# the eight files that say `crate::project::` are unchanged and there is still **one**
+# derivation of how a document becomes a scene. A second copy would drift within a week, and
+# the failure would be silent: clicks landing where the paint is not.
+[dependencies]
+# `theme` converts the chrome's accent choice and an agent's chat colourway into canvas
+# colours, so it genuinely needs both vocabularies. Neither drags anything native in: both
+# crates compile for wasm32, which is exactly what the feature split was for.
+vellum-agent.workspace = true
+vellum-connect.workspace = true
+vellum-doc.workspace = true
+vellum-render.workspace = true
+vellum-scene.workspace = true
+vellum-ui.workspace = true
+wgpu.workspace = true

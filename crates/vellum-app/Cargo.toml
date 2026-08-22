@@ -81,6 +81,7 @@ vellum-ink.workspace = true
 # measurement it deliberately does not do.
 vellum-mindmap.workspace = true
 vellum-render.workspace = true
+vellum-project.workspace = true
 vellum-scene.workspace = true
 vellum-shapes.workspace = true
 vellum-store.workspace = true

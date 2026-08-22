@@ -126,6 +126,34 @@ pub fn import(from: &Path, data: &Path) -> anyhow::Result<()> {
     check_boards(data)
 }
 
+/// Write one board's Loro snapshot to a file.
+///
+/// This is `velmd serve`'s `/snapshot` route with the HTTP taken off, and it is what a
+/// browser client actually consumes: [`vellum_doc::Board::from_bytes`] over these exact
+/// bytes is the whole of the document layer a wasm build needs.
+///
+/// ⚠ **Point it at a copy.** `BoardDb::open` is not read-only -- it runs
+/// `CREATE TABLE IF NOT EXISTS`, may bump `user_version`, and WAL mode creates a `-wal`
+/// sidecar. Harmless on a copy, and not something to do to the only copy of a board that
+/// cannot be re-imported.
+pub fn snapshot(board_path: &Path, out: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(board_path.is_file(), "{} is not a file", board_path.display());
+    let mut db = vellum_store::BoardDb::open(board_path)?;
+    let board = db
+        .load()?
+        .ok_or_else(|| anyhow::anyhow!("{} holds no snapshot", board_path.display()))?;
+    let bytes = board.to_bytes()?;
+    let items = board.items()?.len();
+    std::fs::write(out, &bytes)?;
+    println!(
+        "{} — {items} items, {} KB of snapshot → {}",
+        board.title(),
+        bytes.len() / 1024,
+        out.display()
+    );
+    Ok(())
+}
+
 /// Open every board **in the server's own directory** and report what it holds.
 ///
 /// This is the first point in the whole migration where SQLite touches anything, and it is

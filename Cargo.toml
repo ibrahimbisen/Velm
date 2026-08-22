@@ -165,8 +165,10 @@ vellum-link = { path = "crates/vellum-link", default-features = false }
 vellum-import = { path = "crates/vellum-import" }
 vellum-ink = { path = "crates/vellum-ink" }
 vellum-mindmap = { path = "crates/vellum-mindmap" }
+vellum-project = { path = "crates/vellum-project" }
 vellum-render = { path = "crates/vellum-render" }
 vellum-scene = { path = "crates/vellum-scene" }
+vellum-web = { path = "crates/vellum-web" }
 vellum-shapes = { path = "crates/vellum-shapes" }
 vellum-store = { path = "crates/vellum-store" }
 vellum-table = { path = "crates/vellum-table" }
@@ -241,3 +243,17 @@ strip = false
 # debug build feel broken.
 [profile.dev.package.blake3]
 opt-level = 3
+
+# The browser build.
+#
+# `opt-level = "s"` because bundle size is latency on a phone: every byte is downloaded
+# before anything draws, and `docs/08-web.md` records cold start as the one budget from
+# `docs/01` §3 that a wasm build cannot keep.
+#
+# ⚠ `lto = "thin"`, never "fat". Fat LTO loads every crate's IR into one process at link
+# time, and that is what twice took an 8GB machine down with a kernel panic during a release
+# build. The reason is recorded on `[profile.release]` and applies here identically.
+[profile.web]
+inherits = "release"
+opt-level = "s"
+lto = "thin"

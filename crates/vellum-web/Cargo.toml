@@ -1,0 +1,45 @@
+[package]
+name = "vellum-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Velm in a browser tab: WebGPU canvas, board snapshot over HTTP, pan and zoom."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The whole browser client. It exists so `vellum-app` never grows a `wasm_bindgen`
+# attribute: that crate is 60,000 lines with a window, a clipboard, a native menu bar and
+# SQLite behind it, and none of that can follow us into a tab.
+#
+# What it depends on is the argument for the whole approach -- four crates, all of which
+# already compiled for wasm32 with no changes at all:
+#
+#   vellum-doc      the CRDT document, from snapshot bytes
+#   vellum-project  document -> scene, extracted from vellum-app for exactly this
+#   vellum-scene    the R-tree, the camera, and what is on screen
+#   vellum-render   wgpu, asking for zero features and staying inside Limits::default()
+[dependencies]
+vellum-doc.workspace = true
+vellum-project.workspace = true
+vellum-render.workspace = true
+vellum-scene.workspace = true
+wgpu.workspace = true
+log.workspace = true
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.126"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+console_log = "1"
+web-time = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+  "Document", "Window", "Element", "HtmlCanvasElement", "HtmlElement",
+  "Request", "RequestInit", "Response", "Performance",
+  "WheelEvent", "PointerEvent", "DomRect", "CssStyleDeclaration",
+]

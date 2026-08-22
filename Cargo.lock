@@ -622,6 +622,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "console_log"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86919cef3e37b9356ccf54d4421208c17ecfda01beae61393e7ffd72916c0ef1"
+dependencies = [
+ "log",
+ "web-sys",
+]
+
+[[package]]
 name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5502,6 +5522,7 @@ dependencies = [
  "vellum-ink",
  "vellum-link",
  "vellum-mindmap",
+ "vellum-project",
  "vellum-render",
  "vellum-scene",
  "vellum-shapes",
@@ -5609,6 +5630,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vellum-project"
+version = "1.1.0"
+dependencies = [
+ "vellum-agent",
+ "vellum-connect",
+ "vellum-doc",
+ "vellum-render",
+ "vellum-scene",
+ "vellum-ui",
+ "wgpu",
+]
+
+[[package]]
 name = "vellum-render"
 version = "1.1.0"
 dependencies = [
@@ -5686,6 +5720,26 @@ dependencies = [
  "vellum-connect",
  "vellum-doc",
  "vellum-shapes",
+]
+
+[[package]]
+name = "vellum-web"
+version = "1.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "console_log",
+ "futures-channel",
+ "js-sys",
+ "log",
+ "vellum-doc",
+ "vellum-project",
+ "vellum-render",
+ "vellum-scene",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
+ "wgpu",
 ]
 
 [[package]]

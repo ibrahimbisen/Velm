@@ -49,7 +49,6 @@ pub mod chart;
 pub mod filetree;
 pub mod chrome_pass;
 pub mod compose;
-pub mod connector;
 pub mod decode;
 pub mod draw;
 pub mod edit;
@@ -68,16 +67,19 @@ pub mod mesh;
 pub mod mindmap;
 pub mod note;
 pub mod options;
-pub mod project;
 pub mod session;
 pub mod shapes;
 pub mod shell;
 pub mod snap;
 pub mod surface;
 pub mod table;
+// Re-exported under their old paths so the eight modules that say `crate::project::` are
+// untouched. They live in `vellum-project` now because a browser needs them and does not need
+// the rest of this crate; keeping the paths means there is still one derivation, not two.
+pub use vellum_project::{connector, project, theme};
+
 pub mod text;
 pub mod time;
-pub mod theme;
 pub mod voice;
 pub mod words;
 
