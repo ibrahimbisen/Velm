@@ -827,6 +827,149 @@ impl ActiveState {
     /// One undo group for the batch. A fetch is not a thing the user did, so it should not cost
     /// them a ⌘Z each — and grouping it means one ⌘Z puts the whole batch back if they dislike
     /// what arrived.
+    /// One sync tick: ask if it is time, then merge whatever has come back.
+    ///
+    /// Called every frame, next to [`Self::apply_link_fetches`], because it is the same
+    /// shape — a background answer landing in a channel that the frame loop drains — and the
+    /// same three rules apply to it.
+    ///
+    /// # The order is ask-then-apply, and it is deliberate
+    ///
+    /// A reply asked for on one frame lands on a later one, so draining first would mean the
+    /// answer to *this* frame's question always waited a frame. Asking first costs nothing:
+    /// [`crate::sync::Sync::request`] refuses while one is out.
+    ///
+    /// # ⚠ Not while a gesture is holding an undo group open
+    ///
+    /// The on-canvas caret and the eraser's sweep each hold a Loro undo group open across
+    /// many calls on purpose, so a typed word is one `⌘Z`. Trap 11 is what happens when
+    /// something else opens one meanwhile — and unlike a command, a remote update is **not**
+    /// something the user just asked for, so it must *wait* rather than settle the edit.
+    /// Ending somebody's half-typed sticky because another machine moved a frame is a worse
+    /// bug than the one being avoided. `apply_link_fetches` states this at length; this is
+    /// the second caller of the same rule.
+    ///
+    /// Waiting is free: the guard is **before the drain**, so a reply that cannot be applied
+    /// stays in the channel and lands the moment the gesture ends. Draining and then dropping
+    /// would lose it until the server happened to resend.
+    ///
+    /// # Cost when sync is off
+    ///
+    /// One `Option` test. `--sync-server` is not the default, so for anybody who has not
+    /// asked for this the whole feature is a null check per frame and no thread.
+    pub(crate) fn apply_sync(&mut self) {
+        if self.sync.is_none() {
+            return;
+        }
+        self.attach_sync_to_hot_board();
+
+        // Asked first, and *outside* the group guard: a request is only a question, and
+        // pausing the conversation because somebody is mid-word would make a long edit look
+        // like a disconnection.
+        if self.sync_is_due() {
+            if self.editor.sync_now()
+                && let Some(config) = self.sync.as_mut()
+            {
+                config.asked_at = Some(Instant::now());
+            }
+            self.report_sync_failure();
+        }
+
+        if self.busy_with_a_group() {
+            return;
+        }
+
+        for reply in self.editor.drain_sync() {
+            match reply {
+                crate::sync::SyncReply::Synced { updates, .. } => {
+                    // ⚠ `changes_the_board` rather than applying unconditionally. Once the
+                    // two sides agree every sync answers with nothing, and that is the steady
+                    // state rather than an error — but `apply_remote` goes through
+                    // `Editor::edit`, which reprojects the whole document and asks the
+                    // autosave writer for a delta. On a 1,300-item board, once every three
+                    // seconds, for an update that says nothing happened.
+                    if updates.is_empty() {
+                        continue;
+                    }
+                    if let Err(error) = self.editor.apply_remote(&updates) {
+                        self.failed("merging a change from the server", &error);
+                    } else {
+                        log::debug!("sync: merged {} bytes from the server", updates.len());
+                    }
+                }
+                // Already logged and already backed off by `Sync::drain`. The toast is
+                // `report_sync_failure`'s job, so that a failure noticed here and a failure
+                // noticed there cannot say two different things.
+                crate::sync::SyncReply::Failed { .. } => {}
+            }
+        }
+        self.report_sync_failure();
+    }
+
+    /// Give the board on screen its round trip, if it has not got one.
+    ///
+    /// Lazily, here, rather than at the two places a board opens — and that is the point.
+    /// A tab switch swaps a different [`Editor`] into `self.editor` (`crate::session`), so
+    /// attaching at the open sites would leave every board opened by the *other* route
+    /// silently unsynced. One call, on the frame path, cannot miss a route.
+    ///
+    /// The board's **file stem** is its id, which is what `velmd`'s board list names a board
+    /// by. A board with no path — a bench board, or an import that has not been saved — has
+    /// no id on any server, so it gets nothing rather than a guess.
+    fn attach_sync_to_hot_board(&mut self) {
+        if self.editor.sync_state().is_some() {
+            return;
+        }
+        let Some(config) = self.sync.as_ref() else { return };
+        let Some(id) = self.editor.path().and_then(|path| path.file_stem()).map(|stem| stem.to_string_lossy().into_owned())
+        else {
+            return;
+        };
+        log::info!("sync: {id} <-> {}", config.options.server);
+        self.editor.attach_sync(crate::sync::Sync::new(
+            config.options.server.clone(),
+            config.token.clone(),
+            id,
+        ));
+    }
+
+    /// Whether enough time has passed since the last request.
+    ///
+    /// Separate from [`crate::sync::Sync::is_ready`], which answers a different question —
+    /// *is one already out, and has a failure's backoff elapsed*. Both have to be true, and
+    /// keeping the cadence here is what lets the backoff live entirely in `crate::sync`
+    /// without that module needing to know how often anybody wants to talk.
+    fn sync_is_due(&self) -> bool {
+        let Some(config) = self.sync.as_ref() else { return false };
+        config.asked_at.is_none_or(|at| {
+            at.elapsed().as_secs_f64() >= config.options.period
+        })
+    }
+
+    /// Put a sync failure in front of the user — **once per distinct failure**.
+    ///
+    /// A server that is down fails every attempt, and a toast per attempt is a toast every
+    /// few seconds for as long as the laptop is on the wrong network. So the sentence is
+    /// compared against the last one reported: the first failure is shown, a run of identical
+    /// ones is not, and a *recovery* clears the record so the next real failure is shown
+    /// again. That last clause is the one worth keeping — without it, sync breaking twice in
+    /// an afternoon is announced once.
+    fn report_sync_failure(&mut self) {
+        let latest = self.editor.sync_state().and_then(|sync| sync.last_error()).map(str::to_owned);
+        let Some(config) = self.sync.as_mut() else { return };
+        match latest {
+            Some(detail) if config.reported.as_deref() != Some(detail.as_str()) => {
+                config.reported = Some(detail.clone());
+                // `Toast::error` rather than `failed`, which takes an `anyhow::Error` this
+                // path has not got: `Sync` deliberately hands back a *sentence*, because the
+                // useful thing to show is "connection refused", not a chain of wrappers.
+                self.shell.toast(Toast::error(format!("Sync: {detail}")));
+            }
+            Some(_) => {}
+            None => config.reported = None,
+        }
+    }
+
     pub(crate) fn apply_link_fetches(&mut self) {
         // Ask for what is on screen and missing, then apply whatever has come back. In this
         // order so a card requested on one frame can land on the next.
@@ -7600,7 +7743,7 @@ impl ActiveState {
     /// A sticky dragged **off** its frame, which is where the content used to disappear.
     ///
     /// *"you didnt see it still disappears when i move these things outside of the frame"*,
-    /// with a screenshot of empty selection rings. `draw::clipped_by_frame` hides an item whose
+    /// with a screenshot of empty selection rings. `vellum_project::frame::clipped_by_frame` hides an item whose
     /// ancestor frame no longer intersects it — Miro's behaviour, and right — but Miro also
     /// takes an item *out* of a frame when you drag it out, and nothing here did. The item kept
     /// its parent, kept being clipped, and stopped being drawn while staying perfectly
@@ -12920,7 +13063,7 @@ impl ActiveState {
     /// Which frame each moved item belongs to now.
     ///
     /// **A frame clips its contents, so an item dragged off one and left parented to it simply
-    /// stops being drawn.** `draw::clipped_by_frame` hides any item whose ancestor frame no
+    /// stops being drawn.** `vellum_project::frame::clipped_by_frame` hides any item whose ancestor frame no
     /// longer intersects it — which is Miro's behaviour and right — but Miro also *removes* an
     /// item from a frame when you drag it out, and nothing here did. The result was an item
     /// that still existed, was still selectable and still drew a selection ring around

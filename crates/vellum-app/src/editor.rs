@@ -60,6 +60,19 @@ pub struct Editor {
     /// Kept rather than logged: an edit happens too often to log and the figure is only
     /// interesting next to the frame time it lands in.
     last_reproject: std::time::Duration,
+    /// The round trip to `velmd`, or `None` for a board that syncs with nothing.
+    ///
+    /// **On the editor rather than on `ActiveState`, and that is the whole reason a tab
+    /// switch does not break it.** `crate::session` parks a board by moving its `Editor`
+    /// aside and swaps another in, so anything a board must remember across a switch has to
+    /// live here: put the sync on the hot state instead and every tab change would either
+    /// re-download the whole document or, worse, hand board A's version vector to board B.
+    ///
+    /// ⚠ It is deliberately *not* driven while the board is parked. A parked board cannot be
+    /// edited, so it has nothing to send; what it misses arrives the moment it comes back,
+    /// because [`Self::sync_now`] asks with the board's own current version and the server
+    /// answers with everything since. Nothing accumulates and nothing is lost.
+    sync: Option<crate::sync::Sync>,
 }
 
 impl std::fmt::Debug for Editor {
@@ -126,6 +139,7 @@ impl Editor {
             path: None,
             selection: Vec::new(),
             last_reproject: std::time::Duration::ZERO,
+            sync: None,
         };
         editor.reproject();
         editor
@@ -398,6 +412,84 @@ impl Editor {
         self.autosave
             .as_ref()
             .is_none_or(|autosave| autosave.stats().is_durable())
+    }
+
+    // ----- syncing with velmd ---------------------------------------------
+
+    /// Point this board at a `velmd` server.
+    ///
+    /// The last call wins, and the previous [`crate::sync::Sync`] is dropped — which stops
+    /// its worker, because the worker returns when its `Sender` goes. So re-attaching does
+    /// not leak a thread per attach.
+    pub fn attach_sync(&mut self, sync: crate::sync::Sync) {
+        self.sync = Some(sync);
+    }
+
+    /// What the sync is doing — for the HUD, and for the sentence a failure needs.
+    pub fn sync_state(&self) -> Option<&crate::sync::Sync> {
+        self.sync.as_ref()
+    }
+
+    /// Send one round trip, if one is due. Returns whether it went.
+    ///
+    /// Safe and cheap to call every frame: [`crate::sync::Sync::is_ready`] refuses when one
+    /// is already out or a previous failure's backoff has not elapsed, and refusing costs two
+    /// compares. That is the whole reason this is a per-frame call rather than a timer — a
+    /// timer is a second clock that has to be started, stopped and remembered across a tab
+    /// switch, and this codebase already pays for one of those in the agent runtime.
+    ///
+    /// ⚠ **`vv` and `since` are different questions and the difference is load-bearing.**
+    /// `vv` is what *this* board has, and it decides what comes back. `since` is what the
+    /// *server* had at the last successful round trip, and it decides what goes up. Passing
+    /// one where the other belongs still compiles, still syncs, and quietly sends the entire
+    /// document on every request.
+    pub fn sync_now(&mut self) -> bool {
+        let Some(sync) = self.sync.as_ref() else { return false };
+        if !sync.is_ready() {
+            return false;
+        }
+        // Decoded here, before the board is touched, so the borrow of `self.sync` is over by
+        // the time `request` needs it mutably. `decode_or_empty` rather than `decode`: bytes
+        // that will not parse mean "the server has nothing of ours", which costs one full
+        // upload and self-heals, where a hard error would stop this board syncing for good.
+        let since = vellum_doc::Version::decode_or_empty(sync.since().unwrap_or_default());
+        let vv = self.board.version().encode();
+        let delta = match self.board.export_since(&since) {
+            Ok(delta) => delta,
+            Err(error) => {
+                log::warn!("sync: exporting this board's changes failed ({error})");
+                return false;
+            }
+        };
+        self.sync.as_mut().is_some_and(|sync| sync.request(vv, delta))
+    }
+
+    /// Everything the server has answered since the last call. Never blocks.
+    ///
+    /// ⚠ **The caller must decide whether it may apply these *before* calling this.** A reply
+    /// drained and then dropped is gone until the server happens to resend it, while a reply
+    /// left in the channel arrives on a later frame at no cost. `crate::sync`'s header states
+    /// the rule and `ActiveState::apply_sync` is the one caller that honours it.
+    pub fn drain_sync(&mut self) -> Vec<crate::sync::SyncReply> {
+        self.sync.as_mut().map(crate::sync::Sync::drain).unwrap_or_default()
+    }
+
+    /// Merge an update from the server into this board.
+    ///
+    /// Through [`Self::edit`] rather than around it, so the reproject and the autosave record
+    /// that every other mutation gets happen here too. A remote change that skipped the
+    /// reproject would draw stale *and* hit-test stale, which is the failure `edit`'s own doc
+    /// comment exists to make unforgettable.
+    ///
+    /// **No undo group is opened, and that is correct rather than an omission.**
+    /// [`vellum_doc::Board::apply`] is documented non-undoable: undo covers this peer's own
+    /// edits, so `⌘Z` can never revert work that arrived from somewhere else. A local undo
+    /// deleting a remote edit is the one way a CRDT can still lose somebody's work.
+    pub fn apply_remote(&mut self, updates: &[u8]) -> Result<()> {
+        self.edit(|board| {
+            board.apply(updates)?;
+            Ok(())
+        })
     }
 
     // ----- selection -------------------------------------------------------

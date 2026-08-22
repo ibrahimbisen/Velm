@@ -123,6 +123,22 @@ struct ZoomSweep {
 }
 
 /// Everything that only exists once there is a window.
+/// Where boards sync to, and the little state that keeps the cadence honest.
+///
+/// Separate from [`crate::sync::Sync`], which is one board's round trip: this is the setup —
+/// one server for every board this person opens — plus the two things that stop a per-frame
+/// call being rude. `asked_at` is the cadence, and `reported` is what keeps a server that is
+/// down from raising the same toast every three seconds for the rest of the afternoon.
+pub(crate) struct SyncConfig {
+    pub(crate) options: crate::options::SyncOptions,
+    /// May be empty: velmd needs no token on loopback. See `ActiveState::new`'s warning.
+    pub(crate) token: String,
+    /// When the last round trip was asked for, or `None` before the first.
+    pub(crate) asked_at: Option<Instant>,
+    /// The last failure already put in front of the user.
+    pub(crate) reported: Option<String>,
+}
+
 pub(crate) struct ActiveState {
     pub(crate) window: Arc<Window>,
     pub(crate) surface: crate::surface::Surface,
@@ -143,6 +159,14 @@ pub(crate) struct ActiveState {
     /// keyboard and in the in-app menu, so it is not worth failing a launch over.
     #[cfg(target_os = "macos")]
     pub(crate) menubar: Option<crate::menubar::MenuBar>,
+    /// Where to sync boards, and the bearer token, or `None` when `--sync-server` was not
+    /// given — which is the default and costs nothing.
+    ///
+    /// Held here rather than on the [`Editor`] it configures, because it is a property of
+    /// *this person's setup* and not of any one board: every board they open goes to the
+    /// same server. The `Editor` holds the round trip itself, so a parked board keeps its
+    /// place in the conversation across a tab switch — see `Editor::sync`.
+    pub(crate) sync: Option<SyncConfig>,
     /// Every open board that is **not** the one on screen, so a tab switch is a swap
     /// rather than a reload. See `crate::session` for why the hot board is hoisted out
     /// of it rather than held in it.
@@ -681,7 +705,28 @@ impl Vellum {
         #[cfg(not(feature = "browser"))]
         let browsers = crate::browser_engine::BrowserEngines::unavailable();
 
+        // Resolved once, at startup, rather than per board: the address and the token are a
+        // property of this person's setup. A server given with no token is **allowed and
+        // warned about**, not refused — velmd needs none on loopback and refuses to bind a
+        // public address without one, so an empty token is a legitimate local configuration.
+        // Refusing to start over it would take away the board library, which is the only
+        // screen from which the mistake could be corrected.
+        let sync = self.options.sync.clone().map(|config| {
+            let token = crate::options::sync_token().unwrap_or_default();
+            if token.is_empty() && !crate::options::is_loopback(&config.server) {
+                log::warn!(
+                    "sync: {} is not a loopback address and ${} is not set, so every request \
+                     will be refused. Set it in the shell that launches Velm.",
+                    config.server,
+                    crate::options::TOKEN_VAR
+                );
+            }
+            log::info!("sync: {} every {}s", config.server, config.period);
+            SyncConfig { options: config, token, asked_at: None, reported: None }
+        });
+
         let mut state = ActiveState {
+            sync,
             prompting: None,
             note_editing: None,
             voice_node: None,
@@ -1487,6 +1532,12 @@ impl ActiveState {
         // was behind another one must still land, or the card stays blank until the next time
         // something happens to redraw.
         self.apply_link_fetches();
+
+        // The sync round trip, for the same reason and in the same place: an answer that came
+        // back while the window was behind another one must still land. Before the occlusion
+        // guard, so a board left open on a second monitor keeps up. Two comparisons when
+        // `--sync-server` was not given, which is the default.
+        self.apply_sync();
 
         // The agent pool, for the same reason and one stronger. An occluded window is
         // exactly when agents run longest unattended: events that piled up in a channel

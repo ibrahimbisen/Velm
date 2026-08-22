@@ -63,6 +63,10 @@ use vellum_ink::{Lod, Stroke};
 // the arrangement this repository has paid for three times, because two copies never disagree
 // on the day they are written. `vellum_project::look` owns them; both painters read them.
 pub(crate) use vellum_project::look::grid_step;
+// ⚠ Not defined here any more. An item hidden by the frame it has left is a rule both
+// painters must apply identically or the two applications draw different boards — so it
+// moved down beside `look`, where it also gained the tests it never had in this file.
+use vellum_project::frame::clipped_by_frame;
 use vellum_project::look::{
     CARD_PADDING, FRAME_TITLE_FRACTION, FRAME_TITLE_MAX, FRAME_TITLE_MIN, GRID_DOT,
     MAX_GRID_DOTS, cover_uv, lod_band,
@@ -7971,31 +7975,6 @@ const MINIMAP_INSET: f32 = 6.0;
 /// colour anyway, and the reference board's 596 fit comfortably inside it.
 const MAX_MINIMAP_ITEMS: usize = 2_000;
 
-/// Whether an ancestor frame clips this item away entirely.
-///
-/// Item granularity, not per pixel — see the module's gap note. It is still worth
-/// doing: an item dragged out of a frame stops leaking across the board, which is
-/// the case a viewer actually notices.
-fn clipped_by_frame(projected: &Projected, projection: &Projection) -> bool {
-    let mut parent = projected.parent;
-    // Bounded rather than `while let`: a corrupt document could in principle
-    // describe a cycle, and a render loop is the worst place to discover one.
-    for _ in 0..MAX_NESTING {
-        let Some(id) = parent else { return false };
-        let Some(ancestor) = projection.get(id) else { return false };
-        if matches!(ancestor.item.kind, ItemKind::Frame { .. })
-            && !ancestor.bounds.intersects(&projected.bounds)
-        {
-            return true;
-        }
-        parent = ancestor.parent;
-    }
-    false
-}
-
-/// How deep the containment chain is walked before giving up. Miro's own nesting is
-/// a frame containing a group containing items; 64 is far past anything real.
-const MAX_NESTING: usize = 64;
 
 // `lod_band` is `vellum_project::look::lod_band`, shared with the browser painter. It is
 // quantised so a pan does not re-tessellate 219 strokes every frame, and it rounds **up**:
@@ -8517,82 +8496,7 @@ mod tests {
         }
     }
 
-    /// An item wholly outside its frame is clipped away; one inside it, or one with
-    /// no frame at all, is not.
-    #[test]
-    fn a_frame_clips_only_what_has_left_it() {
-        let mut board = Board::new();
-        let frame = board
-            .add(NewItem::new(
-                ItemKind::Frame {
-                    title: StyledText::plain("Engine bay"),
-                    order: None,
-                    speaker_notes: None,
-                },
-                Placement::new(0.0, 0.0, 1000.0, 800.0),
-            ))
-            .unwrap();
-        let inside = board
-            .add(
-                NewItem::new(
-                    ItemKind::Sticky { text: StyledText::plain("in"), background: None },
-                    Placement::new(100.0, 100.0, 199.0, 228.0),
-                )
-                .with_parent(frame),
-            )
-            .unwrap();
-        let escaped = board
-            .add(
-                NewItem::new(
-                    ItemKind::Sticky { text: StyledText::plain("out"), background: None },
-                    Placement::new(9_000.0, 9_000.0, 199.0, 228.0),
-                )
-                .with_parent(frame),
-            )
-            .unwrap();
-        let loose = board
-            .add(NewItem::new(
-                ItemKind::Sticky { text: StyledText::plain("loose"), background: None },
-                Placement::new(9_000.0, 9_000.0, 199.0, 228.0),
-            ))
-            .unwrap();
 
-        let mut projection = Projection::new();
-        projection.rebuild(&board).unwrap();
-        let clipped = |doc_id| {
-            let id = projection.scene_id(doc_id).unwrap();
-            clipped_by_frame(projection.get(id).unwrap(), &projection)
-        };
-
-        assert!(!clipped(inside));
-        assert!(clipped(escaped), "an item outside its frame was not clipped");
-        assert!(!clipped(loose), "an unparented item was clipped by someone's frame");
-        assert!(!clipped(frame));
-    }
-
-    /// A group is not a frame and does not clip; conflating the two would hide
-    /// anything dragged out of a group.
-    #[test]
-    fn a_group_does_not_clip_its_members() {
-        let mut board = Board::new();
-        let group = board
-            .add(NewItem::new(ItemKind::Group, Placement::new(0.0, 0.0, 100.0, 100.0)))
-            .unwrap();
-        let far = board
-            .add(
-                NewItem::new(
-                    ItemKind::Sticky { text: StyledText::default(), background: None },
-                    Placement::new(9_000.0, 9_000.0, 100.0, 100.0),
-                )
-                .with_parent(group),
-            )
-            .unwrap();
-
-        let mut projection = Projection::new();
-        projection.rebuild(&board).unwrap();
-        let id = projection.scene_id(far).unwrap();
-        assert!(!clipped_by_frame(projection.get(id).unwrap(), &projection));
-    }
 
     /// The three blocks hold three different things, and none of them holds another's.
     ///
