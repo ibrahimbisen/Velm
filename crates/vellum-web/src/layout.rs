@@ -59,12 +59,28 @@ pub struct PictureSlot {
 ///
 /// Explicit, never auto-fitted. A card's text is a label at a fixed scale, and auto-fitting it
 /// makes a short title enormous and a long one microscopic.
+///
+/// ⚠ **Asked of `vellum_project::card`, and it used to be its own arithmetic.** This read
+/// `(height * 0.075).clamp(9.0, 22.0)` while the desktop read
+/// `13.0 * (width / 250).clamp(1.0, 6.0)` — two unrelated derivations of one measurement, in
+/// a client whose whole argument is that it draws the board with the same code. On the
+/// reference board's 250x361 preview that is 22.0 against 13.0: **69% larger type in a tab
+/// than on the Mac**, on every card, with a badge nearly twice the size and a blurb collapsed
+/// from three lines to one. The shared module's own header names this failure as its reason
+/// to exist; the extraction moved the constants and left the number they multiply behind.
+///
+/// ⚠ `Style::font_size` is deliberately **not** consulted, because the desktop does not: it
+/// overwrites that field in the `Style` it hands the shaper, so honouring it here would be the
+/// same divergence arriving by a second route.
+///
+/// `rect()`, not `bounds` — the rotation-expanded AABB would make a turned card set its words
+/// larger than an identical one lying straight.
 pub fn card_font_size(projected: &Projected) -> Option<f32> {
     if !is_card(&projected.item.kind) {
         return None;
     }
-    let explicit = projected.item.style.font_size.map(|size| size as f32);
-    Some(explicit.unwrap_or((projected.bounds.height() * 0.075).clamp(9.0, 22.0) as f32))
+    let (_, (width, _)) = projected.rect();
+    Some(vellum_project::card::base_font_size(width) as f32)
 }
 
 /// Whether this kind draws as a card — one list, so `text_slot`, `card_font_size` and anything

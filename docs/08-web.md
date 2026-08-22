@@ -191,13 +191,21 @@ with `-D warnings`, and do not "fix" this by weakening the native annotation.**
 
 ## 7. The server, and what it will and will not answer
 
-`velmd serve` puts the three exports behind HTTP. Five routes, every one a `GET`:
+`velmd serve` puts the three exports behind HTTP. Six routes, and **one of them writes**:
 
-    /api/v1/health                    version and liveness — deliberately ungated
-    /api/v1/boards                    id, title, item count
-    /api/v1/boards/{id}/snapshot      Loro bytes, straight into `Board::from_bytes`
-    /api/v1/blobs/{hash}              one picture
-    /                                 the client itself
+    GET   /api/v1/health                version and liveness — deliberately ungated
+    GET   /api/v1/boards                id, title, item count, last-modified
+    GET   /api/v1/boards/{id}/snapshot  Loro bytes, straight into `Board::from_bytes`
+    GET   /api/v1/blobs/{hash}          one picture
+    GET   /                             the board picker; the viewer is /index.html
+    POST  /api/v1/boards/{id}/sync      ⚠ the only route that changes a board
+
+⚠ **This table said "five routes, every one a `GET`" after `POST /sync` had shipped**, which
+is the one line in the contract somebody would read before deciding the server is safe to
+expose. It merges rather than replaces — a Loro update cannot remove what it did not add —
+and it takes a labelled restore point before the first change any board ever receives from
+the web, which is what makes the write acceptable at all. Both facts belong in the table, not
+only in the source.
 
 Four decisions worth not re-deriving:
 

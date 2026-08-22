@@ -276,7 +276,7 @@ impl Live {
         // pasted into an issue is the credential riding on the end of it.
         log::info!(
             "velm sync: polling {} every {period:?}",
-            endpoint.split_once("?token=").map_or(endpoint.as_str(), |(url, _)| url)
+            without_token(&endpoint)
         );
         Self { endpoint, period, shared: Rc::new(RefCell::new(Shared::default())) }
     }
@@ -685,6 +685,23 @@ fn backoff_after(failures: u32) -> Duration {
 /// Separate from [`Live::new`] so the two things that are easy to get wrong — a doubled
 /// slash, and where the token goes — are in one place. An empty `server` yields a relative
 /// URL, which is what one-origin hosting wants.
+/// An endpoint with the credential taken off, for anything a person or a log will see.
+///
+/// ⚠ **One function, because the first version of this was a `split_once` inlined at *one* of
+/// the two sites that format an endpoint.** `Live::new`'s log line stripped the token and said
+/// why — *"the last thing that should be pasted into an issue is the credential riding on the
+/// end of it"* — and `round_trip`'s error, one screen down, did not. That error becomes
+/// `Status::reason`, which becomes `Status::line()`, which `sync_status()` hands to
+/// `chrome.js`, which sets it as the **tooltip on the connection indicator**: the secret
+/// guarding 45 irreplaceable boards, displayed on hover, in exactly the state that badge
+/// exists to announce.
+///
+/// Truncated rather than removed, so the sentence still names *which* server failed — an
+/// error naming no address is the report `Sync::endpoint` was kept for in the first place.
+fn without_token(endpoint: &str) -> &str {
+    endpoint.split_once("?token=").map_or(endpoint, |(url, _)| url)
+}
+
 fn endpoint_for(server: &str, board_id: &str, token: Option<&str>) -> String {
     let base = server.trim_end_matches('/');
     let mut url = String::with_capacity(base.len() + board_id.len() + 32);
@@ -791,7 +808,7 @@ async fn round_trip(endpoint: String, body: Vec<u8>) -> Result<Vec<u8>, String> 
         window.fetch_with_str_and_init(&endpoint, &init),
     )
     .await
-    .map_err(|_| format!("could not reach {endpoint}"))?;
+    .map_err(|_| format!("could not reach {}", without_token(&endpoint)))?;
     let response: web_sys::Response =
         response.dyn_into().map_err(|_| "that is not a response".to_owned())?;
 

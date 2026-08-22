@@ -90,6 +90,43 @@ pub const BLURB_SCALE: f64 = 0.86;
 /// tell: air a reader cannot account for is never read as spacing, it is read as a broken card.
 pub const TITLE_LINES: f64 = 3.0;
 
+/// A link card's text size, in world units, at [`LINK_CARD_REFERENCE_WIDTH`].
+///
+/// Fixed rather than auto-fitted, which is the whole difference between a card and a poster: a
+/// card's job is to be legible and small, and auto-fit makes a six-word title fill 190 units of
+/// height. 13 is the design language's body size, and a browser's own link preview and Miro's
+/// card are both within a point of it.
+pub const CARD_FONT_SIZE: f64 = 13.0;
+
+/// The card width [`CARD_FONT_SIZE`] is calibrated for — Miro's own 250, which is also what the
+/// desktop places for a pasted URL and what the reference board's previews are.
+pub const LINK_CARD_REFERENCE_WIDTH: f64 = 250.0;
+
+/// The base size a card of this width sets its text at.
+///
+/// ⚠ **This is the number the whole module exists for, and it was the one thing left behind
+/// when the constants moved down here.** The desktop derived it from the card's **width**;
+/// the browser had its own, unrelated, derived from the **height** —
+/// `(height * 0.075).clamp(9.0, 22.0)`. On the reference board's 250x361 preview that is 13.0
+/// against 22.0: **69% larger type in a tab than on the Mac**, on every card, along with a
+/// badge 38.5 units square against 22.75 and a blurb collapsed from three lines to one.
+///
+/// This module's own header names that failure as its reason to exist — *"a browser card whose
+/// title is set at a different scale from the Mac's is two derivations of one measurement"* —
+/// and the extraction moved the constants and left the number they multiply.
+///
+/// **Width, not height, and the clamp floor of 1.0 matters:** a card narrower than the
+/// reference keeps the reference size rather than shrinking below legibility, and a
+/// deliberately enlarged card enlarges its text with it rather than keeping 13pt type in a
+/// 1000-unit box.
+///
+/// ⚠ **`Style::font_size` is deliberately not consulted.** The desktop overwrites that field
+/// in the `Style` it hands the shaper, so honouring it in one front end and not the other is
+/// the same divergence by a second route.
+pub fn base_font_size(width: f64) -> f64 {
+    CARD_FONT_SIZE * (width / LINK_CARD_REFERENCE_WIDTH).clamp(1.0, 6.0)
+}
+
 /// The most lines of blurb a card will draw.
 ///
 /// *"less decription more white space"*. Unbounded before this, so a tall card gave the blurb
@@ -330,7 +367,26 @@ pub fn estimated_lines(chars: usize, width: f64, size: f64) -> f64 {
 /// beginning of its first line rather than nothing at all.
 pub fn line_budget(width: f64, height: f64, size: f64) -> usize {
     let per_line = chars_per_line(width, size);
-    let lines = ((height / (size * CARD_LINE_HEIGHT)).floor() as usize).max(1);
+    // ⚠ **The same nudge `whole_lines` carries, and it is needed here for the same reason —
+    // the fix landed on one of the two functions that floor this quotient.**
+    //
+    // `stack` builds these boxes by *multiplying* a line height, so a three-line blurb arrives
+    // as exactly `3.0 * L` — and `(3.0 * L) / L` is not 3.0 in IEEE-754. At the reference
+    // card's numbers (250 wide, so a base of 13.0, so `L = 15.093`) the quotient is
+    // 2.9999999999999996, `floor` answers **2**, and a three-line box is handed a two-line
+    // character budget: the blurb is ellipsised a full line early and the room reserved for it
+    // draws nothing. That is the band of empty card the whole reservation change exists to
+    // remove, put back by the clip.
+    //
+    // It survived every test because it does not happen at one or two lines — `2.0 * L` is an
+    // exact float product — so only the three-line case, which is the cap, is wrong. It hits
+    // the title box on the same arithmetic, and it hits **both** front ends, because both ask
+    // this function.
+    //
+    // A relative epsilon rather than an absolute one, for `whole_lines`' reason: the line
+    // height scales with the card, so a tolerance that works at 13 units is useless at 78.
+    const SNAP: f64 = 1e-6;
+    let lines = (((height / (size * CARD_LINE_HEIGHT)) + SNAP).floor() as usize).max(1);
     per_line.saturating_mul(lines).max(per_line)
 }
 
@@ -512,6 +568,40 @@ pub fn says_the_same_as(title: Option<&str>, description: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// ⚠ **A three-line box must be handed a three-line budget.**
+    ///
+    /// `stack` builds these boxes by multiplying a line height, so the cap arrives as exactly
+    /// `3.0 * L` — and `(3.0 * L) / L` is 2.9999999999999996 in IEEE-754 at the reference
+    /// card's numbers. Without the epsilon `floor` answers 2, the blurb is clipped a full
+    /// line early, and the third line of its own box draws nothing.
+    ///
+    /// The A/B is inline: the same quotient without the nudge is asserted to be short, so this
+    /// test fails the moment somebody removes the epsilon as redundant.
+    #[test]
+    fn a_box_built_as_three_lines_is_budgeted_for_three() {
+        // The reference card: 250 wide, so `base_font_size` is 13.0, so a blurb line is
+        // 13.0 * BLURB_SCALE * CARD_LINE_HEIGHT.
+        let size = base_font_size(LINK_CARD_REFERENCE_WIDTH) * BLURB_SCALE;
+        let line = size * CARD_LINE_HEIGHT;
+        let three = line * BLURB_LINES;
+
+        // The unguarded arithmetic really is short — if this stops being true the test below
+        // is no longer testing anything.
+        assert_eq!((three / line).floor() as usize, 2, "the float hazard has gone away");
+
+        let width = LINK_CARD_REFERENCE_WIDTH * 0.93;
+        let per_line = chars_per_line(width, size);
+        assert_eq!(
+            line_budget(width, three, size),
+            per_line * 3,
+            "a three-line box was budgeted for fewer than three lines"
+        );
+
+        // And one and two lines, which were always exact, still answer exactly.
+        assert_eq!(line_budget(width, line, size), per_line);
+        assert_eq!(line_budget(width, line * 2.0, size), per_line * 2);
+    }
+
     // ── strip_site_affix: the two aborts ────────────────────────────────────────────────
 
     /// ⚠ **The reversed range.** `acme-parts.com` names itself `Acme-parts`, whose own hyphen
@@ -523,6 +613,8 @@ mod tests {
     /// pins is not a wrong string, it is no process — so the expected value is the *unchanged*
     /// title, which is what `get` answering `None` correctly degrades to. A card that declines
     /// to shorten its title is the price of a board that opens.
+
+
     #[test]
     fn a_provider_containing_a_separator_does_not_reverse_a_range() {
         let title = "Acme-parts - Brake Discs for the E60";

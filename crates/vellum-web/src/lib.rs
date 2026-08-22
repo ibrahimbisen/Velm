@@ -109,6 +109,22 @@ thread_local! {
     static VIEWER: RefCell<Option<Rc<RefCell<Viewer>>>> = const { RefCell::new(None) };
 }
 
+/// A URL with the credential taken off, for anything a person or a log will see.
+///
+/// ⚠ **These errors go two places, and the second is the one that made this urgent.**
+/// `report` writes the message into `#velm-status` — visible in the corner of the page — and
+/// then sends it to `/velm-report`, which `velmd` prints to its own stdout. So a stale
+/// bookmark to a renamed board, or one dropped packet during boot, put the passphrase on the
+/// screen *and* in the operator's terminal. `boards.js` states the posture this violated:
+/// the passphrase must be "never in a URL, never in history and never in an access log", with
+/// the board link as the one accepted exception. An error string re-sent to a log route is
+/// not that exception.
+///
+/// Truncated rather than removed, because *which* address failed is the whole diagnostic.
+fn without_token(url: &str) -> &str {
+    url.split_once("?token=").map_or(url, |(head, _)| head)
+}
+
 /// Entry point. Called by the page once the canvas exists.
 ///
 /// `board_url` names a source of Loro snapshot bytes — `velmd`'s
@@ -473,10 +489,10 @@ async fn fetch(url: &str) -> Result<Vec<u8>, String> {
     let window = web_sys::window().ok_or("no window")?;
     let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url))
         .await
-        .map_err(|_| format!("could not reach {url}"))?;
+        .map_err(|_| format!("could not reach {}", without_token(url)))?;
     let response: web_sys::Response = response.dyn_into().map_err(|_| "bad response")?;
     if !response.ok() {
-        return Err(format!("{url} answered {}", response.status()));
+        return Err(format!("{} answered {}", without_token(url), response.status()));
     }
     let buffer = wasm_bindgen_futures::JsFuture::from(
         response.array_buffer().map_err(|_| "no body")?,

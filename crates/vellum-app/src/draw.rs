@@ -85,8 +85,7 @@ use vellum_project::card::{
 // moved down beside `look`, where it also gained the tests it never had in this file.
 use vellum_project::frame::clipped_by_frame;
 use vellum_project::look::{
-    CARD_PADDING, FRAME_TITLE_FRACTION, FRAME_TITLE_MAX, FRAME_TITLE_MIN, GRID_DOT,
-    MAX_GRID_DOTS, cover_uv, lod_band,
+    CARD_PADDING, GRID_DOT, MAX_GRID_DOTS, cover_uv, frame_title_size, lod_band,
 };
 use vellum_render::{
     DrawList, DrawStats, GlyphAtlas, ImageInstance, MeshTransform, QuadInstance, Renderer, Rgba,
@@ -2647,7 +2646,12 @@ impl Painter {
                 if title.is_empty() && !caret_here {
                     return None;
                 }
-                let size = (height * FRAME_TITLE_FRACTION).clamp(FRAME_TITLE_MIN, FRAME_TITLE_MAX);
+                // ⚠ Asked, not re-derived. The comment above `TEXT_LAYOUT_BUDGET` has said
+                // this expression is `vellum_project::look::frame_title_size` "shared with the
+                // browser painter" since the constants moved — and it was three constants
+                // inlined here, so the function had *no caller in this crate at all* and the
+                // sharing was a claim rather than a fact.
+                let size = frame_title_size(height);
                 // The shaped size stays in world units — the floor is applied to the *draw
                 // scale* instead, below, for the cache reason `Block::scale` records.
                 min_device_size = FRAME_TITLE_MIN_DEVICE;
@@ -3984,19 +3988,12 @@ fn greek_bar_height(line_height: f64, zoom: f64) -> f64 {
 }
 
 /// Fraction of a card's height taken by its thumbnail.
-/// A link card's text size, in world units, at [`LINK_CARD_REFERENCE_WIDTH`].
-///
-/// Fixed rather than auto-fitted, which is the whole difference between a card and a poster:
-/// a card's job is to be legible and small, and auto-fit makes a six-word title fill 190
-/// units of height. 13 is the design language's body size, and a browser's own link preview
-/// and Miro's card are both within a point of it.
-const CARD_FONT_SIZE: f64 = 13.0;
-/// The card width `CARD_FONT_SIZE` is calibrated for — Miro's own 250, which is also what
-/// `crate::actions::LINK_CARD_SIZE` places and what the reference board's previews are.
-const LINK_CARD_REFERENCE_WIDTH: f64 = 250.0;
+// `CARD_FONT_SIZE`, `LINK_CARD_REFERENCE_WIDTH` and the function over them are
+// `vellum_project::card`'s, shared with the browser painter — which had its own, unrelated,
+// derived from the card's *height*, and drew every card's type 69% larger as a result.
 /// A card's text size at its own width, so the painter and `block` agree on one number.
 pub(crate) fn card_font_size(width: f64) -> f64 {
-    CARD_FONT_SIZE * (width / LINK_CARD_REFERENCE_WIDTH).clamp(1.0, 6.0)
+    vellum_project::card::base_font_size(width)
 }
 
 /// A favicon's corner rounding, in device pixels. Small: an icon is nearly square and a

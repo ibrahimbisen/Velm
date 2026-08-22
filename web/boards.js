@@ -517,16 +517,35 @@ export function mount(options = {}) {
 
   const params = new URLSearchParams(win.location.search);
   let server = resolveServer(win, store, params.get('server'));
-  let token = params.get('token') || store.getToken(server.base) || null;
+  const storedToken = store.getToken(server.base) || null;
+  let token = params.get('token') || storedToken || null;
 
-  // ⚠ A token that arrived in the URL is put away and taken out of the address bar.
+  // ⚠ A token that arrived in the URL is taken out of the address bar, and is stored **only
+  // when there is nothing to overwrite**.
   //
-  // `chrome.js`'s Back button delivers it that way on every return from a board, so without
-  // this the picker's own URL carries the passphrase for the life of the tab — on the borrowed
-  // machine this page is written for, that is the one thing worth not leaving on screen. The
-  // cost is stated rather than hidden: a *new* tab has no session storage and asks again.
+  // Scrubbing is the easy half: `chrome.js`'s Back button delivers the passphrase that way on
+  // every return from a board, so without it the picker's URL carries the secret for the life
+  // of the tab — on the borrowed machine this page is written for, that is the one thing worth
+  // not leaving on screen. The cost is stated rather than hidden: a new tab has no session
+  // storage and asks again.
+  //
+  // Storing it unconditionally was the wrong half, and the case that hurts is not the crafted
+  // link — it is the ordinary one. Rotate the server's token, type the new passphrase here
+  // with *Remember* ticked, then press Back in a board tab you opened before the rotation:
+  // that tab's URL still carries the **old** token, and it was written straight over the new
+  // one. Every visit afterwards 401s for a passphrase already entered correctly, with nothing
+  // on screen to say why.
+  //
+  // It also ran *before* `needsServerConfirmation` had decided whether the `?server=` in the
+  // same link may be used at all — so the gate that exists to make a stranger's link safe did
+  // not cover this write.
+  //
+  // A URL token still works for this visit; it simply does not replace something the user
+  // typed. `connect` below is the only path that overwrites, and that one is a person typing.
   if (params.get('token')) {
-    store.setToken(server.base, token, store.isRemembered(server.base));
+    if (!storedToken) {
+      store.setToken(server.base, token, store.isRemembered(server.base));
+    }
     scrubToken(win);
   }
 

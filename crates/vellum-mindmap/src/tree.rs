@@ -414,7 +414,28 @@ impl MindMap {
     pub fn visible_nodes(&self) -> Vec<NodeId> {
         let mut out = Vec::with_capacity(self.live);
         let mut stack = vec![self.root];
+        // ⚠ **A visited set, because this walk reads a tree that came off a disk.**
+        //
+        // A `MindMap` is `Deserialize`, and `children` round-trips — so a token whose root
+        // lists *itself* as a child parses cleanly, and this loop then pushes the root for
+        // ever while `out` grows without limit. `MindMap::validate` exists and is called from
+        // no production site; `visible_children` filters only on `collapsed`, so nothing
+        // upstream refuses it.
+        //
+        // The consequence is not a wrong drawing, it is the frame never returning: on the
+        // desktop a hang with memory climbing, and in a browser tab the same with no console
+        // anybody can open. A structurally valid but self-referential document is exactly the
+        // shape `WidgetLayer::readable`'s "a token we do not understand degrades rather than
+        // errors" contract does *not* catch, because serde was perfectly happy with it.
+        //
+        // Bounded by the node count rather than trusted: a cycle simply stops, and what has
+        // been collected so far is drawn. That is the degradation this layer promises
+        // everywhere else.
+        let mut seen = std::collections::HashSet::with_capacity(self.live);
         while let Some(v) = stack.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
             out.push(v);
             stack.extend(self.visible_children(v).iter().rev().copied());
         }
@@ -562,6 +583,33 @@ mod tests {
         let a2 = map.add_child(a, Node::new("a2")).unwrap();
         let b = map.add_child(root, Node::new("b")).unwrap();
         (map, [root, a, a1, a2, b])
+    }
+
+
+    /// ⚠ **The module header already promised this, and `visible_nodes` did not keep it.**
+    ///
+    /// *"the traversals below are defensive enough not to hang on a corrupt map"* — true of
+    /// the others and false of that one, which walked a stack with no visited set. `children`
+    /// round-trips through serde, so a map whose root lists **itself** as a child parses
+    /// cleanly, `validate` is called from no production site, and `visible_children` filters
+    /// only on `collapsed`. The loop then pushed the root for ever with `out` growing without
+    /// limit: on the desktop a hang with memory climbing, and in a browser tab the same with
+    /// no console anybody can open.
+    ///
+    /// The test builds the cycle the way the bug arrives — through `serde`, bypassing every
+    /// constructor — rather than by reaching into private fields, because that is the only
+    /// route by which it can happen.
+    #[test]
+    fn a_map_whose_root_is_its_own_child_does_not_hang_the_walk() {
+        let map = MindMap::new("root");
+        let mut json: serde_json::Value = serde_json::to_value(&map).unwrap();
+        let root = serde_json::to_value(map.root()).unwrap();
+        json["slots"][0]["node"]["children"] = serde_json::Value::Array(vec![root]);
+        let cycle: MindMap = serde_json::from_value(json).expect("a cycle deserialises cleanly");
+
+        // Terminates, and hands back what it managed to collect rather than nothing.
+        let visible = cycle.visible_nodes();
+        assert_eq!(visible, vec![cycle.root()], "the root should be reported exactly once");
     }
 
     #[test]
