@@ -60,9 +60,16 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                 // ratio has to be applied or a pan drifts by exactly the device scale.
                 let ratio = web_sys::window().map_or(1.0, |w| w.device_pixel_ratio()).max(1.0);
                 if let Ok(mut viewer) = viewer.try_borrow_mut() {
+                    // ⚠ Not negated. `Camera::pan_by_screen_delta` already does
+                    // `center -= dx / zoom`, so handing it the raw pointer delta is what
+                    // makes the board travel *with* the finger. Negating here inverts it
+                    // twice and the board runs away from the pointer -- which is exactly
+                    // what shipped, and what the user caught in thirty seconds of dragging
+                    // after the pixel-counter had happily reported the frame as correct.
+                    // An assertion about pixels cannot see a sign error in a gesture.
                     viewer
                         .camera
-                        .pan_by_screen_delta(-(nx - x) * ratio, -(ny - y) * ratio);
+                        .pan_by_screen_delta((nx - x) * ratio, (ny - y) * ratio);
                 }
             },
         );
