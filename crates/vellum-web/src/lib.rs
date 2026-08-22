@@ -130,6 +130,14 @@ struct Viewer {
 
 thread_local! {
     static VIEWER: RefCell<Option<Rc<RefCell<Viewer>>>> = const { RefCell::new(None) };
+    /// Whether this board has a server behind it, and so can be edited.
+    ///
+    /// ⚠ **Separate from `VIEWER` on purpose.** It is settled at boot and never changes, so
+    /// answering it from the viewer meant a question with a permanent answer was gated behind
+    /// a borrow the frame loop holds most of the time — and the page, asking once, drew no
+    /// editing interface at all on a board that was perfectly editable. `None` is the window
+    /// before boot finishes and is the only honest "not yet".
+    static EDITABLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// A URL with the credential taken off, for anything a person or a log will see.
@@ -294,10 +302,24 @@ fn with_viewer<T>(fallback: T, f: impl FnOnce(&mut Viewer) -> T) -> T {
 /// to read one `Option`, so it fails only during the frame itself.
 #[wasm_bindgen]
 pub fn can_edit() -> String {
-    VIEWER.with(|slot| {
-        let Some(held) = slot.borrow().clone() else { return "wait".to_owned() };
-        let Ok(viewer) = held.try_borrow() else { return "wait".to_owned() };
-        if viewer.push.is_some() { "yes".to_owned() } else { "no".to_owned() }
+    // ⚠ **Read from a flag, not from the viewer, and that is the third version of this.**
+    //
+    // It answered a `bool` through `try_borrow_mut`, so "a frame is mid-flight" and "no
+    // server" were both `false`. Then it answered three strings through `try_borrow` — and
+    // measured, it still said `"wait"` on **all 100 polls over two seconds**, because the
+    // frame loop holds the inner borrow for the whole of every frame and a `setTimeout`
+    // reliably lands inside one.
+    //
+    // The fix is not a better borrow, it is noticing that this is **not a question about the
+    // viewer's current state**. Whether a board has a server behind it is settled at boot and
+    // never changes, so it belongs in a flag that `boot` writes once — and then the answer
+    // cannot be a coin flip, cannot be timing-dependent, and needs no borrow at all.
+    //
+    // `"wait"` survives for the window before `boot` finishes, which is real.
+    EDITABLE.with(|flag| match flag.get() {
+        Some(true) => "yes".to_owned(),
+        Some(false) => "no".to_owned(),
+        None => "wait".to_owned(),
     })
 }
 
@@ -555,6 +577,8 @@ async fn boot(
     // second derivation could disagree with the first on exactly the boards whose names are
     // not identifiers — which is most of this user's.
     let push = live.as_ref().map(|live| push::Pusher::new(live.endpoint().to_owned()));
+    // Settled here, once, so `can_edit` never has to borrow the viewer to answer it.
+    EDITABLE.with(|flag| flag.set(Some(push.is_some())));
     let viewer = Rc::new(RefCell::new(Viewer {
         device,
         queue,

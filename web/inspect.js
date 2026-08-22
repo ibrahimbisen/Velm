@@ -707,8 +707,15 @@ function numberField(ctx, parent, spec) {
   const input = el('input', 'velm-inspect-num');
   input.type = 'number';
   input.id = id;
-  // A numeric keyboard on a tablet, with a decimal point on it. `type=number` alone gives
-  // iOS a keypad with no minus sign, and a board coordinate is signed.
+  // A numeric keyboard on a tablet rather than the full alphabet.
+  //
+  // ⚠ **It does not solve the minus sign, and saying so is the point.** iOS's decimal keypad
+  // has no `-` key, and neither does its plain numeric one, so a *negative* board coordinate
+  // cannot be typed on the tablet this port exists for. `inputMode: 'text'` would offer one
+  // and would take the numeric keypad away from every other number in the panel, which is
+  // the worse trade for a board whose coordinates are mostly positive. Recorded as a known
+  // gap rather than fixed by guessing: the honest fix is a sign toggle beside the field, and
+  // that is a decision about the layout rather than a line here.
   input.inputMode = 'decimal';
   input.step = 'any';
   input.setAttribute('aria-label', spec.aria || spec.label);
@@ -1184,14 +1191,28 @@ function geometrySection(ctx, body, model) {
       : 'Several objects are selected, so one width and height cannot describe them.')
     : size.why;
 
-  const at = () => ({
-    x: model.x && model.x.state === 'uniform' ? model.x.value : 0,
-    y: model.y && model.y.state === 'uniform' ? model.y.value : 0,
-  });
-  const extent = () => ({
-    w: model.w && model.w.state === 'uniform' ? model.w.value : 0,
-    h: model.h && model.h.state === 'uniform' ? model.h.value : 0,
-  });
+  // ⚠ **Read from the *live* model, not from the one this render was built from**, and that
+  // distinction is the whole of a bug that only appears when two fields are used in a row.
+  //
+  // Enter commits without blurring — deliberately, so X then Tab then Y is one gesture — so
+  // focus never leaves the panel and the rebuild stays deferred for the whole run. The
+  // captured `model` therefore still holds the X the reader has already changed, and pairing
+  // Y's commit against it sends the **old** X back: the second edit silently reverts the
+  // first. Asking the poll's latest copy instead is what makes a chain of edits accumulate
+  // rather than fight.
+  //
+  // The fall-back to the drawn value is for the case where the live property is not uniform;
+  // the commit stamp drops those commits anyway, so this only decides what a doomed message
+  // would have said.
+  const pair = (key) => {
+    const live = ctx.live();
+    const now = live && live[key];
+    if (now && now.state === 'uniform') return now.value;
+    const drawn = model[key];
+    return drawn && drawn.state === 'uniform' ? drawn.value : 0;
+  };
+  const at = () => ({ x: pair('x'), y: pair('y') });
+  const extent = () => ({ w: pair('w'), h: pair('h') });
 
   const grid = el('div', 'velm-inspect-grid');
   if (model.x) {
@@ -1350,7 +1371,10 @@ function readReply(result) {
     return { reason: '' };
   }
   const text = String(result).trim();
-  // The success case, and the most common one.
+  // The success case, and the most common one. An early-out rather than a guard: the
+  // fall-through at the bottom answers `{ reason: '' }` for an empty string too, which the
+  // A/B confirmed by breaking this line and watching nothing go red. It is kept because it
+  // is the branch taken on every successful edit and reading it first says so.
   if (text === '') return { reason: '' };
   if (/^-?\d+$/.test(text)) return { reason: '' };
   if (text.startsWith('{')) {
@@ -1498,6 +1522,9 @@ export function mountInspector(mod, { canvas, open = false } = {}) {
     /// summary's own `unsupported` list; a Map so a control asks once.
     blocked: new Map(),
     stampNow: () => stampOf(session.model),
+    /// The latest summary the poll has read, which is **not** the one the DOM was built from
+    /// whenever a field has focus. `geometrySection` needs it: see the note on `pair`.
+    live: () => session.model,
     note: setNote,
     // Externally tagged, which is serde's default and what `StyleEdit`/`Transform` deserialise
     // from: `{"fill":{"hex":"#ff0000","alpha":255}}`, `{"fill":null}`, `{"locked":true}`,
