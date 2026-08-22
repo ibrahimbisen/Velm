@@ -247,6 +247,18 @@ const ALL_LOCKED: &str = "Everything selected is locked.";
 pub struct Summary {
     /// How many items are selected.
     pub count: usize,
+    /// The one selected item's scene id, or `None` for none or several.
+    ///
+    /// ⚠ **A stable identity for the selection, and the panel needs it to chain two edits.**
+    /// Without it the panel stamps its model with whatever it can see — the count, the kinds,
+    /// the box — and *a successful position edit changes the box*. So typing into X and then
+    /// tabbing to Y made the second field believe the selection had changed underneath it,
+    /// and the edit was refused with a note blaming something that never happened.
+    ///
+    /// A `String` rather than a number because a `SceneId` is a `u64` and JSON numbers are
+    /// doubles: past 2^53 the identity a stamp is built on would start colliding, which is
+    /// the one thing it exists not to do.
+    pub single_id: Option<String>,
     /// The distinct [`ItemKind::tag`] values present, in the order they were first met.
     ///
     /// Tags rather than a composed headline: *"3 sticky notes"* is copy, copy belongs in the
@@ -341,6 +353,7 @@ impl Summary {
     /// An empty selection: no controls, no box, nothing enabled.
     fn empty() -> Self {
         Self {
+            single_id: None,
             count: 0,
             kinds: Vec::new(),
             locked_count: 0,
@@ -536,6 +549,13 @@ pub fn summarise(board: &Board, projection: &Projection, selection: &[SceneId]) 
     }
 
     Summary {
+        // One item, or none. A stamp built on anything an edit can *change* — the box, the
+        // position — is invalidated by a successful edit, which is what made a chained
+        // X-then-Y refuse the second one.
+        single_id: match selection {
+            [only] => Some(only.to_string()),
+            _ => None,
+        },
         count,
         kinds,
         locked_count,

@@ -335,12 +335,37 @@ Everything below was re-checked on 2026-08-22 by running it, not by reading it.
   live Brave tab merged an edit made on the Mac with no reload — `velm sync: merged 1
   update(s)`, fourteen times as the edits streamed in.
 
+### ⚠ The client edits now, and this section used to say it never would
+
+This is the one reversal in the document, so it is written out rather than quietly amended.
+It read: *"The client never sends … read-only is structural rather than conventional. This is
+the RULE ZERO posture and not a gap to close casually — a tab the OS can kill with no flush,
+holding the only recent copy of an irreplaceable board, is exactly what RULE ZERO forbids."*
+
+The user asked for editing, was told that risk, and decided. **The fear was exactly right and
+is what the design answers**, rather than something the decision overruled:
+
+- **Every edit pushes on the frame it happens.** No batching, no timer, no Save button.
+- **The board of record is the server's** — `velmd` runs real SQLite and flushes. The tab
+  holds a working copy, never the only copy.
+- **`velmd` takes a labelled restore point** before the first change any board ever receives
+  from the web. A labelled point is pruned by nothing.
+- **A Loro update merges** — it cannot remove what it did not add, so a bad tab cannot
+  *subtract* from a board.
+- `pagehide` flushes the tail through `sendBeacon`; best effort, and said so.
+
+So the worst case is **losing the last unacknowledged window, never a corrupted board**. The
+sentence above was never what kept boards safe — it stood in for a mechanism that had not been
+built. Measured end to end: a real click selected an item, a real drag moved it,
+`push=saved · 1 push(es)`, and a desktop Velm pointed at the same server took the change after
+snapshotting the board first.
+
+A board served as a static `board.bin` has no server behind it, so `can_edit` answers `"no"`
+and the page draws **no editing interface at all** — an interface whose effects would live and
+die in the tab is a promise this client must not make.
+
 ### Deliberately not built
 
-- **The client never sends.** It receives changes and merges them; there is no delta parameter
-  anywhere in `live.rs`, so read-only is structural rather than conventional. This is the RULE
-  ZERO posture and not a gap to close casually — a tab the OS can kill with no flush, holding
-  the only recent copy of an irreplaceable board, is exactly what RULE ZERO forbids.
 - **The Agent Canvas is absent**, deferred by the user's own direction.
 
 ### Untested rather than working

@@ -12,13 +12,15 @@
 //!   response  [u32 le: length of the version vector][vv bytes][update bytes]
 //! ```
 //!
-//! ⚠ **This client sends no delta, ever, and that is structural rather than a convention.**
+//! ⚠ **This module sends no delta, ever, and that is structural rather than a convention.**
 //! There is no `delta` parameter anywhere in this file: [`request_body`] takes a version
 //! vector and nothing else, so the request it builds is four bytes plus a version and there
-//! is no shape of a send path here for a later change to "finish". `docs/08-web.md` and
-//! RULE ZERO record why the browser is a reader: a tab can be killed by the OS with no
-//! warning and no chance to flush, and a client that could edit would at that moment be
-//! holding the only recent copy of a board that cannot be re-imported.
+//! is no shape of a send path here for a later change to "finish".
+//!
+//! That is a statement about **this file**, not about the client any more. Sending lives in
+//! `crate::push`, deliberately in its own module: the receive half stays a thing that cannot
+//! write however it is later edited, and the write path is one file somebody can read whole
+//! when they want to know what can change a board.
 //!
 //! The reply's own version vector is parsed and **discarded**. `vellum-app`'s `Sync` keeps
 //! the server's version because it has edits of its own to export *since* something; a reader

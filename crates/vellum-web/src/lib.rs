@@ -2,12 +2,36 @@
 //!
 //! # What this is, and deliberately is not
 //!
-//! A **read-only viewer**: it fetches a board's Loro snapshot over HTTP, projects it into a
-//! scene, and draws what the camera can see through WebGPU. Pan and zoom work. Nothing here
-//! can change a board, and that is a safety property rather than a scoping compromise —
-//! `docs/08-web.md` records the reasoning. A browser can kill a background tab with no
-//! warning and no chance to flush; a client that could edit would, at that moment, be
-//! holding the only recent copy of a board that cannot be re-imported.
+//! It fetches a board's Loro snapshot over HTTP, projects it into a scene, draws what the
+//! camera can see through WebGPU, and — since the user asked for it having been told the
+//! risk — **edits it**: select, move, delete, undo, restyle, reorder, search.
+//!
+//! # ⚠ Why editing is safe here, and what makes it so
+//!
+//! This module's header said *"a read-only viewer … nothing here can change a board, and
+//! that is a safety property"* for as long as that was true. It is not the sentence that
+//! kept boards safe; **the sentence was standing in for a mechanism, and the mechanism is
+//! now built**:
+//!
+//! - **Every edit pushes on the frame it happens** — no batching, no timer, no Save button.
+//!   `crate::push` and `after_edit` are where that is enforced.
+//! - **The board of record is the server's.** `velmd` runs real SQLite and flushes; this tab
+//!   holds a working copy.
+//! - **`velmd` takes a labelled restore point** before the first change any board ever
+//!   receives from the web, and a labelled point is pruned by nothing.
+//! - **A Loro update merges.** It cannot remove what it did not add, so a bad tab cannot
+//!   subtract from a board.
+//! - `pagehide` flushes the tail through `sendBeacon` — best effort, and stated as such.
+//!
+//! So the worst case is **losing the last unacknowledged window, never a corrupted board**.
+//! The original fear was exact and remains the thing to design against: a browser can kill a
+//! background tab with no warning and no chance to flush, and a client holding the only
+//! recent copy of an irreplaceable board is what must not exist. It does not, because the
+//! only copy is on the server within a frame of every edit.
+//!
+//! A board served as a static `board.bin` has no server, so `can_edit` answers `"no"` and the
+//! page draws no editing interface at all — an interface whose effects would live and die in
+//! the tab is a promise this client must not make.
 //!
 //! # Why there is no SQLite here
 //!
