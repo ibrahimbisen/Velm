@@ -66,9 +66,16 @@ export function runTouchFixture(mod, canvas) {
     const after = camera(mod);
     const moved = before.x - after.x;
     const expected = 300 * (window.devicePixelRatio || 1) / after.zoom;
-    const ok = moved > expected * 0.6 && Math.abs(after.zoom - before.zoom) < 1e-9;
+    const factor = moved / expected;
+    // ⚠ A **band**, not a floor. `moved > expected * 0.6` catches a *missing* device-ratio
+    // conversion (which halves the pan on a retina screen) and sails past a *doubled* one,
+    // which is the equally likely mistake — the ratio is applied at the call site and could
+    // as easily be folded into the contact as well. On a 1x monitor both bugs are invisible,
+    // so this fixture is the only thing between them and the iPad they show up on.
+    const held = Math.abs(after.zoom - before.zoom) < 1e-9;
+    const ok = factor > 0.8 && factor < 1.25 && held;
     findings.push([ok, `one finger dragged right: world x moved ${moved.toFixed(1)} ` +
-      `(want ~${expected.toFixed(1)}, same sign), zoom held ${after.zoom === before.zoom}`]);
+      `(want ~${expected.toFixed(1)}, ratio ${factor.toFixed(2)}), zoom held ${held}`]);
   }
 
   // 2. Two fingers spreading zoom in, by the ratio of their separation.
@@ -124,9 +131,12 @@ export function runTouchFixture(mod, canvas) {
     const lurch = Math.abs(half.x - before.x) * before.zoom / px;
     const dy = (before.y - after.y) * after.zoom / px;
     const held = Math.abs(after.zoom / before.zoom - 1) < 0.06;
-    const ok = held && dy > 30 && lurch < 20;
-    findings.push([ok, `two fingers moved down 50px: board moved ${dy.toFixed(1)}px down, ` +
-      `lurched ${lurch.toFixed(1)}px sideways mid-gesture (want < 20), zoom held ${held}`]);
+    // Banded for the same reason as finding 1: `dy > 30` against an expected 50 passes on a
+    // doubled ratio, which reports 100.
+    const ok = held && dy > 40 && dy < 62 && lurch < 20;
+    findings.push([ok, `two fingers moved down 50px: board moved ${dy.toFixed(1)}px down ` +
+      `(want ~50), lurched ${lurch.toFixed(1)}px sideways mid-gesture (want < 20), ` +
+      `zoom held ${held}`]);
   }
 
   // 5. A second finger landing mid-drag must not throw the board.
@@ -151,6 +161,44 @@ export function runTouchFixture(mod, canvas) {
     const ok = jump < 20;
     findings.push([ok, `a second finger landing mid-drag moved the board ${jump.toFixed(1)}px ` +
       `on screen (want < 20)`]);
+  }
+
+  // 6. A pinch that scales *and* travels, judged by the world point under the midpoint.
+  //
+  // ⚠ The only gesture that can tell the composition apart from its plausible mistakes, and
+  // none of the five above is one. Findings 2 and 3 are symmetric about a fixed centre, so
+  // the pan term is zero; finding 4 translates without scaling, so the zoom term is 1. The
+  // difference between "zoom about the old midpoint then pan" and either "pan then zoom" or
+  // "zoom about the new midpoint" is exactly `(s-1) × delta` — zero whenever *either* factor
+  // is zero, which is every case above. So all five pass on a build with the terms
+  // transposed.
+  //
+  // The assertion is the property the composition exists to provide: the world point under
+  // the fingers' midpoint does not move.
+  {
+    const px = window.devicePixelRatio || 1;
+    const from = { a: [cx - 60, cy - 60], b: [cx + 60, cy + 60] };
+    const to   = { a: [cx + 40, cy - 160], b: [cx + 280, cy + 80] };
+    const midFrom = [(from.a[0] + from.b[0]) / 2, (from.a[1] + from.b[1]) / 2];
+    const midTo   = [(to.a[0] + to.b[0]) / 2, (to.a[1] + to.b[1]) / 2];
+
+    const before = camera(mod);
+    // The world point under the starting midpoint, computed from the camera rather than
+    // asked of it — the client exposes the camera, not a projection.
+    const canvasW = canvas.width, canvasH = canvas.height;
+    const toWorld = (cam, sx, sy) => [
+      cam.x + (sx * px - canvasW / 2) / cam.zoom,
+      cam.y + (sy * px - canvasH / 2) / cam.zoom,
+    ];
+    const anchored = toWorld(before, midFrom[0], midFrom[1]);
+    twoFingers(canvas, from, to);
+    const after = camera(mod);
+    const landed = toWorld(after, midTo[0], midTo[1]);
+    const drift = Math.hypot(landed[0] - anchored[0], landed[1] - anchored[1]) * after.zoom / px;
+    const scaled = after.zoom / before.zoom;
+    const ok = drift < 6 && scaled > 1.2;
+    findings.push([ok, `a pinch that scaled ${scaled.toFixed(2)}x while travelling left the ` +
+      `world point under the fingers ${drift.toFixed(1)}px from where it started (want < 6)`]);
   }
 
   const failed = findings.filter(([ok]) => !ok);

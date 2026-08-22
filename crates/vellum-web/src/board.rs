@@ -20,10 +20,14 @@ use vellum_scene::{Camera, WorldPoint};
 
 /// A dot's size at a 900-point-tall viewport, scaled from there.
 ///
-/// 1.5, snapped to whole device pixels below. `CLAUDE.md` feedback 11 is the whole story: a
-/// 1.5px dot straddles two device pixels, so partial coverage composited it two shades
-/// lighter than the value asked for, and the dots rendered perfectly and could not be seen.
-const GRID_DOT: f32 = 1.5;
+/// ⚠ **1.0, matching `draw.rs`, and the value is tied to the colour.** This shipped as the
+/// 1.5 of feedback 11 — when the grid was a pale grey and a 1.5px dot straddling two device
+/// pixels composited two shades lighter than asked for. Feedback 27 superseded that: the
+/// token is pure opaque black now, and `Theme::grid`'s own doc says the colour is only
+/// legitimate *because* the dot is one device pixel. Copying the new colour and the old size
+/// draws a 2×2 or 3×3 black square every 14–70 pixels, which is the texture the user asked to
+/// have removed rather than the whisper they asked for.
+const GRID_DOT: f32 = 1.0;
 
 /// The band a grid step is allowed to occupy on screen, in device pixels.
 ///

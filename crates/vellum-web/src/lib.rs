@@ -306,10 +306,12 @@ async fn boot(
         let bounds = viewer.projection.content_bounds();
         match bounds {
             Some(rect) => format!(
-                " · {:.1}% · board {:.0}x{:.0}",
+                " · {:.1}% · board {:.0}x{:.0} at ({:.0}, {:.0})",
                 viewer.camera.zoom() * 100.0,
                 rect.width(),
-                rect.height()
+                rect.height(),
+                viewer.camera.center().x,
+                viewer.camera.center().y
             ),
             None => String::new(),
         }
@@ -598,6 +600,10 @@ impl Viewer {
         // so a picture that arrived is drawn this frame rather than the next one.
         self.images
             .drain(&self.device, &self.queue, self.renderer.textures_mut());
+        // Every distinct zoom mints a whole new set of glyph bitmaps and the engine's cache
+        // has no eviction of its own, so a pinch would otherwise leave one set per frame
+        // resident for the life of the tab.
+        self.text.note_scale(self.camera.zoom() as f32);
 
         let mut list = DrawList::new();
         // Both views are registered up front and flipped between, exactly as `draw.rs` does.
@@ -763,6 +769,11 @@ impl Viewer {
         self.text.flush_greeked(&mut list);
         self.text.retain_visible(&on_screen);
         self.strokes.retain_visible(&on_screen);
+        // ⚠ **After** the list is built, never before. Eviction spares what was marked this
+        // frame, and the marks happen while the list is built — so running it first makes
+        // that guard vacuously true and lets it take a texture the list already references.
+        // `vellum-app` moved this call for exactly that reason.
+        self.images.enforce_budget(self.renderer.textures_mut());
 
         self.renderer.begin_frame();
         self.renderer.prepare(&self.device, &self.queue, &list);

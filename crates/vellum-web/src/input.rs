@@ -72,13 +72,31 @@ fn ratio() -> f64 {
 }
 
 impl Contacts {
-    fn put(&mut self, id: i32, x: f64, y: f64) {
+    /// A new contact, from `pointerdown` and nowhere else.
+    fn press(&mut self, id: i32, x: f64, y: f64) {
+        if !self.moved(id, x, y) {
+            self.down.push(Contact { id, x, y });
+        }
+    }
+
+    /// Update a contact that is already down. Answers whether there was one.
+    ///
+    /// ⚠ **Update-only, and that is the whole of this function's reason to exist.** It used
+    /// to be one insert-or-update called from both handlers, so a `pointermove` from a device
+    /// that had never pressed — a hovering Apple Pencil, a trackpad cursor on an iPad, a mouse
+    /// over a touchscreen — pushed a phantom contact. Two fingers were then "down", so the
+    /// next real move took the pinch arm and computed a ratio against a point that never
+    /// moves; and because only a matching `pointerup` removes a contact and a hovering device
+    /// never sends one, the phantom outlived the gesture and the board panned with the bare
+    /// cursor until the page was reloaded.
+    fn moved(&mut self, id: i32, x: f64, y: f64) -> bool {
         match self.down.iter_mut().find(|c| c.id == id) {
             Some(existing) => {
                 existing.x = x;
                 existing.y = y;
+                true
             }
-            None => self.down.push(Contact { id, x, y }),
+            None => false,
         }
     }
 
@@ -116,7 +134,7 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                 // it does not fire, and without capture it fires on a mouse the moment the
                 // drag reaches the window edge.
                 let _ = target.set_pointer_capture(event.pointer_id());
-                contacts.borrow_mut().put(
+                contacts.borrow_mut().press(
                     event.pointer_id(),
                     event.client_x() as f64,
                     event.client_y() as f64,
@@ -144,11 +162,15 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                 // "gesture start" to latch, and no jump when a third finger lands or lifts.
                 let before_one = contacts.only();
                 let before_pinch = contacts.pinch();
-                contacts.put(
+                // A move for a pointer that never pressed is not a gesture. Ignored, rather
+                // than admitted as a contact — see `Contacts::moved`.
+                if !contacts.moved(
                     event.pointer_id(),
                     event.client_x() as f64,
                     event.client_y() as f64,
-                );
+                ) {
+                    return;
+                }
                 let after_pinch = contacts.pinch();
 
                 let ratio = ratio();
@@ -168,8 +190,15 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                         // `was > PINCH_FLOOR` rather than `> 0.0`: two contacts a hair apart
                         // give an enormous ratio from a one-pixel move, and `zoom_by` refuses
                         // a non-finite factor but happily accepts a merely absurd one.
+                        // Both ends, not just the denominator. A floor on `was` alone let a
+                        // pinch drive the zoom to `MIN_ZOOM`, where `zoom_by` clamps and the
+                        // truncated amount is forgotten — so spreading the fingers back to
+                        // where they started left the board substantially *more* zoomed in
+                        // than before, and repeating the gesture walked it further each time.
+                        // A board opens fitted at about 4%, four times the floor, so an
+                        // ordinary pinch-out reaches it inside one gesture.
                         const PINCH_FLOOR: f64 = 8.0;
-                        if was > PINCH_FLOOR && is > 0.0 {
+                        if was > PINCH_FLOOR && is > PINCH_FLOOR {
                             let anchor =
                                 ScreenPoint::new(mid.0 * ratio, mid.1 * ratio);
                             viewer.camera.zoom_by(is / was, anchor);

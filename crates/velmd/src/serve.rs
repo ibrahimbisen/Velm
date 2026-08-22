@@ -58,6 +58,16 @@ const MAX_CONNECTIONS: usize = 16;
 /// wearing a request's clothes.
 const MAX_HEAD: usize = 16 * 1024;
 
+/// How long a client has to finish sending its request head.
+///
+/// ⚠ A **wall-clock deadline**, not the per-read timeout beside it, and the difference is a
+/// denial of service. `read_head` reads a byte at a time, so a 15-second *read* timeout is
+/// reset by every byte: one byte every fourteen seconds holds a connection for
+/// `MAX_HEAD × 14s` — about sixty-three hours — and sixteen such sockets, at a little over a
+/// byte a second between them, take every slot this server has. No token is needed, because
+/// none of it gets as far as the gate.
+const HEAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct Config {
     pub data: PathBuf,
     pub blobs: PathBuf,
@@ -81,7 +91,10 @@ struct Server {
 
 pub fn run(config: Config) -> anyhow::Result<()> {
     anyhow::ensure!(config.data.is_dir(), "{} is not a directory", config.data.display());
-    refuse_live_data(&config.data)?;
+    // Both, because `BlobStore::open` creates a staging directory inside whatever it is
+    // given — so a `--blobs` pointed at the live store writes into it on the first request,
+    // and the first version checked only `--data`.
+    refuse_live_data(&[&config.data, &config.blobs])?;
     check_exposure(&config)?;
 
     let listener = TcpListener::bind(config.addr)
@@ -114,6 +127,12 @@ pub fn run(config: Config) -> anyhow::Result<()> {
         if live.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
             // Refused rather than queued. A queue that grows without bound is the same
             // failure as no bound at all, just later and harder to see.
+            //
+            // ⚠ The write timeout is set **here**, not only in `serve_one`: this write happens
+            // on the accept thread, so a client that never drains its receive window would
+            // otherwise block the whole listener inside `write_all` with no timeout at all —
+            // the refusal path becoming the outage it exists to prevent.
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
             let _ = respond(&stream, 503, "text/plain", b"velmd is busy\n", None);
             continue;
         }
@@ -134,26 +153,28 @@ pub fn run(config: Config) -> anyhow::Result<()> {
 /// the morning. This is the one mistake with an irreversible outcome — two SQLite writers
 /// over one board — and it has exactly one well-known path, so it is worth checking for by
 /// name rather than trusting the reader.
-fn refuse_live_data(data: &Path) -> anyhow::Result<()> {
-    let Some(home) = std::env::var_os("HOME") else { return Ok(()) };
-    let live = Path::new(&home)
-        .join("Library")
-        .join("Application Support")
-        .join("Vellum")
-        .join("boards");
-    let same = match (data.canonicalize(), live.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    };
-    anyhow::ensure!(
-        !same,
-        "--data points at the desktop app's own board directory ({}).\n\
-         velmd opens boards with SQLite, and two writers over one board file is the one \
-         thing that corrupts one.\n\
-         Copy the directory first:  rsync -av --checksum '{}/' /srv/velm/data/",
-        live.display(),
-        live.display()
-    );
+fn refuse_live_data(paths: &[&Path]) -> anyhow::Result<()> {
+    for path in paths {
+        // ⚠ **Matched on the shape of the path, not against `$HOME`.** The first version read
+        // `HOME`, built the one well-known directory and compared — which meant no `HOME`, no
+        // check. systemd sets none unless the unit says so and `sudo` clears it, so the guard
+        // was disabled in exactly the deployment it was written for. It also degraded to
+        // *allow* when either `canonicalize` failed, which is the wrong direction for a guard
+        // whose failure costs a board.
+        let full = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let text = full.to_string_lossy();
+        let live = text.contains("Application Support/Vellum")
+            || text.contains("Application Support\\Vellum");
+        anyhow::ensure!(
+            !live,
+            "{} is inside the desktop app's own data directory.\n\
+             velmd opens boards with SQLite and creates a staging directory in a blob store, \
+             and two live writers over one board file is the one thing that corrupts one.\n\
+             Copy it first:  rsync -av --checksum '{}/' /srv/velm/data/",
+            full.display(),
+            full.display()
+        );
+    }
     Ok(())
 }
 
@@ -198,7 +219,13 @@ fn serve_one(server: &Server, stream: TcpStream) {
         let _ = respond(&stream, 204, "text/plain", b"", origin.as_deref());
         return;
     }
-    if method != "GET" {
+    // `HEAD` is a `GET` with the body suppressed, which is what every uptime monitor and
+    // `curl -I` sends first. Answering it 405 is the wrong answer to the most common probe,
+    // on a server whose health route exists precisely so an operator can tell "not running"
+    // from "wrong token".
+    let head_only = method == "HEAD";
+    HEAD_ONLY.with(|flag| flag.set(head_only));
+    if method != "GET" && !head_only {
         let _ = respond(&stream, 405, "text/plain", b"this server only answers GET\n", origin.as_deref());
         return;
     }
@@ -259,12 +286,20 @@ fn route(server: &Server, path: &str, query: &str, stream: &TcpStream) -> anyhow
         // be shown to have drawn on a device that cannot be screenshotted — a headless
         // browser, or an iPad in somebody's hands. It is a log line, not a store.
         "/velm-report" => {
-            println!("client: {}", percent_decode(query));
+            // ⚠ **Sanitised, and capped.** This is the only forensic record the server keeps,
+            // and it is written from an unauthenticated request: `percent_decode` faithfully
+            // turns `%0A` into a real newline and `%1b` into ESC, so without this an attacker
+            // can forge lines indistinguishable from velmd's own, clear the operator's
+            // terminal, retitle their window, or fill a redirected log a request at a time.
+            println!("client: {}", printable(&percent_decode(query)));
             respond(stream, 204, "text/plain", b"", origin)
         }
         "/api/v1/boards" => {
-            let _guard = server.boards.lock().map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
-            let body = boards_json(&server.config.data);
+            let body = {
+                let _guard =
+                    server.boards.lock().map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
+                boards_json(&server.config.data)
+            };
             respond(stream, 200, "application/json", body.as_bytes(), origin)
         }
         _ => {
@@ -314,15 +349,21 @@ fn board_by_id(data: &Path, id: &str) -> Option<PathBuf> {
 
 fn snapshot(server: &Server, id: &str, stream: &TcpStream) -> anyhow::Result<()> {
     let origin = server.config.app_origin.as_deref();
-    let _guard = server.boards.lock().map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
-    let Some(path) = board_by_id(&server.config.data, id) else {
-        return respond(stream, 404, "text/plain", b"no such board\n", origin);
+    // ⚠ The lock is scoped to the *database* work and dropped before the write. It exists so
+    // only one board is open at a time, which is a correctness argument about SQLite; holding
+    // it across `respond` turns it into a throughput lock and hands any one slow reader the
+    // ability to stall every board request for the length of the write timeout.
+    let bytes = {
+        let _guard = server.boards.lock().map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
+        let Some(path) = board_by_id(&server.config.data, id) else {
+            return respond(stream, 404, "text/plain", b"no such board\n", origin);
+        };
+        let mut db = BoardDb::open(&path)?;
+        let Some(board) = db.load()? else {
+            return respond(stream, 404, "text/plain", b"that board holds no snapshot\n", origin);
+        };
+        board.to_bytes()?
     };
-    let mut db = BoardDb::open(&path)?;
-    let Some(board) = db.load()? else {
-        return respond(stream, 404, "text/plain", b"that board holds no snapshot\n", origin);
-    };
-    let bytes = board.to_bytes()?;
     respond(stream, 200, "application/octet-stream", &bytes, origin)
 }
 
@@ -383,9 +424,17 @@ fn under(root: &Path, relative: &str) -> Option<PathBuf> {
 /// difference rather than as an early return for the same reason.
 fn same_secret(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
-    let mut difference = (a.len() ^ b.len()) as u8;
-    for i in 0..a.len().max(b.len()) {
-        difference |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    // ⚠ The length is compared **first and honestly**. This used to fold it in as
+    // `(a.len() ^ b.len()) as u8`, and the cast discarded every bit above the low byte — so
+    // the real token followed by 256 NUL bytes compared equal, and `%00` in a query string
+    // delivers them. The token's *length* is not the secret; its bytes are, and those are
+    // still compared without an early return.
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for i in 0..a.len() {
+        difference |= a[i] ^ b[i];
     }
     difference == 0
 }
@@ -418,8 +467,9 @@ fn read_head(stream: &TcpStream) -> Option<(String, String, BTreeMap<String, Str
     let mut reader = BufReader::new(stream);
     let mut buffer = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
+    let began = std::time::Instant::now();
     loop {
-        if buffer.len() >= MAX_HEAD {
+        if buffer.len() >= MAX_HEAD || began.elapsed() > HEAD_DEADLINE {
             return None;
         }
         match reader.read(&mut byte) {
@@ -444,6 +494,16 @@ fn read_head(stream: &TcpStream) -> Option<(String, String, BTreeMap<String, Str
     Some((method, target, headers))
 }
 
+thread_local! {
+    /// Whether the request being answered on this thread was a `HEAD`.
+    ///
+    /// A thread-local rather than a parameter on `respond`, because every one of the dozen
+    /// call sites would otherwise have to thread it through and any one that forgot would
+    /// send a body to a client that asked for none. One connection is one thread here, so
+    /// the scope is exactly right.
+    static HEAD_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn respond(
     mut stream: &TcpStream,
     status: u16,
@@ -461,14 +521,21 @@ fn respond(
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
-    let mut head = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: {content_type}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         X-Content-Type-Options: nosniff\r\n",
-        body.len()
-    );
+    // A 204 carries neither, per RFC 9110 §6.4.1 — and the one 204 that matters is the CORS
+    // preflight, which has to survive an intermediary untouched or the cross-origin path
+    // stops working entirely.
+    let mut head = if status == 204 {
+        format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n")
+    } else {
+        format!(
+            "HTTP/1.1 {status} {reason}\r\n\
+             Content-Type: {content_type}\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             X-Content-Type-Options: nosniff\r\n",
+            body.len()
+        )
+    };
     if let Some(origin) = origin {
         // Named explicitly, never `*`: a wildcard and `Authorization` together mean any page
         // on the internet can read this person's boards from their browser.
@@ -481,7 +548,9 @@ fn respond(
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes())?;
-    stream.write_all(body)?;
+    if !HEAD_ONLY.with(std::cell::Cell::get) {
+        stream.write_all(body)?;
+    }
     stream.flush()?;
     Ok(())
 }
@@ -521,6 +590,23 @@ fn sniff(bytes: &[u8]) -> &'static str {
         [b'%', b'P', b'D', b'F', ..] => "application/pdf",
         _ => "application/octet-stream",
     }
+}
+
+/// One line, with no control characters in it, bounded.
+///
+/// **Control characters are the danger, not non-ASCII.** A newline forges a log line, ESC
+/// drives the operator's terminal, and this is written from an unauthenticated request — but
+/// the client's own reports are full of `·` and `×`, and mangling those to make the filter
+/// simpler would cost the diagnostic to buy nothing. So the rule is exactly the hazard:
+/// anything `char::is_control` becomes a `.`, and the whole line is capped.
+fn printable(raw: &str) -> String {
+    const MAX: usize = 1000;
+    let mut out: String =
+        raw.chars().take(MAX).map(|c| if c.is_control() { '.' } else { c }).collect();
+    if raw.chars().nth(MAX).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 fn percent_decode(raw: &str) -> String {
@@ -657,6 +743,44 @@ mod tests {
         for public in ["/", "/index.html", "/vellum_web.js", "/vellum_web_bg.wasm", "/selftest.js"] {
             assert!(!needs_token(public), "{public} was gated, so the client cannot load itself");
         }
+    }
+
+    /// ⚠ The NUL-padded token that used to authenticate.
+    ///
+    /// `(a.len() ^ b.len()) as u8` is zero whenever the lengths differ by a multiple of 256,
+    /// and the loop padded the shorter side with zero bytes — so the real token followed by
+    /// 256 NULs compared equal, and `%00` in a query string delivers them.
+    #[test]
+    fn a_token_with_padding_after_it_is_not_the_token() {
+        let token = "a".repeat(64);
+        let padded = format!("{token}{}", "\0".repeat(256));
+        assert!(!same_secret(&padded, &token), "a 256-NUL suffix authenticated");
+        assert!(!same_secret(&format!("{token}x"), &token));
+        assert!(same_secret(&token, &token));
+    }
+
+    /// A log line written from an unauthenticated request cannot forge a line, clear a
+    /// terminal, or run past its bound.
+    #[test]
+    fn a_client_report_cannot_write_control_characters_into_the_log() {
+        let forged = printable("ok\nvelmd: /api/v1/boards: token accepted");
+        assert!(!forged.contains('\n'), "a newline survived: {forged}");
+        assert!(!printable("\u{1b}[2J").contains('\u{1b}'), "an escape survived");
+        assert!(printable(&"x".repeat(9999)).chars().count() <= 1001);
+        // A legitimate report keeps its own punctuation: the filter is about control
+        // characters, and mangling `·` would cost the diagnostic to buy nothing.
+        assert_eq!(printable("1306 items · 6.1% · 106fps"), "1306 items · 6.1% · 106fps");
+    }
+
+    /// ⚠ The guard is on the *shape* of the path, so it holds with no `HOME` at all — which
+    /// is every systemd deployment, and was the whole hole.
+    #[test]
+    fn the_desktop_apps_own_directory_is_refused_however_home_is_set() {
+        let live = Path::new("/Users/someone/Library/Application Support/Vellum/boards");
+        let blobs = Path::new("/Users/someone/Library/Application Support/Vellum/blobs");
+        assert!(refuse_live_data(&[live]).is_err(), "--data was allowed at the live directory");
+        assert!(refuse_live_data(&[blobs]).is_err(), "--blobs was allowed at the live store");
+        assert!(refuse_live_data(&[Path::new("/srv/velm/data/boards")]).is_ok());
     }
 
     #[test]

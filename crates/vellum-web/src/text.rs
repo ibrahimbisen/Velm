@@ -58,6 +58,16 @@ pub struct TextLayer {
     glyphs: Vec<(GlyphKey, GlyphImage)>,
     /// Blocks too small to shape, drawn as bars on the type's rhythm.
     greeked: Vec<Greek>,
+    /// The zoom the glyph bitmaps in the engine were rasterised for.
+    ///
+    /// ⚠ **A `GlyphKey` carries the device size and the subpixel phase**, so every distinct
+    /// zoom mints a whole new set of them, and `TextEngine`'s bitmap cache has no eviction of
+    /// its own — its own doc says so and names `forget_glyph_bitmaps` as the release valve.
+    /// Without this field the valve is never pulled: a pinch produces a fresh zoom on every
+    /// frame of the gesture, and on wasm linear memory never returns to the OS, so the peak
+    /// of one pinch becomes the tab's footprint for the rest of its life. `draw.rs` keeps
+    /// exactly this field for exactly this reason.
+    last_scale: f32,
     /// What was queued this frame, in the order it should draw.
     ///
     /// One list rather than the caller holding a parallel one: the key a block was shaped
@@ -128,6 +138,7 @@ impl TextLayer {
             fitted: HashMap::new(),
             glyphs: Vec::new(),
             greeked: Vec::new(),
+            last_scale: 0.0,
             pending: Vec::new(),
         })
     }
@@ -137,8 +148,13 @@ impl TextLayer {
     /// Without this the cache is a leak with a slow fuse: pan across a large board and every
     /// block ever visible stays shaped, holding its glyph bitmaps, for the life of the tab —
     /// and wasm linear memory never returns to the OS, so the peak becomes permanent.
+    /// ⚠ No early return on a size. It used to skip while `layouts.len() < 512`, and
+    /// `fitted` was gated on the same number — but a greeked block never inserts into
+    /// `layouts`, so on a fitted board `layouts` stays at **zero**, the guard fires every
+    /// frame, and `fitted` grows by one per auto-fitted item ever seen and is never released.
+    /// On a board with fewer than 512 text items neither map ever pruned at all.
     pub fn retain_visible(&mut self, visible: &[SceneId]) {
-        if self.layouts.len() < 512 {
+        if self.layouts.is_empty() && self.fitted.is_empty() {
             return;
         }
         let live: std::collections::HashSet<SceneId> = visible.iter().copied().collect();
@@ -172,21 +188,31 @@ impl TextLayer {
         if text.is_empty() {
             return false;
         }
-        let font_size = self.resolve_size(item, generation, text, size, font_size);
+        // ⚠ The greek test comes **before** the fit, on an upper bound taken from the box,
+        // and the order is the whole point: resolving an auto-fitted size is a binary search
+        // that shapes the text about eleven times, and greeking exists precisely to avoid
+        // shaping. Resolving first made a fitted board pay one of those searches per sticky
+        // on its first frame and throw every answer away. `draw.rs` greeks on the same bound
+        // and states the invariant: a greeked block is "sized from the type, not from a
+        // layout". The bound is exact rather than a guess — auto-fit can never return a size
+        // whose line height does not fit the box.
+        //
         // The test is in *device* pixels — that is what "too small to read" means — even
         // though everything shaped below is in world units.
-        if font_size * zoom < MIN_DEVICE_FONT_SIZE {
+        let ceiling = font_size.unwrap_or((size[1] / LINE_HEIGHT).max(1.0));
+        if ceiling * zoom < MIN_DEVICE_FONT_SIZE {
             self.greeked.push(Greek {
                 origin,
                 size: [size[0] * zoom, size[1] * zoom],
-                line_height: font_size * LINE_HEIGHT * zoom,
+                line_height: ceiling * LINE_HEIGHT * zoom,
                 characters: text.char_len(),
-                advance: font_size * AVERAGE_ADVANCE * zoom,
+                advance: ceiling * AVERAGE_ADVANCE * zoom,
                 color,
                 anchor,
             });
             return false;
         }
+        let font_size = self.resolve_size(item, generation, text, size, font_size);
         let key = Key {
             item,
             generation,
@@ -216,8 +242,9 @@ impl TextLayer {
                 origin[1] + (size[1] - layout.extent.height).max(0.0) * 0.5 * zoom,
             ],
         };
-        self.glyphs
-            .extend(self.engine.atlas_entries(layout, (placed[0], placed[1]), zoom));
+        // Rasterisation is deferred to `flush`, which is the only place that holds the
+        // atlas — and holding the atlas is what makes it possible to rasterise *only* what
+        // the atlas is short of. See there.
         self.pending.push((key, placed, zoom, color));
         true
     }
@@ -254,6 +281,17 @@ impl TextLayer {
     /// Upload and draw are one step because they must not be able to disagree: a block drawn
     /// against an atlas that does not hold its glyphs draws nothing, silently, and
     /// `push_layout`'s only complaint is a count of missing slots that nobody reads.
+    /// Drop every rasterised glyph if the zoom has moved since the last frame.
+    ///
+    /// Called once per frame, before anything is queued. Cheap when the zoom held — one
+    /// float compare — and the only thing that bounds the bitmap cache when it did not.
+    pub fn note_scale(&mut self, zoom: f32) {
+        if zoom != self.last_scale {
+            self.engine.forget_glyph_bitmaps();
+            self.last_scale = zoom;
+        }
+    }
+
     pub fn flush(
         &mut self,
         device: &wgpu::Device,
@@ -264,6 +302,25 @@ impl TextLayer {
         if self.pending.is_empty() {
             return 0;
         }
+        // ⚠ **Rasterise only what the atlas is actually short of**, which after the first
+        // frame at a given zoom is never. `atlas_entries` allocates a map and a vector per
+        // block and clones every glyph's bitmap out of the engine's cache, so asking for
+        // every visible block every frame is an allocation and a memcpy per glyph, sixty
+        // times a second, handed to an atlas that already holds the keys and skips them.
+        // `draw.rs` probes first and says why in the same words.
+        self.glyphs.clear();
+        let pending = std::mem::take(&mut self.pending);
+        for (key, origin, zoom, _) in &pending {
+            let Some(layout) = self.layouts.get(key) else { continue };
+            let short = layout.glyphs().any(|glyph| {
+                let physical = glyph.physical((origin[0], origin[1]), *zoom).key;
+                atlas.slot(physical).is_none() && !atlas.is_blank(physical)
+            });
+            if short {
+                self.glyphs
+                    .extend(self.engine.atlas_entries(layout, (origin[0], origin[1]), *zoom));
+            }
+        }
         if atlas.prepare(device, queue, &self.glyphs).is_err() {
             // A full atlas is not fatal: the glyphs that did fit still draw. Reporting it
             // matters more than recovering from it, because the cause is a configuration
@@ -273,7 +330,7 @@ impl TextLayer {
         self.glyphs.clear();
 
         let mut drawn = 0;
-        for (key, origin, zoom, color) in self.pending.drain(..) {
+        for (key, origin, zoom, color) in pending {
             if let Some(layout) = self.layouts.get(&key) {
                 list.push_layout(atlas, layout, origin, zoom, color);
                 drawn += 1;

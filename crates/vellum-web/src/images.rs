@@ -117,6 +117,27 @@ impl ImageLayer {
         });
     }
 
+    /// Release textures the budget cannot afford, and forget what they were for.
+    ///
+    /// ⚠ Uploading does **not** evict — `TextureManager::upload` allocates, uploads a mip
+    /// chain and inserts, and eviction is a separate call the caller has to drive. Without
+    /// it, panning the reference board's 122 images uploads every one at up to 2048² plus
+    /// mips and keeps them for the life of the tab: gigabytes against a budget nothing was
+    /// enforcing, which on an iPad is a jetsam kill rather than a slow frame.
+    ///
+    /// Called **after** the draw list is built, so `mark` has already run for everything on
+    /// screen this frame. `vellum-app` moved this call for exactly that reason: before the
+    /// marks, the `last_marked` guard is vacuously true and eviction can take a texture the
+    /// list being built still references.
+    pub fn enforce_budget(&mut self, textures: &mut TextureManager) {
+        for id in textures.evict_to_budget() {
+            // The hash entry has to go with the texture, or the layer reports `Ready` for an
+            // id the manager has released and every later frame draws nothing where the
+            // picture was, for ever, with no way to ask again.
+            self.states.retain(|_, state| !matches!(state, State::Ready(resident, _) if *resident == id));
+        }
+    }
+
     /// Upload what has arrived. Called once per frame, before the draw list is built.
     pub fn drain(
         &mut self,

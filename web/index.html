@@ -23,6 +23,12 @@
   }
   #velm-status {
     position: fixed; left: 12px; bottom: 12px;
+    /* ⚠ It has nothing to click, and without this it eats the bottom-left corner of the
+       board — which on an iPad held in landscape is exactly where a thumb rests. Worse than
+       dead: a touch pointer gets implicit capture on whatever it pressed, so a pinch with one
+       finger on the badge sends that finger's whole stream to this div, the canvas sees one
+       contact, and the board pans when the user meant to zoom. */
+    pointer-events: none;
     font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
     color: #656D73; background: rgba(255,255,255,.9);
     padding: 6px 10px; border-radius: 6px; border: 1px solid #E2E7EA;
@@ -92,8 +98,23 @@
     let boards;
     try {
       const response = await fetch(withAuth('/api/v1/boards'));
+      // ⚠ 401 is named rather than swallowed. Collapsing it into "no server" sent the
+      // caller down the static-file branch and told the user `./board.bin answered 404`,
+      // which says nothing about the token — and velmd leaves `/api/v1/health` outside the
+      // gate precisely so "not running" and "wrong token" stay distinguishable.
+      if (response.status === 401) {
+        fail(token
+          ? 'That token is not right. Check the ?token= on the end of your link.'
+          : 'This server needs a token. Open the link with ?token=… on the end.');
+        library.hidden = true;
+        return true;
+      }
       if (!response.ok) throw new Error(`the server answered ${response.status}`);
       boards = await response.json();
+      // A 200 carrying JSON that is not an array — a proxy's error shape, say — passed both
+      // checks above and then threw `boards is not iterable` out of this function, leaving a
+      // raw TypeError over a blank canvas with the library still hidden.
+      if (!Array.isArray(boards)) throw new Error('that server did not answer with a board list');
     } catch (e) {
       return false;
     }

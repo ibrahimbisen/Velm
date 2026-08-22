@@ -162,8 +162,15 @@ impl StrokeLayer {
     /// Without this the cache is a leak with a nice name: pan across a board of 219 strokes
     /// and every one of them keeps its triangles for the life of the tab, in a linear memory
     /// that never returns to the OS. The same argument `TextLayer::retain_visible` makes.
+    /// ⚠ No size guard. It used to skip while `ink.len() <= on_screen.len()`, and the two
+    /// count different populations: `ink` holds one entry per *stroke*, `on_screen` one per
+    /// visible item of every kind. On the reference board that is 219 against 596, so the
+    /// guard fired on essentially every frame and nothing was ever released — while the mesh
+    /// held is the one tessellated at the **finest band ever visited**, so a stroke seen once
+    /// at 8× keeps that mesh for the life of the tab. `keep` is a superset of the ink ids by
+    /// construction, so the retain was always cheap and always correct.
     pub fn retain_visible(&mut self, on_screen: &[SceneId]) {
-        if self.ink.len() <= on_screen.len() {
+        if self.ink.is_empty() {
             return;
         }
         let keep: std::collections::HashSet<SceneId> = on_screen.iter().copied().collect();
