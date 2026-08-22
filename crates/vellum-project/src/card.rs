@@ -94,7 +94,8 @@ pub const TITLE_LINES: f64 = 3.0;
 ///
 /// *"less decription more white space"*. Unbounded before this, so a tall card gave the blurb
 /// six or more lines and read as a paragraph with a heading. The lines it gives up are what pay
-/// for the two gaps below; the card's own box does not change.
+/// for the two gaps below; the card's own box does not change. Three is what Miro's own card
+/// shows before it ellipsises.
 pub const BLURB_LINES: f64 = 3.0;
 
 /// Air under the site name, as a fraction of the card's padding.
@@ -126,8 +127,14 @@ pub const BLURB_BOTTOM_AIR: f64 = 0.5;
 /// estimates 31 per line and so **two** lines. It shapes to three: the wrap puts 26 on each of
 /// the first two. The blurb was then positioned two lines down and drew straight through the
 /// title's third line, which is a worse fault than the empty band the estimate had replaced.
-/// Only a screenshot found it — no assertion about box geometry could, because the boxes were
-/// exactly as asked for.
+/// Only a screenshot found it — the `--demo links` one — because no assertion about box
+/// geometry could: the boxes were exactly as asked for.
+///
+/// **The mechanism, since the number reads as a fudge factor without it.** It is the difference
+/// between how many characters *fit* on a line and how many a *word wrap* puts there. Text
+/// breaks at spaces, so every line but the last gives up part of a word; the raw advance
+/// estimate is the count for a string with no spaces in it, which is the one case that never
+/// happens in a title.
 ///
 /// 0.85 turns that 31 into 26, which is what the text actually does.
 const WRAP_EFFICIENCY: f64 = 0.85;
@@ -266,6 +273,16 @@ pub fn whole_lines(available: f64, line_height: f64) -> f64 {
     if line_height <= 0.0 {
         return available.max(0.0);
     }
+    // ⚠ **The nudge is not defensive; an exact fit is the common case.** These heights are
+    // built by adding and subtracting the same line height and padding several times, so a box
+    // sized to hold exactly one line arrives as 22.463999999999874 against a line of
+    // 22.464000000000002 — and `floor` answers **zero**. Measured, on the video card the user
+    // asked to have its caption pinned to the foot: the title box came out empty and the card
+    // drew a poster and a provider row with no title under it.
+    //
+    // A *relative* epsilon rather than an absolute one, because the line height scales with the
+    // card: an absolute tolerance that works at 13 units is either useless or far too generous
+    // at 78.
     const SNAP: f64 = 1e-6;
     (((available / line_height) + SNAP).floor() * line_height).max(0.0)
 }
@@ -442,11 +459,14 @@ pub fn strip_site_affix<'a>(title: &'a str, provider: Option<&str>) -> &'a str {
 /// Whether a card's description only repeats its title, and so is worth no room.
 ///
 /// **18 of the 91 link cards on the reference board carry a `description` byte-identical to
-/// their `title`.** That is Miro's data rather than anybody's bug, and drawing both makes a card
-/// that says one thing twice in two colours.
+/// their `title`, and 15 of those are alibaba.com.** Measured from the capture, not estimated.
+/// That is Miro's data rather than anybody's bug — Miro renders one of them; we rendered both,
+/// and the user photographed a card saying the same sixty-word sentence twice.
 ///
 /// A naive `==` misses the second shape, which is just as common: a description that is the
-/// title truncated and ended with an ellipsis. So the test is *prefix in either direction* —
+/// title **truncated** to about 256 characters and ended with an ellipsis, sometimes differing
+/// in HTML entity spelling as well (`&#43;` against `+`) — which is why `normalise` folds
+/// punctuation rather than comparing bytes. So the test is *prefix in either direction* —
 /// Miro stores the truncated one in `description` on some cards and a description that runs
 /// *past* the title on others.
 ///
@@ -474,6 +494,10 @@ pub fn says_the_same_as(title: Option<&str>, description: &str) -> bool {
         out.trim_end().to_owned()
     }
 
+    /// The shortest prefix worth calling a repeat.
+    ///
+    /// Sixteen characters is enough to be past *"Buy"* and *"Amazon.com:"*, and short enough to
+    /// catch the truncated case — which diverges from the title only at its very end.
     const ENOUGH: usize = 16;
     let Some(title) = title else { return false };
     let (title, description) = (normalise(title), normalise(description));

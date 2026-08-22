@@ -114,7 +114,22 @@ impl Contacts {
     fn moved(&mut self, id: i32, x: f64, y: f64) -> bool {
         match self.down.iter_mut().find(|c| c.id == id) {
             Some(existing) => {
-                existing.travelled += (x - existing.x).hypot(y - existing.y);
+                // ⚠ **Only movement worth calling movement.** Path length is monotonic and
+                // never decays, so counting every sample means a finger *resting* accumulates
+                // digitiser noise until it can no longer be a tap: at a tenth of a pixel per
+                // sample at 60Hz, a deliberate slow press dies after about a second. The old
+                // rule could be defeated by wandering back; this one could be defeated by
+                // holding still, which is the mirror image and the worse of the two — a
+                // careful press is exactly how somebody aims at a small badge.
+                //
+                // A per-sample floor rather than a decay: a real drag moves further than this
+                // between samples and is counted in full, while a hand that is trying to stay
+                // put contributes nothing.
+                const JITTER: f64 = 0.75;
+                let step = (x - existing.x).hypot(y - existing.y);
+                if step > JITTER {
+                    existing.travelled += step;
+                }
                 existing.x = x;
                 existing.y = y;
                 true
@@ -314,23 +329,33 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                     let world = viewer
                         .camera
                         .screen_to_world(ScreenPoint::new(contact.x * ratio, contact.y * ratio));
+                    // ⚠ **`hit_test_where`, not `hit_test` then filter** — and `scene.rs`
+                    // states the rule verbatim: *"The predicate is applied before 'topmost',
+                    // not after… filtering afterwards turns a rejected item into a hole in
+                    // the board."* Filtered after, a clipped card lying over a visible one
+                    // does not merely fail to open — it **swallows the tap**, and the card
+                    // underneath, which is drawn and does have an address, never gets it.
+                    //
+                    // The guard itself is the one both paint passes apply. `Scene::hit_test`
+                    // knows nothing about frames, so without it a tap on visually empty board
+                    // opens the page of a card that is not drawn there — reachable, because a
+                    // frame *resized* past its children on the Mac leaves them clipped and
+                    // persisted, and opening a page is the only verb this viewer has.
+                    //
+                    // Native reaches for the same function for the same reason, at two sites
+                    // in `actions.rs`, where the predicate is the lock set.
                     viewer
                         .projection
                         .scene()
-                        .hit_test(world)
-                        .and_then(|id| viewer.projection.get(id))
-                        // ⚠ **The same guard both paint passes apply, and it has to be here
-                        // too.** `Scene::hit_test` knows nothing about frames — `frame.rs`'s
-                        // own doc says a clipped item is still returned — so without this a
-                        // tap on visually empty board can open the page of a card that is not
-                        // drawn there. It is reachable: a frame *resized* past its children
-                        // on the Mac leaves them clipped and persisted (a resize does not
-                        // carry a frame's contents, deliberately), and opening a page is the
-                        // only verb this viewer has, so there is no harmless version of a
-                        // stray hit.
-                        .filter(|projected| {
-                            !vellum_project::frame::clipped_by_frame(projected, &viewer.projection)
+                        .hit_test_where(world, |id| {
+                            viewer.projection.get(id).is_some_and(|projected| {
+                                !vellum_project::frame::clipped_by_frame(
+                                    projected,
+                                    &viewer.projection,
+                                )
+                            })
                         })
+                        .and_then(|id| viewer.projection.get(id))
                         .and_then(|projected| crate::badges::pressed(projected, world))
                 };
                 // ⚠ **Opened here, synchronously inside the handler.** `window.open` needs

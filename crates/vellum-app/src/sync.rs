@@ -58,9 +58,14 @@
 //! - A **command** is something the user just asked for, so closing their edit to serve it is
 //!   reasonable — `ActiveState::run` calls `settle`.
 //! - A **remote update** is not. Ending somebody's half-typed sticky because a collaborator
-//!   moved a frame is a worse bug than the one being avoided. So the applier returns early
-//!   and the reply stays in this channel; the next frame applies it the moment the gesture
-//!   ends. Nothing is lost by waiting, which is the property that makes waiting legal.
+//!   moved a frame is a worse bug than the one being avoided. So the *applier* returns early
+//!   and the update is held on the `Editor` until the gesture ends. Nothing is lost by
+//!   waiting, which is the property that makes waiting legal.
+//!
+//! ⚠ **It is held on the editor rather than left in this channel, and that was a correction.**
+//! Draining is what clears `outstanding`, so a caller that skipped the drain while a gesture
+//! was open stopped asking altogether — sync stalled in both directions for as long as
+//! somebody was typing. Drain every frame; hold what cannot be applied yet.
 //!
 //! # Remote edits are not undoable, and that is correct
 //!
@@ -263,10 +268,11 @@ impl Sync {
         }
     }
 
-    /// Where this is syncing to. For the HUD and for error text.
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
+    // `pub fn endpoint()` was written here and removed: it claimed to be *"for the HUD and
+    // for error text"*, and it had no caller anywhere in the workspace — the HUD carries no
+    // sync line, and the error text reads the field directly two functions below. An accessor
+    // whose doc names two consumers that do not exist is worse than no accessor: it reads as
+    // evidence that a feature is wired.
 
     /// The version vector the next delta should be exported since, or `None` on a fresh
     /// [`Sync`] that has never had a reply.
@@ -345,11 +351,13 @@ impl Sync {
 
     /// Everything that has come back since the last call. Never blocks.
     ///
-    /// ⚠ **The caller must check `ActiveState::busy_with_a_group` *before* calling this, not
-    /// after.** Replies left in the channel are applied on a later frame; replies drained and
-    /// then dropped are gone, and the client's version vector has not moved, so the server
-    /// would resend them — eventually — but the board would draw the old state until it did.
-    /// Guarding before the drain is what makes waiting free. See the module header.
+    /// ⚠ **Call this every frame, and guard the *apply* rather than the drain.** This method
+    /// is what clears `outstanding`, so a caller that skips it while a gesture is open stops
+    /// asking altogether: one reply arriving mid-word refused every later request, and a
+    /// caret left open stopped sync for good. What must not happen is a reply drained and
+    /// **dropped** — the version vector has not moved, so the server would resend eventually,
+    /// but the board draws the old state until it does. `ActiveState::apply_sync` holds what
+    /// it cannot apply yet, on the `Editor`, and applies it when the gesture ends.
     pub fn drain(&mut self) -> Vec<SyncReply> {
         let mut out = Vec::new();
         loop {

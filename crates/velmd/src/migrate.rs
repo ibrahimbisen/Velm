@@ -149,6 +149,23 @@ pub fn snapshot(board_path: &Path, out: &Path) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("{} holds no snapshot", board_path.display()))?;
     let bytes = board.to_bytes()?;
     let items = board.items()?.len();
+    // RULE ZERO: `write` opens create+truncate, so this is a destructive call on a path the
+    // operator typed. `velmd snapshot --board a.vellum --out b.vellum` — a plausible typo,
+    // two similar names on one line — replaced b.vellum with raw Loro bytes and it stopped
+    // being a SQLite database at all. There is no `rm` in that, so the removal scan could
+    // never have caught it, and the suite stayed green.
+    //
+    // Refused rather than backed up: `import`'s copy already makes this exact decision three
+    // functions up, for the same reason. Somebody who meant it can move the file aside, which
+    // is a deliberate act; nothing here can distinguish a typo from an intention.
+    anyhow::ensure!(
+        !out.exists(),
+        "{} already exists. Refusing to overwrite it — this writes a raw snapshot, and if \
+         that path is a board it would stop being one.\n  \
+         Choose another name, or move the existing file aside yourself first.",
+        out.display()
+    );
+    // RULE ZERO: `write` opens create+truncate; the `exists` check above is the guard.
     std::fs::write(out, &bytes)?;
     println!(
         "{} — {items} items, {} KB of snapshot → {}",
@@ -279,7 +296,15 @@ fn check_boards(data: &Path) -> anyhow::Result<()> {
     let width = rows.iter().map(|(n, _, _)| n.len()).max().unwrap_or(4).min(44);
     println!("{:<width$}  {:>7}  TITLE", "FILE", "ITEMS", width = width);
     for (name, title, items) in &rows {
-        println!("{name:<width$}  {items:>7}  {title}", width = width);
+        // ⚠ **A board's title is document content**, and `POST /sync` is exactly the route
+        // that lets an authorised client rename one — so this is the same string class the
+        // sync log sanitises, in the module the fix for that did not visit. `import` runs
+        // this unconditionally and is documented re-runnable, so it is not a rare path.
+        println!(
+            "{name:<width$}  {items:>7}  {}",
+            crate::serve::printable(title),
+            width = width
+        );
     }
     println!("\n{} board(s) opened and readable", rows.len());
 

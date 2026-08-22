@@ -229,18 +229,30 @@ fn check_exposure(config: &Config) -> anyhow::Result<()> {
 }
 
 fn serve_one(server: &Server, stream: TcpStream) {
-    // ⚠ **Shorter than [`HEAD_DEADLINE`], and that ordering is the whole guard.**
+    // ⚠ **Shorter than [`HEAD_DEADLINE`], and the ordering is the whole guard.**
     //
-    // At fifteen seconds this timeout was *longer* than the ten-second deadline, so the
-    // deadline could never bind first: a connection that sent **zero bytes** sat inside a
-    // blocking `read` for the full fifteen. With [`MAX_CONNECTIONS`] at 16 and no per-address
-    // limit, sixteen sockets that say nothing and reconnect every fifteen seconds take every
-    // slot — before the token is checked, at no cost, from anywhere.
+    // At fifteen seconds this was *longer* than the ten-second deadline, so the deadline
+    // could never bind first: a connection sending **zero bytes** sat inside one blocking
+    // `read` for the full fifteen. With [`MAX_CONNECTIONS`] at 16 and no per-address limit,
+    // sixteen silent sockets reconnecting every fifteen seconds take every slot — before the
+    // token is checked, at no cost, from anywhere.
+    //
+    // It has to be *shorter* rather than merely different, and the arithmetic is worth
+    // writing down because getting it wrong is subtle: `read_head` can only test the deadline
+    // between reads, so a timeout of `t` against a deadline of `d` closes a silent connection
+    // after `t × ceil(d / t)`. At 8s against 10s that is **16 seconds** — worse than the
+    // fifteen this replaced, from a change that looks like a tightening.
     //
     // Three seconds is far past any real client's pause between the packets of one request
-    // head, and it is what lets the deadline below do its job: a client that is genuinely
-    // slow but genuinely talking resets this timer on every byte and is bounded by the
-    // deadline instead.
+    // head, and 3 × 4 = 12s is the true bound on silence.
+    //
+    // ⚠ **`SO_RCVTIMEO` is per-read and socket-wide, so it governs the body too** — and
+    // three seconds is *not* enough there. TCP's initial retransmit timeout is one second and
+    // doubles, so two consecutive losses of one segment produce a gap of three seconds or
+    // more, and a cellular-to-Wi-Fi handover does the same; a legitimate multi-megabyte sync
+    // would fail on a lossy link. The body's read is raised at its own site, after the token
+    // has been checked — which is the right place for it, because by then the connection has
+    // proved it is a client rather than a silence.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(60)));
 
@@ -364,6 +376,11 @@ fn serve_one(server: &Server, stream: TcpStream) {
                 return;
             }
         };
+        // The head is in and the token has passed, so this is a real client rather than a
+        // silence holding a slot. A body can be megabytes over a lossy link, where a three-
+        // second gap between segments is two retransmits rather than a stall — see the
+        // arithmetic on the head's timeout above.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
         let Some(body) = sync::read_body(&stream, &leftover, length) else {
             let _ = respond(
                 &stream,
@@ -527,7 +544,16 @@ fn static_file(server: &Server, path: &str, stream: &TcpStream) -> anyhow::Resul
     let Some(root) = &server.config.web else {
         return respond(stream, 404, "text/plain", b"not found\n", origin);
     };
-    let relative = if path == "/" { "index.html" } else { path.trim_start_matches('/') };
+    // ⚠ **`/` is the board picker, not the viewer.** It used to be `index.html`, which opens
+    // *one* board and falls back to its own inline placeholder list when no `?board=` is
+    // given — the list `chrome.js` itself calls *"wrong now that there is one"*. So the
+    // ~1,200 lines of `boards.html` shipped as "the front door that did not exist" were
+    // reachable only by pressing Back **inside a board you had already opened**, and the
+    // address the hosting guide tells people to open landed on the placeholder.
+    //
+    // A front door nobody is routed to is not a front door. `index.html` is still served at
+    // its own name, which is what every board link the picker builds points at.
+    let relative = static_target(path);
     let Some(file) = under(root, relative) else {
         return respond(stream, 404, "text/plain", b"not found\n", origin);
     };
@@ -646,9 +672,18 @@ fn read_head(stream: &TcpStream) -> Option<Head> {
     let target = request.path?.to_owned();
     let mut headers = BTreeMap::new();
     for header in request.headers.iter() {
-        if let Ok(value) = std::str::from_utf8(header.value) {
-            headers.insert(header.name.to_ascii_lowercase(), value.to_owned());
-        }
+        // ⚠ **The name is kept even when the value will not decode**, and that is a guard
+        // rather than tidiness. `proxied()` tests for the *presence* of a forwarding header
+        // and its doc says the value "is never read, so there is nothing here to spoof" — but
+        // dropping the whole entry here meant the value *was* read, by this `from_utf8`, and
+        // that read decided presence. A tokenless server behind the documented proxy, sent
+        // `X-Forwarded-For: \xC3\x28`, saw no forwarding header and served every board.
+        //
+        // An undecodable value becomes empty rather than absent: nothing in this crate reads
+        // a header value except `authorization`, where an empty string fails the compare, and
+        // `content-length`, where it fails to parse. Both are the safe direction.
+        let value = std::str::from_utf8(header.value).unwrap_or_default();
+        headers.insert(header.name.to_ascii_lowercase(), value.to_owned());
     }
     Some(Head { method, target, headers, leftover: reader.buffer().to_vec() })
 }
@@ -769,6 +804,21 @@ pub(crate) fn printable(raw: &str) -> String {
     out
 }
 
+/// Which file a request path names.
+///
+/// ⚠ **`/` is the board picker, not the viewer.** It used to be `index.html`, which opens
+/// *one* board and falls back to its own inline placeholder list when no `?board=` is given —
+/// the list `chrome.js` itself calls *"wrong now that there is one"*. So the page shipped as
+/// "the front door that did not exist" was reachable only by pressing Back **inside a board
+/// you had already opened**, and the address the hosting guide tells people to open landed on
+/// the placeholder. A front door nobody is routed to is not a front door.
+///
+/// `index.html` is still served at its own name, which is what every board link the picker
+/// builds points at.
+fn static_target(path: &str) -> &str {
+    if path == "/" { "boards.html" } else { path.trim_start_matches('/') }
+}
+
 /// Whether a character must not reach a terminal.
 ///
 /// ⚠ **`char::is_control` is not enough, and the gap is not academic.** Rust defines it as
@@ -780,14 +830,28 @@ pub(crate) fn printable(raw: &str) -> String {
 /// of them defeats what this function exists to guarantee.
 ///
 /// Category is not directly available without a Unicode table, so the ranges are named. They
-/// are the ones that alter *rendering*; the rest of Cf (a soft hyphen, a joiner) is inert in
-/// a log and left alone rather than replaced with a dot nobody can account for.
+/// are the ones that alter the *order or visibility* of what follows. A joiner does neither —
+/// U+200C and U+200D are orthography, and a soft hyphen is inert — so those are left alone
+/// rather than replaced with a dot nobody can account for.
 fn is_unprintable(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
             // Bidi overrides and embeddings, and the isolates that replaced them.
-            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            // ⚠ **Not the whole `200b..200f` block.** U+200C ZWNJ and U+200D ZWJ are inside
+            // it and are *orthography*: every ZWJ emoji sequence in a board name would log
+            // as its pieces — `👩‍💻` as two characters and a dot — and Persian and
+            // Devanagari break at every ZWNJ. The doc above this promised they were left
+            // alone and the range said otherwise.
+            '\u{200b}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            // Line and paragraph separators. Category Zl/Zp rather than Cc, so `is_control`
+            // misses them — and a log consumer that splits on them sees two lines, which is
+            // exactly the promise this function exists to keep.
+            | '\u{2028}' | '\u{2029}'
+            // The Arabic letter mark, and the deprecated tag block, which some renderers
+            // still fold into the text before it.
+            | '\u{061c}' | '\u{e0000}'..='\u{e007f}'
             // The byte-order mark, which some terminals treat as a directional hint.
             | '\u{feff}'
             // Interlinear annotation, which hides what follows it.
@@ -983,6 +1047,39 @@ mod tests {
             ]);
             assert!(proxied(&through), "{marker} must be recognised as a proxy");
         }
+    }
+
+    /// ⚠ The root is the picker. It was `index.html`, which opens one board — so the page
+    /// that lists them was reachable only from inside a board somebody had already opened,
+    /// and the address the hosting guide names landed on a placeholder list that the
+    /// client's own code calls obsolete.
+    /// ⚠ The three characters this must never eat, and the four it must.
+    ///
+    /// A board name is document content and reaches a log line. Mangling a real name is a
+    /// smaller harm than letting a control character through, which is why the first version
+    /// took the whole `200b..200f` block — but it took the two **joiners** with it, and those
+    /// are orthography: every ZWJ emoji and every Persian word breaks at one.
+    #[test]
+    fn a_log_line_keeps_real_writing_and_loses_what_moves_it() {
+        // Survive: joiners, a soft hyphen, and letters from scripts that genuinely run right
+        // to left. An Arabic name is not an attack.
+        for keep in ["👩\u{200d}💻 Notes", "مرحبا", "עברית", "می\u{200c}شود", "汽车 · 2020"] {
+            assert_eq!(printable(keep), keep, "{keep:?} is writing, not a control");
+        }
+        // Do not: a newline, an escape, a bidi *override*, and a paragraph separator.
+        assert_eq!(printable("a\nb"), "a.b");
+        assert_eq!(printable("a\u{1b}[2Jb"), "a.[2Jb");
+        assert_eq!(printable("a\u{202e}b"), "a.b");
+        assert_eq!(printable("a\u{2029}b"), "a.b");
+    }
+
+    #[test]
+    fn the_root_is_the_board_list_and_not_one_board() {
+        assert_eq!(static_target("/"), "boards.html");
+        // Both pages keep their own names: every link the picker builds points at the second.
+        assert_eq!(static_target("/boards.html"), "boards.html");
+        assert_eq!(static_target("/index.html"), "index.html");
+        assert_eq!(static_target("/vellum_web_bg.wasm"), "vellum_web_bg.wasm");
     }
 
     #[test]

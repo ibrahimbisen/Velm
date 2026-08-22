@@ -522,14 +522,20 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
     // something is still happening. Fifteen seconds is past a cold start on a slow phone
     // (155ms warm, and the budget for the whole boot is a few seconds) and well short of the
     // point where somebody assumes it is broken.
-    // ⚠ Generous on purpose. Boot is a GPU handshake plus a whole board over the wire, and
-    // the cost of being early here is worse than the cost of being late: "Did not load" on a
-    // board that is still loading is a red word on a page that is about to work, and somebody
-    // who sees it once stops believing the indicator. Measured cold on loopback: under a
-    // second. An iPad on a bad link is the case this has to clear.
+    // ⚠ **Forty-five seconds, and the trade is stated because it cuts both ways.**
     //
-    // It recovers either way — the branch below resets the clock the moment a real status
-    // arrives — but a false alarm that corrects itself is still a false alarm.
+    // Boot is a GPU handshake plus a whole board over the wire. Being *early* here puts a red
+    // "Did not load" on a page that is about to work, and somebody who sees that once stops
+    // believing the indicator — so the number has to clear an iPad on a bad link, not a
+    // laptop on loopback (measured there: 941ms). Being *late* means a 404, a wrong token or
+    // a GPU that will not start says "Connecting" for three quarters of a minute.
+    //
+    // Late is the better failure, because the page's own status line carries the real
+    // sentence the whole time — `report()` writes it into `#velm-status` — so nobody is left
+    // with no information, only with a bar that is slower to agree.
+    //
+    // It recovers either way: the branch below resets the clock the moment a real status
+    // arrives. A false alarm that corrects itself is still a false alarm.
     const STARTING_PATIENCE_MS = 45000;
     let waitingSince = Date.now();
     const words = () => {
@@ -563,8 +569,38 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
     };
     const tick = () => {
       if (!session.live) return;
-      const next = words();
+      // ⚠ **The whole body is guarded, and the reason is the indicator's own purpose.**
+      // A throw from `mod.sync_status()` propagated past the reschedule at the bottom, so
+      // nothing restarted the chain and the badge froze on its last state — and if that was
+      // "Live", it said Live on a dead connection for the life of the tab, which is precisely
+      // the report this exists to prevent. `panic = "abort"` poisons a wasm module, so every
+      // export throws afterwards: the case where the page is *most* broken is the case where
+      // this was *least* able to say so.
+      let next;
+      try {
+        next = words();
+      } catch (error) {
+        connection.dataset.state = 'offline';
+        connection.textContent = '';
+        const word = document.createElement('span');
+        word.className = 'velm-chrome-sync-word';
+        word.textContent = 'Stopped';
+        connection.append(word);
+        connection.title = String(error);
+        shownState = 'stopped';
+        // No reschedule. A module that throws once throws every time, and a timer asking it
+        // once a second for the life of the tab is noise on a page that has already said
+        // everything it can.
+        return;
+      }
       if (next === null) {
+        // ⚠ **The divider goes with it.** Every group above is conditional and the bar is
+        // built by joining them, so a divider left against the bar's own edge is the tell
+        // that a group failed to draw — this file says so where the joining happens, and
+        // then removed the indicator without it. `previousElementSibling` is that divider by
+        // construction: the connection is the last group, so it is always preceded by one.
+        const rule = connection.previousElementSibling;
+        if (rule && rule.classList.contains('velm-chrome-rule')) rule.remove();
         connection.remove();
         return;
       }
@@ -584,7 +620,13 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
       }
       session.syncTimer = window.setTimeout(tick, 1000);
     };
-    tick();
+    // ⚠ **Scheduled, not called.** Calling it here ran before `insertAdjacentElement` puts
+    // the bar in the document — so a throw on the first tick meant **no bar at all**: no
+    // Back, no board name, no zoom, on a page that otherwise worked. And `mounted` was
+    // already set, so a retry took the already-mounted branch and removed a bar that had
+    // never been inserted. A first reading one second late costs nothing; the word starts
+    // empty and the element is already sized by its dot.
+    session.syncTimer = window.setTimeout(tick, 0);
   }
 
   // After the canvas, and with no `z-index`. A positioned element paints above the static

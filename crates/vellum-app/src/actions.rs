@@ -838,20 +838,17 @@ impl ActiveState {
     /// bug than the one being avoided. `apply_link_fetches` states this at length; this is
     /// the second caller of the same rule.
     ///
-    /// Waiting is free: the guard is **before the drain**, so a reply that cannot be applied
-    /// stays in the channel and lands the moment the gesture ends. Draining and then dropping
-    /// would lose it until the server happened to resend.
+    /// ⚠ **The guard is after the drain, and this paragraph used to say the opposite.**
+    /// Leaving a reply in the channel looks free and is not: `Sync::outstanding` is cleared
+    /// **by** the drain, so one reply arriving mid-gesture refused every later request —
+    /// typing for four minutes stopped sync in both directions for four minutes. The drain
+    /// happens every frame and what waits is the *apply*, held on the [`Editor`] with the
+    /// board it belongs to, where a tab switch cannot deliver it somewhere else.
     ///
     /// # Cost when sync is off
     ///
     /// One `Option` test. `--sync-server` is not the default, so for anybody who has not
     /// asked for this the whole feature is a null check per frame and no thread.
-    /// How many consecutive failures to merge before receiving is paused and named.
-    ///
-    /// Three rather than one, because a single failure can be a truncated reply or a race,
-    /// and three rather than ten because each attempt costs a full projection rebuild.
-    const MERGE_ATTEMPTS: u32 = 3;
-
     pub(crate) fn apply_sync(&mut self) {
         if self.sync.is_none() {
             return;
@@ -880,24 +877,21 @@ impl ActiveState {
         // refused. Typing for four minutes stopped sync in both directions for four minutes;
         // a caret left open while somebody walked away stopped it for good.
         //
-        // What must still wait is the **apply**, and it waits in `SyncConfig::pending` where
-        // nothing can lose it. `crate::sync`'s header states the rule the old code was trying
-        // to honour — a reply drained and dropped is gone — and holding it is what honours it.
-        let arrived = self.editor.drain_sync();
-        if let Some(config) = self.sync.as_mut() {
-            for reply in arrived {
-                // `changes_the_board` rather than an inlined emptiness test. Once the two
-                // sides agree, every sync answers with nothing — the steady state, not an
-                // error — and queueing that would cost a full `Projection::rebuild` and an
-                // autosave delta on a 1,300-item board every period, for an update that says
-                // nothing happened. Its own doc comment asks to be the one derivation of
-                // this; inlining it here made that comment false.
-                if !reply.changes_the_board() {
-                    continue;
-                }
-                if let crate::sync::SyncReply::Synced { updates, .. } = reply {
-                    config.pending.push(updates);
-                }
+        // What must still wait is the **apply**, and it waits on the `Editor` — with the board
+        // it belongs to, where a tab switch cannot deliver it to a different one. `Editor`'s
+        // `remote` field carries the whole argument.
+        for reply in self.editor.drain_sync() {
+            // `changes_the_board` rather than an inlined emptiness test. Once the two sides
+            // agree, every sync answers with nothing — the steady state, not an error — and
+            // queueing that would cost a full `Projection::rebuild` and an autosave delta on
+            // a 1,300-item board every period, for an update that says nothing happened. Its
+            // own doc comment asks to be the one derivation of this; inlining it made that
+            // comment false.
+            if !reply.changes_the_board() {
+                continue;
+            }
+            if let crate::sync::SyncReply::Synced { updates, .. } = reply {
+                self.editor.hold_remote(updates);
             }
         }
         self.report_sync_failure();
@@ -911,25 +905,29 @@ impl ActiveState {
         if self.busy_with_a_group() {
             return;
         }
-        let Some(config) = self.sync.as_mut() else { return };
-        // Given up on: keep talking to the server — the version vector is still honest and a
-        // later update may merge fine — but stop reprojecting the board against bytes that
-        // have already failed three times. The queue is dropped rather than kept, or it grows
-        // without bound for the rest of the session.
-        if config.apply_failures >= Self::MERGE_ATTEMPTS {
-            config.pending.clear();
+        // Given up on **for this board**: keep talking to the server, since the version
+        // vector is still honest, but stop reprojecting against bytes that have already
+        // failed three times. The queue is dropped rather than kept — it is bounded, but
+        // holding sixty updates nobody will ever apply is memory spent on nothing.
+        //
+        // ⚠ Not permanent. `Editor::note_merge` clears the count on any later success, and
+        // the gate is on the *drain* rather than around the reset — which is the shape the
+        // first version got wrong: it gated the whole loop and reset only inside it, so three
+        // failures stopped receiving for the life of the process while sending carried on.
+        if self.editor.merges_are_failing() {
+            drop(self.editor.take_remote());
             return;
         }
-        let pending = std::mem::take(&mut config.pending);
-        for updates in pending {
+        for updates in self.editor.take_remote() {
             match self.editor.apply_remote(&updates) {
                 Ok(()) => {
                     log::debug!("sync: merged {} bytes from the server", updates.len());
-                    if let Some(config) = self.sync.as_mut() {
-                        config.apply_failures = 0;
-                    }
+                    self.editor.note_merge(true);
                 }
-                Err(error) => self.note_merge_failure(&error),
+                Err(error) => {
+                    self.editor.note_merge(false);
+                    self.note_merge_failure(&error);
+                }
             }
         }
     }
@@ -946,16 +944,16 @@ impl ActiveState {
     /// `vellum-doc` produced a toast every three seconds and a full `Projection::rebuild`
     /// with it, for the life of the session.
     ///
-    /// So: the sentence is deduped, and after [`Self::MERGE_ATTEMPTS`] consecutive failures the
+    /// So: the sentence is deduped, and after [`Editor::MERGE_ATTEMPTS`] consecutive failures the
     /// applying stops and says so. **Stopping is the honest answer** — an update that will
     /// not merge three times will not merge a fourth, and the alternative is a board that
     /// silently reprojects itself for ever. Receiving resumes the moment one succeeds, which
     /// it can, because the transport keeps running and a *later* update may be fine.
     fn note_merge_failure(&mut self, error: &anyhow::Error) {
         log::error!("sync: merging a change from the server: {error:#}");
+        let given_up = self.editor.merges_are_failing();
         let Some(config) = self.sync.as_mut() else { return };
-        config.apply_failures = config.apply_failures.saturating_add(1);
-        let detail = if config.apply_failures >= Self::MERGE_ATTEMPTS {
+        let detail = if given_up {
             format!(
                 "a change from the server will not merge into this board ({error}). \
                  Receiving is paused; the board on this machine is untouched."

@@ -25,6 +25,16 @@ fn main() -> Result<()> {
         Command::Run(options) => *options,
     };
 
+    // ⚠ **Here, and it has to be here.** `take_sync_token` calls `std::env::remove_var`,
+    // which is undefined behaviour if another thread reads the environment concurrently — and
+    // `getenv` is called by more things than it looks, SQLite's temporary-file lookup among
+    // them. This process is single-threaded at exactly this point and stops being so a few
+    // lines below, once a board is opened and its autosave writer starts.
+    //
+    // Why it is removed at all: an environment is inherited, and this application launches
+    // `claude`, `codex` and a PTY the user can type into. See the function's own note.
+    let _ = vellum_app::options::take_sync_token();
+
     let event_loop = EventLoop::new().context("could not create the event loop")?;
     // Poll rather than Wait: the canvas redraws continuously so that a pan reaches
     // the screen on the next vblank rather than on the next event, and so an

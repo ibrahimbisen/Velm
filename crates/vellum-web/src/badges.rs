@@ -8,7 +8,7 @@
 //!
 //! # One function answers "where is it", and both halves ask it
 //!
-//! [`badge`] and [`play`] are the only places either rectangle is worked out.
+//! [`badge`] and the private `play_box` are the only places either rectangle is worked out.
 //! [`BadgeLayer::push`] draws what they answer and [`pressed`] hit-tests what they answer, so
 //! the paint and the press cannot come to disagree — which is `draw::kanban_runs`' rule and
 //! `CardLayout::badge`'s, and this repository has paid for breaking it more than once. A second
@@ -287,7 +287,7 @@ fn play_box(projected: &Projected, url: &str) -> Option<WorldRect> {
 
 /// The card's address if it is one this viewer will open, already normalised.
 ///
-/// One definition, asked by [`badge`], [`play`], [`pressed`] and [`BadgeLayer::push`] alike, so
+/// One definition, asked by [`badge`], `play_box`, [`pressed`] and [`BadgeLayer::push`] alike, so
 /// a card cannot draw a button that the press path then declines to answer for.
 ///
 /// [`vellum_link::host_of`] is the predicate, and it is the same one the desktop app's
@@ -403,7 +403,7 @@ impl BadgeLayer {
     ) -> bool {
         let Some(projected) = projection.get(id) else { return false };
         // Resolved once per card per frame, then handed to both boxes. The public [`badge`] and
-        // [`play`] each resolve it for themselves, which is right for a caller holding only a
+        // `play_box` each resolve it for themselves, which is right for a caller holding only a
         // `Projected` and would be two more allocations per card per frame here — on a board
         // that is 91 cards, which is what the reference board is.
         let Some(url) = openable(&projected.item.kind) else { return false };

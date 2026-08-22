@@ -73,6 +73,31 @@ pub struct Editor {
     /// because [`Self::sync_now`] asks with the board's own current version and the server
     /// answers with everything since. Nothing accumulates and nothing is lost.
     sync: Option<crate::sync::Sync>,
+    /// Updates that have arrived for **this board** and are waiting for a gesture to end.
+    ///
+    /// ⚠ **On the `Editor`, because a queue on `ActiveState` is a queue that reaches the
+    /// wrong board.** It lived there first, and the route is short: type in a sticky on board
+    /// A so `busy_with_a_group` is true, let a reply for A arrive and queue, switch tab.
+    /// `swap_in` closes the group and `mem::replace`s a different `Editor` in; the next frame
+    /// applies A's bytes to **B**. `Board::apply` is a bare `LoroDoc::import` — no board
+    /// identity, no validation — so A's operations merge into B's tree, non-undoably, and
+    /// `edit` records it straight to disk. The restore point does not even fire, because B
+    /// has synced before and already carries the label.
+    ///
+    /// Held with the board it belongs to, that is unreachable: the queue travels with its own
+    /// document across a park, an unpark and a close, and a board that is not on screen
+    /// simply does not drain.
+    ///
+    /// **Bounded**, because a failed apply leaves the version vector where it was and the
+    /// server recomputes the same, growing payload every period — twenty entries a minute for
+    /// as long as a caret is open, all applied in one frame when it closes. The newest are
+    /// kept: a Loro update is cumulative, so a later one carries what an earlier one did.
+    remote: std::collections::VecDeque<Vec<u8>>,
+    /// Consecutive updates that would not merge **into this board**.
+    ///
+    /// Per board for the same reason the queue is: three failures on one board must not stop
+    /// receiving on every other one. Reset by a success, and by attaching a new sync.
+    merge_failures: u32,
 }
 
 impl std::fmt::Debug for Editor {
@@ -140,6 +165,8 @@ impl Editor {
             selection: Vec::new(),
             last_reproject: std::time::Duration::ZERO,
             sync: None,
+            remote: std::collections::VecDeque::new(),
+            merge_failures: 0,
         };
         editor.reproject();
         editor
@@ -423,6 +450,12 @@ impl Editor {
     /// not leak a thread per attach.
     pub fn attach_sync(&mut self, sync: crate::sync::Sync) {
         self.sync = Some(sync);
+        // A new conversation. Anything queued against the old one was answered by a server
+        // this board is no longer talking to, and a failure count from it says nothing about
+        // this one — which is also the only way somebody who has given up gets to try again
+        // without restarting.
+        self.remote.clear();
+        self.merge_failures = 0;
     }
 
     /// What the sync is doing — for the HUD, and for the sentence a failure needs.
@@ -474,6 +507,58 @@ impl Editor {
         self.sync.as_mut().map(crate::sync::Sync::drain).unwrap_or_default()
     }
 
+    /// How many updates this board may hold while a gesture is open.
+    ///
+    /// A failed apply leaves the version vector unmoved, so the server recomputes the same —
+    /// and growing — payload every period. At the default cadence that is twenty a minute for
+    /// as long as a caret is open, every one of them a full reproject when it closes.
+    ///
+    /// Sixty is two minutes of a healthy conversation, which is far past any gesture somebody
+    /// is actually in the middle of, and short enough that the catch-up is one frame's work
+    /// rather than a stall.
+    const REMOTE_QUEUE: usize = 60;
+
+    /// Hold an update until this board can take it.
+    ///
+    /// **Drops the oldest when full, and that is safe rather than lossy**: a Loro update is
+    /// cumulative — it carries everything since the version the server was answering — so a
+    /// later one supersedes an earlier one from the same conversation. Dropping the *newest*
+    /// would be the losing choice.
+    pub fn hold_remote(&mut self, updates: Vec<u8>) {
+        if self.remote.len() >= Self::REMOTE_QUEUE {
+            self.remote.pop_front();
+            log::debug!("sync: the remote queue is full; dropping the oldest update");
+        }
+        self.remote.push_back(updates);
+    }
+
+    /// Everything held for this board, taken.
+    pub fn take_remote(&mut self) -> Vec<Vec<u8>> {
+        self.remote.drain(..).collect()
+    }
+
+    /// Whether merging into this board has been given up on.
+    pub const fn merges_are_failing(&self) -> bool {
+        self.merge_failures >= Self::MERGE_ATTEMPTS
+    }
+
+    /// Record the outcome of a merge. `true` is a success.
+    ///
+    /// ⚠ **A success resets the count, so receiving genuinely resumes** — the first version
+    /// gated the whole apply loop on the count and reset it only *inside* the loop, which is
+    /// unreachable once the gate fires. Three failures stopped receiving for the life of the
+    /// process while sending carried on, which is one-way divergence after a single toast.
+    /// Here the gate stops the *queue* draining, and one later update that merges clears it.
+    pub fn note_merge(&mut self, ok: bool) {
+        self.merge_failures = if ok { 0 } else { self.merge_failures.saturating_add(1) };
+    }
+
+    /// How many consecutive failures before this board stops applying what arrives.
+    ///
+    /// Three rather than one, because a single failure can be a truncated reply or a race,
+    /// and three rather than ten because each attempt costs a full projection rebuild.
+    pub const MERGE_ATTEMPTS: u32 = 3;
+
     /// Merge an update from the server into this board.
     ///
     /// Through [`Self::edit`] rather than around it, so the reproject and the autosave record
@@ -499,7 +584,7 @@ impl Editor {
         // Once per board **ever**, not once per launch: the check is a scan of the board's
         // own restore points for the label, which `BoardDb::restore_points` answers without
         // reading a single snapshot's bytes.
-        self.take_restore_point_before_the_first_merge();
+        self.take_restore_point_before_the_first_merge()?;
         self.edit(|board| {
             board.apply(updates)?;
             Ok(())
@@ -515,31 +600,34 @@ impl Editor {
 
     /// Snapshot the board, unless one is already there.
     ///
-    /// **Reported and continued rather than propagated.** A failure here must not stop the
-    /// merge: the alternative to an unprotected sync is not a protected one, it is a board
-    /// that silently stops receiving — and the user would find out about that much later than
-    /// about a warning in the log. It is loud rather than silent for the same reason.
-    fn take_restore_point_before_the_first_merge(&mut self) {
-        let Some(autosave) = self.autosave.as_mut() else { return };
-        match autosave.restore_points() {
-            Ok(points) => {
-                if points.iter().any(|point| point.label.as_deref() == Some(Self::BEFORE_SYNC)) {
-                    return;
-                }
-            }
-            Err(error) => {
-                log::error!("sync: cannot read this board's restore points ({error}); \
-                             merging anyway, but there is no snapshot to go back to");
-                return;
-            }
+    /// ⚠ **A failure here stops the merge, and the first version did the opposite.** It
+    /// logged and carried on, reasoning that the alternative to an unprotected sync is a
+    /// board that silently stops receiving. That reasoning is wrong in the one direction that
+    /// matters: **a guard whose failure mode is permit is not a guard**, and this one stands
+    /// between a network and the only copy of somebody's board. `velmd`'s sibling — added the
+    /// same day, for a *server* holding copies — propagates and refuses. The client, holding
+    /// the originals, must not be the lenient one.
+    ///
+    /// Nothing is lost by refusing: the version vector has not moved, so the same update is
+    /// offered again next period, and `note_merge` counts it — so a genuinely broken store
+    /// stops after three attempts and says so, rather than merging without a way back.
+    ///
+    /// Once per board **ever**, not once per launch: the check is a scan of the board's own
+    /// restore points for the label. It costs one blocking round trip to the autosave writer
+    /// per merge, which is a real cost and the reason the queue that feeds this is bounded.
+    fn take_restore_point_before_the_first_merge(&mut self) -> Result<()> {
+        let Some(autosave) = self.autosave.as_mut() else { return Ok(()) };
+        let points = autosave
+            .restore_points()
+            .context("reading this board's restore points before merging a remote change")?;
+        if points.iter().any(|point| point.label.as_deref() == Some(Self::BEFORE_SYNC)) {
+            return Ok(());
         }
-        match autosave.create_restore_point(&self.board, Self::BEFORE_SYNC) {
-            Ok(id) => log::info!("sync: restore point {id} taken before the first merge"),
-            Err(error) => log::error!(
-                "sync: could not take a restore point before merging ({error}); \
-                 merging anyway, but there is no snapshot to go back to"
-            ),
-        }
+        let id = autosave
+            .create_restore_point(&self.board, Self::BEFORE_SYNC)
+            .context("taking a restore point before merging a remote change")?;
+        log::info!("sync: restore point {id} taken before the first merge");
+        Ok(())
     }
 
     // ----- selection -------------------------------------------------------

@@ -48,7 +48,19 @@ pub fn write(data: &Path, out: &Path) -> anyhow::Result<()> {
     let bytes: u64 = entries.iter().map(|e| e.bytes).sum();
 
     let manifest = Manifest { version: MANIFEST_VERSION, entries };
+    // A manifest is re-generated freely, so overwriting *a manifest* is the job — what must
+    // not happen is `--out` naming something else. Requiring the extension costs a re-run
+    // when somebody meant a different name, and is the whole guard when they meant a
+    // different file.
+    anyhow::ensure!(
+        out.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")),
+        "--out must name a .json file, got {}.\n  \
+         This truncates whatever it writes to, and a manifest is not worth a board.",
+        out.display()
+    );
     let json = serde_json::to_vec_pretty(&manifest)?;
+    // RULE ZERO: `write` opens create+truncate on a path the operator typed. The `.json`
+    // requirement above is what makes that safe — it cannot be pointed at a `.vellum`.
     std::fs::write(out, json)?;
 
     println!(

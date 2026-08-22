@@ -63,6 +63,23 @@ use vellum_ink::{Lod, Stroke};
 // the arrangement this repository has paid for three times, because two copies never disagree
 // on the day they are written. `vellum_project::look` owns them; both painters read them.
 pub(crate) use vellum_project::look::grid_step;
+// ⚠ Not defined here any more, and this one was the *third* time — a link card's type scale,
+// the air between its three voices, and the two string rules that decide what its title
+// actually says. Every one of these was arrived at by the user photographing a Velm card beside
+// Miro's, and several of them twice, so a browser card setting its title at a different scale
+// from the Mac's is exactly the failure `look`'s header names at length.
+//
+// ⚠ **These were *copied* into `vellum_project::card`, not moved**, and this file went on
+// carrying a private duplicate of all fourteen for a whole round — which is the arrangement
+// the shared crate exists to prevent, arriving inside the change that created it. The copies
+// were verified code-identical before being deleted; two of them (`strip_site_affix`,
+// `says_the_same_as`) have aborted the application on real board data, and the tests that pin
+// those aborts now live beside the one copy of the code rather than beside one of two.
+use vellum_project::card::{
+    BLURB_BOTTOM_AIR, BLURB_LINES, BLURB_SCALE, CARD_LINE_HEIGHT, PROVIDER_GAP, PROVIDER_SCALE,
+    TITLE_GAP, TITLE_LINES, TITLE_SCALE, ellipsise, estimated_lines, line_budget,
+    says_the_same_as, strip_site_affix, whole_lines,
+};
 // ⚠ Not defined here any more. An item hidden by the frame it has left is a rule both
 // painters must apply identically or the two applications draw different boards — so it
 // moved down beside `look`, where it also gained the tests it never had in this file.
@@ -2708,9 +2725,10 @@ impl Painter {
                 // page's blurb is any length: without this, a forum page with a 400-character
                 // description drew its text straight out through the bottom of the card and on
                 // to the board, over whatever was beneath it.
-                let per_line = chars_per_line(w, size);
-                let lines = ((h / (size * CARD_LINE_HEIGHT)).floor() as usize).max(1);
-                card_line_budget = per_line.saturating_mul(lines).max(per_line);
+                // The same three statements `vellum_project::card::line_budget` is, inlined
+                // here and now asked instead — a third copy of the one derivation that decides
+                // how much of a blurb is shaped.
+                card_line_budget = line_budget(w, h, size);
                 (
                     FitBox::new(w.max(1.0) as f32, h.max(1.0) as f32),
                     Anchor::Inset(x, y),
@@ -4257,43 +4275,15 @@ fn push_open_badge(
 // `cover_uv` is `vellum_project::look::cover_uv` — shared with the browser painter, which
 // crops a card's picture into the same band by the same rule.
 
-/// Line spacing inside a card, as a multiple of the font size. Tighter than prose: a card is
-/// a stack of short labels rather than a paragraph.
-const CARD_LINE_HEIGHT: f64 = 1.35;
+// `CARD_LINE_HEIGHT` and `ellipsise` are `vellum_project::card`'s — see the import. Note what
+// the deleted copy of `ellipsise`'s doc comment claimed: *"a budget under two leaves no room
+// for both a character and the ellipsis, so the whole string is kept"*. Its own body has
+// answered `""` at 0 and `"…"` at 1 since the overflow that reasoning caused was fixed, so the
+// sentence described the **bug** rather than the function. The `locked: false` trap exactly,
+// and one more reason a measurement should exist once.
 // `CARD_PADDING` is `vellum_project::look::CARD_PADDING`, measured off Miro's own card and
 // shared with the browser painter. It is the single number that decides a card's proportions,
 // which is exactly why it must not exist twice.
-
-/// Shortens `text` to at most `budget` characters, ending in an ellipsis when it had to cut.
-///
-/// Characters, not bytes: the cut has to land on a boundary, and a budget in bytes would split
-/// a multi-byte one. A budget under two leaves no room for both a character and the ellipsis,
-/// so the whole string is kept — better a row that overruns slightly than one showing only "…".
-fn ellipsise(text: &str, budget: usize) -> String {
-    // **No room means nothing, not everything.** This used to return the whole string
-    // when `budget < 2`, on the reasoning that there was no room for an ellipsis — which
-    // is true and is the opposite of the right answer. A block with nothing left got the
-    // text in full, so a card whose title had already spent the budget then drew its
-    // entire 600-character URL underneath and out through the bottom. The guard meant to
-    // protect the ellipsis was the overflow.
-    if budget == 0 {
-        return String::new();
-    }
-    if text.chars().count() <= budget {
-        return text.to_owned();
-    }
-    if budget == 1 {
-        return "…".to_owned();
-    }
-    let kept: String = text.chars().take(budget - 1).collect();
-    // Cut at the last word boundary in the kept part, so a row ends on a word rather than
-    // mid-syllable — unless that would throw most of it away.
-    let trimmed = kept.trim_end();
-    match trimmed.rsplit_once(' ') {
-        Some((head, _)) if head.chars().count() >= budget / 2 => format!("{head}…"),
-        _ => format!("{trimmed}…"),
-    }
-}
 
 /// Where a link card's pieces sit, in the item's own space with its top-left at `(0, 0)`.
 ///
@@ -4393,60 +4383,11 @@ const BADGE_RADIUS: f32 = 0.22;
 /// caller, which is not the same as one *world* unit — see `push_open_badge`.
 const BADGE_WEIGHT: f32 = 0.075;
 
-/// The title's size, as a multiple of the card's base size.
-///
-/// **Back to parity with the base size, from a third above it.** Enlarging it answered *"from
-/// a distance I want to be able to see more"* and overshot: against the Miro card the user
-/// then sent as a reference, a Velm title was two words filling the card. Miro's own title is
-/// close to its body size and earns its prominence from *colour* — near-black against the
-/// blurb's grey — rather than from scale.
-///
-/// The blurb is still set below this, so the hierarchy survives; it is the *distance* between
-/// them that shrank, which is what the reference shows.
-const TITLE_SCALE: f64 = 1.0;
-
-/// The site name's size, as a multiple of the card's base size.
-///
-/// **Below the base**, so the three voices of a card are three sizes rather than two. It used
-/// to be the base itself — the same size as the title and *larger* than the blurb, which is
-/// backwards from every card this is modelled on, and is most of what the user was describing
-/// as *"it kind of just looks a little bit off"* with a Miro card open beside it. Measured off
-/// that reference, Miro runs roughly 0.65 : 1.0 : 0.76 for name : title : blurb.
-///
-/// The title deliberately did **not** move to reach that ratio: `TITLE_SCALE` was raised once
-/// and the user asked for it back down, so the distance is opened from below instead. That also
-/// leaves the title's greek threshold where they asked for it.
-const PROVIDER_SCALE: f64 = 0.80;
-
-/// The most lines of title a card will give up before the blurb gets what is left.
-///
-/// A **ceiling**, not a reservation — see `title_lines_for`. It used to be taken flat, so a
-/// one-line title left two empty lines between itself and the blurb while a three-line title
-/// got none, and the user photographed exactly that band under *"Crush 80 Reboot Pro"*.
-const TITLE_LINES: f64 = 3.0;
-
-/// The most lines of blurb a card will draw.
-///
-/// *"less decription more white space"*. Unbounded before this, so a tall card gave the blurb
-/// six or more lines and the card read as a paragraph with a heading. Three is what Miro's own
-/// card shows before it ellipsises, and the lines this gives up are what pay for the gaps
-/// below — the card's own box does not change.
-const BLURB_LINES: f64 = 3.0;
-
-/// Air under the site name, as a fraction of the card's padding.
-///
-/// Zero before this: **every gap inside a card came from `CARD_LINE_HEIGHT` alone**, so the
-/// three blocks were as close to each other as two lines of one paragraph are, and no amount
-/// of size or colour difference could make them read as three things. Miro's card separates
-/// them visibly. This is the *"more white space"* half of the same feedback.
-const PROVIDER_GAP: f64 = 0.5;
-
-/// Air under the title, as a fraction of the card's padding.
-///
-/// Larger than `PROVIDER_GAP`: the name and the title belong together — the name is a label
-/// *for* the title — and the blurb is the separate thing. A uniform gap makes the card read as
-/// three equal strangers rather than as a heading and its description.
-const TITLE_GAP: f64 = 0.75;
+// A card's type scale and the air between its three voices — `TITLE_SCALE`, `PROVIDER_SCALE`,
+// `TITLE_LINES`, `BLURB_LINES`, `PROVIDER_GAP`, `TITLE_GAP`, `BLURB_SCALE` and
+// `BLURB_BOTTOM_AIR` — are `vellum_project::card`'s, and are imported at the top of this file.
+// The two constants left below are the ones that genuinely belong to *this* painter: a video
+// card's caption and its ▶ are drawn here and have no counterpart in the browser.
 
 /// …and how many a **video** card gets, where the picture is the point.
 ///
@@ -4464,66 +4405,11 @@ const VIDEO_TITLE_LINES: f64 = 1.0;
 /// stays legible around it. Miro's sits at roughly the same fraction.
 const PLAY_FRACTION: f64 = 0.25;
 
-/// Air below the blurb, in blurb line-heights.
-///
-/// *"the paragraph should be fixed so that there is a little bit of spacing underneath them."*
-/// Half a line: enough that the last row of text is visibly *inside* the card rather than
-/// resting on its edge, and not so much that a short card loses a line of blurb to margin.
-const BLURB_BOTTOM_AIR: f64 = 0.5;
-
-/// The blurb's size, as a multiple of the card's base size.
-///
-/// Below the base rather than at it, so the hierarchy is carried by *two* differences — size
-/// and colour — rather than by colour alone. A muted blurb at the same size as the title still
-/// reads as one block of text at a glance, which is the state the user was describing.
-const BLURB_SCALE: f64 = 0.86;
-
-/// How many characters of a card's text fit on one line of a box `width` wide at `size`.
-///
-/// **The one estimate.** Both the character budget a card's text is clipped to and the number
-/// of lines its title box reserves are answers to "how long is this run", and two copies of the
-/// arithmetic would be two answers — a layout that reserves two lines for a title the clip cut
-/// to one is the empty band this pair exists to prevent.
-///
-/// Advance-blind on purpose: half the font size is a proportional face's mean advance to within
-/// a few percent, and measuring properly needs a shaping pass, which is the very thing this
-/// decides the input to. The floor of 8 keeps a degenerate box from answering zero.
-///
-/// **Discounted by `WRAP_EFFICIENCY`, and that is not a fudge factor — it is the difference
-/// between how many characters *fit* on a line and how many a *word wrap* puts there.** Text
-/// breaks at spaces, so every line but the last gives up part of a word; the raw advance
-/// estimate is the count for a string with no spaces in it, which is the one case that never
-/// happens in a title.
-///
-/// Both readers want to be wrong in the same direction, which is what lets one number serve
-/// them: under-counting makes the clip budget *shorter* (less overflow) and the line
-/// reservation *taller* (no collision). Over-counting breaks both.
-pub(crate) fn chars_per_line(width: f64, size: f64) -> usize {
-    ((width / (size * 0.5) * WRAP_EFFICIENCY).floor() as usize).max(8)
-}
-
-/// How much of a line's raw character capacity survives being word-wrapped.
-///
-/// **Measured against the failure, not guessed.** At 0.5 em with no discount, the reference
-/// card's title — *"rust-lang/rust: Empowering everyone to build reliable software"*, 62
-/// characters in a 238-unit box at 15 units — estimated 31 per line and so **two** lines. It
-/// shapes to three: the wrap puts 26 on each of the first two. The blurb was then positioned
-/// two lines down and drew straight through the title's third line, which is a worse fault
-/// than the empty band the estimate replaced, and the `--demo links` screenshot is what found
-/// it — no assertion about box geometry could, because the boxes were exactly as asked for.
-///
-/// 0.85 turns that 31 into 26, which is what the text actually does.
-const WRAP_EFFICIENCY: f64 = 0.85;
-
-/// The lines `chars` characters need in a box `width` wide at `size`.
-///
-/// ⚠ **Bolding widens advances by 3-5%**, so a title within a character or two of a line
-/// boundary can shape one line longer than this predicts. `whole_lines` clamps the box to the
-/// card either way, so the failure mode is a tighter gap under the title rather than text
-/// leaving the card — which is the direction to be wrong in.
-pub(crate) fn estimated_lines(chars: usize, width: f64, size: f64) -> f64 {
-    chars.max(1).div_ceil(chars_per_line(width, size)) as f64
-}
+// `chars_per_line` and `estimated_lines` are `vellum_project::card`'s, and so is the
+// `WRAP_EFFICIENCY` they are discounted by — which is private there, because the two functions
+// are the only things that ever needed it and a shared constant nobody reads is a third way to
+// disagree. It is the difference between how many characters *fit* on a line and how many a
+// word wrap puts there, and it is why one estimate can serve both the clip and the reservation.
 
 #[expect(
     clippy::fn_params_excessive_bools,
@@ -4699,23 +4585,9 @@ pub(crate) fn card_layout(
     //
     // Snapping down is the whole fix. A box that is an exact multiple of its own line height
     // either fits a line or does not offer the room for one.
-    let whole_lines = |available: f64, line_height: f64| {
-        if line_height <= 0.0 {
-            return available.max(0.0);
-        }
-        // **The nudge is not defensive; an exact fit is the common case.** These heights are
-        // built by adding and subtracting the same line height and padding several times, so a
-        // box sized to hold exactly one line arrives as 22.463999999999874 against a line of
-        // 22.464000000000002 — and `floor` answers **zero**. Measured, on the video card the
-        // user asked to have its caption pinned to the foot: the title box came out empty and
-        // the card drew a poster and a provider row with no title under it.
-        //
-        // A relative epsilon rather than an absolute one, because the line height scales with
-        // the card: an absolute tolerance that works at 13 units is either useless or far too
-        // generous at 78.
-        const SNAP: f64 = 1e-6;
-        (((available / line_height) + SNAP).floor() * line_height).max(0.0)
-    };
+    // `whole_lines` is `vellum_project::card::whole_lines`, shared with the browser painter.
+    // It was a closure here, body-identical to that function, and the epsilon's whole
+    // explanation lived in this copy — it has moved with it rather than been left behind.
 
     // **The lines the title needs, not the lines it may have.** `TITLE_LINES` was taken flat,
     // so the box was three lines tall whatever was in it: a one-line title left two empty lines
@@ -4810,92 +4682,10 @@ pub(crate) fn has_link(kind: &ItemKind) -> bool {
     link_url(kind).is_some_and(|url| vellum_link::host_of(url).is_some())
 }
 
-/// Removes the site's own name from the front or the back of a page title.
-///
-/// # Why the row above makes it redundant
-///
-/// *"for amazon.com you dont have to write the amazon.com at the beginning."* Pages name
-/// themselves in their `<title>` because a browser tab has nowhere else to say it — so the
-/// reference board carries *"Amazon.com : Superbat 3G/6G/12G SDI Cable…"* and
-/// *"IQL-IMX678/FF | DigiKey Electronics"*. A card has already said the site, in its own row,
-/// with the site's own icon beside it. Repeating it spends the first line of the title — the
-/// one line that survives being small on screen — on a word the user is not reading.
-///
-/// Both ends, because pages do both: American retailers lead with it, and most of the rest of
-/// the web trails it after a pipe or a dash.
-///
-/// # What it refuses to do
-///
-/// It only ever strips across a **separator**, and never leaves a title shorter than
-/// [`SHORTEST_TITLE`]. Both guards earn their place: without the separator a page called
-/// *"Amazonian Fish"* on `amazon.com` loses its first word, and without the length floor a
-/// DigiKey page titled simply *"DigiKey"* is left with nothing at all — a card with an empty
-/// title where the real one was is much worse than a card that repeats itself.
-fn strip_site_affix<'a>(title: &'a str, provider: Option<&str>) -> &'a str {
-    /// A title this short is very likely *only* the site's name, and the site's name is the
-    /// most useful thing left to show.
-    const SHORTEST_TITLE: usize = 3;
-    /// What a page puts between its own name and its title.
-    const SEPARATORS: [char; 6] = [':', '|', '-', '\u{2013}', '\u{2014}', '\u{00BB}'];
-
-    let Some(provider) = provider.map(str::trim).filter(|p| !p.is_empty()) else { return title };
-    // `Amazon` against a title leading `Amazon.com` — the row says the short name and the page
-    // writes the domain, so the comparison is on the provider as a *prefix* of the run rather
-    // than on equality.
-    //
-    // **`get`, never `[..]`.** This function is on the paint path and `[profile.release]` sets
-    // `panic = "abort"`, so a bad index here does not throw — it kills the application on the
-    // frame a card first becomes visible. Two ways in, both found by an adversarial review of
-    // this very change and neither reachable from the tests that shipped with it:
-    //
-    // - **A non-boundary.** `provider.len()` is a boundary in *the provider*, which the old
-    //   comment here reasoned about — and says nothing about `text`. An Alibaba listing whose
-    //   title opens with CJK puts a continuation byte at index 7, and `Alibaba` is 7 bytes.
-    //   The user's board is largely Alibaba.
-    // - **A reversed range**, below.
-    //
-    // `str::get` answers `None` for both rather than aborting, which is the difference between
-    // a card that declines to shorten its title and a board that will not open.
-    let matches_here = |text: &str| {
-        text.get(..provider.len()).is_some_and(|head| head.eq_ignore_ascii_case(provider))
-    };
-
-    let trimmed = title.trim();
-    // Every index below comes from `match_indices`, which yields the separator itself — so the
-    // text after it starts at `at + sep.len()`. Adding 1 works for `:` and `|` and **panics on
-    // an en dash**, which is three bytes and is what most of the web actually uses.
-    // Caught by a test on a real title: `Sony Imx678 Camera – Sincerefirst`.
-    let after = |at: usize, sep: &str| &trimmed[at + sep.len()..];
-
-    // Leading: "Amazon.com : Superbat …"
-    if matches_here(trimmed)
-        && let Some((at, sep)) = trimmed.match_indices(SEPARATORS).next()
-        // **The separator has to come *after* the provider.** A provider is only a name until
-        // it contains one of these: `provider_for` falls back to capitalising the registrable
-        // domain label, and a hyphen is legal in one — so `acme-parts.com` yields `Acme-parts`,
-        // whose own hyphen is the first match in the title, and `trimmed[9..3]` is a reversed
-        // range. Guaranteed, not occasional: `matches_here` has just established that the
-        // title *starts with* the provider, so the separator inside it is always found first.
-        && let Some(between) = trimmed.get(provider.len()..at).map(str::trim)
-    {
-        let tail = after(at, sep).trim();
-        // Only across a separator, and only when what sits *between* the name and it is the
-        // rest of a domain rather than words — so "Amazon Basics: …" keeps its first word.
-        if tail.chars().count() >= SHORTEST_TITLE && between.len() <= 4 {
-            return tail;
-        }
-    }
-    // Trailing: "IQL-IMX678/FF | DigiKey Electronics"
-    for (at, sep) in trimmed.match_indices(SEPARATORS).collect::<Vec<_>>().into_iter().rev() {
-        if matches_here(after(at, sep).trim()) {
-            let head = trimmed[..at].trim();
-            if head.chars().count() >= SHORTEST_TITLE {
-                return head;
-            }
-        }
-    }
-    trimmed
-}
+// `strip_site_affix` is `vellum_project::card`'s. It is one of the two functions in this file
+// that has aborted the whole application on real board data — twice, on a byte index that
+// landed inside a character — so the tests pinning both aborts now sit beside the single copy
+// of the code rather than beside one of two.
 
 /// A card's address, for the badge and for the press that lands on it.
 pub(crate) fn link_url(kind: &ItemKind) -> Option<&str> {
@@ -5110,60 +4900,12 @@ fn card_text(kind: &ItemKind, slot: u16, line_budget: usize) -> vellum_text::Sty
     text::convert(&DocText::from_spans(spans))
 }
 
-/// Whether a card's blurb is just its title again, in which case it is not drawn.
-///
-/// # This is Miro's data, not a bug of ours — but the card is ours
-///
-/// Measured from the reference capture (`captures/reference-board.html`): **18 of the 91
-/// `preview` widgets carry an `openGraph.description` that is the `openGraph.title`**, and
-/// 15 of those are alibaba.com. Miro renders one of them; we rendered both, and the user
-/// photographed a card saying the same sixty-word sentence twice.
-///
-/// # Why equality is not enough, and where the line is
-///
-/// The second shape is the one a naive `==` misses and is just as common in that capture: a
-/// description that is the title **truncated** to ~256 characters and ended with an ellipsis,
-/// sometimes differing in HTML entity spelling as well (`&#43;` against `+`). It reads as the
-/// same sentence twice just as plainly. So the test is a prefix on normalised text, with a
-/// floor: a genuinely short blurb that happens to open with the title's first few words is a
-/// real blurb, and suppressing it would lose the only description the card has. Sixteen
-/// characters is enough to be past "Buy" and "Amazon.com:" and short enough to catch the
-/// truncated case, which diverges only at its very end.
-fn says_the_same_as(title: Option<&str>, description: &str) -> bool {
-    /// Case-folded, entity-and-punctuation-agnostic, whitespace-collapsed.
-    fn normalise(text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut spaced = true;
-        for character in text.chars() {
-            if character.is_alphanumeric() {
-                out.extend(character.to_lowercase());
-                spaced = false;
-            } else if !spaced {
-                out.push(' ');
-                spaced = true;
-            }
-        }
-        out.trim_end().to_owned()
-    }
-
-    const ENOUGH: usize = 16;
-    let Some(title) = title else { return false };
-    let (title, description) = (normalise(title), normalise(description));
-    // Either direction: Miro stores the truncated one in `description` on some cards and a
-    // description that runs *past* the title on others.
-    if !(title.starts_with(&description) || description.starts_with(&title)) {
-        return false;
-    }
-    let (shorter, longer) = (title.len().min(description.len()), title.len().max(description.len()));
-    // **Both halves of this guard earn their place.** Without the floor, a card whose title
-    // is a bare site name suppresses nothing useful but a card with a two-word title would
-    // eat a real description. Without the ratio, a title of `Alibaba.com` swallows the blurb
-    // *"Alibaba.com is the world's largest…"* — a real description, thrown away for sharing
-    // eleven characters with the title. The duplicate this exists for is two strings of
-    // nearly the same length; a prefix that is a small fraction of the whole is a blurb that
-    // happens to open with the title, which is ordinary and worth keeping.
-    shorter >= ENOUGH && shorter * 2 >= longer
-}
+// `says_the_same_as` is `vellum_project::card`'s — the other of the two string rules that
+// decide what a card actually says, and the other one whose shape has cost this application a
+// process. Measured from the reference capture (`captures/reference-board.html`): 18 of the 91
+// `preview` widgets carry an `openGraph.description` that *is* the `openGraph.title`, 15 of
+// them alibaba.com. Miro draws one of the two; we drew both, and the user photographed a card
+// saying the same sixty-word sentence twice.
 
 // ── The Agent Canvas ─────────────────────────────────────────────────────────
 //

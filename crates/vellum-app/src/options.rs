@@ -287,6 +287,13 @@ pub fn sync_token() -> Option<String> {
     std::env::var(TOKEN_VAR).ok().map(|value| value.trim().to_owned()).filter(|t| !t.is_empty())
 }
 
+/// Where the token is kept once it has been taken out of the environment.
+///
+/// A `OnceLock` rather than a field on [`Options`], because `Options` derives `Debug` and a
+/// secret in a derived `Debug` is a secret in whatever log line ever formats it — the same
+/// reasoning that gave `SyncReply` a hand-written one.
+static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
 /// [`sync_token`], and then **take it out of this process's environment**.
 ///
 /// # ⚠ Why an environment variable is not automatically the safer choice
@@ -305,21 +312,44 @@ pub fn sync_token() -> Option<String> {
 /// # Safety
 ///
 /// `remove_var` is unsafe because another thread reading the environment concurrently is a
-/// data race. This is called from `ActiveState::new`, on the main thread, before the agent
-/// runtime, the link pool, the sync worker or any autosave writer exists — so there is no
-/// other thread to race with. **Moving this call later is what would make it unsound**, which
-/// is why it is a distinct function with this note rather than a line inside the caller.
+/// data race, and `getenv` is called by more things than it looks — SQLite's temporary-file
+/// lookup among them.
 ///
-/// It is deliberately *not* called when `--sync-server` was not given: a user who exports the
-/// variable in their shell profile and launches without the flag should still find it set the
-/// next time they check, rather than discovering that Velm quietly ate it.
+/// ⚠ **This must be called from `main`, before the event loop, and the first version was not.**
+/// It claimed to run "before the agent runtime, the link pool, the sync worker or any autosave
+/// writer exists" — from `ActiveState::new`, by which point `Editor::open` has already started
+/// the autosave *writer thread* and `Appearance::watch` its poller. The argument was the whole
+/// safety case and the argument was false. It is the argument, not a check, that makes an
+/// `unsafe` sound, so the fix is to make the argument true rather than to soften it.
+///
+/// Called once. A second call is a no-op that answers the same value, so a caller cannot lose
+/// the token by asking twice, and nothing has to remember the ordering.
+///
+/// # Why the environment was not automatically safer than a flag
+///
+/// A flag was rejected because argv is readable by every process through `ps`. True — but an
+/// environment is **inherited**, and this application's job includes launching third-party
+/// binaries: `claude`, `codex`, `gemini`, and a PTY the user can type into. Nothing in the
+/// tree calls `env_clear`, so every one of them could read `$VELM_SYNC_TOKEN` directly. The
+/// mechanism chosen to defeat an attacker who can run `ps` was handing the secret to the
+/// attacker this application invites in on purpose.
+///
+/// ⚠ It is taken **unconditionally**, not only when `--sync-server` was given. The startup
+/// warning tells people to export it from their shell profile, so a launch *without* the flag
+/// is the common case — and that is exactly the launch that would otherwise hand it to every
+/// agent. The cost is that the variable is gone from this process; it is untouched in the
+/// shell that set it.
 pub fn take_sync_token() -> Option<String> {
-    let token = sync_token();
-    if token.is_some() {
-        // SAFETY: see above — main thread, before anything else is spawned.
-        unsafe { std::env::remove_var(TOKEN_VAR) };
-    }
-    token
+    TOKEN
+        .get_or_init(|| {
+            let token = sync_token();
+            // SAFETY: `main` calls this before the event loop is built and before any board
+            // is opened, so this process is single-threaded here. See the note above for why
+            // that has to be asserted at the call site rather than hoped for.
+            unsafe { std::env::remove_var(TOKEN_VAR) };
+            token
+        })
+        .clone()
 }
 
 /// Whether a server address is this machine, so a missing token is a legitimate setup

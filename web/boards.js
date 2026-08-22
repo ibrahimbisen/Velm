@@ -842,12 +842,19 @@ export function mount(options = {}) {
 /**
  * How many items, and when it changed if the server says.
  *
- * ⚠ **`modified` is read and is not sent today.** `boards_json` in `crates/velmd/src/serve.rs`
- * emits `id`, `title` and `items` only, though `BoardIndex` carries a `modified: SystemTime`
- * that the listing is already **sorted by**, newest first. So the date is honestly absent
- * rather than invented, the ordering is stated instead because that much is guaranteed, and
- * this reader is ready for the one-line server change without a second edit here. If that
- * change never lands, this branch is dead — say so rather than let it read as a feature.
+ * `modified` is milliseconds since the epoch, formatted in the reader's own locale rather
+ * than the server's. `boards_json` in `crates/velmd/src/serve.rs` sends it, and the listing
+ * is sorted by it, newest first — which the heading says, because the ordering is the thing
+ * a reader actually navigates by.
+ *
+ * A missing or zero value renders **no date at all** rather than 1970: a clock the file
+ * predates is a fact about the filesystem, not about the board, and an obviously wrong date
+ * is worse than none. That is why this degrades instead of falling back.
+ *
+ * ⚠ This doc said the field *was not sent* and told the next reader the branch was dead and
+ * could be deleted — written against the server as it was that morning, and stale by the same
+ * commit, which added it. A comment that instructs somebody to delete working code is the
+ * `locked: false` trap pointed at the reader instead of at the compiler.
  */
 function describeBoard(board) {
   const count = Number(board?.items);

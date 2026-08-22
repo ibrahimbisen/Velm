@@ -412,8 +412,24 @@ says nothing is wrong, and serves every board you own to anyone who finds the ad
 
 velmd now catches this itself: a request that arrives through a proxy, on a server with
 no token, is refused with a message naming the problem. **You should never see it.** If
-you do, it means `VELMD_TOKEN` is not reaching the service — check step 12 and
-`systemctl show velmd -p Environment`.
+you do, it means `VELMD_TOKEN` is not reaching the service. Check it like this:
+
+```bash
+sudo cat /srv/velm/secret/velmd.env      # should print VELMD_TOKEN=<a long hex string>
+sudo systemctl restart velmd
+sudo journalctl -u velmd -n 20 --no-pager
+```
+
+Among the startup lines velmd prints is one beginning `auth`. It reads
+`auth    bearer token required` when the token arrived and `auth    none (loopback only)`
+when it did not. **That line is the answer**, and it is the only one that is.
+
+⚠️ **`systemctl show velmd -p Environment` will not tell you** — and this box used to say
+it would. The unit reads the token from `EnvironmentFile=`, deliberately, so that it is
+*not* in `systemctl show` and not in `ps`; the unit's own comment says so four steps
+earlier. It prints an empty `Environment=` whether the token arrived or not, which is the
+worst possible answer here: a check that looks like it passed, on the one failure that
+exposes every board you own.
 
 There is no version of this where a missing token is safe once the proxy is in front.
 
@@ -553,8 +569,14 @@ that step for whichever provider you pick.
 ## Part 6 — Let the Mac sync with the server
 
 Everything up to here gets your boards **onto** the server and into a browser. This is what
-keeps them in step afterwards, so a change made on the Mac appears in the browser and a change
-made in the browser comes back — without copying anything by hand again.
+keeps them in step afterwards, so a change made on the Mac appears in the browser — on every
+computer you have one open on — without copying anything by hand again.
+
+⚠️ **It goes one way, on purpose.** The browser *receives* changes and never sends any,
+because a tab can be closed by the phone or the iPad with no warning and no chance to save.
+A tab holding the only recent copy of one of your boards is exactly what must not happen.
+The desktop app is still where a board is changed; the table at the end of this file says the
+same thing.
 
 **You only do this once.** After it, the Mac just works.
 
@@ -563,8 +585,9 @@ automatically, and a backup you have actually restored is what makes that safe t
 
 ### Step 31 — Tell the Mac where the server is (YOU)
 
-Open **Terminal on your Mac** — not the server — and run these two lines, replacing the
-address with your own and the long token with the one from step 12:
+Open **Terminal on your Mac** — not the server — and run these two lines, replacing the long
+token with the one from step 12. (The server's address is not needed here; it goes on the
+command in step 32.)
 
 ```bash
 echo 'export VELM_SYNC_TOKEN="paste-your-token-here"' >> ~/.zshrc
@@ -578,7 +601,7 @@ and this token is the only thing standing between a stranger and every board you
 ### Step 32 — Start Velm with syncing on (YOU)
 
 ```bash
-/Applications/Velm.app/Contents/MacOS/vellum-app --sync-server https://boards.YOURDOMAIN.com
+/Applications/Velm.app/Contents/MacOS/Velm --sync-server https://boards.YOURDOMAIN.com
 ```
 
 **What should happen:** Velm opens normally. Nothing looks different — that is correct. Within

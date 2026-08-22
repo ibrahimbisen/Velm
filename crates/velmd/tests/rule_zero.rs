@@ -12,9 +12,13 @@
 //! So the promise is a test. It reads this crate's own source and fails on any call that
 //! could remove or displace a file.
 //!
-//! **There is no exemption for test code**, which is why `manifest.rs`'s scratch helper builds
-//! a fresh directory per run rather than clearing one. An exemption is a hole, and a hole in
-//! this particular rule is how an irreplaceable board goes missing.
+//! **The removal scan has no exemption for test code**, which is why `manifest.rs`'s scratch
+//! helper builds a fresh directory per run rather than clearing one. An exemption is a hole,
+//! and a hole in this particular rule is how an irreplaceable board goes missing.
+//!
+//! The *truncating*-write scan covers `src/` alone, and the reason is written out at that
+//! test. The short version: a test that removes is as dangerous as production that removes,
+//! and a test that writes a fixture into a `TempDir` is simply how a test is written.
 //!
 //! What is deliberately *not* forbidden: `std::fs::copy`, `create_dir_all` and `write`.
 //! Importing is a copy, and writing into the server's own data directory is the job.
@@ -44,13 +48,31 @@ const FORBIDDEN: [&str; 6] = [
 /// `rm` anywhere for the scan to catch. That was found by hand and guarded by hand at its one
 /// call site.
 ///
-/// These are not forbidden outright: writing into the server's own data directory is the job,
-/// and `create_dir_all` and `write` are how a manifest gets written. What is required is that
-/// each one is **acknowledged** — a `RULE ZERO:` note on the line or the line above, saying
+/// These are not forbidden outright: writing into the server's own data directory is the job.
+/// What is required is that each one is **acknowledged** — a `RULE ZERO:` note on the line or the line above, saying
 /// why this particular write cannot destroy a board. The point is not the comment, it is that
 /// adding one of these is a decision somebody has to make in writing.
-const TRUNCATING: [&str; 4] =
-    ["std::fs::copy", "fs::copy(", "File::create", ".truncate(true)"];
+const TRUNCATING: [&str; 5] = [
+    // ⚠ **Bare, for the reason `FORBIDDEN`'s `rename(` gives three lines above** — and it
+    // was written qualified anyway, in the same hunk that added that comment. `use
+    // std::fs::copy;` then `copy(&stale, &live_board)` matched neither `std::fs::copy` nor
+    // `fs::copy(`. Feedback 35's rule, stated in a comment and not applied below it.
+    "copy(",
+    // The one the first version of this list excused **by name** in its own doc, while two
+    // live sites took an operator-supplied path with no `exists` check. `write` opens
+    // create+truncate: `velmd snapshot --out b.vellum` replaced a board with raw bytes.
+    //
+    // Qualified, unlike `copy(` above, and the asymmetry is measured rather than chosen: a
+    // bare `write(` matches `pub fn write(`, `manifest::write(` and every `Write` impl in
+    // the workspace — sixteen lines on the first run, none of them a hazard. **A guard that
+    // fires on things that are fine is a guard people learn to silence.** `fs::write(`
+    // catches both spellings that exist here; a `use std::fs::write;` would escape it, and
+    // that is a real hole, named rather than papered over.
+    "fs::write(",
+    "File::create",
+    ".truncate(true)",
+    "OpenOptions",
+];
 
 /// The code on a line, with a trailing comment removed.
 ///
@@ -160,6 +182,74 @@ fn the_scan_would_actually_catch_something() {
     );
 }
 
+/// Every `fn` in a `mod tests` carries `#[test]`.
+///
+/// ⚠ **This exists because it happened three times in one session, twice in this file's own
+/// crate.** Inserting a new test above an existing one, anchored on its `fn` line rather than
+/// on its attribute, moves the attribute onto the *new* test — so the old one silently stops
+/// running while the suite reports **more** tests than before, which is the reading least
+/// likely to prompt a second look.
+///
+/// Clippy catches it (`duplicated attribute`, then `never used`) and clippy is `-D warnings`
+/// in CI, so nothing was ever shipped. What clippy does not do is fail the *test* run, which
+/// is what somebody watches while iterating — and three times the gap between those two was
+/// long enough to keep editing on top of a suite that had quietly shrunk.
+///
+/// Helper functions are allowed: only a `fn` at the top level of the module counts, and one
+/// taking arguments is a helper by construction.
+#[test]
+fn every_test_in_this_crate_still_has_its_attribute() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    sources(&root.join("src"), &mut files);
+    sources(&root.join("tests"), &mut files);
+
+    let mut orphans = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let Some(start) = lines.iter().position(|l| l.trim_start().starts_with("#[cfg(test)]"))
+        else {
+            continue;
+        };
+        for (index, line) in lines.iter().enumerate().skip(start) {
+            let trimmed = line.trim_start();
+            // Four spaces of indent is the module's top level; a nested `fn` is a closure or
+            // an impl and is not a test.
+            if !trimmed.starts_with("fn ") || line.len() - trimmed.len() != 4 {
+                continue;
+            }
+            // A helper takes arguments; a test cannot.
+            if !trimmed.contains("()") {
+                continue;
+            }
+            // The attribute sits directly above, or above a doc block.
+            let has_attribute = lines[..index]
+                .iter()
+                .rev()
+                .take_while(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("///") || t.starts_with("#[") || t.is_empty()
+                })
+                .any(|l| l.trim_start().starts_with("#[test]"));
+            if !has_attribute {
+                orphans.push(format!(
+                    "{}:{}: {}",
+                    file.strip_prefix(root).unwrap_or(file).display(),
+                    index + 1,
+                    trimmed
+                ));
+            }
+        }
+    }
+    assert!(
+        orphans.is_empty(),
+        "these look like tests and will never run — most likely an insert above took their \n\
+         `#[test]`. Anchor on the attribute, not the `fn`:\n{}",
+        orphans.join("\n")
+    );
+}
+
 /// Every truncating write is acknowledged in writing.
 ///
 /// ⚠ **RULE ZERO is about content, not about which syscall takes it.** `import` once used
@@ -175,6 +265,18 @@ fn the_scan_would_actually_catch_something() {
 #[test]
 fn every_truncating_write_says_why_it_is_safe() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // ⚠ **`src/` only, unlike the removal scan above, and the asymmetry is deliberate.**
+    //
+    // A test that *removes* a directory is exactly as dangerous as production code that does
+    // — it runs on this machine, and a scratch path is one typo from a real one. That is why
+    // the removal scan has no exemption and why `manifest.rs`'s helper builds a fresh
+    // directory per run rather than clearing one.
+    //
+    // A test that *writes* a fixture into a `TempDir` is how every test in this crate is
+    // written. Requiring a `RULE ZERO:` note on each would put sixteen of them in this crate
+    // alone, none of which is a hazard, and a guard that fires on things that are fine is a
+    // guard people learn to silence. What this exists to catch is a truncating write on a
+    // path **an operator typed**, and only production takes one.
     let mut files = Vec::new();
     sources(&root.join("src"), &mut files);
     assert!(!files.is_empty(), "found no source to scan — the test is not testing anything");
@@ -183,7 +285,22 @@ fn every_truncating_write_says_why_it_is_safe() {
     for file in &files {
         let text = std::fs::read_to_string(file).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        for (index, line) in lines.iter().enumerate() {
+        // ⚠ **A `#[cfg(test)]` module inside `src/` is test code**, and the paragraph on this
+        // test says why those are out of scope for truncation. Scanning to the marker rather
+        // than filtering by directory, because that is where this crate's unit tests live —
+        // conventionally last in the file, which is what makes a scan-until sound. If one
+        // ever appears in the middle, this stops early and under-scans: the failure direction
+        // is a guard that misses, so the marker is asserted to be last where it is present.
+        let end = lines.iter().position(|l| l.trim_start().starts_with("#[cfg(test)]"));
+        if let Some(at) = end {
+            assert!(
+                lines[at..].iter().filter(|l| l.trim_start().starts_with("mod ")).count() <= 1,
+                "{}: more than one module after the #[cfg(test)] marker — this scan assumes \
+                 the test module is last and would stop early",
+                file.display()
+            );
+        }
+        for (index, line) in lines.iter().take(end.unwrap_or(lines.len())).enumerate() {
             if !TRUNCATING.iter().any(|needle| code_of(line).contains(needle)) {
                 continue;
             }

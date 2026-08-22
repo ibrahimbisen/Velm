@@ -44,14 +44,6 @@ struct Key {
     /// written, and states the sharper half of the hazard: a *stale* slot draws the caret on
     /// one card while typing into another.
     slot: u16,
-    /// Font size in tenths of a **world** unit.
-    ///
-    /// World rather than device, so the key does not move with the camera. Keyed on a
-    /// device size, a layout would be re-shaped on every frame of a zoom -- which is both
-    /// the cost the cache exists to avoid and, worse, a visible re-wrap.
-    size_tenths: u32,
-    /// Wrap width, in world units for the same reason.
-    width_tenths: u32,
 }
 
 /// A shaped block, and which version of its item it was shaped from.
@@ -69,6 +61,23 @@ struct Key {
 /// module's own siblings `shapes.rs` and `strokes.rs` already did. Only this one accumulated.
 struct Shaped {
     generation: u64,
+    /// Font size in tenths of a **world** unit, and the wrap width in the same units.
+    ///
+    /// World rather than device, so neither moves with the camera. Held against a *device*
+    /// size, a layout would be re-shaped on every frame of a zoom — which is both the cost
+    /// this cache exists to avoid and, worse, a visible re-wrap.
+    ///
+    /// ⚠ **Fields, not key components, for the same reason `generation` is.** They were in
+    /// the key, and the first fix moved only the generation out — an N−1 fix, and the case it
+    /// left behind is the common one: **a sticky is auto-fitted** (`font_size: None`, which
+    /// is every sticky on the reference board), so a merge that changes its words refits to a
+    /// *different size*, mints a different key, and strands the old entry. A synced resize
+    /// strands one `Layout` per tenth-of-a-unit step, in memory that never returns to the OS.
+    ///
+    /// With them here the entry is replaced, which is what `shapes.rs` and `strokes.rs` do —
+    /// both key on `SceneId` alone and carry everything else in the value.
+    size_tenths: u32,
+    width_tenths: u32,
     layout: Layout,
 }
 
@@ -82,7 +91,7 @@ pub struct TextLayer {
     /// the layout key can even be computed. Uncached it would run every frame, on every
     /// sticky on screen, for the life of the tab.
     /// Keyed without the generation, for [`Shaped`]'s reason; the stamp rides in the value.
-    fitted: HashMap<(SceneId, u16, u32, u32), (u64, f32)>,
+    fitted: HashMap<(SceneId, u16), (u64, u32, u32, f32)>,
     /// Reused every frame. The glyph list is rebuilt per frame but its allocation is not.
     glyphs: Vec<(GlyphKey, GlyphImage)>,
     /// Blocks too small to shape, drawn as bars on the type's rhythm.
@@ -200,7 +209,7 @@ impl TextLayer {
         }
         let live: std::collections::HashSet<SceneId> = visible.iter().copied().collect();
         self.layouts.retain(|key, _| live.contains(&key.item));
-        self.fitted.retain(|(item, ..), _| live.contains(item));
+        self.fitted.retain(|(item, _), _| live.contains(item));
     }
 
     /// Shape and queue one item's text. Returns `false` if it was too small to draw.
@@ -256,14 +265,15 @@ impl TextLayer {
             return false;
         }
         let font_size = self.resolve_size(item, slot, generation, text, size, font_size);
-        let key = Key {
-            item,
-            slot,
-            size_tenths: (font_size * 10.0) as u32,
-            width_tenths: (size[0] * 10.0) as u32,
-        };
-        // Reshaped when the item has changed under it, and **replaced rather than added**.
-        let stale = self.layouts.get(&key).is_none_or(|held| held.generation != generation);
+        let key = Key { item, slot };
+        let (size_tenths, width_tenths) = ((font_size * 10.0) as u32, (size[0] * 10.0) as u32);
+        // Reshaped when anything it was shaped against has moved, and **replaced rather than
+        // added** — one entry per block, for the life of that block's visibility.
+        let stale = self.layouts.get(&key).is_none_or(|held| {
+            held.generation != generation
+                || held.size_tenths != size_tenths
+                || held.width_tenths != width_tenths
+        });
         if stale {
             let layout = self.engine.layout(
                 text,
@@ -273,7 +283,7 @@ impl TextLayer {
                     ..Default::default()
                 },
             );
-            self.layouts.insert(key, Shaped { generation, layout });
+            self.layouts.insert(key, Shaped { generation, size_tenths, width_tenths, layout });
         }
         let layout = &self.layouts[&key].layout;
         // Rasterised at the size it will actually be drawn, which is what keeps a zoomed-in
@@ -312,9 +322,12 @@ impl TextLayer {
         {
             return size;
         }
-        let key = (item, slot, (size[0] * 10.0) as u32, (size[1] * 10.0) as u32);
-        if let Some((stamp, fitted)) = self.fitted.get(&key)
+        let key = (item, slot);
+        let (w, h) = ((size[0] * 10.0) as u32, (size[1] * 10.0) as u32);
+        if let Some((stamp, box_w, box_h, fitted)) = self.fitted.get(&key)
             && *stamp == generation
+            && *box_w == w
+            && *box_h == h
         {
             return *fitted;
         }
@@ -322,7 +335,7 @@ impl TextLayer {
         let params = LayoutParams { max_width: Some(area.width), ..Default::default() };
         let resolved =
             self.engine.fit_font_size(text, &params, area, &vellum_text::AutoFit::default());
-        self.fitted.insert(key, (generation, resolved));
+        self.fitted.insert(key, (generation, w, h, resolved));
         resolved
     }
 
