@@ -522,7 +522,15 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
     // something is still happening. Fifteen seconds is past a cold start on a slow phone
     // (155ms warm, and the budget for the whole boot is a few seconds) and well short of the
     // point where somebody assumes it is broken.
-    const STARTING_PATIENCE_MS = 15000;
+    // ⚠ Generous on purpose. Boot is a GPU handshake plus a whole board over the wire, and
+    // the cost of being early here is worse than the cost of being late: "Did not load" on a
+    // board that is still loading is a red word on a page that is about to work, and somebody
+    // who sees it once stops believing the indicator. Measured cold on loopback: under a
+    // second. An iPad on a bad link is the case this has to clear.
+    //
+    // It recovers either way — the branch below resets the clock the moment a real status
+    // arrives — but a false alarm that corrects itself is still a false alarm.
+    const STARTING_PATIENCE_MS = 45000;
     let waitingSince = Date.now();
     const words = () => {
       const line = mod.sync_status();
