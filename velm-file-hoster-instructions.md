@@ -398,6 +398,25 @@ That is deliberate rather than unfinished. A browser tab can be killed by the op
 with no warning and no chance to save; a client that could edit would, at that moment, be
 holding the only recent copy of a board that cannot be re-imported.
 
+### ⚠️ The one mistake that would undo all of this
+
+When you put the reverse proxy in front (step 25), velmd ends up listening on
+`127.0.0.1` — the proxy talks to it, nothing else does. That is correct and it is what
+the steps above tell you to do.
+
+**It is also the one arrangement where forgetting `VELMD_TOKEN` is invisible.** velmd
+refuses to start on a public address without a token, and it says so loudly. It does
+*not* refuse to start on `127.0.0.1` without one, because that is how you run it on your
+own laptop while testing. So a server behind a proxy with no token set starts perfectly,
+says nothing is wrong, and serves every board you own to anyone who finds the address.
+
+velmd now catches this itself: a request that arrives through a proxy, on a server with
+no token, is refused with a message naming the problem. **You should never see it.** If
+you do, it means `VELMD_TOKEN` is not reaching the service — check step 12 and
+`systemctl show velmd -p Environment`.
+
+There is no version of this where a missing token is safe once the proxy is in front.
+
 ### Part 4b — Hardening, now that it is reachable from anywhere
 
 **22. YOU** — turn on automatic security updates:
@@ -650,6 +669,7 @@ Written down so nothing above reads as a promise it does not keep:
 | A list of your boards to pick from | **built** |
 | Two-way syncing between the Mac and the server | **built** — Part 6, and Part 2 is only the first crossing |
 | The browser keeping up on its own, without a reload | **built** |
+| A "Live" indicator, so you can tell when it has stopped keeping up | **built** |
 | Editing a board in a browser | **not built** — the desktop app only. This is on purpose: a browser tab can be closed by the phone or the iPad with no warning and no chance to save, and a tab holding the only recent copy of a board is exactly what must not happen |
 | The Agent Canvas in a browser | **not built**, and deferred by choice |
 | Miro import in a browser | **not built** — it needs the desktop app's importer |

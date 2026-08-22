@@ -311,6 +311,17 @@ Everything below was re-checked on 2026-08-22 by running it, not by reading it.
   `vellum_project::frame::clipped_by_frame`. Before this the two applications drew different
   boards: an item dragged off a frame was hidden on the Mac and still drawn in a tab.
 - **A board picker** at `boards.html`, which is the front door that did not exist.
+- **A link card's three voices** — a muted site name, a bold title, a grey blurb. Until this
+  they drew as blank white rectangles with only the ↗ on them: `ItemKind::text()` answers
+  `None` for `LinkPreview`, so the card-text path had never been called. Two things had to be
+  fixed to see it, and the second was invisible behind the first — `TextEngine::with_fonts`,
+  which is how the browser builds its engine, never pointed `sans-serif` at the bundled Inter,
+  so every bold span in the tab silently shaped at regular weight.
+- **A connection indicator** on the bar: *Live*, *Connecting*, *Reconnecting*, *Not
+  connected*. Driven by a one-second timer rather than `requestAnimationFrame`, because rAF
+  stops when a tab is hidden and that is exactly when a board falls behind. Without it, a
+  stopped server and a board nobody is editing look identical — and on an iPad there is no
+  console to check.
 - **Two-way sync.** Measured three ways against copies with a scratch `HOME`: 41 shapes placed
   on the Mac took the server from 1089 to 1130 items; a stale copy synced up to 1130; and a
   live Brave tab merged an edit made on the Mac with no reload — `velm sync: merged 1
