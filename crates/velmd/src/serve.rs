@@ -7,9 +7,16 @@
 //!
 //! # 🛑 RULE ZERO
 //!
-//! **Nothing here writes to a board and there is no route that could.** Every handler is a
-//! `GET`; there is no `POST`, no `PUT`, no `DELETE`, and `tests/rule_zero.rs` greps this
-//! file along with the rest of the crate for any call that can unlink or move a file.
+//! **Nothing here removes a file, and one route — and only one — changes a board.**
+//! `POST /api/v1/boards/{id}/sync` merges a client's Loro update into a board and saves it;
+//! every other handler is a `GET`. There is no `DELETE` and no route that can remove
+//! anything, and `tests/rule_zero.rs` greps this file along with the rest of the crate for
+//! any call that could unlink or move one.
+//!
+//! What makes the one writing route safe is the shape of what it applies: a Loro update is a
+//! **merge**, so it can add and it cannot remove what it did not add — and `sync.rs` takes a
+//! labelled restore point before the first change a board ever receives from the web, which
+//! is what makes even a merge reversible.
 //!
 //! But read-only in the HTTP sense is not the whole promise, and this is the part worth
 //! being precise about: [`vellum_store::BoardDb::open`] **is not a read-only open**. It runs
@@ -42,6 +49,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::sync;
 use vellum_store::{BlobStore, BoardDb, Hash, list_boards};
 
 /// How many connections are served at once.
@@ -78,15 +86,15 @@ pub struct Config {
 }
 
 /// Everything a request handler needs, shared across connection threads.
-struct Server {
-    config: Config,
+pub(crate) struct Server {
+    pub(crate) config: Config,
     /// One board opened at a time.
     ///
     /// Not a throughput decision — a correctness one. Two `BoardDb`s over one file is two
     /// SQLite connections to a database in WAL mode, which is legal and which this codebase
     /// has already been burned by once in the desktop app (`session.rs`: two `Editor`s over
     /// one file is two autosave threads). Serialising costs nothing at this scale.
-    boards: Mutex<()>,
+    pub(crate) boards: Mutex<()>,
 }
 
 pub fn run(config: Config) -> anyhow::Result<()> {
@@ -115,7 +123,13 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     );
     println!("  http://{actual}/");
     println!();
-    println!("This program never removes a file, and no route can change a board.");
+    // ⚠ The second half of this used to read "and no route can change a board". That stopped
+    // being true the moment `/sync` landed, and a banner that overstates what a program will
+    // not do is worse than no banner: it is the `locked: false` trap printed to a terminal.
+    println!("This program never removes a file.");
+    println!("`POST /sync` is the one route that changes a board, and it only ever *merges* —");
+    println!("a Loro update cannot remove what it did not add, and a labelled restore point is");
+    println!("taken before the first change any board ever receives from the web.");
     println!("It does open boards with SQLite, which writes a -wal sidecar: point --data at");
     println!("a copy, never at the directory the desktop app is using.");
 
@@ -205,7 +219,7 @@ fn serve_one(server: &Server, stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(60)));
 
-    let Some((method, target, headers)) = read_head(&stream) else {
+    let Some((method, target, headers, leftover)) = read_head(&stream) else {
         let _ = respond(&stream, 400, "text/plain", b"bad request\n", None);
         return;
     };
@@ -225,7 +239,7 @@ fn serve_one(server: &Server, stream: TcpStream) {
     // from "wrong token".
     let head_only = method == "HEAD";
     HEAD_ONLY.with(|flag| flag.set(head_only));
-    if method != "GET" && !head_only {
+    if method != "GET" && method != "POST" && !head_only {
         let _ = respond(&stream, 405, "text/plain", b"this server only answers GET\n", origin.as_deref());
         return;
     }
@@ -260,6 +274,51 @@ fn serve_one(server: &Server, stream: TcpStream) {
         && !authorised(&headers, query, expected)
     {
         let _ = respond(&stream, 401, "text/plain", b"a bearer token is required\n", origin.as_deref());
+        return;
+    }
+
+    // ⚠ **After the token check, before `route`.** The order is load-bearing: a 401 must cost
+    // zero buffered bytes, so the body is read only once the token has passed. And the `Err`
+    // arm is not optional — a POST does not go through `route`, which is where the log line
+    // and the 500 live, so without it a poisoned lock is a silently dropped connection.
+    if method == "POST" {
+        let Some(id) = sync::board_id(path) else {
+            let _ = respond(
+                &stream,
+                405,
+                "text/plain",
+                b"only a board's sync route answers POST\n",
+                origin.as_deref(),
+            );
+            return;
+        };
+        let length = match sync::content_length(&headers) {
+            Ok(length) => length,
+            Err(refusal) => {
+                let _ = respond(
+                    &stream,
+                    refusal.status,
+                    "text/plain",
+                    refusal.message.as_bytes(),
+                    origin.as_deref(),
+                );
+                return;
+            }
+        };
+        let Some(body) = sync::read_body(&stream, &leftover, length) else {
+            let _ = respond(
+                &stream,
+                400,
+                "text/plain",
+                b"that request body did not arrive\n",
+                origin.as_deref(),
+            );
+            return;
+        };
+        if let Err(error) = sync::handle(server, id, &body, &stream) {
+            eprintln!("velmd: {path}: {error:#}");
+            let _ = respond(&stream, 500, "text/plain", b"something went wrong\n", origin.as_deref());
+        }
         return;
     }
 
@@ -339,7 +398,7 @@ fn boards_json(data: &Path) -> String {
 /// By scan and compare, never by joining the id onto a directory. A joined path needs a
 /// traversal check that has to be right; a comparison against stems that came out of a
 /// directory listing cannot reach anything that is not already in that directory.
-fn board_by_id(data: &Path, id: &str) -> Option<PathBuf> {
+pub(crate) fn board_by_id(data: &Path, id: &str) -> Option<PathBuf> {
     list_boards(data)
         .ok()?
         .into_iter()
@@ -463,7 +522,18 @@ fn authorised(headers: &BTreeMap<String, String>, query: &str, expected: &str) -
     false
 }
 
-fn read_head(stream: &TcpStream) -> Option<(String, String, BTreeMap<String, String>)> {
+/// The request head, and **whatever the reader took past it**.
+///
+/// ⚠ The fourth element is not tidiness. `BufReader` fills its 8 KB buffer from the socket
+/// however few bytes the read asked for, so by the time the loop below sees `\r\n\r\n` the
+/// first kilobytes of any body are already inside it — and a sync POST is small enough that
+/// head and body arrive in one segment, which on loopback is every request. Dropping the
+/// reader there loses them, and the body read then waits for bytes that were already
+/// delivered until the timeout fires and the client gets a 400. Not an edge case: the
+/// default path.
+fn read_head(
+    stream: &TcpStream,
+) -> Option<(String, String, BTreeMap<String, String>, Vec<u8>)> {
     let mut reader = BufReader::new(stream);
     let mut buffer = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
@@ -491,7 +561,7 @@ fn read_head(stream: &TcpStream) -> Option<(String, String, BTreeMap<String, Str
             headers.insert(header.name.to_ascii_lowercase(), value.to_owned());
         }
     }
-    Some((method, target, headers))
+    Some((method, target, headers, reader.buffer().to_vec()))
 }
 
 thread_local! {
@@ -504,7 +574,7 @@ thread_local! {
     static HEAD_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn respond(
+pub(crate) fn respond(
     mut stream: &TcpStream,
     status: u16,
     content_type: &str,
@@ -518,6 +588,7 @@ fn respond(
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Content Too Large",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
@@ -541,8 +612,8 @@ fn respond(
         // on the internet can read this person's boards from their browser.
         head.push_str(&format!(
             "Access-Control-Allow-Origin: {origin}\r\n\
-             Access-Control-Allow-Headers: authorization\r\n\
-             Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+             Access-Control-Allow-Headers: authorization, content-type\r\n\
+             Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
              Vary: Origin\r\n"
         ));
     }

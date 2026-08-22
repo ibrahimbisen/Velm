@@ -46,6 +46,7 @@ use std::process::ExitCode;
 mod manifest;
 mod migrate;
 mod serve;
+mod sync;
 
 const USAGE: &str = "\
 velmd — the Velm board server
