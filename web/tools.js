@@ -1056,6 +1056,10 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
 
   function openMenu(x, y) {
     closePopover();
+    // Where a paste lands. Defensive, like `bound()`: the page must keep working against a
+    // wasm build that has not got this export. Without it a paste falls back to the viewport
+    // centre — on screen and honest, but not where the user is pointing.
+    if (typeof mod.velm_note_paste_aim === 'function') mod.velm_note_paste_aim(x, y);
     // ⚠ `context_target` does the selecting, because only wasm knows the scene. A
     // right-click on an **unselected** item selects it first; one **inside** an existing
     // selection leaves it alone, so right-clicking one of five picked items still offers all

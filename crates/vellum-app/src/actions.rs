@@ -5043,6 +5043,7 @@ impl ActiveState {
             "zoom-flicker" => self.demo_zoom_flicker(),
             "move-images" => self.demo_move_images(),
             "leave-frame" => self.demo_leave_frame(),
+            "duplicate" => self.demo_duplicate(),
             "copy-paste" => self.demo_copy_paste(),
             "context-menu" => self.demo_context_menu(),
             "edit-then-delete" => self.demo_edit_then_delete(),
@@ -7834,6 +7835,68 @@ impl ActiveState {
     /// Asserts both directions, because a build that simply never parents anything would pass
     /// the first half: out of the frame the sticky must become loose **and** be drawable, and
     /// dragged back on it must be adopted again.
+    /// ⚠ **Duplicate, on a frame with a child and on two shapes joined by a connector.**
+    ///
+    /// Both halves are the assertion, because either alone passes on a broken build: a
+    /// duplicate that copies *only* the roots still creates items, and a count check would
+    /// call that success. What it does not do is bring the frame's contents — so duplicating
+    /// a frame gave an **empty box** — or re-point the new connector, so the copy stayed
+    /// attached to the originals and moving it dragged a line back to where it came from.
+    ///
+    /// `copy`/`paste` had both fixed since feedback 17; this sibling never got them, and it
+    /// was found while writing the browser's clipboard against this file as the model. That
+    /// is feedback 35's rule paying out a year late: **when a fix lands, check its siblings.**
+    fn demo_duplicate(&mut self) {
+        let built = self.editor.edit(|board| {
+            board.begin_undo_group()?;
+            let frame = board.add(NewItem::new(
+                ItemKind::Frame {
+                    title: vellum_doc::StyledText::plain("Region"),
+                    order: None,
+                    speaker_notes: None,
+                },
+                Placement::new(0.0, 0.0, 600.0, 400.0),
+            ))?;
+            let child = board.add(
+                NewItem::new(
+                    ItemKind::Sticky {
+                        text: vellum_doc::StyledText::plain("on the frame"),
+                        background: None,
+                    },
+                    Placement::new(0.0, 0.0, 120.0, 120.0),
+                )
+                .with_parent(frame),
+            )?;
+            board.end_undo_group();
+            Ok((frame, child))
+        });
+        let Ok((frame, child)) = built else {
+            self.ok("duplicate: could not build the fixture");
+            return;
+        };
+
+        let before = self.editor.board().item_count();
+        self.editor.select(vec![frame]);
+        self.run(Command::Duplicate);
+        let after = self.editor.board().item_count();
+
+        // The frame *and* its child: three items become five, not four.
+        let carried = after - before == 2;
+        // And the copy's child is filed on the copy, not on the original frame.
+        let copies: Vec<DocId> = self.editor.selected_ids();
+        let child_landed_right = copies.iter().any(|id| {
+            let kids = self.editor.board().children(Some(*id));
+            !kids.is_empty() && !kids.contains(&child)
+        });
+
+        self.ok(format!(
+            "--demo duplicate: {} item(s) added ({}), and the copy's child is on the copy ({})",
+            after - before,
+            if carried { "the frame carried its contents" } else { "THE CONTENTS WERE LEFT BEHIND" },
+            child_landed_right,
+        ));
+    }
+
     fn demo_leave_frame(&mut self) {
         use winit::event::{ElementState, MouseButton};
 
@@ -15107,29 +15170,75 @@ impl ActiveState {
         }
     }
 
+    /// ⚠ **Duplicate used to take the selection and nothing else**, which made it wrong in
+    /// the two ways `copy`/`paste` had already been fixed for — and the fix was never applied
+    /// to this sibling. Feedback 17's defect, one verb over, found while building the
+    /// browser's own clipboard against this file as the model.
+    ///
+    /// - **A frame's contents were left behind**, so duplicating a frame produced an empty
+    ///   box. `Board::descendants` is what `copy` takes and what this now takes.
+    /// - **A connector kept pointing at the original**, because an `ItemId` was carried over
+    ///   verbatim. `cut_loose` then `rebound` across two passes is the existing answer, and
+    ///   an endpoint whose target was not part of the duplicate is left free rather than
+    ///   bound to something the user did not copy.
+    /// - **A duplicated child came out loose.** `NewItem` carries no parent, so a sticky on a
+    ///   frame was duplicated onto the board instead of onto the frame — which, since a frame
+    ///   clips what has left it, meant a duplicate that drew nothing at all.
     fn duplicate_selection(&mut self) {
-        let ids = self.editor.selected_ids();
-        if ids.is_empty() {
+        let roots = self.editor.selected_ids();
+        if roots.is_empty() {
             return;
         }
-        let items: Vec<vellum_doc::Item> = ids
+        // Roots first, then everything under them, deduplicated — a frame and one of its own
+        // stickies both being selected must not copy that sticky twice. Parents precede
+        // children, which is what lets the reparent pass below always find its target.
+        let mut ids: Vec<DocId> = Vec::new();
+        for root in &roots {
+            for id in std::iter::once(*root).chain(self.editor.board().descendants(*root)) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        let items: Vec<(DocId, Option<DocId>, vellum_doc::Item)> = ids
             .iter()
-            .filter_map(|id| self.editor.board().item(*id).ok())
+            .filter_map(|id| {
+                let item = self.editor.board().item(*id).ok()?;
+                Some((*id, self.editor.board().parent_of(*id), item))
+            })
             .collect();
+        // Only a parent that is itself being duplicated is followed; a child whose parent
+        // stays put keeps that parent, so duplicating one sticky off a frame leaves the copy
+        // on the same frame rather than orphaning it.
+        let copied: std::collections::HashSet<DocId> = ids.iter().copied().collect();
         let result = self.editor.edit(|board| {
             board.begin_undo_group()?;
+            let mut remap: HashMap<DocId, DocId> = HashMap::new();
             let mut created = Vec::with_capacity(items.len());
-            for item in &items {
+            for (id, _, item) in &items {
                 let placement = Placement {
                     x: item.placement.x + OFFSET,
                     y: item.placement.y + OFFSET,
                     ..item.placement
                 };
-                created.push(
-                    board.add(
-                        NewItem::new(item.kind.clone(), placement).with_style(item.style.clone()),
-                    )?,
-                );
+                // Loose first: an endpoint naming an id that does not exist yet is a document
+                // that briefly lies, and the second pass is what makes it true.
+                let new = board.add(
+                    NewItem::new(cut_loose(item.kind.clone()), placement)
+                        .with_style(item.style.clone()),
+                )?;
+                remap.insert(*id, new);
+                created.push(new);
+            }
+            // Second pass: parents, then connector endpoints, now that every copy has an id.
+            for (id, parent, item) in &items {
+                let Some(new) = remap.get(id).copied() else { continue };
+                let parent = match parent {
+                    Some(old) if copied.contains(old) => remap.get(old).copied(),
+                    other => *other,
+                };
+                board.reparent(new, parent)?;
+                board.set_kind(new, rebound(item.kind.clone(), &remap))?;
             }
             board.end_undo_group();
             Ok(created)

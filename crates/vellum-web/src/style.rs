@@ -769,7 +769,7 @@ fn from_rgba(rgba: Rgba) -> Color {
 /// group would commit their unfinished gesture as part of ours. The caller's job is to settle
 /// any live text session before dispatching a board-mutating command, which is the rule
 /// `vellum-app` arrived at after finding this same leak three separate times.
-fn grouped<T>(
+pub(crate) fn grouped<T>(
     board: &mut Board,
     projection: &mut Projection,
     f: impl FnOnce(&mut Board) -> vellum_doc::Result<T>,

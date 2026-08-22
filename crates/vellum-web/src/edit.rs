@@ -593,6 +593,27 @@ impl EditState {
         self.selection = ids;
     }
 
+    /// Replaces the selection with `ids`, keeping only the ones the projection still holds.
+    ///
+    /// The door a **creating** operation needs. A paste and a duplicate both answer with
+    /// document ids, and an item created a moment ago has no scene id until
+    /// `Projection::rebuild` has interned one — so this is called after the rebuild, never
+    /// before, or it selects nothing at all.
+    ///
+    /// ⚠ Selecting the result is the only feedback either gesture gives. A duplicate lands
+    /// 24 world units from its original, which at a fitted 4% is one device pixel: without
+    /// this, a duplicate and a no-op are indistinguishable on screen.
+    ///
+    /// Filtered rather than trusted, for [`EditState::sync`]'s reason — an id the projection
+    /// does not hold draws a ring around nothing.
+    pub fn select(&mut self, ids: Vec<SceneId>, projection: &Projection) {
+        if !self.enabled {
+            return;
+        }
+        self.selection = ids;
+        self.sync(projection);
+    }
+
     pub fn clear(&mut self) {
         self.selection.clear();
     }

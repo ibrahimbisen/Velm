@@ -93,7 +93,7 @@ const TAP_SLOP: f64 = 6.0;
 /// camera takes is a **physical** one. A gesture that skips the conversion drifts by exactly
 /// the device ratio: half speed on a retina iPad, and *exactly correct* on a 1x monitor —
 /// so it is a bug that cannot be reproduced on the machine most likely to be testing it.
-fn ratio() -> f64 {
+pub(crate) fn ratio() -> f64 {
     web_sys::window().map_or(1.0, |w| w.device_pixel_ratio()).max(1.0)
 }
 

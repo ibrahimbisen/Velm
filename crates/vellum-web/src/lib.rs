@@ -83,6 +83,7 @@ const FIT_MARGIN: f64 = 0.02;
 mod badges;
 mod board;
 mod card;
+mod clip;
 mod edit;
 mod find;
 mod live;
