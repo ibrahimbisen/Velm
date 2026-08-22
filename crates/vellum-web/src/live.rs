@@ -281,6 +281,17 @@ impl Live {
         Self { endpoint, period, shared: Rc::new(RefCell::new(Shared::default())) }
     }
 
+    /// The sync URL this client is polling, **with whatever auth the page attached**.
+    ///
+    /// Exists so `crate::push::Pusher` reads the endpoint rather than deriving a second one.
+    /// The page built the snapshot URL with its own encoding and its own token,
+    /// [`from_snapshot_url`] has already turned it into a sync endpoint, and a second
+    /// derivation could disagree with the first on exactly the boards whose names are not
+    /// identifiers — which is most of this user's.
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     /// Ask, if it is time and nothing is in flight. Never blocks; the answer arrives later.
     ///
     /// `version` is the board's **current** version, taken fresh by the caller after applying
@@ -561,7 +572,7 @@ fn tick(wake: bool) {
 /// own doc says it: undo covers this peer's own edits, so receiving somebody else's change
 /// must never let the local user undo work that was not theirs. This client has no undo at
 /// all, which makes the point moot today and worth writing down for the day it does not.
-fn merge(viewer: &mut Viewer, updates: &[Vec<u8>]) -> Result<usize, String> {
+pub(crate) fn merge(viewer: &mut Viewer, updates: &[Vec<u8>]) -> Result<usize, String> {
     let mut applied = 0usize;
     let mut failure: Option<String> = None;
     for delta in updates {

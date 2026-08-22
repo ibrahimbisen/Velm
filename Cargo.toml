@@ -168,6 +168,7 @@ vellum-mindmap = { path = "crates/vellum-mindmap" }
 vellum-project = { path = "crates/vellum-project" }
 vellum-render = { path = "crates/vellum-render" }
 vellum-scene = { path = "crates/vellum-scene" }
+vellum-search = { path = "crates/vellum-search" }
 vellum-web = { path = "crates/vellum-web" }
 vellum-shapes = { path = "crates/vellum-shapes" }
 vellum-store = { path = "crates/vellum-store" }

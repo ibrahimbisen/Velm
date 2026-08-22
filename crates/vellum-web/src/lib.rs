@@ -43,12 +43,27 @@ use vellum_scene::{Camera, ScreenSize, SceneItem};
 /// The same 0.02 `vellum_app::FIT_MARGIN` uses. Duplicated rather than imported because
 /// `vellum-app` does not compile for this target at all — and two bytes of constant is a
 /// better dependency than a crate with SQLite and a native menu bar in it.
+/// How thick a selection ring is drawn, in **device pixels**.
+///
+/// One, and it is its own number rather than shared with anything else for the reason the
+/// desktop's `SELECTION_RING_WIDTH` is: it was two, tuned against every other gesture's
+/// stroke, and the user photographed a board with everything selected — *"the border on the
+/// selected items are too thick"*. A ring holds its device width while the item under it
+/// shrinks with the zoom, so at a fitted camera two pixels is a band around a small item
+/// rather than an outline on it. The complaint is about the ratio, and the ratio is only
+/// reachable through this one number.
+const SELECTION_RING_WIDTH: f64 = 1.0;
+
 const FIT_MARGIN: f64 = 0.02;
 
 mod badges;
 mod board;
 mod card;
+mod edit;
+mod find;
 mod live;
+mod push;
+mod style;
 mod widgets;
 mod images;
 mod layout;
@@ -103,6 +118,14 @@ struct Viewer {
     /// `requestAnimationFrame` stops when a tab is hidden, and a board that silently stops
     /// keeping up while you look at something else is the report this exists to prevent.
     live: Option<live::Live>,
+    /// The send half. `None` for a static `board.bin` with no server, exactly as `live` is —
+    /// a page with nowhere to push to is not a page that refuses to edit, it is a page that
+    /// never had a server, and that falls out of the parse rather than a flag.
+    push: Option<push::Pusher>,
+    /// Selection, the in-flight gesture, and what a release asks the document to do.
+    edit: edit::EditState,
+    /// The board's own words, indexed on demand.
+    finder: find::Finder,
 }
 
 thread_local! {
@@ -205,6 +228,181 @@ pub fn fit_board() {
             viewer.camera.fit_to_rect(bounds, FIT_MARGIN);
         }
     });
+}
+
+// ---------------------------------------------------------------------------------------
+// Editing: what the page can ask the board to do
+//
+// ⚠ **Undo, redo, delete and select-all are NOT here — they are `crate::edit`'s own
+// `velm_*` exports.** They live beside the state they change, and they already push through
+// `announce` after the mutation and the reprojection. A second copy here looked tidier and
+// would have called `note_edit` twice per edit.
+// ---------------------------------------------------------------------------------------
+//
+// ⚠ **Every one of these is the last hop of a feature, and a hop with no caller is this
+// repository's signature defect** — found nine times by its own count, and twice more today.
+// They are grouped here so the list can be read against `web/tools.js` and `web/inspect.js`
+// in one sitting: an export nothing calls, and a `mod.<name>` the JS calls that is not here,
+// are the two shapes to look for.
+//
+// ⚠ **Every one takes the viewer through `try_borrow_mut` and answers rather than panicking.**
+// These are called from DOM listeners, and `panic = "abort"` on wasm means a panic inside one
+// is not an error anybody sees — it is the tab dying, with the board still on screen.
+//
+// ⚠ **Every one that changes the document ends with `after_edit`.** That is what reprojects,
+// re-syncs the selection against the new projection, and pushes to the server. Forgetting it
+// leaves the board drawn stale, hit-tested stale, and — worst — changed only in this tab.
+
+/// Reproject, re-sync the selection, and send. The one place an edit is finished.
+///
+/// ⚠ **`push.tick` is called here, on the same frame, rather than left to the 250ms timer.**
+/// That is the difference between "every edit pushes immediately" being a property of the
+/// design and being a property of the *build*: a tab closed in the window between an edit and
+/// the next tick would lose it, and this is the safety argument the whole editable client
+/// rests on.
+fn after_edit(viewer: &mut Viewer) {
+    viewer.edit.sync(&viewer.projection);
+    if let Some(push) = viewer.push.as_mut() {
+        push.note_edit();
+        push.tick(&viewer.board);
+    }
+}
+
+/// Run something against the viewer, or answer the fallback if a frame holds it.
+fn with_viewer<T>(fallback: T, f: impl FnOnce(&mut Viewer) -> T) -> T {
+    VIEWER.with(|slot| {
+        let Some(held) = slot.borrow().clone() else { return fallback };
+        let Ok(mut viewer) = held.try_borrow_mut() else { return fallback };
+        f(&mut viewer)
+    })
+}
+
+/// Whether this board can be edited: `"yes"`, `"no"`, or `"wait"`.
+///
+/// ⚠ **Three answers, not two, and the two-answer version cost an afternoon.** It returned a
+/// `bool` and took the viewer through `try_borrow_mut` — so *"a frame is mid-flight"* and
+/// *"this board has no server"* were the same value, `false`. The frame loop holds that borrow
+/// for most of every 16ms, so the page asking once got a coin flip, and a board that was
+/// perfectly editable silently drew no toolbar at all. Measured through a probe: the palette
+/// was laid out correctly at `12,61 100x397` and had simply never been mounted.
+///
+/// That is the **fourth** time today an export's "not ready" and its "no" have been one value
+/// — `sync_status` answering `"off"` before boot, `camera_report` answering `"none"`, and this
+/// twice. The shape is always the same and so is the fix: say which.
+///
+/// A **shared** borrow, too. `try_borrow_mut` fails while any borrow is out; this only needs
+/// to read one `Option`, so it fails only during the frame itself.
+#[wasm_bindgen]
+pub fn can_edit() -> String {
+    VIEWER.with(|slot| {
+        let Some(held) = slot.borrow().clone() else { return "wait".to_owned() };
+        let Ok(viewer) = held.try_borrow() else { return "wait".to_owned() };
+        if viewer.push.is_some() { "yes".to_owned() } else { "no".to_owned() }
+    })
+}
+
+/// What is selected, as JSON, for the toolbar and the properties panel.
+///
+/// One derivation for both, so the bar and the panel cannot come to disagree about whether a
+/// selection has a fill — which is the failure `context_bar`'s "derive from what it *has*"
+/// rule exists to prevent, arriving by a second route.
+#[wasm_bindgen]
+pub fn selection_summary() -> String {
+    with_viewer("{}".to_owned(), |viewer| {
+        let selection = viewer.edit.selection().to_vec();
+        let summary = style::summarise(&viewer.board, &viewer.projection, &selection);
+        serde_json::to_string(&summary).unwrap_or_else(|_| "{}".to_owned())
+    })
+}
+
+/// Apply one style change to the selection. The JSON is a `style::StyleEdit`.
+///
+/// Answers a sentence when the document cannot honour the change, and an empty string when it
+/// could — because a control that silently does nothing is worse than one that says why. Font
+/// *weight* is the live example: `Style` has no weight field.
+#[wasm_bindgen]
+pub fn style_selection(edit: String) -> String {
+    with_viewer("the board is not ready".to_owned(), |viewer| {
+        let Ok(parsed) = serde_json::from_str::<style::StyleEdit>(&edit) else {
+            return format!("that is not a style change: {edit}");
+        };
+        let selection = viewer.edit.selection().to_vec();
+        let Viewer { board, projection, .. } = &mut *viewer;
+        match style::apply_style(board, projection, &selection, parsed) {
+            Ok(0) => String::new(),
+            Ok(_) => {
+                after_edit(viewer);
+                String::new()
+            }
+            Err(why) => why,
+        }
+    })
+}
+
+/// Move, resize, rotate or reorder the selection. The JSON is a `style::Transform`.
+#[wasm_bindgen]
+pub fn transform_selection(change: String) -> String {
+    with_viewer("the board is not ready".to_owned(), |viewer| {
+        let Ok(parsed) = serde_json::from_str::<style::Transform>(&change) else {
+            return format!("that is not a transform: {change}");
+        };
+        let selection = viewer.edit.selection().to_vec();
+        let Viewer { board, projection, .. } = &mut *viewer;
+        match style::apply_transform(board, projection, &selection, parsed) {
+            Ok(0) => String::new(),
+            Ok(_) => {
+                after_edit(viewer);
+                String::new()
+            }
+            Err(why) => why,
+        }
+    })
+}
+
+/// Search the board.
+///
+/// Answers `{"matches": [...], "indexed": n, "partial": bool}`.
+///
+/// ⚠ **`partial` is not decoration.** A board past `MAX_INDEXED_ITEMS` is searched only in
+/// part, and a caller that does not say so is showing incomplete results as though they were
+/// complete — which is the failure the cap exists to make *visible* rather than to hide. It
+/// was reachable only through an accessor nothing called, which is the same thing as not
+/// existing.
+#[wasm_bindgen]
+pub fn find(query: String) -> String {
+    const EMPTY: &str = r#"{"matches":[],"indexed":0,"partial":false}"#;
+    with_viewer(EMPTY.to_owned(), |viewer| {
+        let Viewer { finder, projection, .. } = &mut *viewer;
+        let matches = finder.search(projection, &query);
+        let answer = serde_json::json!({
+            "matches": matches,
+            "indexed": finder.indexed(),
+            "partial": finder.truncated(),
+        });
+        serde_json::to_string(&answer).unwrap_or_else(|_| EMPTY.to_owned())
+    })
+}
+
+/// Put a search result on screen.
+///
+/// ⚠ `FIT_MARGIN` is a **fraction of the rectangle**, not a margin in pixels — passing pixels
+/// here drives the fit below `MIN_ZOOM` and clamps, which opened every board at exactly 1.0%
+/// once already.
+#[wasm_bindgen]
+pub fn focus_match(item: f64) -> bool {
+    with_viewer(false, |viewer| {
+        if !item.is_finite() || item < 0.0 {
+            return false;
+        }
+        let Some(rect) = find::focus(&viewer.projection, item as u64) else { return false };
+        viewer.camera.fit_to_rect(rect, FIT_MARGIN);
+        // Backed off, so focusing one sticky does not fill the window with it.
+        let size = viewer.camera.viewport();
+        let middle = vellum_scene::ScreenPoint::new(size.width / 2.0, size.height / 2.0);
+        let zoom = viewer.camera.zoom().min(find::FOCUS_MAX_ZOOM);
+        viewer.camera.set_zoom_about(zoom, middle);
+        true
+    })
 }
 
 /// The camera, as a string, for a fixture to read.
@@ -352,6 +550,11 @@ async fn boot(
     if live.is_none() {
         log::info!("velm sync: this board came from a static file, so there is nothing to poll");
     }
+    // ⚠ Reused, never re-derived. The page built the snapshot URL with its own encoding and
+    // its own token; `from_snapshot_url` has already turned it into a sync endpoint, and a
+    // second derivation could disagree with the first on exactly the boards whose names are
+    // not identifiers — which is most of this user's.
+    let push = live.as_ref().map(|live| push::Pusher::new(live.endpoint().to_owned()));
     let viewer = Rc::new(RefCell::new(Viewer {
         device,
         queue,
@@ -371,6 +574,9 @@ async fn boot(
         widgets: widgets::WidgetLayer::new(),
         badges: badges::BadgeLayer::new(),
         live,
+        push,
+        edit: edit::EditState::new(),
+        finder: find::Finder::new(),
     }));
 
     // Prove the board actually drew, rather than trusting that it did.
@@ -426,6 +632,10 @@ async fn boot(
     // no board ever asks the server anything. That is this repository's signature defect,
     // found nine times by its own count, so the call is commented rather than merely present.
     live::drive();
+    // ⚠ **The entire reachability of `crate::push`.** Without this the file compiles, its
+    // logic is right, and no edit ever leaves the tab. It also arms the `pagehide` flush,
+    // which is the one thing standing between a closed tab and a lost edit.
+    push::drive();
     Ok(())
 }
 
@@ -963,6 +1173,47 @@ impl Viewer {
                 slot.anchor,
             );
         }
+        // The selection, and the marquee if one is being swept.
+        //
+        // ⚠ **In the board view, and stroked in *screen* pixels.** A ring holds its device
+        // width while the item under it shrinks with the zoom, which is the whole reason
+        // `SELECTION_RING_WIDTH` is its own constant on the desktop (feedback 32): at a
+        // fitted camera a two-pixel ring is a band *around* a small item rather than an
+        // outline *on* it, and the user asked for it thinner. A world-unit stroke is
+        // invisible at 4% and a slab at 8x.
+        //
+        // ⚠ **Nothing is drawn for the drag itself.** The preview goes through
+        // `Projection::moved`, so a dragged item's quads, text and bounds are *already* at
+        // the dragged position — applying the offset here as well would move everything
+        // twice, which is the mistake `EditState::moved_offset`'s own doc warns about.
+        list.use_view(board);
+        let ring_width = (SELECTION_RING_WIDTH as f32) / zoom;
+        for ring in self.edit.rings(&self.projection) {
+            let origin = self.camera.to_camera_relative(vellum_scene::WorldPoint::new(
+                ring.centre.x - ring.size.0 / 2.0,
+                ring.centre.y - ring.size.1 / 2.0,
+            ));
+            list.push_quad(
+                vellum_render::QuadInstance::solid(
+                    origin,
+                    [ring.size.0 as f32, ring.size.1 as f32],
+                    vellum_render::Rgba::TRANSPARENT,
+                )
+                .with_border(theme.accent, ring_width)
+                .with_rotation(ring.rotation),
+            );
+        }
+        if let Some(sweep) = self.edit.marquee() {
+            let origin = self.camera.to_camera_relative(sweep.min);
+            let size = [sweep.width() as f32, sweep.height() as f32];
+            let mut wash = theme.accent;
+            wash.a = 0.10;
+            list.push_quad(
+                vellum_render::QuadInstance::solid(origin, size, wash)
+                    .with_border(theme.accent, ring_width),
+            );
+        }
+
         list.use_view(screen);
         self.text.flush(&self.device, &self.queue, self.renderer.atlas_mut(), &mut list);
         // Separate from the flush above, and it must stay separate: a fitted board is

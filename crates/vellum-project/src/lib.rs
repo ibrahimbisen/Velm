@@ -15,6 +15,9 @@
 /// Where a link card's three voices go and what they say -- pure, and tested here
 /// because `vellum-web` is `cfg(target_arch = "wasm32")` and can hold no runnable test.
 pub mod card;
+/// Every item's words, including the four whose text is inside an opaque JSON token —
+/// so a search in a browser finds what a search on the Mac finds.
+pub mod words;
 pub mod connector;
 pub mod frame;
 pub mod look;

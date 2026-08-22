@@ -190,6 +190,7 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
 
     {
         let contacts = Rc::clone(&contacts);
+        let viewer = Rc::clone(&viewer);
         let target = canvas.clone();
         let handler = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
             move |event: web_sys::PointerEvent| {
@@ -200,11 +201,32 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                 // it does not fire, and without capture it fires on a mouse the moment the
                 // drag reaches the window edge.
                 let _ = target.set_pointer_capture(event.pointer_id());
+                let single = contacts.borrow().down.is_empty();
                 contacts.borrow_mut().press(
                     event.pointer_id(),
                     event.client_x() as f64,
                     event.client_y() as f64,
                 );
+                // ⚠ **The edit layer is offered the press, and only for the first finger.**
+                //
+                // A second finger is a pinch, and a pinch that also picked something up would
+                // move an item and the camera at once. `crate::edit` answers whether it took
+                // the gesture; the move handler reads the same answer rather than guessing,
+                // which is what stops a drag being both a move and a pan.
+                //
+                // Left button only, for `pointerup`'s reason: a right press is a menu, not a
+                // grab.
+                if single && event.button() == 0 {
+                    let ratio = ratio();
+                    if let Ok(mut viewer) = viewer.try_borrow_mut() {
+                        let at = viewer.camera.screen_to_world(ScreenPoint::new(
+                            event.client_x() as f64 * ratio,
+                            event.client_y() as f64 * ratio,
+                        ));
+                        // ⇧ adds to the selection rather than replacing it.
+                        crate::edit::pointer_down(&mut viewer, at, event.shift_key());
+                    }
+                }
             },
         );
         canvas
@@ -244,6 +266,11 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
 
                 match (before_pinch, after_pinch) {
                     (Some((mid, was)), Some((now_mid, is))) => {
+                        // A second finger means this is a pinch, not a drag. Anything picked
+                        // up is put back rather than carried along — moving an item and the
+                        // camera at once is the shape `Input::cancel_gesture` exists for on
+                        // the desktop.
+                        crate::edit::pointer_cancel(&mut viewer);
                         // ⚠ **The factor is a ratio of separations, not an exponential of a
                         // pixel delta.** `zoom_by` multiplies, so a ratio is already the
                         // right shape and it is scale-invariant — the CSS-to-physical
@@ -279,6 +306,20 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                         );
                     }
                     _ => {
+                        // ⚠ **The edit layer first.** If a gesture picked something up, this
+                        // motion moves *it*, not the board — and `pointer_move` answers
+                        // whether it took the motion, so the two can never both happen. It
+                        // answers `false` when nothing is being dragged, which is the common
+                        // case and costs one compare.
+                        {
+                            let at = viewer.camera.screen_to_world(ScreenPoint::new(
+                                event.client_x() as f64 * ratio,
+                                event.client_y() as f64 * ratio,
+                            ));
+                            if crate::edit::pointer_move(&mut viewer, at) {
+                                return;
+                            }
+                        }
                         // One contact: a plain drag.
                         //
                         // ⚠ Not negated. `Camera::pan_by_screen_delta` already does
@@ -325,6 +366,17 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                 }
                 let lifted = contacts.borrow_mut().lift(event.pointer_id());
                 let Some((contact, was_multi)) = lifted else { return };
+                // ⚠ **The edit layer is asked first, and a completed move is not a tap.**
+                // Without this a drag that finishes over a link card would move the item *and*
+                // open its page — and `pointer_up` is also the only thing that commits, so a
+                // `return` above it would leave a preview drawn against a document that never
+                // changed.
+                {
+                    let Ok(mut viewer) = viewer.try_borrow_mut() else { return };
+                    if crate::edit::pointer_up(&mut viewer) {
+                        return;
+                    }
+                }
                 if was_multi {
                     return;
                 }
@@ -388,9 +440,18 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
     }
     {
         let contacts = Rc::clone(&contacts);
+        let viewer = Rc::clone(&viewer);
         let handler = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
             move |event: web_sys::PointerEvent| {
                 contacts.borrow_mut().remove(event.pointer_id());
+                // ⚠ **Feedback 27's rule: give every way a gesture can end without a release
+                // a call to the function that closes it.** This repository has paid for that
+                // on four separate gestures. A cancelled drag whose preview is never put back
+                // leaves items drawn where they are not, against a document that never
+                // changed — and `pointercancel` is routine on a touchscreen.
+                if let Ok(mut viewer) = viewer.try_borrow_mut() {
+                    crate::edit::pointer_cancel(&mut viewer);
+                }
             },
         );
         canvas

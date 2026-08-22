@@ -17,6 +17,15 @@ description = "Turning a Velm document into a drawable scene: projection, connec
 # derivation of how a document becomes a scene. A second copy would drift within a week, and
 # the failure would be silent: clicks landing where the paint is not.
 [dependencies]
+# The four structured widgets' own models, so `words` can read a token rather than a second
+# copy of one. All four are pure geometry over serde and cross to wasm untouched, which is
+# what makes this module reachable from the browser at all.
+vellum-table.workspace = true
+vellum-chart.workspace = true
+vellum-mindmap.workspace = true
+vellum-flow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 # `theme` converts the chrome's accent choice and an agent's chat colourway into canvas
 # colours, so it genuinely needs both vocabularies. Neither drags anything native in: both
 # crates compile for wasm32, which is exactly what the feature split was for.

@@ -128,8 +128,15 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key>        <string>app.velm.Velm</string>
   <key>CFBundleIconFile</key>          <string>Velm</string>
   <key>CFBundlePackageType</key>       <string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.1.0</string>
-  <key>CFBundleVersion</key>           <string>1.1.0</string>
+  <!-- Both of these are placeholders and are overwritten a few lines below from
+       `[workspace.package] version` in Cargo.toml, which is the one place a version
+       number is written. Without that the About dialog (`env!("CARGO_PKG_VERSION")`)
+       and Finder would read two different numbers, and nothing here compares them.
+       A bundle reporting 0.0.0 names the step that did not run; a real-looking 1.1.0
+       left here would go stale in silence, which is the trap `locked: false` and
+       `THEME_BORDER` have each already cost once. -->
+  <key>CFBundleShortVersionString</key><string>0.0.0</string>
+  <key>CFBundleVersion</key>           <string>0.0.0</string>
   <key>LSMinimumSystemVersion</key>    <string>11.0</string>
   <key>NSHighResolutionCapable</key>   <true/>
   <!-- The canvas is drawn by us at every zoom, so macOS must not scale the
@@ -175,6 +182,20 @@ PLIST
 # indistinguishable from "the icon did not get built". `set -e` turns that into a
 # failed build instead.
 plutil -lint "$APP/Contents/Info.plist"
+
+# The version, stamped from the one place it is written. The heredoc above is quoted
+# (`<<'PLIST'`) on purpose so that nothing in that XML is at the mercy of the shell,
+# and unquoting it to interpolate `$VERSION` would put every `$` in the document at
+# risk for one substitution. `plutil -replace` edits the finished file instead.
+VERSION="$(awk '/^\[workspace\.package\]/{f=1} f && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)"
+test -n "$VERSION"
+plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
+plutil -replace CFBundleVersion            -string "$VERSION" "$APP/Contents/Info.plist"
+
+# Read it back rather than trusting the write. `plutil -replace` on a key that is not
+# there succeeds by adding it, so a renamed key would leave the real one at 0.0.0 and
+# report nothing at all.
+test "$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")" = "$VERSION"
 test -f "$APP/Contents/Resources/Velm.icns"
 
 # The agent shims, checked as executables rather than as files. A `cp` of something the

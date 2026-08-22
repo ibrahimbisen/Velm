@@ -170,6 +170,42 @@
         token,
       });
 
+      // ⚠ **The editing interface, and only when this board can actually be edited.**
+      //
+      // `can_edit()` answers false for a static `./board.bin` — a page with no server behind
+      // it has nowhere to push to, and a toolbar whose effects would live and die in the tab
+      // is a promise this client must not make. That is the house rule about never describing
+      // a gesture the user cannot perform, applied to a whole interface rather than a button.
+      //
+      // Both mounts gate every one of their own controls on `typeof mod.fn === 'function'`
+      // too, so a wasm build missing an export draws that control disabled with a tooltip
+      // rather than throwing when it is pressed.
+      // ⚠ **Waited for, not asked immediately.** `start` hands off to an async boot, so the
+      // viewer does not exist yet on the line after it — and every one of these exports
+      // answers its *fallback* when it cannot borrow a viewer. `can_edit()` would say `false`
+      // for a board that is perfectly editable, and the whole interface would silently not
+      // appear. That is the third time today an export's "not ready" and its "no" have been
+      // the same value; `camera_report() === 'none'` is the readiness signal the perf fixture
+      // already uses, so it is the one used here.
+      for (let i = 0; i < 200 && velm.camera_report() === 'none'; i++) {
+        await new Promise(r => setTimeout(r, 50));
+      }
+      // ⚠ `can_edit()` answers `"wait"` while a frame holds the viewer, which is most of
+      // every 16ms — so it is *polled* until it says yes or no. Asking once got a coin flip
+      // and silently drew no toolbar on a board that was perfectly editable.
+      let editable = 'wait';
+      for (let i = 0; i < 100 && editable === 'wait'; i++) {
+        editable = typeof velm.can_edit === 'function' ? velm.can_edit() : 'no';
+        if (editable === 'wait') await new Promise(r => setTimeout(r, 20));
+      }
+      if (editable === 'yes') {
+        const canvas = document.getElementById('canvas');
+        const { mountTools } = await import('./tools.js');
+        mountTools(velm, { canvas });
+        const { mountInspector } = await import('./inspect.js');
+        mountInspector(velm, { canvas });
+      }
+
       // A gesture fixture, on request. `?selftest=touch` drives real PointerEvents at the
       // real canvas and reports what the camera did — the only honest check of an input
       // path, and the only one that can be run on the iPad by the person holding it.

@@ -32,7 +32,8 @@ wasm-bindgen --target web --no-typescript --out-dir web/dist \
 # ⚠ A fixed list, not a glob, so a new page has to be named here — which is the point: a
 # `web/*.html` glob would also copy `probe.html`, a diagnostic that has no business in a
 # deployed bundle. `boards.html` is the front door; `index.html` opens one board.
-cp web/index.html web/selftest.js web/chrome.js web/boards.html web/boards.js web/dist/
+cp web/index.html web/selftest.js web/chrome.js web/boards.html web/boards.js \
+   web/tools.js web/inspect.js web/dist/
 
 echo "web/dist ready — $(du -h web/dist/vellum_web_bg.wasm | cut -f1) of wasm"
 echo "A board and its pictures are not built, they are exported:"

@@ -44,6 +44,10 @@ serde.workspace = true
 vellum-render.workspace = true
 vellum-shapes.workspace = true
 serde_json.workspace = true
+# The inverted index and the fuzzy query, unchanged. Its only dependency is `thiserror` and
+# every filesystem use is confined to the on-disk index, which a tab does not have — so the
+# browser searches a board with the same code the desktop does rather than a smaller matcher.
+vellum-search.workspace = true
 vellum-scene.workspace = true
 vellum-text.workspace = true
 wgpu.workspace = true
@@ -68,4 +72,7 @@ features = [
   # The only thing that bounds a `fetch` that never settles. Feedback 44's lesson: bounding
   # only the awaits you have *observed* hang leaves the next one to hang instead.
   "AbortSignal",
+  # `Window::navigator()` -> `sendBeacon`, the only fire-and-forget that survives a tab
+  # being closed. It is how an unacknowledged edit gets one last chance to reach the server.
+  "Navigator",
 ]
