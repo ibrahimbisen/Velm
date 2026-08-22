@@ -544,11 +544,17 @@ impl Editor {
 
     /// Record the outcome of a merge. `true` is a success.
     ///
-    /// ⚠ **A success resets the count, so receiving genuinely resumes** — the first version
-    /// gated the whole apply loop on the count and reset it only *inside* the loop, which is
-    /// unreachable once the gate fires. Three failures stopped receiving for the life of the
-    /// process while sending carried on, which is one-way divergence after a single toast.
-    /// Here the gate stops the *queue* draining, and one later update that merges clears it.
+    /// ⚠ **A success resets the count, and the caller must leave a way for one to happen.**
+    /// Two versions of this got that wrong in the same way: the gate was placed above the
+    /// apply loop and the reset lived inside it, so once the gate closed nothing could ever
+    /// reset it — receiving was dead for the rest of the board's session while sending
+    /// carried on, which is one-way divergence after a single toast, and both versions'
+    /// comments claimed recovery was possible.
+    ///
+    /// `ActiveState::apply_sync` keeps the **newest** queued update and attempts it once per
+    /// period while this is true. That is what makes "resumes on a later success" a fact
+    /// rather than a hope, and it is affordable because a Loro update is cumulative: the
+    /// newest carries what the ones behind it did.
     pub fn note_merge(&mut self, ok: bool) {
         self.merge_failures = if ok { 0 } else { self.merge_failures.saturating_add(1) };
     }
@@ -1067,6 +1073,63 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let blobs = BlobStore::open(home.path().join("blobs")).unwrap();
         (home, Editor::in_memory(Board::new(), blobs))
+    }
+
+    /// ⚠ **The queue is bounded, and it drops the oldest.**
+    ///
+    /// A failed apply leaves the version vector unmoved, so the server recomputes the same —
+    /// and growing — payload every period: twenty a minute for as long as a caret is open,
+    /// every one of them a full reproject when it closes. Dropping the *oldest* is what makes
+    /// that safe rather than lossy: a Loro update is cumulative, so a later one carries
+    /// everything an earlier one did, and dropping the newest would be the losing choice.
+    #[test]
+    fn the_remote_queue_is_bounded_and_keeps_the_newest() {
+        let (_home, mut editor) = editor();
+        for n in 0..Editor::REMOTE_QUEUE + 10 {
+            editor.hold_remote(vec![u8::try_from(n % 251).unwrap()]);
+        }
+        let held = editor.take_remote();
+        assert_eq!(held.len(), Editor::REMOTE_QUEUE, "the queue is not bounded");
+        let last = u8::try_from((Editor::REMOTE_QUEUE + 9) % 251).unwrap();
+        assert_eq!(held.last().unwrap(), &vec![last], "the newest update was dropped");
+        assert!(editor.take_remote().is_empty(), "taking twice hands the same bytes out twice");
+    }
+
+    /// ⚠ **Giving up must be recoverable, and two versions of this were not.**
+    ///
+    /// Both put the gate above the apply loop and the reset inside it, so once the gate closed
+    /// nothing could ever reset it — receiving was dead for the rest of the board's session
+    /// while sending carried on, which is one-way divergence, and both versions' comments
+    /// claimed recovery was possible. The assertion that matters is the last one.
+    #[test]
+    fn merging_gives_up_after_three_failures_and_comes_back_on_a_success() {
+        let (_home, mut editor) = editor();
+        assert!(!editor.merges_are_failing(), "a fresh board has not given up");
+        for _ in 0..Editor::MERGE_ATTEMPTS {
+            editor.note_merge(false);
+        }
+        assert!(editor.merges_are_failing(), "three failures did not stop the applying");
+        editor.note_merge(true);
+        assert!(!editor.merges_are_failing(), "a later success must clear it — the doc says so");
+    }
+
+    /// A queue belongs to its board, and attaching a new conversation empties it.
+    ///
+    /// The bug this pins is the one where a queue on the *application* delivered an update
+    /// meant for board A into board B after a tab switch: `Board::apply` is a bare
+    /// `LoroDoc::import` with no identity check, so the merge succeeds and is not undoable.
+    #[test]
+    fn a_new_conversation_starts_with_nothing_held_over() {
+        let (_home, mut editor) = editor();
+        editor.hold_remote(vec![1, 2, 3]);
+        editor.note_merge(false);
+        editor.attach_sync(crate::sync::Sync::new(
+            "http://127.0.0.1:1".to_owned(),
+            String::new(),
+            "scratch".to_owned(),
+        ));
+        assert!(editor.take_remote().is_empty(), "a stale update survived a new sync");
+        assert!(!editor.merges_are_failing(), "a stale failure count survived a new sync");
     }
 
     fn sticky(x: f64, y: f64) -> NewItem {

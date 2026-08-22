@@ -168,9 +168,9 @@ const DEFAULT_MINDMAP_SIZE: (f64, f64) = (520.0, 260.0);
 /// derived from a cached layout, so handing out borrows would keep this layer borrowed
 /// across `TextLayer::queue`, which needs the engine this layer also borrows.
 ///
-/// ⚠ `slot` is what makes two labels on one item distinguishable. `TextLayer`'s cache key
-/// is `(item, generation, size, width)` and nothing else, so a table with two cells of the
-/// same width at the same size would draw the *first* cell's words in both — the exact bug
+/// ⚠ `slot` is what makes two labels on one item distinguishable. `TextLayer`'s cache key is
+/// `(item, slot)`, and without the slot it is the item alone — so a table's cells would all
+/// resolve to one entry and every one of them would draw the *first* cell's words, the bug
 /// `draw.rs`'s `BlockKey::new(id, slot)` exists to prevent. It is stable for as long as the
 /// layout is: slots are handed out in the order the widget's own layout lists its pieces.
 pub struct WidgetText {

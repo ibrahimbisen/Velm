@@ -40,11 +40,17 @@ pub fn verify(data: &Path, manifest_path: &Path) -> anyhow::Result<()> {
         missing.len()
     );
 
+    // ⚠ **A path out of the manifest, and a manifest is a file `--manifest` names.** It is
+    // normally one velmd wrote, and normally the paths in it came from a directory walk on
+    // this machine — but "normally" is not a guard, and the whole point of `verify` is that
+    // it is run on a copy somebody else may have handled. Same class as the board id and the
+    // board title; this is the third module to get the same treatment, and it is here because
+    // the previous two were found by a review rather than by looking for siblings.
     for path in missing.iter().take(20) {
-        println!("  MISSING   {path}");
+        println!("  MISSING   {}", crate::serve::printable(path));
     }
     for path in mismatched.iter().take(20) {
-        println!("  MISMATCH  {path}");
+        println!("  MISMATCH  {}", crate::serve::printable(path));
     }
 
     // Extra files are reported and are **not** a failure. The manifest is taken before the
@@ -317,7 +323,9 @@ fn check_boards(data: &Path) -> anyhow::Result<()> {
     if !unreadable.is_empty() {
         println!("\n{} board(s) could NOT be read:", unreadable.len());
         for line in &unreadable {
-            println!("  {line}");
+            // The line is a file name plus a SQLite or Loro error, and a file name comes off
+            // the disk this is pointed at.
+            println!("  {}", crate::serve::printable(line));
         }
         anyhow::bail!("some boards did not load — stop and ask before going further");
     }

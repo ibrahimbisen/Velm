@@ -45,7 +45,7 @@ use vellum_text::{SpanStyle, StyledText, TextSpan};
 /// Which of a card's three labels a block is.
 ///
 /// ⚠ **A slot is what makes two blocks on one item distinguishable.** `TextLayer`'s cache key is
-/// `(item, slot, generation, size, width)`, so two blocks of the same width at the same size
+/// `(item, slot)`, so two blocks on one item
 /// would otherwise resolve to one entry and the second would draw the first one's words. Here
 /// the three *are* different sizes, so a missing slot would not show today — which is exactly
 /// the kind of latent key collision that surfaces the day somebody makes two of the scales

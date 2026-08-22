@@ -410,9 +410,9 @@ refuses to start on a public address without a token, and it says so loudly. It 
 own laptop while testing. So a server behind a proxy with no token set starts perfectly,
 says nothing is wrong, and serves every board you own to anyone who finds the address.
 
-velmd now catches this itself: a request that arrives through a proxy, on a server with
-no token, is refused with a message naming the problem. **You should never see it.** If
-you do, it means `VELMD_TOKEN` is not reaching the service. Check it like this:
+velmd catches the common case itself: a request that arrives through a proxy, on a server
+with no token, is refused with a message naming the problem. If you see that message, it
+means `VELMD_TOKEN` is not reaching the service. Check it like this:
 
 ```bash
 sudo cat /srv/velm/secret/velmd.env      # should print VELMD_TOKEN=<a long hex string>
@@ -431,7 +431,16 @@ earlier. It prints an empty `Environment=` whether the token arrived or not, whi
 worst possible answer here: a check that looks like it passed, on the one failure that
 exposes every board you own.
 
-There is no version of this where a missing token is safe once the proxy is in front.
+⚠️ **That refusal is a backstop, not the gate — the token is the gate.** velmd recognises a
+proxy by the headers one normally adds (`X-Forwarded-For` and its two relatives), and Caddy
+set up as in step 25 sends them. Several other arrangements do not: `nginx` with a bare
+`proxy_pass`, a load balancer in TCP mode, `stunnel`, and an SSH tunnel (`ssh -R`) all
+forward without adding anything. **On any of those, a tokenless velmd answers normally and
+serves every board.**
+
+So: never rely on the refusal to tell you the token is missing. Check the `auth` line above,
+once, after every change to the unit. There is no version of this where a missing token is
+safe once anything at all is forwarding to velmd.
 
 ### Part 4b — Hardening, now that it is reachable from anywhere
 
@@ -619,19 +628,32 @@ problem — `connection refused` means the server is not running or the address 
 ### Step 33 — Make it the normal way you open Velm (YOU)
 
 Clicking the Velm icon in your Dock does **not** pass the option, so it opens without syncing.
-Two ways to fix that, and the first is simpler:
+Two ways to fix that, and the second is simpler:
 
-**Either** make a small launcher: open **Script Editor**, paste this, and save it as an
-Application called `Velm` on your Desktop —
+**Either** make a small launcher: open **Script Editor**, paste this — replacing both the token
+and the address — and save it as an Application called `Velm Sync` on your Desktop:
 
 ```applescript
 do shell script "export VELM_SYNC_TOKEN='paste-your-token-here'; \
-open -a Velm --args --sync-server https://boards.YOURDOMAIN.com"
+nohup /Applications/Velm.app/Contents/MacOS/Velm \
+--sync-server https://boards.YOURDOMAIN.com > /dev/null 2>&1 &"
 ```
+
+⚠️ **It runs the binary directly rather than `open -a Velm`, and that is not a style
+preference.** `open` hands the request to macOS's launch service, which starts the app in its
+own environment — so the `export` on the line before it never reaches Velm, and you would get
+an app that looks like it is syncing and is not. Tested on this machine: run this way, Velm
+finds the token; the token has to travel down to a *child process*, which is what `nohup …`
+makes it.
 
 **Or** just run the Terminal line from step 32 whenever you want syncing, and click the icon
 when you do not. Both are fine; nothing breaks either way, because a board that has been
 offline for a week catches up the moment it next syncs.
+
+⚠️ **Whichever you pick, quit Velm before you sync a board you also have open by the other
+route.** Two copies of Velm with the same board open is two programs writing one file, which
+is the one thing that genuinely corrupts one — the same warning as pointing `velmd` at your
+Mac's own folder.
 
 ### What syncing does and does not do
 

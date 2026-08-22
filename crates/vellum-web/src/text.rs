@@ -13,7 +13,16 @@
 //! records it: caching on the *projection's* stamp means any edit anywhere re-shapes **every
 //! visible block**, sixty times a second, through cosmic-text. Here nothing edits at all, so
 //! a wrong key would simply reshape every block every frame forever — the same cost with no
-//! edit to blame it on. The key is `(item, generation, quantised size)`.
+//! edit to blame it on.
+//!
+//! ⚠ **The key is `(item, slot)`, and the generation, the size and the wrap width are all
+//! *fields* on the value.** They were key components, and this line said so — which is the
+//! `locked: false` trap in the file that has been re-keyed twice: whatever a block was shaped
+//! against, it must **replace** its entry rather than mint a new one. In the key, a synced
+//! edit that refits a sticky to a different size strands the old layout for as long as the
+//! item stays visible, in wasm memory that never returns to the OS. `shapes.rs` and
+//! `strokes.rs` had the right shape all along — `SceneId` alone, everything else in the
+//! value — and this was the only one that accumulated.
 //!
 //! # Fonts
 //!

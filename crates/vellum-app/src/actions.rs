@@ -905,20 +905,28 @@ impl ActiveState {
         if self.busy_with_a_group() {
             return;
         }
-        // Given up on **for this board**: keep talking to the server, since the version
-        // vector is still honest, but stop reprojecting against bytes that have already
-        // failed three times. The queue is dropped rather than kept — it is bounded, but
-        // holding sixty updates nobody will ever apply is memory spent on nothing.
+        // ⚠ **Given up on means "one attempt per period", not "never again" — and the
+        // version before this said the second while its doc claimed the first.**
         //
-        // ⚠ Not permanent. `Editor::note_merge` clears the count on any later success, and
-        // the gate is on the *drain* rather than around the reset — which is the shape the
-        // first version got wrong: it gated the whole loop and reset only inside it, so three
-        // failures stopped receiving for the life of the process while sending carried on.
-        if self.editor.merges_are_failing() {
-            drop(self.editor.take_remote());
-            return;
-        }
-        for updates in self.editor.take_remote() {
+        // The gate sat above the loop and the reset lived inside it, so `note_merge(true)`
+        // was unreachable the moment the gate closed: three failures stopped receiving for
+        // the life of the board's session while sending carried on, which is one-way
+        // divergence. That is the *same* mirror-image mistake this whole round was written to
+        // catch, made inside the fix for it — the first version put the reset below a gate it
+        // could never pass, and this one nearly repeated it a level up.
+        //
+        // Keeping the **newest** update and retrying it is what makes the recovery claim
+        // true, and it is cheap because a Loro update is cumulative and idempotent: the
+        // newest carries everything the ones behind it did, so one attempt per period is the
+        // whole cost while a board is broken, against one per update while it is healthy.
+        let queued = if self.editor.merges_are_failing() {
+            let mut held = self.editor.take_remote();
+            held.drain(..held.len().saturating_sub(1));
+            held
+        } else {
+            self.editor.take_remote()
+        };
+        for updates in queued {
             match self.editor.apply_remote(&updates) {
                 Ok(()) => {
                     log::debug!("sync: merged {} bytes from the server", updates.len());

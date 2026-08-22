@@ -65,11 +65,18 @@ struct Contact {
     /// [`ratio`], and nowhere else.
     x: f64,
     y: f64,
-    /// How far this finger has travelled since it landed, summed over every move.
-    ///
-    /// A tap is decided from this rather than from the distance between where it went down
-    /// and where it came up — see the release handler for why those are different questions.
+    /// Where this finger landed, so its net displacement can be measured.
+    start_x: f64,
+    start_y: f64,
+    /// How far it has travelled since, summed over every move above the jitter floor.
     travelled: f64,
+    /// How far it currently is from where it landed.
+    ///
+    /// ⚠ **Both this and [`Self::travelled`], because either alone is defeatable** — and each
+    /// by the gesture the other catches. See the update path for the arithmetic; the short
+    /// version is that a drag that returns to its start has no displacement, and a drag slow
+    /// enough never clears the per-sample floor.
+    drift: f64,
 }
 
 /// How far a finger or a cursor may travel and still count as a tap. CSS pixels.
@@ -94,7 +101,7 @@ impl Contacts {
     /// A new contact, from `pointerdown` and nowhere else.
     fn press(&mut self, id: i32, x: f64, y: f64) {
         if !self.moved(id, x, y) {
-            self.down.push(Contact { id, x, y, travelled: 0.0 });
+            self.down.push(Contact { id, x, y, start_x: x, start_y: y, travelled: 0.0, drift: 0.0 });
             if self.down.len() >= 2 {
                 self.ever_multi = true;
             }
@@ -117,19 +124,26 @@ impl Contacts {
                 // ⚠ **Only movement worth calling movement.** Path length is monotonic and
                 // never decays, so counting every sample means a finger *resting* accumulates
                 // digitiser noise until it can no longer be a tap: at a tenth of a pixel per
-                // sample at 60Hz, a deliberate slow press dies after about a second. The old
-                // rule could be defeated by wandering back; this one could be defeated by
-                // holding still, which is the mirror image and the worse of the two — a
+                // sample at 60Hz, a deliberate slow press dies after about a second. A
                 // careful press is exactly how somebody aims at a small badge.
                 //
                 // A per-sample floor rather than a decay: a real drag moves further than this
-                // between samples and is counted in full, while a hand that is trying to stay
-                // put contributes nothing.
+                // between samples and is counted in full, while a hand trying to stay put
+                // contributes nothing.
+                //
+                // ⚠ **On its own the floor is the third mirror of the same bug**, and that is
+                // why the release tests two things rather than one. Displacement alone could
+                // be defeated by wandering back to the start; floored path length alone can
+                // be defeated by moving *slowly* — a pan under about 45 px/s never exceeds
+                // the floor on any sample, accumulates nothing, and ends as a tap. Neither
+                // measure is sufficient; both together are, because a real drag fails at
+                // least one and a real tap passes both.
                 const JITTER: f64 = 0.75;
                 let step = (x - existing.x).hypot(y - existing.y);
                 if step > JITTER {
                     existing.travelled += step;
                 }
+                existing.drift = (x - existing.start_x).hypot(y - existing.start_y);
                 existing.x = x;
                 existing.y = y;
                 true
@@ -315,11 +329,11 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                     return;
                 }
                 // A pan that finishes over a card is not a request to open it.
-                // ⚠ **Path length, not displacement.** A pan that wanders out and comes
-                // back near where it began has a displacement of nearly zero, so a
-                // straight-line test calls it a tap and opens whatever card it happens to
-                // finish over. The distance travelled cannot be undone by coming back.
-                if contact.travelled > TAP_SLOP {
+                // ⚠ **Both measures, and a drag fails at least one.** A pan that wanders
+                // out and back has almost no *displacement*, so a straight-line test calls it
+                // a tap; a pan slow enough never clears the jitter floor, so *path length*
+                // calls it one too. The `Contact` fields carry the full argument.
+                if contact.travelled > TAP_SLOP || contact.drift > TAP_SLOP {
                     return;
                 }
                 let ratio = ratio();

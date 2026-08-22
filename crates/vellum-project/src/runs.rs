@@ -309,9 +309,16 @@ mod tests {
     /// [`params_for`] rather than being built by hand — otherwise this re-tests the engine
     /// that already has its own tests, and says nothing about the substitution that is the
     /// only thing this module decides. A/B: put `style.font_family` back into `params_for`
-    /// and the delta is 0.0%; write `None` instead and it is 0.0% as well, because
-    /// `with_fonts` leaves the `sans-serif` alias on cosmic-text's own default, `"Open Sans"`,
-    /// which is not one of the two faces loaded here.
+    /// and the delta is 0.0%.
+    ///
+    /// ⚠ **The second half of this A/B is no longer reproducible, and it is recorded rather
+    /// than deleted because the change that broke it is the interesting part.** It used to
+    /// read that writing `None` also gives 0.0%, *because* `with_fonts` leaves the
+    /// `sans-serif` alias on cosmic-text's own default. That was true and is the bug the
+    /// browser later paid for: `with_fonts` is how a tab builds its engine, so every bold
+    /// span in a browser silently shaped at regular weight. `with_fonts` now points the alias
+    /// at the bundle when the bundle is among what was loaded — so `None` resolves to Inter
+    /// here and the measurement it described cannot be taken any more.
     #[test]
     fn a_bold_span_is_heavier_and_has_not_left_the_family() {
         let mut engine = browser_engine();
