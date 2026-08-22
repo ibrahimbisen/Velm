@@ -12,6 +12,9 @@
 //! Nothing here opens a window, a file or a socket. That is what makes it the layer a wasm
 //! viewer needs, and it is why extracting it cost no change to any caller.
 
+/// Where a link card's three voices go and what they say -- pure, and tested here
+/// because `vellum-web` is `cfg(target_arch = "wasm32")` and can hold no runnable test.
+pub mod card;
 pub mod connector;
 pub mod frame;
 pub mod look;

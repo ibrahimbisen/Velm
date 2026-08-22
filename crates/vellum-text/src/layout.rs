@@ -689,7 +689,29 @@ impl TextEngine {
             .into_iter()
             .map(|data| fontdb::Source::Binary(std::sync::Arc::new(data)))
             .collect::<Vec<_>>();
-        Self::from_font_system(FontSystem::new_with_fonts(sources))
+        let mut engine = Self::from_font_system(FontSystem::new_with_fonts(sources))?;
+        // ⚠ **The same line [`Self::new`] calls, and for the same reason — it was missing
+        // here, and the browser is what found it.**
+        //
+        // `vellum-web` builds its engine through this function rather than `new`, because
+        // `new` scans the system's fonts and there are none in a tab. So the bundle was
+        // loaded and the `sans-serif` alias was left pointing wherever fontdb defaults —
+        // which meant `family_has_bold(None)` asked about the wrong family, answered `false`,
+        // and **every bold span in the browser silently shaped at regular weight.** A link
+        // card's title is the visible case: it is the one thing on a card that is meant to be
+        // heavier than everything around it, and it was not. `new`'s own comment states the
+        // rule this violated — *loading a bold face the alias does not point at changes
+        // nothing* — and the fix is not to move the bundle, it is to point the alias.
+        //
+        // **Conditional, because this function's contract is "exactly the supplied fonts".**
+        // A test that loads two faces of its own must not have `sans-serif` redirected to a
+        // family it never asked for, so the alias moves only when the bundle is genuinely
+        // among what was loaded. That keeps `with_fonts`'s reproducible-metrics promise
+        // intact while making the one case that matters correct.
+        if engine.families().iter().any(|family| family == BUNDLED_FAMILY) {
+            engine.fonts.db_mut().set_sans_serif_family(BUNDLED_FAMILY);
+        }
+        Ok(engine)
     }
 
     fn from_font_system(fonts: FontSystem) -> Result<Self> {
@@ -1369,6 +1391,46 @@ pub(crate) mod tests {
             f64::from(heavy) > f64::from(regular) * 1.01,
             "asking for bold changed nothing: {regular:.2} against {heavy:.2} — the weight is \
              being dropped at shaping"
+        );
+    }
+
+    /// ⚠ **An engine built from the bundle alone must resolve `sans-serif` to it.**
+    ///
+    /// This is the browser's engine: `vellum-web` calls [`TextEngine::with_fonts`] rather
+    /// than [`TextEngine::new`], because `new` scans the system's fonts and a tab has none.
+    /// `with_fonts` loaded Inter and **did not point the alias at it**, so
+    /// `family_has_bold(None)` asked about whatever fontdb defaults to, answered `false`, and
+    /// every bold span in the browser shaped at regular weight — visible as a link card's
+    /// title being no heavier than its blurb.
+    ///
+    /// Measured rather than asserted structurally: the advance of a bold run against a
+    /// regular one. `feedback 27` records why a width comparison is not enough on its own —
+    /// it cannot tell *heavier* from *different family* — so the proportionality test below
+    /// covers that half and this one covers the half it cannot see, which is whether the
+    /// request survives at all. A/B: with the alias line removed, the delta here is 0.0%.
+    #[test]
+    fn the_bundled_family_is_what_sans_serif_means_in_a_font_only_engine() {
+        let mut engine = TextEngine::with_fonts(BUNDLED_FONTS.iter().map(|f| f.to_vec()))
+            .expect("the bundled faces parse");
+        assert!(
+            engine.family_has_bold(None),
+            "sans-serif does not resolve to a family with a bold face, so every bold span \
+             in the browser would silently shape at regular weight"
+        );
+
+        let width = |engine: &mut TextEngine, bold: bool| {
+            let params = LayoutParams { font_family: None, ..params(18.0) };
+            let text = StyledText::from_spans([TextSpan::new(
+                "Empowering everyone",
+                SpanStyle { bold, ..SpanStyle::default() },
+            )]);
+            engine.measure(&text, &params).width
+        };
+        let regular = width(&mut engine, false);
+        let heavy = width(&mut engine, true);
+        assert!(
+            heavy > regular,
+            "bold ({heavy}) is not wider than regular ({regular}), so the weight was dropped"
         );
     }
 

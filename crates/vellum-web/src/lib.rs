@@ -47,6 +47,7 @@ const FIT_MARGIN: f64 = 0.02;
 
 mod badges;
 mod board;
+mod card;
 mod live;
 mod widgets;
 mod images;
@@ -886,6 +887,30 @@ impl Viewer {
                     label.anchor,
                 );
             }
+            // ⚠ **A card's words are not `kind.text()` either**, and for the same reason a
+            // widget's are not: `ItemKind::text()` answers `None` for `LinkPreview`, `Embed`
+            // and `Document` — so 91 of the reference board's items drew as blank white
+            // rectangles with a ↗ in the corner, and `layout::text_slot`'s card arm had never
+            // once been called. Three blocks rather than one, because `push_layout` takes one
+            // colour *and* one size per run and a card is a muted site name over a bold title
+            // over a grey blurb.
+            for block in card::blocks(projected, text_colour, muted) {
+                let top_left = self.camera.world_to_screen(block.rect.min);
+                self.text.queue(
+                    item.id,
+                    block.slot,
+                    projected.generation,
+                    &block.text,
+                    [top_left.x as f32, top_left.y as f32],
+                    [block.rect.width() as f32, block.rect.height() as f32],
+                    Some(block.font_size),
+                    zoom,
+                    block.color,
+                    block.anchor,
+                );
+            }
+            // Answers `None` for every card kind, which is what makes the loop above the only
+            // path a card's text has. Left as the early-out it already was.
             let Some(styled) = projected.item.kind.text() else { continue };
             // ⚠ **Not the item's own rectangle.** A sticky's words are inset by Miro's own
             // 8% and centred; a frame's name is small and sits *above* the frame; a card's
