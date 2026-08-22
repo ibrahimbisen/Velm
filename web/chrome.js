@@ -292,7 +292,11 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
   // The board list, carrying the token and nothing else. `board`, `selftest`, `zoom`, `cx`
   // and `cy` all name *this* board or a fixture to run on it — carrying `selftest=touch` back
   // would start a gesture fixture on a page that has hidden its canvas.
-  const listUrl = new URL(location.pathname, location.href);
+  // ⚠ `./boards.html`, not this page's own path. Back used to reload index.html with the
+  // board dropped, which fell through to its inline placeholder list — right when there was
+  // no picker and wrong now that there is one. `canGoBack` already suppresses the button on
+  // the static `./board.bin` route, so this adds no dead link.
+  const listUrl = new URL('./boards.html', location.href);
   if (token) listUrl.searchParams.set('token', token);
 
   let back = null;

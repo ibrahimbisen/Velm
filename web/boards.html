@@ -1,0 +1,256 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- ⚠ No `user-scalable=no`, unlike `index.html`. That page suppresses zoom because the board
+     handles its own pinch and a browser zoom on top of it fights the camera. This page is a
+     document: pinching it to read a long board name is the browser doing its job. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Velm — your boards</title>
+<style>
+  /* Every colour here is `index.html`'s and `chrome.js`'s, deliberately, and not `theme.rs`'s
+     nearest equivalent: this design draws its structure with hairlines rather than shadows, so
+     two nearly-identical hairlines on one screen read as a mistake rather than as a system.
+     Light only — Velm has no dark mode and a picker that flips would not match the board it
+     opens. */
+  :root {
+    --ink: #22282C;
+    --ink-muted: #656D73;
+    --ink-faint: #8B959B;
+    --paper: #F7F9FA;
+    --card: #ffffff;
+    --line: #E2E7EA;
+    --wash: #F2F5F6;
+    --press: #E9EEF0;
+    --accent: #00A38C;
+    --focus: #6FD6E6;
+  }
+
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background: var(--paper);
+    color: var(--ink);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  main {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 40px 24px 64px;
+    /* Keeps the page clear of an iPad's rounded corners and its home indicator. */
+    padding-left: max(24px, env(safe-area-inset-left));
+    padding-right: max(24px, env(safe-area-inset-right));
+    padding-bottom: max(64px, env(safe-area-inset-bottom));
+  }
+
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; letter-spacing: -.01em; }
+  .sub { margin: 0; color: var(--ink-muted); font-size: 13px; }
+  .where {
+    margin: 2px 0 0;
+    color: var(--ink-faint);
+    /* §3: monospace for anything that names a machine, the same stack the status line uses. */
+    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    overflow-wrap: anywhere;
+  }
+  header { margin-bottom: 28px; }
+
+  /* A message and a warning are the same object: a bold line naming what happened and a
+     paragraph naming what to do about it. The warning is the softer of the two because the
+     thing it describes has not stopped anything yet. */
+  .message, .warning {
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin: 0 0 20px;
+    max-width: 72ch;
+  }
+  .message { background: var(--card); border: 1px solid var(--line); }
+  .warning { background: var(--wash); border: 1px solid var(--line); }
+  .message strong, .warning strong { display: block; font-weight: 600; margin-bottom: 4px; }
+  .message p, .warning p { margin: 0; color: var(--ink-muted); font-size: 13px; }
+
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px 16px;
+    margin: 0 0 24px;
+    max-width: 48ch;
+  }
+  .panel label.field { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
+  .panel label.field + input { margin-bottom: 4px; }
+  .panel input[type="text"], .panel input[type="password"] {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    /* 44px, Apple's own minimum — the same figure `chrome.js` sizes every control to, and for
+       the same reason: this is aimed with a finger. */
+    min-height: 44px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--card);
+    color: inherit;
+    /* ⚠ 16px, not 13px. iOS zooms the whole page in when a field smaller than this takes
+       focus, and it does not zoom back out — so the picker ends up half off screen with the
+       keyboard up, which reads as the layout breaking. */
+    font: 16px/1.4 inherit;
+    font-family: inherit;
+  }
+  .panel input:focus-visible { outline: 2px solid var(--focus); outline-offset: -1px; border-color: var(--focus); }
+  .panel .hint { margin: 4px 0 16px; color: var(--ink-muted); font-size: 12px; }
+  .panel .check {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    /* The whole row is the target, not the 13px box inside it. */
+    min-height: 44px;
+    font-size: 13px;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .panel .check input { width: 18px; height: 18px; flex: none; accent-color: var(--accent); }
+
+  .btn {
+    appearance: none;
+    -webkit-appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 44px;
+    min-width: 44px;
+    padding: 0 18px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--card);
+    color: inherit;
+    font: inherit;
+    font-weight: 500;
+    cursor: pointer;
+    text-decoration: none;
+    /* §3: motion is functional and fast, 120-160ms, ease-out. */
+    transition: background-color 120ms ease-out;
+    /* iOS otherwise paints its own grey flash over every state below. */
+    -webkit-tap-highlight-color: transparent;
+    /* Drops the 300ms a browser holds in case the tap was half a double-tap-to-zoom. */
+    touch-action: manipulation;
+  }
+  /* ⚠ Guarded, because :hover latches on a touchscreen: a tapped button keeps the wash until
+     something else is tapped, so the page shows a control as pointed-at that nothing is
+     pointing at. `chrome.js` carries the same guard for the same reason. */
+  @media (hover: hover) {
+    .btn:hover { background: var(--wash); }
+    .velm-card:hover { border-color: var(--ink-faint); }
+  }
+  .btn:active { background: var(--press); }
+  .btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+  .grid {
+    display: grid;
+    gap: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  }
+  .velm-card {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+    /* Comfortably past the 44px minimum: a board is the thing this page exists to hit. */
+    min-height: 68px;
+    padding: 14px 16px;
+    border-radius: 10px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    color: inherit;
+    text-decoration: none;
+    transition: border-color 120ms ease-out;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  .velm-card:active { background: var(--wash); }
+  /* The only accent on the page. In Velm it means *selection* or *the active tool*, and the
+     board you are about to open is the closest thing a list has to either. */
+  .velm-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .velm-card strong {
+    font-weight: 600;
+    /* One line: a wrapping title makes its own card taller than its neighbours, which is the
+       raggedness feedback 22 spent a round removing from the desktop library. */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .velm-card-meta { color: var(--ink-muted); font-size: 12px; }
+
+  footer { margin-top: 32px; }
+  .note { color: var(--ink-muted); font-size: 12px; max-width: 68ch; margin: 0 0 16px; }
+  .footer-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .btn, .velm-card { transition: none; }
+  }
+</style>
+
+<main>
+  <header>
+    <h1>Your boards</h1>
+    <!-- aria-live: on a tablet this line is the only thing that says a request is in flight. -->
+    <p class="sub" id="velm-sub" aria-live="polite">Connecting…</p>
+    <p class="where" id="velm-where"></p>
+  </header>
+
+  <div class="message" id="velm-message" role="alert" hidden>
+    <strong id="velm-message-title"></strong>
+    <p id="velm-message-detail"></p>
+  </div>
+
+  <div class="warning" id="velm-warning" hidden></div>
+
+  <form class="panel" id="velm-connect" hidden>
+    <label class="field" for="velm-server">Server address</label>
+    <!-- ⚠ `type="text"`, not `type="url"`. A bare `192.168.1.20:7777` fails the browser's own
+         url validation, and the form then refuses to submit behind a tooltip that says nothing
+         about what is wrong — for the address most likely to be typed on a home network. -->
+    <input id="velm-server" name="server" type="text" inputmode="url"
+           autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"
+           placeholder="velm.example.com">
+    <p class="hint">Where <code>velmd serve</code> is running. Its own default port is 7777.</p>
+
+    <label class="field" for="velm-passphrase">Passphrase</label>
+    <input id="velm-passphrase" name="passphrase" type="password"
+           autocomplete="current-password" placeholder="Leave empty if the server has none">
+    <p class="hint">The <code>VELMD_TOKEN</code> the server was started with.</p>
+
+    <label class="check" for="velm-remember">
+      <input id="velm-remember" type="checkbox">
+      Remember the passphrase on this device
+    </label>
+    <p class="hint">
+      Off, the passphrase is forgotten when this tab closes — which is what you want on a
+      computer that is not yours. On, it stays until you press <em>Forget this device</em>.
+    </p>
+
+    <button class="btn" id="velm-connect-go" type="submit">Connect</button>
+  </form>
+
+  <div class="grid" id="velm-boards"></div>
+
+  <footer>
+    <p class="note">
+      Your boards live on your own server and are never uploaded anywhere else. Editing is not
+      available in a browser yet — the desktop app is still where a board is changed.
+    </p>
+    <div class="footer-actions">
+      <button class="btn" id="velm-retry" type="button" hidden>Try again</button>
+      <button class="btn" id="velm-change" type="button" hidden>Change server</button>
+      <button class="btn" id="velm-forget" type="button" hidden>Forget this device</button>
+    </div>
+  </footer>
+</main>
+
+<script type="module">
+  // Nothing runs on import: `boards.js` is a module of pure helpers plus one `mount`, which is
+  // what lets a Node harness drive the URL builder, the token lookup and the failure
+  // classifier without a browser.
+  import { mount } from './boards.js';
+  mount();
+</script>

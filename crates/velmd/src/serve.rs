@@ -315,7 +315,11 @@ fn serve_one(server: &Server, stream: TcpStream) {
             );
             return;
         };
-        if let Err(error) = sync::handle(server, id, &body, &stream) {
+        // The same decode the snapshot route needs, for the same reason — and it is the
+        // sibling check that found it: a board reachable for reading and not for syncing
+        // would be a board that loads and then silently never updates.
+        let id = percent_decode(id);
+        if let Err(error) = sync::handle(server, &id, &body, &stream) {
             eprintln!("velmd: {path}: {error:#}");
             let _ = respond(&stream, 500, "text/plain", b"something went wrong\n", origin.as_deref());
         }
@@ -363,7 +367,19 @@ fn route(server: &Server, path: &str, query: &str, stream: &TcpStream) -> anyhow
         }
         _ => {
             if let Some(id) = path.strip_prefix("/api/v1/boards/").and_then(|r| r.strip_suffix("/snapshot")) {
-                return snapshot(server, id, stream);
+                // ⚠ **Decoded, because a board id is a file stem and real ones have spaces
+                // in them.** A browser sends `encodeURIComponent(id)`, so
+                // *"BMW 2020 530i g30"* arrives as `BMW%202020%20530i%20g30` and matched
+                // nothing: measured, a **404 on almost every board this user owns**, while a
+                // board with a one-word name worked perfectly — which is what made it look
+                // like a problem with particular boards rather than with every name.
+                //
+                // Decoding does not weaken the traversal defence, and that is worth stating
+                // because it is the reason this is safe: `board_by_id` **compares** the id
+                // against the stems of a directory listing rather than joining it onto a
+                // path, so a decoded `../` is a stem that does not exist rather than a way
+                // out of the directory.
+                return snapshot(server, &percent_decode(id), stream);
             }
             if let Some(hash) = path.strip_prefix("/api/v1/blobs/") {
                 return blob(server, hash, stream);
@@ -383,8 +399,15 @@ fn boards_json(data: &Path) -> String {
     let mut rows = Vec::new();
     for index in list_boards(data).unwrap_or_default() {
         let Some(id) = index.path.file_stem().and_then(|s| s.to_str()) else { continue };
+        // `modified` is milliseconds since the epoch, so the client formats it in the
+        // reader's own locale rather than the server's. `0` for a clock the file predates,
+        // which the picker renders as no date at all rather than as 1970.
+        let modified = index
+            .modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis());
         rows.push(format!(
-            "{{\"id\":{},\"title\":{},\"items\":{}}}",
+            "{{\"id\":{},\"title\":{},\"items\":{},\"modified\":{modified}}}",
             json_string(id),
             json_string(&index.title),
             index.item_count
@@ -809,6 +832,37 @@ mod tests {
     /// Gating the bundle looks safer and is simply broken: a page's own module and wasm
     /// fetches cannot carry a token, so the client 401s on itself and never starts. Gating
     /// nothing puts irreplaceable boards behind a guessable URL.
+    /// ⚠ A board id is a **file stem**, and real ones have spaces: this user's boards are
+    /// named things like *"BMW 2020 530i g30"*. A browser sends `encodeURIComponent`, so
+    /// without a decode almost every board on the server answered 404 while a one-word name
+    /// worked — which reads as a problem with particular boards rather than with every name.
+    ///
+    /// Measured before the fix: `GET /api/v1/boards/BMW%202020%20530i%20g30/snapshot` gave
+    /// **404**, and the same board under a one-word stem gave **200, 931,984 bytes**.
+    #[test]
+    fn a_board_id_with_spaces_survives_the_trip_through_a_url() {
+        assert_eq!(percent_decode("BMW%202020%20530i%20g30"), "BMW 2020 530i g30");
+        // The three other shapes a real stem reaches this function in.
+        assert_eq!(percent_decode("Cars%20%26%20Bikes"), "Cars & Bikes");
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        assert_eq!(percent_decode("plain-name"), "plain-name");
+    }
+
+    /// Decoding must not become a way out of the data directory.
+    ///
+    /// It cannot be, and the reason is structural rather than careful: `board_by_id`
+    /// **compares** an id against the stems of a directory listing instead of joining it onto
+    /// a path, so a decoded `../` is simply a stem no board has. The assertion here is that
+    /// the decode is honest about what it produced — a guard that silently mangled the input
+    /// would be a guard nobody could reason about.
+    #[test]
+    fn a_traversal_in_an_id_decodes_to_something_no_board_is_called() {
+        let decoded = percent_decode("..%2F..%2Fetc%2Fpasswd");
+        assert_eq!(decoded, "../../etc/passwd");
+        // No file stem contains a separator, so this matches nothing in any listing.
+        assert!(decoded.contains('/'), "the decode must not hide what it produced");
+    }
+
     #[test]
     fn the_token_gates_the_boards_and_not_the_client() {
         for data in [

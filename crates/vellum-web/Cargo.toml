@@ -26,7 +26,21 @@ crate-type = ["cdylib", "rlib"]
 vellum-doc.workspace = true
 vellum-connect.workspace = true
 vellum-ink.workspace = true
+# For `provider_for`/`host_of` on the ↗ badge: the same host table that names a card's site
+# offline is what decides whether a card has an address a browser can open. Inherited from
+# the workspace root, which declares it `default-features = false` -- so the `net` feature,
+# and with it `ureq` and `ring`, is not in this build. `crates/vellum-web` must never fetch.
+vellum-link.workspace = true
 vellum-project.workspace = true
+# The four pure layout crates behind the structured widgets. None of them does any I/O --
+# a table's column widths, a chart's axis ticks, a kanban's lane packing and a tidy tree are
+# all arithmetic over measured text -- so they cross to wasm untouched, the way the rest of
+# the drawing stack did.
+vellum-chart.workspace = true
+vellum-flow.workspace = true
+vellum-mindmap.workspace = true
+vellum-table.workspace = true
+serde.workspace = true
 vellum-render.workspace = true
 vellum-shapes.workspace = true
 serde_json.workspace = true
@@ -51,4 +65,7 @@ features = [
   "Request", "RequestInit", "Response", "Performance", "Location",
   "WheelEvent", "PointerEvent", "DomRect", "CssStyleDeclaration",
   "Blob", "ImageBitmap", "OffscreenCanvas", "OffscreenCanvasRenderingContext2d", "ImageData",
+  # The only thing that bounds a `fetch` that never settles. Feedback 44's lesson: bounding
+  # only the awaits you have *observed* hang leaves the next one to hang instead.
+  "AbortSignal",
 ]

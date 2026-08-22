@@ -33,6 +33,17 @@ use vellum_text::{GlyphImage, GlyphKey, Layout, LayoutParams, StyledText, TextEn
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 struct Key {
     item: SceneId,
+    /// Which of this item's labels. `0` for everything with one block — a sticky, a frame's
+    /// name, a card.
+    ///
+    /// ⚠ **Without this a table's cells share one cache entry.** The key was written when an
+    /// item had exactly one block, and the rest of it — the generation, the size, the wrap
+    /// width — is identical for every cell in a column, so two cells with the same geometry
+    /// would resolve to the same `Layout` and the second would draw the first one's words.
+    /// `draw.rs` has carried the same field as `BlockKey::new(id, slot)` since tables were
+    /// written, and states the sharper half of the hazard: a *stale* slot draws the caret on
+    /// one card while typing into another.
+    slot: u16,
     generation: u64,
     /// Font size in tenths of a **world** unit.
     ///
@@ -53,7 +64,7 @@ pub struct TextLayer {
     /// binary search that shapes the text about fourteen times, and it has to happen before
     /// the layout key can even be computed. Uncached it would run every frame, on every
     /// sticky on screen, for the life of the tab.
-    fitted: HashMap<(SceneId, u64, u32, u32), f32>,
+    fitted: HashMap<(SceneId, u16, u64, u32, u32), f32>,
     /// Reused every frame. The glyph list is rebuilt per frame but its allocation is not.
     glyphs: Vec<(GlyphKey, GlyphImage)>,
     /// Blocks too small to shape, drawn as bars on the type's rhythm.
@@ -153,6 +164,18 @@ impl TextLayer {
     /// `layouts`, so on a fitted board `layouts` stays at **zero**, the guard fires every
     /// frame, and `fitted` grows by one per auto-fitted item ever seen and is never released.
     /// On a board with fewer than 512 text items neither map ever pruned at all.
+    /// The shaper itself, for a layer that has to *measure* before it can lay anything out.
+    ///
+    /// ⚠ Handed out rather than duplicated, and that is the point. A mind map's geometry comes
+    /// from its shaped labels — the tree's extent is determined by how wide the words are — and
+    /// a table's row heights come from the same place. A second `TextEngine` would be a second
+    /// font database and a second glyph cache on a device that has neither to spare, and worse,
+    /// two shapers that could disagree about the width of the same string: the browser would
+    /// then lay a table out to one measurement and draw its words at another.
+    pub fn engine_mut(&mut self) -> &mut TextEngine {
+        &mut self.engine
+    }
+
     pub fn retain_visible(&mut self, visible: &[SceneId]) {
         if self.layouts.is_empty() && self.fitted.is_empty() {
             return;
@@ -167,6 +190,8 @@ impl TextLayer {
     pub fn queue(
         &mut self,
         item: SceneId,
+        // Which of this item's labels — see `Key::slot`. `0` for an item with one block.
+        slot: u16,
         generation: u64,
         text: &StyledText,
         // Top-left of the text box, in the same camera-relative pixels the quads use.
@@ -212,9 +237,10 @@ impl TextLayer {
             });
             return false;
         }
-        let font_size = self.resolve_size(item, generation, text, size, font_size);
+        let font_size = self.resolve_size(item, slot, generation, text, size, font_size);
         let key = Key {
             item,
+            slot,
             generation,
             size_tenths: (font_size * 10.0) as u32,
             width_tenths: (size[0] * 10.0) as u32,
@@ -253,6 +279,7 @@ impl TextLayer {
     fn resolve_size(
         &mut self,
         item: SceneId,
+        slot: u16,
         generation: u64,
         text: &StyledText,
         size: [f32; 2],
@@ -264,7 +291,7 @@ impl TextLayer {
         {
             return size;
         }
-        let key = (item, generation, (size[0] * 10.0) as u32, (size[1] * 10.0) as u32);
+        let key = (item, slot, generation, (size[0] * 10.0) as u32, (size[1] * 10.0) as u32);
         if let Some(fitted) = self.fitted.get(&key) {
             return *fitted;
         }

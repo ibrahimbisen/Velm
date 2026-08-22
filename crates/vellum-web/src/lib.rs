@@ -45,7 +45,10 @@ use vellum_scene::{Camera, ScreenSize, SceneItem};
 /// better dependency than a crate with SQLite and a native menu bar in it.
 const FIT_MARGIN: f64 = 0.02;
 
+mod badges;
 mod board;
+mod live;
+mod widgets;
 mod images;
 mod layout;
 mod input;
@@ -67,6 +70,14 @@ struct Viewer {
     /// does not match the pass -- which is exactly how this was found: the GPU refused
     /// `vellum-quad` against a single-sampled pass and the board drew nothing at all.
     msaa: wgpu::TextureView,
+    /// The document itself, kept rather than dropped after the first projection.
+    ///
+    /// ⚠ It used to be dropped: `boot` parsed the snapshot, built the projection and let the
+    /// `Board` go, because nothing downstream needed it. **Sync is what needs it** —
+    /// `Board::apply` is the only way an update from the server becomes a change on screen,
+    /// and `version()` is what tells the server what this tab already has. A projection is
+    /// derived state and cannot answer either question.
+    board: Board,
     projection: Projection,
     camera: Camera,
     clear: Rgba,
@@ -81,6 +92,16 @@ struct Viewer {
     images: images::ImageLayer,
     shapes: shapes::ShapeLayer,
     strokes: strokes::StrokeLayer,
+    /// Tables, charts, mind maps and kanban boards. Without it all four draw as one flat
+    /// coloured box, which is what a browser showed where the desktop app showed a table.
+    widgets: widgets::WidgetLayer,
+    /// The ↗ on a link card and the ▶ on a video card. Stateless.
+    badges: badges::BadgeLayer,
+    /// The poll loop that keeps this board in step with the server, or `None` for a static
+    /// `board.bin` with no server behind it. Driven by its own timer, not by the frame loop —
+    /// `requestAnimationFrame` stops when a tab is hidden, and a board that silently stops
+    /// keeping up while you look at something else is the report this exists to prevent.
+    live: Option<live::Live>,
 }
 
 thread_local! {
@@ -306,6 +327,14 @@ async fn boot(
     let clear = board::clear_colour(&background, vellum_project::theme::Theme::LIGHT.canvas);
 
     let items = projection.len();
+    // Derived from the URL the snapshot came back through, rather than from a new parameter:
+    // the page built that string with its own encoding and its own token, and it is known to
+    // work because the board on screen arrived through it. `None` for `./board.bin`, which is
+    // a static file with nothing to sync with — that falls out of the parse, not a flag.
+    let live = live::from_snapshot_url(board_url, live::DEFAULT_PERIOD_MS);
+    if live.is_none() {
+        log::info!("velm sync: this board came from a static file, so there is nothing to poll");
+    }
     let viewer = Rc::new(RefCell::new(Viewer {
         device,
         queue,
@@ -313,6 +342,7 @@ async fn boot(
         config,
         renderer,
         msaa,
+        board,
         projection,
         camera,
         clear,
@@ -321,6 +351,9 @@ async fn boot(
         images: images::ImageLayer::new(blob_base, blob_suffix),
         shapes: shapes::ShapeLayer::new(),
         strokes: strokes::StrokeLayer::new(),
+        widgets: widgets::WidgetLayer::new(),
+        badges: badges::BadgeLayer::new(),
+        live,
     }));
 
     // Prove the board actually drew, rather than trusting that it did.
@@ -370,6 +403,12 @@ async fn boot(
         None => format!("{items} items · could not read the frame back{view} · {ms}ms"),
     });
     schedule_frame();
+    // ⚠ **After `VIEWER` is installed above** — `live::tick` reads it, and a timer armed
+    // before it would spend its first ticks finding nothing. This one line is the entire
+    // reachability of `crate::live`: without it the file compiles, its logic is right, and
+    // no board ever asks the server anything. That is this repository's signature defect,
+    // found nine times by its own count, so the call is commented rather than merely present.
+    live::drive();
     Ok(())
 }
 
@@ -687,11 +726,22 @@ impl Viewer {
         // z — which is why the pictures and the strokes cannot be their own loops. `draw.rs`
         // is one loop for exactly this reason.
         for item in &visible {
+            // ⚠ **After the push, never before.** `on_screen` is what the four caches are
+            // pruned against, so guarding above it would drop a clipped item's shaped text
+            // and tessellated ink — and re-derive both the moment a frame drag momentarily
+            // separated from a child. `draw.rs` prunes on projection membership and never on
+            // clipping, and this keeps that property identical on both front ends.
             on_screen.push(item.id);
             let Some(projected) = self.projection.get(item.id) else {
                 list.push_scene_item(item, &self.camera);
                 continue;
             };
+            // An item whose frame no longer contains it is not drawn. Miro's rule, and the
+            // desktop app's since feedback 39 — without it the two applications draw
+            // different boards, which is worse than either drawing less.
+            if vellum_project::frame::clipped_by_frame(projected, &self.projection) {
+                continue;
+            }
             match &projected.item.kind {
                 // ⚠ **Triangles, and deliberately no quad behind them.**
                 // `push_scene_item` draws one solid box per item in the item's dominant
@@ -723,6 +773,26 @@ impl Viewer {
                         item.id,
                         &self.projection,
                         stroke_colour,
+                    );
+                }
+                // ⚠ **And no quad behind these either.** The four structured widgets are the
+                // last kinds that were falling through to `push_scene_item`, which drew each
+                // of them as one flat coloured rectangle — a table with no grid, a chart with
+                // no bars, a kanban with no columns. Their own geometry replaces the box
+                // rather than sitting on it, for the ink arm's reason: the box is drawn in a
+                // batch that lands underneath, so it would show through every gap the drawing
+                // deliberately leaves.
+                vellum_doc::ItemKind::Table { .. }
+                | vellum_doc::ItemKind::Chart { .. }
+                | vellum_doc::ItemKind::MindMap { .. }
+                | vellum_doc::ItemKind::Kanban { .. } => {
+                    self.widgets.push(
+                        &mut list,
+                        &self.camera,
+                        item.id,
+                        &self.projection,
+                        theme,
+                        self.text.engine_mut(),
                     );
                 }
                 _ => {
@@ -762,6 +832,18 @@ impl Viewer {
                             vellum_render::ImageInstance::new(origin, size, uv),
                         );
                     }
+                    // The card's ↗ and its ▶, after the picture so they sit on top of the
+                    // poster they overlap. Answers `false` for anything that is not a card
+                    // with an address a browser can open — which is not a cue to draw the
+                    // item some other way, it is the honest drawing of a card with nowhere
+                    // to go.
+                    self.badges.push(
+                        &mut list,
+                        &self.camera,
+                        item.id,
+                        &self.projection,
+                        theme,
+                    );
                 }
             }
         }
@@ -777,6 +859,33 @@ impl Viewer {
         let muted = vellum_project::theme::Theme::LIGHT.text_muted;
         for item in &visible {
             let Some(projected) = self.projection.get(item.id) else { continue };
+            // The same guard the geometry loop applies, and it has to be here too: without
+            // it a clipped item's words draw with no box under them, which is feedback 35's
+            // sibling rule exactly. `draw.rs` checks in both of its passes for this reason.
+            if vellum_project::frame::clipped_by_frame(projected, &self.projection) {
+                continue;
+            }
+            // ⚠ **A widget's labels are many and are not `kind.text()`.** A table's cells, a
+            // kanban's cards and a mind map's nodes live inside the item's own token, so the
+            // `text()` accessor answers `None` for all four and their words would simply
+            // never be drawn. Queued first, and with a real slot per label: the layout cache
+            // keys on `(item, slot, …)`, and without the slot two cells with the same
+            // geometry resolve to one entry and the second draws the first one's words.
+            for label in self.widgets.text_slots(item.id, &self.projection, theme) {
+                let top_left = self.camera.world_to_screen(label.rect.min);
+                self.text.queue(
+                    item.id,
+                    label.slot,
+                    projected.generation,
+                    &label.text,
+                    [top_left.x as f32, top_left.y as f32],
+                    [label.rect.width() as f32, label.rect.height() as f32],
+                    Some(label.font_size),
+                    zoom,
+                    label.color,
+                    label.anchor,
+                );
+            }
             let Some(styled) = projected.item.kind.text() else { continue };
             // ⚠ **Not the item's own rectangle.** A sticky's words are inset by Miro's own
             // 8% and centred; a frame's name is small and sits *above* the frame; a card's
@@ -800,6 +909,9 @@ impl Viewer {
             let converted = vellum_project::runs::convert(styled);
             self.text.queue(
                 item.id,
+                // Slot 0: everything on this path has exactly one block. The structured
+                // widgets are the only items with several, and they queue their own below.
+                0,
                 projected.generation,
                 &converted,
                 [top_left.x as f32, top_left.y as f32],
@@ -819,6 +931,7 @@ impl Viewer {
         self.text.retain_visible(&on_screen);
         self.strokes.retain_visible(&on_screen);
         self.shapes.retain_visible(&on_screen);
+        self.widgets.retain_visible(&on_screen);
         // ⚠ **After** the list is built, never before. Eviction spares what was marked this
         // frame, and the marks happen while the list is built — so running it first makes
         // that guard vacuously true and lets it take a texture the list already references.

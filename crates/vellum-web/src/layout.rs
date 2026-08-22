@@ -48,6 +48,31 @@ pub struct PictureSlot {
     pub cover: bool,
 }
 
+/// The size a card sets its words at, or `None` for an item that is not a card.
+///
+/// ⚠ **Standalone, and it has to be.** `crate::badges` needs this number to size the ↗ — the
+/// badge is 1.75 line-heights — and `text_slot` needs the badge's box to know how far to
+/// shorten the title. Asking `text_slot` for the size, which is where this arithmetic used to
+/// live, closes that into `text_slot -> badge -> text_slot`: **unbounded recursion, and under
+/// `panic = "abort"` a stack overflow is not an error anybody sees, it is the tab dying on
+/// the frame a link card first became visible.**
+///
+/// Explicit, never auto-fitted. A card's text is a label at a fixed scale, and auto-fitting it
+/// makes a short title enormous and a long one microscopic.
+pub fn card_font_size(projected: &Projected) -> Option<f32> {
+    if !is_card(&projected.item.kind) {
+        return None;
+    }
+    let explicit = projected.item.style.font_size.map(|size| size as f32);
+    Some(explicit.unwrap_or((projected.bounds.height() * 0.075).clamp(9.0, 22.0) as f32))
+}
+
+/// Whether this kind draws as a card — one list, so `text_slot`, `card_font_size` and anything
+/// that follows cannot come to disagree about what a card is.
+fn is_card(kind: &ItemKind) -> bool {
+    matches!(kind, ItemKind::LinkPreview { .. } | ItemKind::Embed { .. } | ItemKind::Document { .. })
+}
+
 /// The box an item's text is set in, or `None` if it has none worth setting.
 pub fn text_slot(projected: &Projected, text: Rgba, muted: Rgba) -> Option<TextSlot> {
     let bounds = projected.bounds;
@@ -91,15 +116,32 @@ pub fn text_slot(projected: &Projected, text: Rgba, muted: Rgba) -> Option<TextS
             let band = if has_picture(&projected.item.kind) { h * CARD_IMAGE_FRACTION } else { pad };
             let top = bounds.min.y + band + pad;
             let height = (bounds.max.y - pad - top).max(1.0);
+            let size = card_font_size(projected).unwrap_or(11.0);
+            // ⚠ **The words yield to the ↗ badge, and only when they actually share a row.**
+            // On a card with no picture the text starts at the very top, where the badge is,
+            // so a full-width slot puts the title under the button. Paint order cannot save
+            // it and it is worth saying why: glyphs are flushed after the loop, in the screen
+            // view, so the title draws *over* the plate whichever is pushed first.
+            //
+            // Conditional rather than unconditional, which is `draw.rs`'s own rule for the
+            // same collision: a card *with* a picture starts its words far below the badge,
+            // and shortening every one of them makes every title on the board mysteriously
+            // narrow for a collision that cannot happen.
+            let width = match crate::badges::badge(projected) {
+                Some(badge) if badge.max.y > top => {
+                    (badge.min.x - pad * 0.5 - (bounds.min.x + pad)).max(1.0)
+                }
+                _ => (w - pad * 2.0).max(1.0),
+            };
             Some(TextSlot {
                 rect: WorldRect::from_origin_size(
                     vellum_scene::WorldPoint::new(bounds.min.x + pad, top),
-                    (w - pad * 2.0).max(1.0),
+                    width,
                     height,
                 ),
                 anchor: Anchor::TopLeft,
                 color: colour,
-                font_size: Some(explicit.unwrap_or((h * 0.075).clamp(9.0, 22.0) as f32)),
+                font_size: Some(size),
             })
         }
 

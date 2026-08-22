@@ -49,6 +49,13 @@ use crate::Viewer;
 #[derive(Default)]
 struct Contacts {
     down: Vec<Contact>,
+    /// Whether this gesture has ever had two fingers on it.
+    ///
+    /// ⚠ **Latched, and it has to be.** A tap is decided at `pointerup`, and by the time the
+    /// *second* finger of a pinch lifts there is one contact left which may have travelled
+    /// almost nowhere — so a pinch would end by opening whatever card was under that finger.
+    /// Cleared when the last finger goes, not when the count drops to one.
+    ever_multi: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -58,7 +65,18 @@ struct Contact {
     /// [`ratio`], and nowhere else.
     x: f64,
     y: f64,
+    /// Where this finger first landed, so a release can ask whether it is a tap or the end
+    /// of a drag. A pan that happens to finish over a card must not open it.
+    start_x: f64,
+    start_y: f64,
 }
+
+/// How far a finger or a cursor may travel and still count as a tap. CSS pixels.
+///
+/// Generous, because the target is a finger's: `draw.rs`'s own `CLICK_SLOP` exists for the
+/// same decision natively, and a value tight enough for a mouse makes the badge unpressable
+/// on the device this whole client is for.
+const TAP_SLOP: f64 = 6.0;
 
 /// CSS pixels to physical pixels — trap 4, in one place so it cannot be applied twice or
 /// forgotten once.
@@ -75,7 +93,10 @@ impl Contacts {
     /// A new contact, from `pointerdown` and nowhere else.
     fn press(&mut self, id: i32, x: f64, y: f64) {
         if !self.moved(id, x, y) {
-            self.down.push(Contact { id, x, y });
+            self.down.push(Contact { id, x, y, start_x: x, start_y: y });
+            if self.down.len() >= 2 {
+                self.ever_multi = true;
+            }
         }
     }
 
@@ -102,6 +123,20 @@ impl Contacts {
 
     fn remove(&mut self, id: i32) {
         self.down.retain(|c| c.id != id);
+        if self.down.is_empty() {
+            self.ever_multi = false;
+        }
+    }
+
+    /// Remove a contact and report it, with whether this gesture was ever multi-touch.
+    fn lift(&mut self, id: i32) -> Option<(Contact, bool)> {
+        let index = self.down.iter().position(|c| c.id == id)?;
+        let contact = self.down.remove(index);
+        let multi = self.ever_multi;
+        if self.down.is_empty() {
+            self.ever_multi = false;
+        }
+        Some((contact, multi))
     }
 
     /// Midpoint and separation of the two driving contacts, in CSS pixels.
@@ -241,7 +276,60 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
         handler.forget();
     }
 
-    for end in ["pointerup", "pointercancel"] {
+    // ⚠ **`pointerup` and `pointercancel` are two handlers now, not one loop.** They used to
+    // share one, which was right while a release only ended a gesture. A release can open a
+    // link card's page; a *cancel* — the browser taking the pointer away, a system gesture,
+    // the page being hidden — must never do that. Sharing the handler would make an
+    // interruption indistinguishable from a deliberate tap.
+    {
+        let viewer = Rc::clone(&viewer);
+        let contacts = Rc::clone(&contacts);
+        let handler = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
+            move |event: web_sys::PointerEvent| {
+                // Left button only. A right-click is a press *and* a release that passes the
+                // slop test, so without this the context menu and the page would both open.
+                if event.button() != 0 {
+                    contacts.borrow_mut().remove(event.pointer_id());
+                    return;
+                }
+                let lifted = contacts.borrow_mut().lift(event.pointer_id());
+                let Some((contact, was_multi)) = lifted else { return };
+                if was_multi {
+                    return;
+                }
+                // A pan that finishes over a card is not a request to open it.
+                if (contact.x - contact.start_x).hypot(contact.y - contact.start_y) > TAP_SLOP {
+                    return;
+                }
+                let ratio = ratio();
+                let url = {
+                    // Scoped, so the borrow is over before the window is asked to navigate.
+                    let Ok(viewer) = viewer.try_borrow() else { return };
+                    let world = viewer
+                        .camera
+                        .screen_to_world(ScreenPoint::new(contact.x * ratio, contact.y * ratio));
+                    viewer
+                        .projection
+                        .scene()
+                        .hit_test(world)
+                        .and_then(|id| viewer.projection.get(id))
+                        .and_then(|projected| crate::badges::pressed(projected, world))
+                };
+                // ⚠ **Opened here, synchronously inside the handler.** `window.open` needs
+                // the transient activation a real `pointerup` grants; deferred to the next
+                // frame it is a popup and every browser refuses it silently — which would be
+                // a badge that draws, hit-tests, reports success and does nothing.
+                if let Some(url) = url {
+                    crate::badges::open_in_new_tab(&url);
+                }
+            },
+        );
+        canvas
+            .add_event_listener_with_callback("pointerup", handler.as_ref().unchecked_ref())
+            .ok();
+        handler.forget();
+    }
+    {
         let contacts = Rc::clone(&contacts);
         let handler = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
             move |event: web_sys::PointerEvent| {
@@ -249,7 +337,7 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
             },
         );
         canvas
-            .add_event_listener_with_callback(end, handler.as_ref().unchecked_ref())
+            .add_event_listener_with_callback("pointercancel", handler.as_ref().unchecked_ref())
             .ok();
         handler.forget();
     }
