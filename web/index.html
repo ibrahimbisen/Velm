@@ -140,6 +140,13 @@
       // A gesture fixture, on request. `?selftest=touch` drives real PointerEvents at the
       // real canvas and reports what the camera did — the only honest check of an input
       // path, and the only one that can be run on the iPad by the person holding it.
+      if (params.get('selftest') === 'perf') {
+        for (let i = 0; i < 200 && velm.camera_report() === 'none'; i++) {
+          await new Promise(r => setTimeout(r, 50));
+        }
+        const { runPerfFixture } = await import('./selftest.js');
+        await runPerfFixture(velm);
+      }
       if (params.get('selftest') === 'touch') {
         const { runTouchFixture } = await import('./selftest.js');
         // Wait for the board: the fixture reads the camera, and before boot resolves there

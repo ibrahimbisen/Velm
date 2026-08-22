@@ -161,3 +161,49 @@ export function runTouchFixture(mod, canvas) {
   console.log(verdict);
   return failed.length === 0;
 }
+
+/**
+ * Frame timing on a fitted board — the number `docs/08-web.md` lists as unmeasured.
+ *
+ * Measures the interval between animation frames, which is what a person feels, rather than
+ * the time inside `frame()`, which omits everything the browser does around it. The **first**
+ * frames are reported separately and on purpose: that is when every visible block is shaped
+ * and every auto-fitted sticky is binary-searched for its size, and an average over a
+ * hundred frames hides exactly the stall a person would notice on opening a board.
+ */
+export function runPerfFixture(mod, frames = 120) {
+  return new Promise((resolve) => {
+    const gaps = [];
+    let last = performance.now();
+    function tick() {
+      const now = performance.now();
+      gaps.push(now - last);
+      last = now;
+      if (gaps.length < frames) return requestAnimationFrame(tick);
+
+      // The first gap is the wait for the first frame, not a frame, so it is dropped.
+      const measured = gaps.slice(1);
+      const sorted = [...measured].sort((a, b) => a - b);
+      const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
+      const opening = measured.slice(0, 10);
+      const worstOpening = Math.max(...opening);
+      const steady = measured.slice(10);
+      const line =
+        `perf — ${measured.length} frames: median ${at(0.5).toFixed(1)}ms ` +
+        `(${(1000 / at(0.5)).toFixed(0)}fps), 95th ${at(0.95).toFixed(1)}ms, ` +
+        `worst ${sorted[sorted.length - 1].toFixed(1)}ms; ` +
+        `first 10 frames worst ${worstOpening.toFixed(1)}ms, ` +
+        `steady median ${median(steady).toFixed(1)}ms`;
+      mod.verdict(line);
+      console.log(line);
+      resolve(line);
+    }
+    requestAnimationFrame(tick);
+  });
+}
+
+function median(xs) {
+  if (xs.length === 0) return 0;
+  const sorted = [...xs].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+}

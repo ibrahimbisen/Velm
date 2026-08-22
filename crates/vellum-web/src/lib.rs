@@ -45,6 +45,7 @@ use vellum_scene::{Camera, ScreenSize, SceneItem};
 /// better dependency than a crate with SQLite and a native menu bar in it.
 const FIT_MARGIN: f64 = 0.02;
 
+mod board;
 mod images;
 mod input;
 mod strokes;
@@ -67,6 +68,13 @@ struct Viewer {
     projection: Projection,
     camera: Camera,
     clear: Rgba,
+    /// The board's own colour and pattern, read once from the document.
+    ///
+    /// ⚠ The desktop app prefers a **global** pattern and grid colour from its library
+    /// sidecar, per the user's own instruction that the grid apply to every board. A browser
+    /// has no sidecar, so it draws this — which is exactly the fallback the desktop app uses
+    /// when no global choice has been made, so the two agree by default.
+    background: vellum_doc::Background,
     text: text::TextLayer,
     images: images::ImageLayer,
     strokes: strokes::StrokeLayer,
@@ -156,6 +164,10 @@ async fn boot(
     blob_base: &str,
     blob_suffix: &str,
 ) -> Result<(), String> {
+    // Reported in the status line beside the item count. Cold start is the headline metric
+    // this port is worst at — `docs/01` budgets 300ms for the desktop app and a tab will not
+    // meet it — so it is measured on the device rather than estimated on this one.
+    let began = web_time::Instant::now();
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;
     let canvas: web_sys::HtmlCanvasElement = document
@@ -235,7 +247,8 @@ async fn boot(
 
     let renderer = Renderer::new(&device, format);
     let msaa = make_msaa(&device, format, width, height);
-    let clear = vellum_project::theme::Theme::LIGHT.canvas;
+    let background = board.background();
+    let clear = board::clear_colour(&background, vellum_project::theme::Theme::LIGHT.canvas);
 
     let items = projection.len();
     let viewer = Rc::new(RefCell::new(Viewer {
@@ -248,6 +261,7 @@ async fn boot(
         projection,
         camera,
         clear,
+        background,
         text: text::TextLayer::new()?,
         images: images::ImageLayer::new(blob_base, blob_suffix),
         strokes: strokes::StrokeLayer::new(),
@@ -287,12 +301,15 @@ async fn boot(
             None => String::new(),
         }
     };
+    let ms = began.elapsed().as_millis();
     report(&match drawn {
         Some(painted) if painted > 0 => {
-            format!("{items} items · {painted} pixels painted{view}")
+            format!("{items} items · {painted} pixels painted{view} · {ms}ms")
         }
-        Some(_) => format!("{items} items · NOTHING PAINTED — the board is not drawing{view}"),
-        None => format!("{items} items · could not read the frame back{view}"),
+        Some(_) => {
+            format!("{items} items · NOTHING PAINTED — the board is not drawing{view} · {ms}ms")
+        }
+        None => format!("{items} items · could not read the frame back{view} · {ms}ms"),
     });
     schedule_frame();
     Ok(())
@@ -560,6 +577,15 @@ impl Viewer {
         // ends the quad batch once per item.
         let board = list.view(View::board(&self.camera));
         let screen = list.view(View::screen(self.camera.viewport()));
+        // The board's own surface, before anything on it. In the screen view, because a dot
+        // sized in world units is a smear at a fitted 4% and a disc at 8x.
+        list.use_view(screen);
+        board::push_grid(
+            &mut list,
+            &self.camera,
+            &self.background,
+            vellum_project::theme::Theme::LIGHT.grid,
+        );
         list.use_view(board);
 
         // Only what the camera can see. This is the project's whole thesis -- frame cost
@@ -663,12 +689,9 @@ impl Viewer {
                 projected.bounds.width() as f32,
                 projected.bounds.height() as f32,
             ];
-            let font_size = projected
-                .item
-                .style
-                .font_size
-                .map(|s| s as f32)
-                .unwrap_or(vellum_text::DEFAULT_FONT_SIZE);
+            // `None` means auto-fit, which the text layer resolves. It is deliberately not
+            // defaulted here: see `TextLayer::queue`.
+            let font_size = projected.item.style.font_size.map(|s| s as f32);
             let colour = vellum_project::theme::Theme::LIGHT.text;
             // ⚠ `vellum_doc::StyledText` and `vellum_text::StyledText` are different types:
             // the document's spans carry Miro's rich-text model, the engine's carry what
@@ -692,6 +715,10 @@ impl Viewer {
         }
         list.use_view(screen);
         self.text.flush(&self.device, &self.queue, self.renderer.atlas_mut(), &mut list);
+        // Separate from the flush above, and it must stay separate: a fitted board is
+        // entirely greeked, so folding this into a function that returns early when nothing
+        // was shaped makes the one case it exists for the one case it never runs in.
+        self.text.flush_greeked(&mut list);
         self.text.retain_visible(&on_screen);
         self.strokes.retain_visible(&on_screen);
 
