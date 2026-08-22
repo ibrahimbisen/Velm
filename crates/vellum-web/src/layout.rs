@@ -12,28 +12,8 @@
 
 use vellum_doc::ItemKind;
 use vellum_project::project::Projected;
-use vellum_render::{Rgba, UvRect};
+use vellum_render::Rgba;
 use vellum_scene::WorldRect;
-
-/// Fraction of a sticky's box left as padding on each side.
-///
-/// Miro's own inset, and `vellum_app::text::STICKY_PADDING` is the same 0.08. Without it a
-/// sticky's words touch its edges, which is the single thing that most makes a note look
-/// wrong — paper has a margin.
-const STICKY_PADDING: f64 = 0.08;
-
-/// A frame's name: a fraction of the frame's height, clamped, drawn **above** it.
-///
-/// ⚠ Above, not inside. Miro puts a frame's name over its top edge, and so does the desktop
-/// app (`Anchor::Above`). Drawing it inside makes the largest thing on the board wear a
-/// caption across its own content — and because the size scales with the frame, a large frame
-/// gets an enormous one.
-const FRAME_TITLE_FRACTION: f64 = 0.03;
-const FRAME_TITLE_MIN: f64 = 14.0;
-const FRAME_TITLE_MAX: f64 = 96.0;
-
-/// Padding inside a link card, as a fraction of its width.
-const CARD_PADDING: f64 = 0.035;
 
 /// How much of a card's height its picture takes.
 ///
@@ -90,7 +70,7 @@ pub fn text_slot(projected: &Projected, text: Rgba, muted: Rgba) -> Option<TextS
             if title.is_empty() {
                 return None;
             }
-            let size = (h * FRAME_TITLE_FRACTION).clamp(FRAME_TITLE_MIN, FRAME_TITLE_MAX);
+            let size = frame_title_size(h);
             Some(TextSlot {
                 rect: WorldRect::from_origin_size(
                     vellum_scene::WorldPoint::new(bounds.min.x, bounds.min.y - size * 1.2),
@@ -175,61 +155,12 @@ fn inset(rect: WorldRect, x: f64, y: f64) -> WorldRect {
     WorldRect::from_origin_size(vellum_scene::WorldPoint::new(rect.min.x + x, rect.min.y + y), w, h)
 }
 
-/// The part of a texture that fills `into` without distorting it — `object-fit: cover`.
+/// Re-exported so this module reads as one place, while the values live in one place.
 ///
-/// Trims the *longer* axis equally at both ends, so a centred subject stays centred. Cover
-/// rather than contain: both fix the distortion, and `contain` leaves empty bands in a slot
-/// that was sized for a picture, which reads as a layout bug. `draw.rs`'s `cover_uv`, same
-/// arithmetic.
-pub fn cover_uv(source: (u32, u32), into: (f64, f64)) -> UvRect {
-    let (sw, sh) = (f64::from(source.0).max(1.0), f64::from(source.1).max(1.0));
-    let (iw, ih) = (into.0.max(1.0), into.1.max(1.0));
-    let source_aspect = sw / sh;
-    let target_aspect = iw / ih;
-    if source_aspect > target_aspect {
-        // Wider than the slot: keep full height, trim the sides.
-        let keep = (target_aspect / source_aspect) as f32;
-        let margin = (1.0 - keep) / 2.0;
-        UvRect::new([margin, 0.0], [margin + keep, 1.0])
-    } else {
-        let keep = (source_aspect / target_aspect) as f32;
-        let margin = (1.0 - keep) / 2.0;
-        UvRect::new([0.0, margin], [1.0, margin + keep])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The assertion is about the **sampled aspect in texels**, not the UV numbers.
-    ///
-    /// `UvRect::FULL` happens to have the slot's aspect whenever the source already does,
-    /// which is the case that used to pass by accident. Measuring what is sampled is what
-    /// tells a working crop from a lucky one.
-    #[test]
-    fn a_picture_is_cropped_to_its_slot_rather_than_stretched_into_it() {
-        for (source, into) in
-            [((1920u32, 1080u32), (300.0, 200.0)), ((600, 800), (300.0, 200.0)), ((1, 4000), (300.0, 200.0))]
-        {
-            let uv = cover_uv(source, into);
-            let texels = (
-                (uv.max[0] - uv.min[0]) as f64 * f64::from(source.0),
-                (uv.max[1] - uv.min[1]) as f64 * f64::from(source.1),
-            );
-            let sampled = texels.0 / texels.1;
-            let wanted = into.0 / into.1;
-            assert!(
-                (sampled / wanted - 1.0).abs() < 0.01,
-                "{source:?} into {into:?} sampled {sampled:.3} against {wanted:.3}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_full_crop_is_what_a_matching_aspect_produces() {
-        let uv = cover_uv((300, 200), (600.0, 400.0));
-        assert!(uv.min[0].abs() < 0.001 && (uv.max[0] - 1.0).abs() < 0.001);
-        assert!(uv.min[1].abs() < 0.001 && (uv.max[1] - 1.0).abs() < 0.001);
-    }
-}
+/// ⚠ These are **not** defined here. `vellum_project::look` owns them and the desktop
+/// painter reads the same constants — which is the point: a browser board that insets a
+/// sticky differently from the Mac app is two derivations of one measurement, and this
+/// repository has paid for that three times.
+pub use vellum_project::look::{
+    CARD_PADDING, STICKY_PADDING, cover_uv, frame_title_size,
+};

@@ -33,6 +33,7 @@ use std::collections::HashMap;
 
 use vellum_doc::ItemKind;
 use vellum_ink::{Lod, Stroke};
+use vellum_project::look::lod_band;
 use vellum_project::project::Projection;
 use vellum_render::{DrawList, MeshTransform, Rgba};
 use vellum_scene::{Camera, ItemId as SceneId, WorldPoint};
@@ -176,18 +177,6 @@ impl StrokeLayer {
         let keep: std::collections::HashSet<SceneId> = on_screen.iter().copied().collect();
         self.ink.retain(|id, _| keep.contains(id));
     }
-}
-
-/// The zoom octave a stroke is tessellated for.
-///
-/// **`ceil`, not `round`.** Rounding to the nearest octave under-tessellates any zoom in the
-/// upper half of a band by up to √2, which is exactly the visible coarseness feedback 27
-/// fixed natively. Erring towards more triangles is the half of the error nobody can see.
-fn lod_band(zoom: f64) -> i32 {
-    if !zoom.is_finite() || zoom <= 0.0 {
-        return 0;
-    }
-    zoom.log2().ceil().clamp(-8.0, 8.0) as i32
 }
 
 fn tessellate(points: &[vellum_doc::Point], thickness: f64, band: i32) -> vellum_ink::Mesh {

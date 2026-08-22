@@ -15,39 +15,15 @@
 //! global choice has been made, so the two agree by default rather than by coincidence.
 
 use vellum_doc::{Background, Pattern};
+// ⚠ Not defined here. `vellum_project::look` owns every one of these and `draw.rs` reads the
+// same values — which is exactly the point. The browser's dot shipped at the `1.5` of
+// feedback 11 while its colour came from feedback 27, which reduced the dot to 1.0 in the
+// same round: two numbers from two different moments, drawing a 3x3 black square where the
+// desktop app draws a single pixel.
+use vellum_project::look::{GRID_DOT, MAX_GRID_DOTS, grid_step};
 use vellum_render::{DrawList, QuadInstance, Rgba};
 use vellum_scene::{Camera, WorldPoint};
 
-/// A dot's size at a 900-point-tall viewport, scaled from there.
-///
-/// ⚠ **1.0, matching `draw.rs`, and the value is tied to the colour.** This shipped as the
-/// 1.5 of feedback 11 — when the grid was a pale grey and a 1.5px dot straddling two device
-/// pixels composited two shades lighter than asked for. Feedback 27 superseded that: the
-/// token is pure opaque black now, and `Theme::grid`'s own doc says the colour is only
-/// legitimate *because* the dot is one device pixel. Copying the new colour and the old size
-/// draws a 2×2 or 3×3 black square every 14–70 pixels, which is the texture the user asked to
-/// have removed rather than the whisper they asked for.
-const GRID_DOT: f32 = 1.0;
-
-/// The band a grid step is allowed to occupy on screen, in device pixels.
-///
-/// Below the floor the dots merge into a texture; above the ceiling they stop reading as a
-/// grid at all. Stepping through 1, 2, 5 × 10^n and taking the first that lands inside is
-/// what makes the spacing feel constant through a zoom rather than doubling in jumps.
-const GRID_MIN_PIXELS: f64 = 14.0;
-const GRID_MAX_PIXELS: f64 = 70.0;
-
-/// The most dots one frame will draw.
-///
-/// The loop below is `columns × rows`, so a dense display at the tight end of the spacing
-/// band can ask for a great many. Beyond this the grid is dropped for the frame — the
-/// alternative is spending most of a frame's budget on a texture nobody is looking at.
-///
-/// ⚠ Checked **after** the line pattern returns, not before. Lines cost `columns + rows`
-/// quads rather than `columns × rows`, so gating both on the same number makes graph paper
-/// vanish on a display where only the dots were ever expensive. `draw.rs` records paying for
-/// exactly that.
-const MAX_GRID_DOTS: i64 = 20_000;
 
 /// The board's colour, or the theme's if it never chose one.
 pub fn clear_colour(background: &Background, theme_canvas: Rgba) -> Rgba {
@@ -126,25 +102,4 @@ pub fn push_grid(list: &mut DrawList, camera: &Camera, background: &Background, 
             ));
         }
     }
-}
-
-/// The world-unit spacing whose on-screen size lands inside the readable band.
-///
-/// 1, 2, 5 × 10^n, smallest first, so the step changes at the moment the previous one leaves
-/// the band rather than at a round zoom. `None` means no step fits, which happens at a very
-/// wide zoom and correctly draws nothing at all.
-pub fn grid_step(zoom: f64) -> Option<f64> {
-    if !zoom.is_finite() || zoom <= 0.0 {
-        return None;
-    }
-    for decade in -3..=7 {
-        for multiple in [1.0, 2.0, 5.0] {
-            let step: f64 = multiple * 10f64.powi(decade);
-            let on_screen = step * zoom;
-            if (GRID_MIN_PIXELS..=GRID_MAX_PIXELS).contains(&on_screen) {
-                return Some(step);
-            }
-        }
-    }
-    None
 }

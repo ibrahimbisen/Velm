@@ -13,5 +13,6 @@
 //! viewer needs, and it is why extracting it cost no change to any caller.
 
 pub mod connector;
+pub mod look;
 pub mod project;
 pub mod theme;

@@ -55,9 +55,12 @@ pub const MIN_DEVICE_FONT_SIZE: f32 = 5.0;
 /// update", and the picker's own list turned out to be the same class of fault.
 pub const DEFAULT_FONT_FAMILY: &str = vellum_text::BUNDLED_FAMILY;
 
-/// Fraction of a sticky's box left as padding on each side, matching Miro's own
-/// inset. Auto-fit measures against what is left.
-pub const STICKY_PADDING: f64 = 0.08;
+/// Fraction of a sticky's box left as padding on each side, matching Miro's own inset.
+/// Auto-fit measures against what is left.
+///
+/// ⚠ **Re-exported, not defined here.** `vellum_project::look` owns it, because the browser
+/// front end insets a sticky by the same amount and used to carry its own copy of the number.
+pub use vellum_project::look::STICKY_PADDING;
 
 /// Which of an item's text blocks a layout belongs to.
 ///

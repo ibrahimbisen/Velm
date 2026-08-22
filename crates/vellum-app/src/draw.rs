@@ -58,6 +58,15 @@ use vellum_doc::{
     Align, CardMode, ItemKind, Pattern, Style, StyledText as DocText, TextSpan as DocSpan,
 };
 use vellum_ink::{Lod, Stroke};
+// ⚠ **Not defined here any more, and that is the point.** These are the measurements the
+// browser front end needs too, and it had its own copies carrying the same values — which is
+// the arrangement this repository has paid for three times, because two copies never disagree
+// on the day they are written. `vellum_project::look` owns them; both painters read them.
+pub(crate) use vellum_project::look::grid_step;
+use vellum_project::look::{
+    CARD_PADDING, FRAME_TITLE_FRACTION, FRAME_TITLE_MAX, FRAME_TITLE_MIN, GRID_DOT,
+    MAX_GRID_DOTS, cover_uv, lod_band,
+};
 use vellum_render::{
     DrawList, DrawStats, GlyphAtlas, ImageInstance, MeshTransform, QuadInstance, Renderer, Rgba,
     ShapeStyle, View,
@@ -124,18 +133,13 @@ const SELECTION_RING_WIDTH: f32 = 1.0;
 /// once the importer emits `ItemKind::LinkPreview` instead of substituting text.
 const TEXT_LAYOUT_BUDGET: Duration = Duration::from_millis(3);
 
-/// Frame title height as a fraction of the frame, clamped — in **world** units, so a bigger
-/// frame gets a bigger name and the label stays proportionate to the region it names.
-///
-/// ⚠ This used to claim that *"Miro scales a frame's name with the frame rather than with the
-/// zoom"*, offered as the reason no device floor was needed. **It is wrong**, and it is the
-/// belief that produced the bug: the user photographed the same board in both applications and
-/// Miro's "Education" and "Food" were large and perfectly legible over small frames while
-/// Velm's were an illegible smear. Miro scales with the frame *and clamps*. So does this now —
-/// see `FRAME_TITLE_MIN_DEVICE`, which floors the drawn size without touching either of these.
-const FRAME_TITLE_FRACTION: f64 = 0.03;
-const FRAME_TITLE_MIN: f64 = 14.0;
-const FRAME_TITLE_MAX: f64 = 96.0;
+// A frame's title size is `vellum_project::look::frame_title_size`, shared with the browser
+// painter. It used to be three constants here, under a comment claiming that *"Miro scales a
+// frame's name with the frame rather than with the zoom"* — offered as the reason no device
+// floor was needed. **That was wrong**, and it is the belief that produced the bug: the user
+// photographed both applications and Miro's frame names were legible where Velm's were a
+// smear. Miro scales with the frame *and clamps*. The floor below is the half that stayed,
+// because it is about this painter's cache and a caret, neither of which a reader has.
 
 /// The smallest a frame's title is ever **drawn**, in device pixels.
 ///
@@ -4246,64 +4250,15 @@ fn push_open_badge(
     seg((0.75, -0.75), (0.75, -0.25));
 }
 
-/// The sub-rectangle of a texture to sample so it **fills** a box of `into` without being
-/// stretched — CSS's `object-fit: cover`, and the fix for *"the images are all distorted"*.
-///
-/// The card painter used to hand every image [`vellum_render::UvRect::FULL`], which maps the
-/// whole texture onto whatever box the layout reserved. A card's image band has a fixed
-/// aspect — the item's width against a fraction of its height — and a page's `og:image` does
-/// not: a 1200×630 banner is 1.90 wide and a product shot is 1.00, against a band that is
-/// about 1.47. So every picture on the board was scaled by a different amount horizontally
-/// and vertically, which is exactly what "distorted" looks like, and the squarer the source
-/// the worse it was.
-///
-/// **Cover rather than contain**, deliberately. Both fix the distortion; they differ in what
-/// they give up. `contain` fits the whole image and leaves empty bands, which on a card whose
-/// band was sized for a picture reads as a layout bug. `cover` fills the band and trims the
-/// overflow **equally from both sides**, so a centred subject stays centred — and the boards
-/// this exists for are full of product photography, which is centred on white by convention.
-/// It is also what Miro's own card does.
-///
-/// A degenerate box or texture answers `FULL`: a zero somewhere is a caller with nothing to
-/// draw, and cropping to nothing would be worse than not cropping.
-fn cover_uv(source: (u32, u32), into: (f64, f64)) -> vellum_render::UvRect {
-    let (sw, sh) = (f64::from(source.0), f64::from(source.1));
-    let (bw, bh) = into;
-    if sw <= 0.0 || sh <= 0.0 || bw <= 0.0 || bh <= 0.0 {
-        return vellum_render::UvRect::FULL;
-    }
-    // How much of each axis survives. Exactly one of these is 1.0 — the axis that already
-    // matches — and the other is the ratio of the two aspects.
-    let (source_aspect, box_aspect) = (sw / sh, bw / bh);
-    let (keep_u, keep_v) = if source_aspect > box_aspect {
-        (box_aspect / source_aspect, 1.0) // wider than the box: trim the sides
-    } else {
-        (1.0, source_aspect / box_aspect) // taller than the box: trim top and bottom
-    };
-    #[expect(clippy::cast_possible_truncation, reason = "a UV coordinate is 0..=1")]
-    let uv = {
-        let (u0, v0) = (((1.0 - keep_u) / 2.0) as f32, ((1.0 - keep_v) / 2.0) as f32);
-        vellum_render::UvRect::new([u0, v0], [1.0 - u0, 1.0 - v0])
-    };
-    uv
-}
+// `cover_uv` is `vellum_project::look::cover_uv` — shared with the browser painter, which
+// crops a card's picture into the same band by the same rule.
 
 /// Line spacing inside a card, as a multiple of the font size. Tighter than prose: a card is
 /// a stack of short labels rather than a paragraph.
 const CARD_LINE_HEIGHT: f64 = 1.35;
-/// Fraction of a card's width used as padding around its contents.
-///
-/// **Measured off Miro's own card**, from the reference the user sent: *"i just want the card
-/// proportions very similar to miro's."* On a 422-unit-wide card its picture is inset about 14
-/// units a side — 3.3%. Velm's was 6%, nearly double, and because the inset is taken from all
-/// four sides *and* between every row, that difference compounded: the picture was visibly
-/// smaller, the text block narrower, and the whole card read as cramped while somehow also
-/// having too much air in it.
-///
-/// This is the single number that decides a card's proportions, which is why it is the one
-/// that had to move. Everything else — the image band's share, the type scale, the line
-/// height — was already close to the reference.
-const CARD_PADDING: f64 = 0.035;
+// `CARD_PADDING` is `vellum_project::look::CARD_PADDING`, measured off Miro's own card and
+// shared with the browser painter. It is the single number that decides a card's proportions,
+// which is exactly why it must not exist twice.
 
 /// Shortens `text` to at most `budget` characters, ending in an ellipsis when it had to cut.
 ///
@@ -7926,57 +7881,15 @@ fn push_grid(list: &mut DrawList, ctx: &DrawContext<'_>, screen: u32) {
     }
 }
 
-/// The world spacing of the grid at a given zoom.
-///
-/// Walks the 1-2-5 decades until one lands in the on-screen band. `None` when no
-/// decade does, which only happens at the extremes of the 1%–6400% clamp and is the
-/// right answer there: a grid nobody can resolve is noise.
-///
-/// **`pub(crate)` because Snap to grid reads it.** The spacing a gesture lands on and the
-/// spacing that is drawn have to be the same number, or the board says one thing and the
-/// pointer does another — the `draw::kanban_runs` rule again, and the reason
-/// `crate::snap::snap_to_grid` takes a step rather than working one out.
-pub(crate) fn grid_step(zoom: f64) -> Option<f64> {
-    if !zoom.is_finite() || zoom <= 0.0 {
-        return None;
-    }
-    for decade in -3..=7 {
-        for multiple in [1.0, 2.0, 5.0] {
-            let step = multiple * 10f64.powi(decade);
-            let on_screen = step * zoom;
-            if (GRID_MIN_PIXELS..=GRID_MAX_PIXELS).contains(&on_screen) {
-                return Some(step);
-            }
-        }
-    }
-    None
-}
-
-/// The band a grid step's on-screen spacing has to land in, in physical pixels.
-/// Below the first the dots merge into a wash; above the second they stop reading as
-/// a grid at all.
-/// The closest together the dots may sit, in device pixels.
-///
-/// *"make the dots closer to one another."* The grid walks the 1-2-5 sequence and takes the
-/// first step whose on-screen spacing lands in this band, so lowering the floor lets it keep a
-/// finer step for longer before stepping up — which is what makes the dots closer rather than
-/// simply making them appear at more zooms. 14 against the 24 it was: at a typical working
-/// zoom that is one step finer through most of the range.
-const GRID_MIN_PIXELS: f64 = 14.0;
-/// …and the furthest apart, before it steps down to a finer one.
-///
-/// Lowered with the floor, and it has to be: the band is what selects the step, so leaving the
-/// ceiling at 120 while dropping the floor to 14 would widen the band rather than shift it, and
-/// the same step would still be chosen at most zooms.
-const GRID_MAX_PIXELS: f64 = 70.0;
-
-/// Dot size at a nominal 900px-tall viewport, scaled with the viewport so a Retina
-/// display gets a 2px dot rather than a half-visible one.
-const GRID_DOT: f32 = 1.0;
-
-/// A hard ceiling on the grid, so a pathological zoom cannot emit a million quads.
-/// At the band above, a 5K display needs about 3,000.
-const MAX_GRID_DOTS: i64 = 20_000;
+// The grid's spacing, its band, its dot size and its ceiling are all
+// `vellum_project::look`'s now, shared with the browser painter — which had its own copies,
+// and had taken the dot size from one round and the colour from another.
+//
+// `grid_step` is re-exported `pub(crate)` from the import at the top of this file **because
+// Snap to grid reads it**: the spacing a gesture lands on and the spacing that is drawn have
+// to be the same number, or the board says one thing and the pointer does another. That is
+// the `draw::kanban_runs` rule again, and the reason `crate::snap::snap_to_grid` takes a step
+// rather than working one out.
 
 /// The minimap: the whole board in a corner, with the viewport marked on it.
 ///
@@ -8084,28 +7997,12 @@ fn clipped_by_frame(projected: &Projected, projection: &Projection) -> bool {
 /// a frame containing a group containing items; 64 is far past anything real.
 const MAX_NESTING: usize = 64;
 
-/// The zoom band an ink stroke is tessellated for, as a power of two.
-///
-/// Quantised so that a pan or a small zoom change does not re-tessellate 219 strokes
-/// every frame. Whole octaves because `vellum_ink::Lod`'s tolerance is already
-/// proportional to `1/zoom`: within a band the mesh is at worst twice as detailed as
-/// it needs to be, which costs vertices and never costs quality.
-///
-/// # `ceil`, not `round` — the comment above was describing a different function
-///
-/// It rounded to the *nearest* octave, which lands **below** the required detail for any
-/// zoom in the upper half of a band: at zoom 1.4 the band answers 1.0, so the stroke is
-/// tessellated to a 0.5-world-unit tolerance where 0.357 was needed. That is a real
-/// under-tessellation of up to √2, i.e. a 0.71-device-pixel error budget instead of 0.5 —
-/// visible faceting on round caps and joins, and precisely the *"so much more pixelated"*
-/// the user reported. Rounding up costs vertices in the worst case and cannot cost quality,
-/// which is what the paragraph above always claimed.
-fn lod_band(zoom: f64) -> i32 {
-    if !zoom.is_finite() || zoom <= 0.0 {
-        return 0;
-    }
-    zoom.log2().ceil().clamp(-8.0, 8.0) as i32
-}
+// `lod_band` is `vellum_project::look::lod_band`, shared with the browser painter. It is
+// quantised so a pan does not re-tessellate 219 strokes every frame, and it rounds **up**:
+// rounding to the nearest octave lands below the required detail for any zoom in the upper
+// half of a band — at zoom 1.4 it answers 1.0, tessellating to a 0.5-world-unit tolerance
+// where 0.357 was needed. That is the *"so much more pixelated"* the user reported. Rounding
+// up costs vertices in the worst case and cannot cost quality.
 
 fn tessellate_ink(points: &[vellum_doc::Point], thickness: f64, band: i32) -> vellum_ink::Mesh {
     let coordinates: Vec<(f64, f64)> = points.iter().map(|p| (p.x, p.y)).collect();
