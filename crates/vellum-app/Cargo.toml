@@ -19,6 +19,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+# The sync sidecar's HTTP client. `vellum-app` is native-only, so this needs no target
+# table — the browser client talks to velmd through the DOM's own `fetch`.
+ureq.workspace = true
 arboard.workspace = true
 rfd.workspace = true
 bytemuck.workspace = true

@@ -219,7 +219,7 @@ fn serve_one(server: &Server, stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(60)));
 
-    let Some((method, target, headers, leftover)) = read_head(&stream) else {
+    let Some(Head { method, target, headers, leftover }) = read_head(&stream) else {
         let _ = respond(&stream, 400, "text/plain", b"bad request\n", None);
         return;
     };
@@ -522,6 +522,15 @@ fn authorised(headers: &BTreeMap<String, String>, query: &str, expected: &str) -
     false
 }
 
+/// A parsed request head, and whatever the reader took past it.
+struct Head {
+    method: String,
+    target: String,
+    headers: BTreeMap<String, String>,
+    /// ⚠ See [`read_head`]: the body usually arrives inside the head parser's buffer.
+    leftover: Vec<u8>,
+}
+
 /// The request head, and **whatever the reader took past it**.
 ///
 /// ⚠ The fourth element is not tidiness. `BufReader` fills its 8 KB buffer from the socket
@@ -531,9 +540,7 @@ fn authorised(headers: &BTreeMap<String, String>, query: &str, expected: &str) -
 /// reader there loses them, and the body read then waits for bytes that were already
 /// delivered until the timeout fires and the client gets a 400. Not an edge case: the
 /// default path.
-fn read_head(
-    stream: &TcpStream,
-) -> Option<(String, String, BTreeMap<String, String>, Vec<u8>)> {
+fn read_head(stream: &TcpStream) -> Option<Head> {
     let mut reader = BufReader::new(stream);
     let mut buffer = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
@@ -561,7 +568,7 @@ fn read_head(
             headers.insert(header.name.to_ascii_lowercase(), value.to_owned());
         }
     }
-    Some((method, target, headers, reader.buffer().to_vec()))
+    Some(Head { method, target, headers, leftover: reader.buffer().to_vec() })
 }
 
 thread_local! {

@@ -67,6 +67,7 @@ pub mod mesh;
 pub mod mindmap;
 pub mod note;
 pub mod options;
+pub mod sync;
 pub mod session;
 pub mod shapes;
 pub mod shell;
