@@ -7,6 +7,8 @@
     margin: 0; height: 100%; overflow: hidden; background: #F2F2F2;
     /* Stops Safari's rubber-band bounce carrying the whole page while a finger pans. */
     overscroll-behavior: none;
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    color: #22282C;
   }
   #canvas {
     display: block; width: 100vw; height: 100vh;
@@ -26,33 +28,131 @@
     padding: 6px 10px; border-radius: 6px; border: 1px solid #E2E7EA;
     max-width: calc(100vw - 24px);
   }
+
+  /* The board list. Shown when no board has been chosen, hidden once one is open, so the
+     canvas is never competing with it for the same screen. */
+  #velm-library {
+    position: fixed; inset: 0; overflow: auto;
+    background: #F7F9FA; padding: 40px 24px 64px;
+    /* Keeps the list clear of an iPad's rounded corners and its home indicator. */
+    padding-left: max(24px, env(safe-area-inset-left));
+    padding-right: max(24px, env(safe-area-inset-right));
+  }
+  #velm-library h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; letter-spacing: -.01em; }
+  #velm-library p.sub { margin: 0 0 28px; color: #656D73; font-size: 13px; }
+  #velm-boards {
+    display: grid; gap: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    max-width: 1200px;
+  }
+  #velm-boards a {
+    display: block; padding: 14px 16px; border-radius: 10px;
+    background: #fff; border: 1px solid #E2E7EA; color: inherit; text-decoration: none;
+    /* A finger needs a target, not a link. */
+    min-height: 56px;
+  }
+  #velm-boards a:hover { border-color: #00A38C; }
+  #velm-boards a strong { display: block; font-weight: 600; margin-bottom: 2px; }
+  #velm-boards a span { color: #656D73; font-size: 12px; }
+  #velm-library .note {
+    margin-top: 28px; color: #656D73; font-size: 12px; max-width: 60ch;
+  }
 </style>
 <canvas id="canvas"></canvas>
 <div id="velm-status">Starting…</div>
+<div id="velm-library" hidden>
+  <h1>Your boards</h1>
+  <p class="sub">Read-only. Drag to pan, pinch or scroll to zoom.</p>
+  <div id="velm-boards"></div>
+  <p class="note"></p>
+</div>
 <script type="module">
   import init, * as velm from './vellum_web.js';
   const status = document.getElementById('velm-status');
+  const library = document.getElementById('velm-library');
   const params = new URLSearchParams(location.search);
+
+  // A token in the URL, kept in the URL.
+  //
+  // `<script type="module">` and `WebAssembly.instantiateStreaming` fetch their own URLs
+  // and cannot be handed a header, so a bundle behind a header-only gate cannot load
+  // itself — which is why `velmd` accepts `?token=` as well, and why every link built
+  // below carries it forward. It is the weaker of the two forms and the instructions say
+  // so; what makes it acceptable is that this is one person's own server.
+  const token = params.get('token');
+  const withAuth = (url) => url + (token ? (url.includes('?') ? '&' : '?') + `token=${encodeURIComponent(token)}` : '');
+
+  function fail(message) {
+    status.textContent = message;
+    console.error(message);
+  }
+
+  /** Show the board list. Returns false when there is no server to ask. */
+  async function showLibrary() {
+    let boards;
+    try {
+      const response = await fetch(withAuth('/api/v1/boards'));
+      if (!response.ok) throw new Error(`the server answered ${response.status}`);
+      boards = await response.json();
+    } catch (e) {
+      return false;
+    }
+    const list = document.getElementById('velm-boards');
+    if (boards.length === 0) {
+      library.querySelector('p.sub').textContent =
+        'This server is not holding any boards yet.';
+    }
+    for (const board of boards) {
+      const link = document.createElement('a');
+      link.href = `?board=${encodeURIComponent(board.id)}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
+      link.innerHTML = '<strong></strong><span></span>';
+      link.querySelector('strong').textContent = board.title || board.id;
+      link.querySelector('span').textContent = `${board.items} items`;
+      list.append(link);
+    }
+    library.querySelector('.note').textContent =
+      'Your boards live on your own server and are never uploaded anywhere else. ' +
+      'Editing is not available in a browser yet — the desktop app is still where a board is changed.';
+    document.getElementById('canvas').hidden = true;
+    status.hidden = true;
+    library.hidden = false;
+    return true;
+  }
+
   try {
     await init();
-    velm.start('canvas', params.get('board') || './board.bin');
 
-    // A gesture fixture, on request. `?selftest=touch` drives real PointerEvents at the real
-    // canvas and reports what the camera did — the only honest check of an input path, and
-    // the only one that can be run on the iPad by the person holding it.
-    if (params.get('selftest') === 'touch') {
-      const { runTouchFixture } = await import('./selftest.js');
-      // Wait for the board: the fixture reads the camera, and before boot resolves there
-      // is not one. Polling beats a fixed delay — a slow first paint would make a fixed
-      // delay report a failure that is really a race.
-      for (let i = 0; i < 200 && velm.camera_report() === 'none'; i++) {
-        await new Promise(r => setTimeout(r, 50));
+    // Three ways in, in order of how specific they are.
+    //
+    //   ?board=<id>   a board on a velmd server
+    //   (nothing)     the server's board list, if there is a server
+    //   board.bin     a static export beside the page, which is the development route
+    const id = params.get('board');
+    if (!id && await showLibrary()) {
+      // The list is up; nothing to render.
+    } else {
+      const boardUrl = id ? withAuth(`/api/v1/boards/${encodeURIComponent(id)}/snapshot`) : './board.bin';
+      const blobBase = id ? '/api/v1/blobs/' : './blobs/';
+      // The token goes *after* the hash, so it is a suffix rather than part of the base.
+      const blobSuffix = (id && token) ? `?token=${encodeURIComponent(token)}` : '';
+      velm.start('canvas', boardUrl, blobBase, blobSuffix);
+
+      // A gesture fixture, on request. `?selftest=touch` drives real PointerEvents at the
+      // real canvas and reports what the camera did — the only honest check of an input
+      // path, and the only one that can be run on the iPad by the person holding it.
+      if (params.get('selftest') === 'touch') {
+        const { runTouchFixture } = await import('./selftest.js');
+        // Wait for the board: the fixture reads the camera, and before boot resolves there
+        // is not one. Polling beats a fixed delay — a slow first paint would make a fixed
+        // delay report a failure that is really a race.
+        for (let i = 0; i < 200 && velm.camera_report() === 'none'; i++) {
+          await new Promise(r => setTimeout(r, 50));
+        }
+        runTouchFixture(velm, document.getElementById('canvas'));
       }
-      runTouchFixture(velm, document.getElementById('canvas'));
     }
   } catch (e) {
     // A wasm failure that only reaches the console is invisible to anyone on a tablet.
-    status.textContent = String(e);
-    console.error(e);
+    fail(String(e));
   }
 </script>

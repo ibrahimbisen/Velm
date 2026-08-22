@@ -78,15 +78,21 @@ thread_local! {
 
 /// Entry point. Called by the page once the canvas exists.
 ///
-/// `board_url` names a file of Loro snapshot bytes — `velmd`'s `/snapshot` route, or a
-/// static file during development. Errors land in the console *and* in the DOM, because a
-/// wasm panic that only reaches the console is invisible to anyone holding an iPad.
+/// `board_url` names a source of Loro snapshot bytes — `velmd`'s
+/// `/api/v1/boards/{id}/snapshot`, or a static `board.bin` during development —
+/// and a picture's URL is `blob_base` + its BLAKE3 hash + `blob_suffix`. All three are
+/// given by the page rather than built here, so the same wasm serves a `velmd` origin and a
+/// directory of static files with no build flag telling the two apart. The suffix exists
+/// because a token rides in the query string, which has to land after the hash.
+///
+/// Errors land in the console *and* in the DOM, because a wasm panic that only reaches the
+/// console is invisible to anyone holding an iPad.
 #[wasm_bindgen]
-pub fn start(canvas_id: String, board_url: String) {
+pub fn start(canvas_id: String, board_url: String, blob_base: String, blob_suffix: String) {
     console_error_panic_hook::set_once();
     let _ = console_log::init_with_level(log::Level::Info);
     wasm_bindgen_futures::spawn_local(async move {
-        if let Err(error) = boot(&canvas_id, &board_url).await {
+        if let Err(error) = boot(&canvas_id, &board_url, &blob_base, &blob_suffix).await {
             let message = error.to_string();
             log::error!("velm: {message}");
             report(&message);
@@ -144,7 +150,12 @@ pub fn verdict(line: &str) {
     report(line);
 }
 
-async fn boot(canvas_id: &str, board_url: &str) -> Result<(), String> {
+async fn boot(
+    canvas_id: &str,
+    board_url: &str,
+    blob_base: &str,
+    blob_suffix: &str,
+) -> Result<(), String> {
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;
     let canvas: web_sys::HtmlCanvasElement = document
@@ -238,7 +249,7 @@ async fn boot(canvas_id: &str, board_url: &str) -> Result<(), String> {
         camera,
         clear,
         text: text::TextLayer::new()?,
-        images: images::ImageLayer::new("./blobs/"),
+        images: images::ImageLayer::new(blob_base, blob_suffix),
         strokes: strokes::StrokeLayer::new(),
     }));
 
@@ -250,7 +261,11 @@ async fn boot(canvas_id: &str, board_url: &str) -> Result<(), String> {
     // colour. That is an assertion rather than a photograph, it runs on the device the user
     // is actually holding, and it is the same discipline `--demo` fixtures use natively:
     // report a measured number with a verdict, never an intention.
-    let drawn = viewer.borrow_mut().self_check().await;
+    let pending = viewer.borrow_mut().begin_self_check();
+    let drawn = match pending {
+        Some(readback) => readback.count().await,
+        None => None,
+    };
 
     input::attach(&canvas, Rc::clone(&viewer));
     VIEWER.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&viewer)));
@@ -356,14 +371,46 @@ fn schedule_frame() {
     closure.forget();
 }
 
-impl Viewer {
-    /// Render one frame offscreen and count the pixels that are not the background.
+/// A frame the GPU has been asked to hand back, waiting to be counted.
+struct Readback {
+    buffer: wgpu::Buffer,
+    done: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+impl Readback {
+    /// How many pixels are not the background.
     ///
     /// Returns `None` if the read-back could not complete, which is a different answer from
     /// zero and must not be reported as a failure: some browsers and power modes decline to
     /// map a buffer without a live frame loop, and calling that "the board is broken" would
     /// be the probe page's mistake repeated.
-    async fn self_check(&mut self) -> Option<u32> {
+    async fn count(self) -> Option<u32> {
+        // On the web the device is ticked by the browser, so there is nothing to poll; the
+        // callback arrives when the queue drains.
+        match self.done.await {
+            Ok(Ok(())) => {}
+            _ => return None,
+        }
+        let Ok(data) = self.buffer.slice(..).get_mapped_range() else { return None };
+        // Cleared to black, so anything not black is something the renderer drew.
+        let painted = data.chunks_exact(4).filter(|p| p[0] > 4 || p[1] > 4 || p[2] > 4).count();
+        drop(data);
+        self.buffer.unmap();
+        Some(painted as u32)
+    }
+}
+
+impl Viewer {
+    /// Render one frame offscreen and ask the GPU to hand the pixels back.
+    ///
+    /// ⚠ **Split from the counting on purpose, and the seam is where the `await` is.** The
+    /// caller holds the `Viewer` in a `RefCell`, and awaiting while that borrow is live is a
+    /// panic waiting for a second borrower — today there is none, because this runs before
+    /// the listeners are attached and before the frame loop starts, which is exactly the
+    /// kind of "safe because of what happens to be true elsewhere" this file should not
+    /// rely on. So the borrow ends when this returns, and [`Readback::count`] awaits with
+    /// nothing borrowed at all.
+    fn begin_self_check(&mut self) -> Option<Readback> {
         const SIDE: u32 = 256;
         // ⚠ The renderer's pipelines are built once, for the surface's format. A readback
         // target in any other format is rejected -- WebGPU matches the whole attachment
@@ -388,7 +435,10 @@ impl Viewer {
         let mut camera = self.camera;
         camera.set_viewport(ScreenSize::new(SIDE as f64, SIDE as f64));
         if let Some(bounds) = self.projection.content_bounds() {
-            camera.fit_to_rect(bounds, 8.0);
+            // The same fraction the canvas fits with. It read `8.0` here, meaning seventeen
+            // times the board — enough to drive the fit past `MIN_ZOOM` and clamp, so this
+            // probe was answering about a view nobody would ever see.
+            camera.fit_to_rect(bounds, FIT_MARGIN);
         }
 
         let mut list = DrawList::new();
@@ -457,18 +507,7 @@ impl Viewer {
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = send.send(result);
             });
-        // On the web the device is ticked by the browser, so there is nothing to poll; the
-        // callback arrives when the queue drains.
-        match recv.await {
-            Ok(Ok(())) => {}
-            _ => return None,
-        }
-        let Ok(data) = readback.slice(..).get_mapped_range() else { return None };
-        // Cleared to black, so anything not black is something the renderer drew.
-        let painted = data.chunks_exact(4).filter(|p| p[0] > 4 || p[1] > 4 || p[2] > 4).count();
-        drop(data);
-        readback.unmap();
-        Some(painted as u32)
+        Some(Readback { buffer: readback, done: recv })
     }
 
     fn resize(&mut self, width: u32, height: u32) {

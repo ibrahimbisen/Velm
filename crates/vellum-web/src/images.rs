@@ -57,17 +57,25 @@ pub struct ImageLayer {
     states: HashMap<String, State>,
     in_flight: usize,
     ready: Rc<RefCell<Vec<Decoded>>>,
-    /// Where blobs are fetched from, e.g. `./blobs/`. `velmd` will serve this path.
+    /// A blob's URL is `base` + its hash + `suffix`.
+    ///
+    /// Two halves rather than one, and the second half is not decoration: `velmd` accepts a
+    /// bearer token in the query string as well as in a header, because a page's own module
+    /// and wasm fetches cannot carry a header. So a blob behind a token is
+    /// `/api/v1/blobs/<hash>?token=…` — a query that has to land *after* the hash, which a
+    /// single prefix cannot express.
     base: String,
+    suffix: String,
 }
 
 impl ImageLayer {
-    pub fn new(base: impl Into<String>) -> Self {
+    pub fn new(base: impl Into<String>, suffix: impl Into<String>) -> Self {
         Self {
             states: HashMap::new(),
             in_flight: 0,
             ready: Rc::new(RefCell::new(Vec::new())),
             base: base.into(),
+            suffix: suffix.into(),
         }
     }
 
@@ -91,7 +99,7 @@ impl ImageLayer {
     }
 
     fn start(&self, hash: String) {
-        let url = format!("{}{hash}", self.base);
+        let url = format!("{}{hash}{}", self.base, self.suffix);
         let ready = Rc::clone(&self.ready);
         wasm_bindgen_futures::spawn_local(async move {
             match decode(&url).await {
@@ -136,9 +144,6 @@ impl ImageLayer {
         }
     }
 
-    pub fn resident(&self) -> usize {
-        self.states.values().filter(|s| matches!(s, State::Ready(_))).count()
-    }
 }
 
 /// Fetch, decode and read back one image's pixels.

@@ -30,12 +30,22 @@
 //!   manifest. Answers in bytes, before anything semantic is attempted.
 //! - `import` — *are the copies actually readable as boards?* Copies into the live data
 //!   directory, then runs recovery/integrity/load **on the copies only**.
+//!
+//! Then two exports and the server itself:
+//!
+//! - `snapshot` / `blobs` — one board's document bytes and one board's pictures, which is
+//!   what a browser client consumes. `serve` is these two with the HTTP put back on.
+//! - `serve` — the read-only server. Every route is a `GET`; there is no route that could
+//!   change a board. ⚠ It does open boards with SQLite, so **point `--data` at a copy** —
+//!   `serve.rs` refuses the desktop app's own directory by name rather than trusting this
+//!   sentence to be read.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod manifest;
 mod migrate;
+mod serve;
 
 const USAGE: &str = "\
 velmd — the Velm board server
@@ -46,6 +56,8 @@ USAGE:
     velmd import   --from <DIR> --data <DIR>
     velmd snapshot --board <FILE> --out <FILE>
     velmd blobs    --board <FILE> --blobs <DIR> --out <DIR>
+    velmd serve    --data <DIR> --blobs <DIR> [--web <DIR>] [--addr <IP:PORT>]
+                   [--app-origin <URL>]     (token: $VELMD_TOKEN)
     velmd --version
 
 Nothing in this program removes a file. Migration copies; it never moves.
@@ -97,6 +109,25 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             let out = flag(args, "--out")?;
             migrate::export_blobs(&board, &blobs, &out)
         }
+        "serve" => {
+            let addr = optional(args, "--addr")
+                .unwrap_or_else(|| "127.0.0.1:8787".into())
+                .to_string_lossy()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("--addr must be like 127.0.0.1:8787 ({e})"))?;
+            serve::run(serve::Config {
+                data: flag(args, "--data")?,
+                blobs: flag(args, "--blobs")?,
+                web: optional(args, "--web"),
+                addr,
+                // ⚠ The token comes from the environment, never from a flag. An argument is
+                // visible in `ps` to every account on the machine and lands in shell
+                // history; this is a secret guarding boards that cannot be re-imported.
+                token: std::env::var("VELMD_TOKEN").ok().filter(|t| !t.is_empty()),
+                app_origin: optional(args, "--app-origin")
+                    .map(|p| p.to_string_lossy().into_owned()),
+            })
+        }
         "import" => {
             let from = flag(args, "--from")?;
             let data = flag(args, "--data")?;
@@ -107,6 +138,11 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             anyhow::bail!("unknown command {other:?}")
         }
     }
+}
+
+/// Read `--name <value>` if it is present.
+fn optional(args: &[String], name: &str) -> Option<PathBuf> {
+    flag(args, name).ok()
 }
 
 /// Read `--name <value>`.
