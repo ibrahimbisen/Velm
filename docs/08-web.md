@@ -234,7 +234,7 @@ copy, opened in Brave on an M2.
 | | |
 |---|---|
 | Cold start to a drawn frame | **155 ms**, GPU handshake and board fetch included |
-| Fitted board, 119 frames | median **9.4 ms (106 fps)**, 95th 36.5 ms, worst 63.4 ms |
+| Fitted board, 119 frames | median **10.9 ms (92 fps)**, 95th 39.0 ms, worst 89.0 ms |
 | First ten frames | worst **30.9 ms** — shaping and auto-fit, then it settles |
 | Steady-state median | **9.4 ms** |
 | Bundle | 4.6 MB of wasm, 681 KB brotli'd on the first spike |
@@ -259,6 +259,35 @@ lurched half the fingers' separation and back on every event in between. Samplin
 the two moves reports 200.0 px of lurch, the separation exactly. And the second-finger case
 passed because it moved the finger that had just landed, which computes against its own
 position on either build; moving the *other* finger reports a 284.5 px jump.
+
+## 8a. What the review changed, and the instrument it did not have
+
+Three adversarial reviews over this work returned **17 findings that survived an independent
+skeptic each**, six high. Separately the user opened the page and named **four** defects in
+one glance. The two sets do not overlap at all, and that is the finding worth keeping:
+
+> Not one of the user's four was in the review, and not one of the review's seventeen was
+> visible on screen.
+
+The user's four were all *wrong numbers* in code that compiled, passed its tests and had a
+caller — an image size in the wrong units, a text box that was the item's own rectangle, a
+frame title that was auto-fitted, a card thumbnail stretched instead of cropped. A reviewer
+asks *is this correct*; an auditor asks *can a person get here*; neither looks at the screen.
+**A port needs a fourth instrument: the two applications side by side.** `?zoom=`, `?cx=` and
+`?cy=` exist so that comparison is against a matched camera rather than eyeballed.
+
+The review's own six high findings, kept because each is a shape rather than a slip:
+
+- **Two leaks a desktop absorbs and a tablet does not** — glyph bitmaps never released on a
+  zoom change (wasm linear memory never returns to the OS, so one pinch's peak is permanent),
+  and textures uploaded but never evicted.
+- **`pointermove` created contacts for pointers that never pressed**, so a hovering Pencil
+  turned a one-finger pan into a pinch and outlived the gesture.
+- **The status badge ate the bottom-left corner** of the board — implicit pointer capture
+  meant a thumb resting there sent its whole stream to a `<div>`.
+- **A slowloris before the token gate** — a per-*read* timeout is not a deadline.
+- **A RULE ZERO guard that disabled itself** whenever `$HOME` was unset, which is every
+  systemd unit. A guard whose failure mode is *permit* is not a guard.
 
 ## 9. Still unproven
 
