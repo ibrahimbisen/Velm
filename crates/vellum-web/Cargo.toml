@@ -24,6 +24,7 @@ vellum-doc.workspace = true
 vellum-project.workspace = true
 vellum-render.workspace = true
 vellum-scene.workspace = true
+vellum-text.workspace = true
 wgpu.workspace = true
 log.workspace = true
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }

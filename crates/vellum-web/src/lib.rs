@@ -39,6 +39,7 @@ use vellum_render::{DrawList, Renderer, Rgba, View};
 use vellum_scene::{Camera, ScreenSize, SceneItem};
 
 mod input;
+mod text;
 
 /// Everything a frame needs, once startup has resolved.
 struct Viewer {
@@ -57,6 +58,7 @@ struct Viewer {
     projection: Projection,
     camera: Camera,
     clear: Rgba,
+    text: text::TextLayer,
 }
 
 thread_local! {
@@ -74,7 +76,7 @@ pub fn start(canvas_id: String, board_url: String) {
     let _ = console_log::init_with_level(log::Level::Info);
     wasm_bindgen_futures::spawn_local(async move {
         if let Err(error) = boot(&canvas_id, &board_url).await {
-            let message = format!("{error}");
+            let message = error.to_string();
             log::error!("velm: {message}");
             report(&message);
         }
@@ -187,6 +189,7 @@ async fn boot(canvas_id: &str, board_url: &str) -> Result<(), String> {
         projection,
         camera,
         clear,
+        text: text::TextLayer::new()?,
     }));
 
     // Prove the board actually drew, rather than trusting that it did.
@@ -439,7 +442,14 @@ impl Viewer {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut list = DrawList::new();
-        list.view(View::board(&self.camera));
+        // Both views are registered up front and flipped between, exactly as `draw.rs` does.
+        // Quads live in camera-relative world pixels; **glyphs live in physical screen
+        // pixels**, because they are rasterised at a physical size and positioning them in
+        // world units would resample every one. CLAUDE.md names this flip as the reason text
+        // ends the quad batch once per item.
+        let board = list.view(View::board(&self.camera));
+        let screen = list.view(View::screen(self.camera.viewport()));
+        list.use_view(board);
 
         // Only what the camera can see. This is the project's whole thesis -- frame cost
         // scales with what is on screen, not with what exists -- and it is the R-tree that
@@ -451,9 +461,52 @@ impl Viewer {
         // Painter's order. Frames take a negative z band so they draw behind everything,
         // which is decided once in `vellum_project::project` rather than here.
         visible.sort_by_key(|item| item.z);
-        for item in visible {
+        let zoom = self.camera.zoom() as f32;
+        let mut on_screen = Vec::with_capacity(visible.len());
+        for item in &visible {
             list.push_scene_item(item, &self.camera);
+            on_screen.push(item.id);
         }
+
+        // Shape and queue every visible item's words.
+        for item in &visible {
+            let Some(projected) = self.projection.get(item.id) else { continue };
+            let Some(styled) = projected.item.kind.text() else { continue };
+            let top_left = self.camera.world_to_screen(projected.bounds.min);
+            let size = [
+                (projected.bounds.width() as f32) * zoom,
+                (projected.bounds.height() as f32) * zoom,
+            ];
+            let font_size = projected
+                .item
+                .style
+                .font_size
+                .map(|s| s as f32)
+                .unwrap_or(vellum_text::DEFAULT_FONT_SIZE);
+            let colour = vellum_project::theme::Theme::LIGHT.text;
+            // ⚠ `vellum_doc::StyledText` and `vellum_text::StyledText` are different types:
+            // the document's spans carry Miro's rich-text model, the engine's carry what
+            // cosmic-text needs. Flattening to plain here is a **known loss** -- bold, links
+            // and per-run colour do not survive it -- and it is the honest first step rather
+            // than a finished one. `draw.rs` does the real conversion per item kind; that
+            // work belongs with the painter.
+            let flattened = vellum_text::StyledText::plain(
+                styled.spans().iter().map(|s| s.text.as_str()).collect::<String>(),
+            );
+            self.text.queue(
+                item.id,
+                projected.generation,
+                &flattened,
+                [top_left.x as f32, top_left.y as f32],
+                size,
+                font_size,
+                zoom,
+                colour,
+            );
+        }
+        list.use_view(screen);
+        self.text.flush(&self.device, &self.queue, self.renderer.atlas_mut(), &mut list);
+        self.text.retain_visible(&on_screen);
 
         self.renderer.begin_frame();
         self.renderer.prepare(&self.device, &self.queue, &list);

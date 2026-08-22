@@ -5735,6 +5735,7 @@ dependencies = [
  "vellum-project",
  "vellum-render",
  "vellum-scene",
+ "vellum-text",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

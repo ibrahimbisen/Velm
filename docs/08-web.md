@@ -175,6 +175,20 @@ patching only the two that were observed to hang left `toBlob` to hang next (fee
 sibling rule, paid again), and a headless timeout is reported **WARN, not FAIL** — a probe
 that says STOP for a reason unrelated to the hardware is one nobody reads to the end.
 
+## 6a. One wasm-only lint, and why it is left alone
+
+`cargo clippy --target wasm32-unknown-unknown` reports `unfulfilled_lint_expectations` on
+`vellum-ui/src/dialog.rs:24`'s `#[expect(clippy::large_enum_variant)]`. It is correct and it
+is a *consequence* of the feature split: with `native` off, `Dialog::Rules` and
+`Dialog::Schedule` carry smaller types, so the enum is no longer large enough to trip the lint
+the expectation was written for.
+
+Left as `#[expect]` rather than relaxed to `#[allow]`. The expectation is doing real work on
+the target that ships — it will fire natively the day those variants stop being large, which
+is the whole point of `expect` over `allow` — and trading that for silence on a target the
+lint does not ship to would be optimising the wrong build. **So do not lint the wasm target
+with `-D warnings`, and do not "fix" this by weakening the native annotation.**
+
 ## 7. Still unproven
 
 Treat these as unknown rather than done:
