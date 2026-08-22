@@ -287,6 +287,41 @@ pub fn sync_token() -> Option<String> {
     std::env::var(TOKEN_VAR).ok().map(|value| value.trim().to_owned()).filter(|t| !t.is_empty())
 }
 
+/// [`sync_token`], and then **take it out of this process's environment**.
+///
+/// # ⚠ Why an environment variable is not automatically the safer choice
+///
+/// A flag was rejected because argv is readable by every process on the machine through `ps`.
+/// That is true, and on its own it makes an environment variable look like the answer — but
+/// an environment is *inherited*, and this application's job includes launching third-party
+/// binaries: `claude`, `codex`, `gemini`, and a PTY the user can type into. Nothing in the
+/// tree calls `env_clear`, so every one of them could read `$VELM_SYNC_TOKEN` directly. The
+/// mechanism chosen to avoid an attacker who can run `ps` was handing the secret to the
+/// attacker this application invites in on purpose.
+///
+/// Removing it after the one read closes that: the value is already in memory where it is
+/// needed, and a child spawned later inherits an environment that no longer carries it.
+///
+/// # Safety
+///
+/// `remove_var` is unsafe because another thread reading the environment concurrently is a
+/// data race. This is called from `ActiveState::new`, on the main thread, before the agent
+/// runtime, the link pool, the sync worker or any autosave writer exists — so there is no
+/// other thread to race with. **Moving this call later is what would make it unsound**, which
+/// is why it is a distinct function with this note rather than a line inside the caller.
+///
+/// It is deliberately *not* called when `--sync-server` was not given: a user who exports the
+/// variable in their shell profile and launches without the flag should still find it set the
+/// next time they check, rather than discovering that Velm quietly ate it.
+pub fn take_sync_token() -> Option<String> {
+    let token = sync_token();
+    if token.is_some() {
+        // SAFETY: see above — main thread, before anything else is spawned.
+        unsafe { std::env::remove_var(TOKEN_VAR) };
+    }
+    token
+}
+
 /// Whether a server address is this machine, so a missing token is a legitimate setup
 /// rather than one that will be refused on every request.
 ///
@@ -399,6 +434,21 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command> {
     // often, and a cadence with nowhere to send is simply unused. Refusing it would make
     // `--sync-every 5` fail on a machine that has not set a server yet, which is the
     // configuration somebody arrives at while setting one up.
+    if let Some(server) = &sync_server {
+        // ⚠ **A scheme, or nothing works and the reason is invisible.** `ureq` cannot resolve
+        // `localhost:8787/api/v1/...` to an absolute http(s) URI, so a schemeless address
+        // fails every request with a URI-parse sentence that names neither the flag nor the
+        // fix. Worse, `is_loopback` answers *true* for it, so the missing-token warning does
+        // not fire either — the one message that would have pointed at the real problem is
+        // suppressed by the same mistake. Caught here, at the door, where the sentence can
+        // name what to type.
+        anyhow::ensure!(
+            server.starts_with("http://") || server.starts_with("https://"),
+            "--sync-server needs a full address beginning http:// or https://, got `{server}`\n\
+             For a server on this machine:      --sync-server http://127.0.0.1:8787\n\
+             For one on the internet:           --sync-server https://boards.example.com"
+        );
+    }
     options.sync = sync_server.map(|server| SyncOptions { server, period: sync_period });
 
     Ok(Command::Run(Box::new(options)))
@@ -455,6 +505,22 @@ mod tests {
         assert!((sync.period - 10.0).abs() < f64::EPSILON, "period was {}", sync.period);
     }
 
+    /// ⚠ A schemeless address is refused at the door, and both halves of why are the point:
+    /// `ureq` cannot build a request from it, **and** `is_loopback` answers `true` for it — so
+    /// the missing-token warning is suppressed by the same mistake that breaks every request,
+    /// and the user gets a URI-parse error naming neither.
+    #[test]
+    fn a_server_address_must_carry_its_scheme() {
+        for good in ["http://127.0.0.1:8787", "https://boards.example.com"] {
+            assert!(run(&["--sync-server", good]).sync.is_some(), "{good} should be accepted");
+        }
+        for bad in ["localhost:8787", "boards.example.com", "127.0.0.1:8787", "ftp://x"] {
+            let refused = parse_args(["--sync-server".to_string(), bad.to_string()]);
+            let message = refused.expect_err("{bad} must be refused").to_string();
+            assert!(message.contains("http://"), "the message must say what to type: {message}");
+        }
+    }
+
     /// A cadence with nowhere to send is unused, not an error — someone setting this up
     /// types one flag before the other, and failing there fails the launch over a
     /// half-finished configuration.
@@ -488,7 +554,11 @@ mod tests {
             "https://LOCALHOST",
             "http://[::1]:8787",
             "http://user@localhost:8787/api",
-            "localhost:8787",
+            // ⚠ Not `localhost:8787` — `is_loopback` still answers true for a schemeless
+            // address, and that is *why* `parse_args` refuses one outright. Asserting it here
+            // as a supported spelling is what made the combination invisible: the warning
+            // that would have named the missing token is suppressed by the same mistake that
+            // makes every request fail.
         ] {
             assert!(is_loopback(here), "{here} should be loopback");
         }

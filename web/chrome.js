@@ -173,6 +173,37 @@ const CSS = `
   background: #E2E7EA;
 }
 
+/* The connection, as a dot and a word. Muted by default: a board that is keeping up is the
+   normal state and should not be the loudest thing on the bar. Only a *problem* is coloured,
+   and it is coloured amber rather than with the accent — the accent means selection or the
+   active tool everywhere else in Velm, and a viewer has neither. */
+.velm-chrome-sync {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding-right: 4px;
+  font: 12px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #656D73;
+  white-space: nowrap;
+}
+.velm-chrome-sync::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+.velm-chrome-sync[data-state='trouble'] { color: #A8620E; }
+.velm-chrome-sync[data-state='offline'] { color: #A8320E; }
+/* Narrow windows: the word goes and the dot stays, because the dot is the part that says
+   "something is wrong" at a glance and the bar must not push the board off the screen. */
+@media (max-width: 520px) {
+  .velm-chrome-sync .velm-chrome-sync-word { display: none; }
+  .velm-chrome-sync { gap: 0; }
+}
+
 .velm-chrome-zoom {
   flex: none;
   min-width: 5.5ch;
@@ -270,6 +301,10 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
     mounted.live = false;
     mounted.bar.remove();
     window.removeEventListener('keydown', mounted.onKeyDown);
+    // The rAF poll stops on its own through `session.live`; a `setTimeout` chain does not —
+    // it is already scheduled. Without this a second `mountChrome` leaves the first one's
+    // timer writing into a span that has been removed from the document.
+    if (mounted.syncTimer) window.clearTimeout(mounted.syncTimer);
     mounted = null;
   }
 
@@ -278,6 +313,10 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
   const canZoom = typeof mod.zoom_by === 'function';
   const canFit = typeof mod.fit_board === 'function';
   const canRead = typeof mod.camera_report === 'function';
+  // The connection, when the build has one. A static `./board.bin` page has no server, so
+  // `sync_status` answers "off" and the dot is not drawn at all — an indicator that is
+  // permanently grey says less than no indicator.
+  const canSync = typeof mod.sync_status === 'function';
   // ⚠ Back is gated on there being a board list to go back *to*. On the static `./board.bin`
   // route there is no server: `showLibrary()` fails, `index.html` falls through to the same
   // board, and the button is one that reloads the page you are already on. A board id is what
@@ -345,6 +384,26 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
   if (canZoom) controls.push(button('Zoom in', 'Zoom in (+)', ICON_PLUS, zoomIn));
   for (const control of controls) control.disabled = !ready;
 
+  // ⚠ **The one thing that tells you a board has stopped keeping up.**
+  //
+  // Without it, a stopped server, an expired token or an update that will not merge look
+  // exactly like a board nobody is editing: the poll backs off to a minute and keeps trying,
+  // the console carries a warning, and on an iPad there is no console. The boot line in
+  // `#velm-status` still reads "1130 items · 4531 pixels painted", which reads as healthy.
+  //
+  // A dot and a word rather than a dot alone: "live" and "offline" are two states a colour
+  // has to carry on its own otherwise, and this palette has one accent.
+  let connection = null;
+  if (canSync) {
+    connection = document.createElement('span');
+    connection.className = 'velm-chrome-sync';
+    // Announced, unlike the zoom readout — this changes a handful of times an hour and each
+    // change is something the reader would want to know. The zoom changes sixty times a
+    // second, which is why that one is `off`.
+    connection.setAttribute('aria-live', 'polite');
+    connection.textContent = '';
+  }
+
   let readout = null;
   if (canRead) {
     readout = document.createElement('span');
@@ -363,6 +422,7 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
   if (name) groups.push([name]);
   const view = controls.concat(readout ? [readout] : []);
   if (view.length) groups.push(view);
+  if (connection) groups.push([connection]);
   if (!groups.length) return null;
   groups.forEach((group, index) => {
     if (index > 0) bar.append(divider());
@@ -445,6 +505,78 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
       requestAnimationFrame(poll);
     };
     requestAnimationFrame(poll);
+  }
+
+  if (connection) {
+    // ⚠ **A timer, not `requestAnimationFrame`, and the difference is the whole point.**
+    // rAF stops when the tab is hidden — which is exactly when a board falls behind and
+    // exactly what this exists to report. A tab returned to after ten minutes must be able to
+    // say "offline" rather than showing whatever it last managed to paint. One second,
+    // because the states change a handful of times an hour and a faster poll is a DOM read
+    // nobody benefits from.
+    let shownState = '';
+    // ⚠ **`starting` has to time out, or a board that never loads says "Connecting" for ever.**
+    // The viewer is only installed once `boot` succeeds, so a 404, a bad token or a GPU that
+    // will not come up all leave `sync_status` answering `starting` permanently. The page's
+    // own status line carries the real sentence; what this must not do is keep promising that
+    // something is still happening. Fifteen seconds is past a cold start on a slow phone
+    // (155ms warm, and the budget for the whole boot is a few seconds) and well short of the
+    // point where somebody assumes it is broken.
+    const STARTING_PATIENCE_MS = 15000;
+    let waitingSince = Date.now();
+    const words = () => {
+      const line = mod.sync_status();
+      // `off` is a page with no server behind it — the static `./board.bin` route. Nothing
+      // is wrong, there is simply nothing to report, so the indicator removes itself rather
+      // than sitting there grey for ever.
+      // Final: a static page with no server behind it. Nothing is wrong and nothing will
+      // ever be reported, so the indicator removes itself rather than sitting there grey.
+      if (line === 'off') return null;
+      // ⚠ Not the same as `off`, and conflating them is what made the indicator never
+      // appear: this bar is built before `boot` finishes, so every board reads as having no
+      // viewer for the first tick or two.
+      if (line === 'starting') {
+        return Date.now() - waitingSince > STARTING_PATIENCE_MS
+          ? { state: 'offline', word: 'Did not load' }
+          : { state: 'live', word: 'Connecting' };
+      }
+      // Booted: anything later that reads `starting` again would be a fresh wait, not this
+      // one. (Nothing does today — the viewer is never uninstalled — and resetting the clock
+      // here is what keeps that true if it ever is.)
+      waitingSince = Date.now();
+      // `busy` means a frame holds the viewer borrowed. Keep the last reading: a state that
+      // flickers on a frame boundary is worse than one that is a second stale.
+      if (line === 'busy') return undefined;
+      if (line.startsWith('live')) return { state: 'live', word: 'Live' };
+      if (line.startsWith('connecting')) return { state: 'live', word: 'Connecting' };
+      if (line.startsWith('offline')) return { state: 'offline', word: 'Not connected' };
+      if (line.startsWith('retrying')) return { state: 'trouble', word: 'Reconnecting' };
+      return { state: 'trouble', word: 'Unknown' };
+    };
+    const tick = () => {
+      if (!session.live) return;
+      const next = words();
+      if (next === null) {
+        connection.remove();
+        return;
+      }
+      if (next && next.state + next.word !== shownState) {
+        shownState = next.state + next.word;
+        connection.dataset.state = next.state;
+        // `textContent` on a fresh span, never `innerHTML`: the sentence after the state
+        // comes off the wire, and although only the first word is used here, the habit is
+        // what keeps that true after the next edit.
+        connection.textContent = '';
+        const word = document.createElement('span');
+        word.className = 'velm-chrome-sync-word';
+        word.textContent = next.word;
+        connection.append(word);
+        // The reason a reader would want, without spending bar width on it.
+        connection.title = mod.sync_status();
+      }
+      session.syncTimer = window.setTimeout(tick, 1000);
+    };
+    tick();
   }
 
   // After the canvas, and with no `z-index`. A positioned element paints above the static

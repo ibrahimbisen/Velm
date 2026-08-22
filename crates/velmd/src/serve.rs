@@ -192,6 +192,19 @@ fn refuse_live_data(paths: &[&Path]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether this request reached us through a reverse proxy.
+///
+/// The three headers every proxy in common use sets — `X-Forwarded-For` and `X-Real-IP` by
+/// convention, `Forwarded` by RFC 7239. Presence is the whole test: the *value* is attacker
+/// -influenced and is never read, so there is nothing here to spoof into a bypass.
+fn proxied(headers: &std::collections::BTreeMap<String, String>) -> bool {
+    const FORWARDING: [&str; 3] = ["x-forwarded-for", "x-real-ip", "forwarded"];
+    // `read_head` lower-cases every name as it parses, so these compare directly — but
+    // `eq_ignore_ascii_case` anyway, because a guard that depends on an upstream detail is
+    // one that a change upstream turns off silently, which is this file's own recent lesson.
+    headers.keys().any(|name| FORWARDING.iter().any(|marker| name.eq_ignore_ascii_case(marker)))
+}
+
 /// A public address needs a token. Loopback does not.
 ///
 /// The asymmetry is the point: local development should not need a secret, and the moment
@@ -216,13 +229,59 @@ fn check_exposure(config: &Config) -> anyhow::Result<()> {
 }
 
 fn serve_one(server: &Server, stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+    // ⚠ **Shorter than [`HEAD_DEADLINE`], and that ordering is the whole guard.**
+    //
+    // At fifteen seconds this timeout was *longer* than the ten-second deadline, so the
+    // deadline could never bind first: a connection that sent **zero bytes** sat inside a
+    // blocking `read` for the full fifteen. With [`MAX_CONNECTIONS`] at 16 and no per-address
+    // limit, sixteen sockets that say nothing and reconnect every fifteen seconds take every
+    // slot — before the token is checked, at no cost, from anywhere.
+    //
+    // Three seconds is far past any real client's pause between the packets of one request
+    // head, and it is what lets the deadline below do its job: a client that is genuinely
+    // slow but genuinely talking resets this timer on every byte and is bounded by the
+    // deadline instead.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(60)));
 
     let Some(Head { method, target, headers, leftover }) = read_head(&stream) else {
         let _ = respond(&stream, 400, "text/plain", b"bad request\n", None);
         return;
     };
+
+    // ⚠ **A tokenless server must not answer a request that came through a proxy.**
+    //
+    // `check_exposure` inspects the *bind address* and lets loopback through with no token,
+    // on the reasoning that local development should not need a secret. That reasoning is
+    // right and the guard is incomplete, because the canonical way to serve this on the
+    // internet is **exactly** a loopback bind: WebGPU needs a secure context, velmd
+    // terminates no TLS, so the documented deployment is Caddy or nginx on 443 forwarding to
+    // `127.0.0.1:8787`. Written the obvious way — no token, since it is "only listening on
+    // localhost" — that publishes every board with no gate at all, and the startup check
+    // says nothing because the address really is loopback.
+    //
+    // A forwarding header is the one signal that distinguishes the two. It is set by every
+    // reverse proxy and it is *absent* from a genuine local request, so refusing here costs
+    // nothing to the case the exemption exists for and closes the case it accidentally
+    // blessed. A header can be forged — but only by someone already able to reach a loopback
+    // socket, who has this person's machine and does not need to.
+    if server.config.token.is_none() && proxied(&headers) {
+        eprintln!(
+            "velmd: refusing a forwarded request: this server has no VELMD_TOKEN set.\n\
+             It is bound to a loopback address, which needs no token — but something is \
+             forwarding requests to it from elsewhere, which means the boards behind it are \
+             reachable with no gate at all.\n\
+             Set one and restart:  VELMD_TOKEN=$(openssl rand -hex 32) velmd serve ..."
+        );
+        let _ = respond(
+            &stream,
+            403,
+            "text/plain",
+            b"this server is not configured to be reached from outside this machine\n",
+            None,
+        );
+        return;
+    }
 
     let origin = server.config.app_origin.clone();
     // A browser sends a preflight before a cross-origin request carrying an
@@ -320,7 +379,7 @@ fn serve_one(server: &Server, stream: TcpStream) {
         // would be a board that loads and then silently never updates.
         let id = percent_decode(id);
         if let Err(error) = sync::handle(server, &id, &body, &stream) {
-            eprintln!("velmd: {path}: {error:#}");
+            eprintln!("velmd: {}: {error:#}", printable(path));
             let _ = respond(&stream, 500, "text/plain", b"something went wrong\n", origin.as_deref());
         }
         return;
@@ -328,7 +387,7 @@ fn serve_one(server: &Server, stream: TcpStream) {
 
     let result = route(server, path, query, &stream);
     if let Err(error) = result {
-        eprintln!("velmd: {path}: {error:#}");
+        eprintln!("velmd: {}: {error:#}", printable(path));
         let _ = respond(&stream, 500, "text/plain", b"something went wrong\n", origin.as_deref());
     }
 }
@@ -700,14 +759,40 @@ fn sniff(bytes: &[u8]) -> &'static str {
 /// the client's own reports are full of `·` and `×`, and mangling those to make the filter
 /// simpler would cost the diagnostic to buy nothing. So the rule is exactly the hazard:
 /// anything `char::is_control` becomes a `.`, and the whole line is capped.
-fn printable(raw: &str) -> String {
+pub(crate) fn printable(raw: &str) -> String {
     const MAX: usize = 1000;
     let mut out: String =
-        raw.chars().take(MAX).map(|c| if c.is_control() { '.' } else { c }).collect();
+        raw.chars().take(MAX).map(|c| if is_unprintable(c) { '.' } else { c }).collect();
     if raw.chars().nth(MAX).is_some() {
         out.push('…');
     }
     out
+}
+
+/// Whether a character must not reach a terminal.
+///
+/// ⚠ **`char::is_control` is not enough, and the gap is not academic.** Rust defines it as
+/// Unicode category **Cc only** — `\0..=\x1f` and `\x7f..=\x9f`. It says nothing about
+/// category **Cf**, which carries U+202E RIGHT-TO-LEFT OVERRIDE and the U+2066..=U+2069
+/// isolates: a log line containing one renders *reversed* from that point on, so a forged
+/// suffix can be made to read as though it came first. U+200B ZERO WIDTH SPACE hides a
+/// segment outright. None of them is a control character by Rust's definition and every one
+/// of them defeats what this function exists to guarantee.
+///
+/// Category is not directly available without a Unicode table, so the ranges are named. They
+/// are the ones that alter *rendering*; the rest of Cf (a soft hyphen, a joiner) is inert in
+/// a log and left alone rather than replaced with a dot nobody can account for.
+fn is_unprintable(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            // Bidi overrides and embeddings, and the isolates that replaced them.
+            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            // The byte-order mark, which some terminals treat as a directional hint.
+            | '\u{feff}'
+            // Interlinear annotation, which hides what follows it.
+            | '\u{fff9}'..='\u{fffb}'
+        )
 }
 
 fn percent_decode(raw: &str) -> String {
@@ -729,10 +814,15 @@ fn percent_decode(raw: &str) -> String {
                     }
                 }
             }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
+            // ⚠ **`+` is a literal plus.** It means a space only in
+            // `application/x-www-form-urlencoded`, which is a *body* encoding — applying it
+            // to a path segment means a board named `C++ notes` decodes to `C  notes` and
+            // answers 404. The picker's own links are safe either way because
+            // `encodeURIComponent` emits `%2B`, so this only ever bit a hand-typed or copied
+            // URL: the exact case somebody hits once and cannot explain.
+            //
+            // The query string is decoded by this same function, and a token is hex, so
+            // nothing there wants the form rule either.
             other => {
                 out.push(other);
                 i += 1;
@@ -846,6 +936,10 @@ mod tests {
         assert_eq!(percent_decode("Cars%20%26%20Bikes"), "Cars & Bikes");
         assert_eq!(percent_decode("caf%C3%A9"), "café");
         assert_eq!(percent_decode("plain-name"), "plain-name");
+        // ⚠ A literal plus, not a space: that rule belongs to form bodies, and applying it
+        // here made a board called `C++ notes` unreachable by a hand-typed URL.
+        assert_eq!(percent_decode("C++ notes"), "C++ notes");
+        assert_eq!(percent_decode("C%2B%2B%20notes"), "C++ notes");
     }
 
     /// Decoding must not become a way out of the data directory.
@@ -861,6 +955,34 @@ mod tests {
         assert_eq!(decoded, "../../etc/passwd");
         // No file stem contains a separator, so this matches nothing in any listing.
         assert!(decoded.contains('/'), "the decode must not hide what it produced");
+    }
+
+    /// ⚠ **A tokenless loopback server must refuse a forwarded request.**
+    ///
+    /// The exemption exists so local development needs no secret, and the deployment the
+    /// hosting guide describes — TLS terminated by a reverse proxy, velmd on `127.0.0.1` —
+    /// is *also* a loopback bind. Written the obvious way, with no token because "it is only
+    /// on localhost", that publishes ~58 irreplaceable boards with no gate, and the startup
+    /// check stays quiet because the address really is loopback.
+    ///
+    /// Both halves are the assertion: a plain local request is still served, and a forwarded
+    /// one is not. Testing only the second would pass on a build that had simply removed the
+    /// exemption, which is a different behaviour with a different cost.
+    #[test]
+    fn a_tokenless_server_can_tell_a_local_request_from_a_forwarded_one() {
+        let local = std::collections::BTreeMap::from([
+            ("host".to_owned(), "127.0.0.1:8787".to_owned()),
+            ("user-agent".to_owned(), "curl/8".to_owned()),
+        ]);
+        assert!(!proxied(&local), "a genuine local request must still be answered");
+
+        for marker in ["x-forwarded-for", "x-real-ip", "forwarded", "X-Forwarded-For"] {
+            let through = std::collections::BTreeMap::from([
+                ("host".to_owned(), "boards.example.com".to_owned()),
+                (marker.to_owned(), "203.0.113.9".to_owned()),
+            ]);
+            assert!(proxied(&through), "{marker} must be recognised as a proxy");
+        }
     }
 
     #[test]
@@ -934,7 +1056,13 @@ mod tests {
     #[test]
     fn a_percent_encoded_report_decodes() {
         assert_eq!(percent_decode("1306%20items%20%C2%B7%206.1%25"), "1306 items · 6.1%");
-        assert_eq!(percent_decode("a+b"), "a b");
+        // ⚠ **This used to assert `"a b"`, and it was asserting the bug.** `+` means a space
+        // only in `application/x-www-form-urlencoded`, a *body* encoding. Every caller here
+        // builds its string with `encodeURIComponent`, which emits `%2B` for a plus and
+        // `%20` for a space — so nothing ever wanted the form rule, and applying it made a
+        // board named `C++ notes` unreachable by a hand-typed URL.
+        assert_eq!(percent_decode("a+b"), "a+b");
+        assert_eq!(percent_decode("a%2Bb"), "a+b");
         // A stray `%` is kept rather than swallowed: a report is a diagnostic, and losing a
         // character from one is worse than showing it oddly.
         assert_eq!(percent_decode("100% done"), "100% done");

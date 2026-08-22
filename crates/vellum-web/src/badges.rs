@@ -349,14 +349,12 @@ fn has_web_scheme(url: &str) -> bool {
 /// is what `vellum_project::look`'s header calls the failure that *"is never that the copies
 /// disagree on the day they are written; it is that one of them is changed a year later."*
 ///
-/// The colours handed over are inert: `text_slot` needs them for the slot it returns and the size
-/// does not depend on them. That is a slightly awkward call for a slightly good reason, and the
-/// durable fix is a `card_font_size` in `look` that both this and `crate::layout` read.
+/// ⚠ **Through `crate::layout::card_font_size`, never through `text_slot`.** `crate::card` asks
+/// *this* module where the badge is, in order to shorten a title that would sit under it — so a
+/// route back through the slot function would close a cycle, and under `panic = "abort"` an
+/// unbounded recursion is not an error anybody sees, it is the tab dying on the frame a link
+/// card first became visible. `card_font_size` exists to be the one derivation all three read.
 fn card_font_size(projected: &Projected) -> Option<f64> {
-    // ⚠ Not through `text_slot`, which now asks *this* module where the badge is in order to
-    // shorten a title that would sit under it. Going back through it would be unbounded
-    // recursion — and under `panic = "abort"` a stack overflow is the tab dying, not an error
-    // report. `crate::layout::card_font_size` exists to be the one derivation both can read.
     crate::layout::card_font_size(projected).map(f64::from)
 }
 

@@ -430,13 +430,25 @@ fn frame(version: &[u8], updates: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// A board id, bounded, for a log line.
+/// A board id, bounded **and stripped**, for a log line.
 ///
-/// It cannot carry a control character — `httparse` refuses a request target containing one,
-/// so the id never gets this far — but it can be as long as a request head allows, and a
-/// 16 KB line in an operator's log is a line nobody reads.
+/// ⚠ **This doc used to say a control character could not get here, and that stopped being
+/// true in the commit that made ids percent-decoded.** The reasoning was sound and was about
+/// somebody else's code: `httparse` refuses a raw control byte in a request target, so nothing
+/// could reach this. But `%0A` is three perfectly legal URI bytes, and the decode that makes
+/// *"BMW 2020 530i g30"* work turns them into a real newline **after** httparse has finished
+/// with the request.
+///
+/// So `POST /api/v1/boards/x%0Avelmd:%20token%20accepted/sync` wrote a second, forged line
+/// into the operator's log, indistinguishable from velmd's own — and `%1b` put ANSI escapes
+/// into their terminal. No board needed to exist: this is logged before the id is looked up.
+///
+/// This is the `locked: false` trap in its purest form: a comment that was a **true statement
+/// about an upstream fact**, invalidated by a change in a different function, breaking no
+/// test. The fix is not the truncation, which was always fine — it is that a string from the
+/// wire now goes through `printable` like every other one.
 fn short(id: &str) -> String {
-    id.chars().take(64).collect()
+    crate::serve::printable(&id.chars().take(64).collect::<String>())
 }
 
 #[cfg(test)]
@@ -659,6 +671,13 @@ mod tests {
     #[test]
     fn a_log_line_from_a_board_id_is_bounded() {
         assert_eq!(short("products"), "products");
+        // ⚠ The decode that makes a board named "BMW 2020 530i g30" reachable is also what
+        // lets `%0A` become a real newline here, after httparse has stopped looking.
+        assert_eq!(short("x\nvelmd: token accepted"), "x.velmd: token accepted");
+        assert_eq!(short("x\u{1b}[2J"), "x.[2J");
+        // Category Cf, which `char::is_control` does not cover: a bidi override renders the
+        // rest of the line backwards.
+        assert_eq!(short("a\u{202e}b"), "a.b");
         assert_eq!(short(&"x".repeat(9999)).chars().count(), 64);
     }
 }

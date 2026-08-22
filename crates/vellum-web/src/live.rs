@@ -630,10 +630,18 @@ fn merge(viewer: &mut Viewer, updates: &[Vec<u8>]) -> Result<usize, String> {
 #[wasm_bindgen]
 pub fn sync_status() -> String {
     crate::VIEWER.with(|slot| {
-        let Some(held) = slot.borrow().clone() else { return "off".to_owned() };
+        // ⚠ **`starting` and `off` are different answers and must not share a word.**
+        // Both used to be `"off"`: no viewer yet, and a viewer with no server behind it. A
+        // caller that removes its indicator on `"off"` — which is the right thing to do for a
+        // static page, where there is nothing to report and a permanently grey dot says less
+        // than no dot — then removed it on the *first tick after mounting*, because the bar is
+        // built before `boot` has finished and every board looked serverless for a moment.
+        // Measured: the indicator never appeared on a board that was syncing perfectly.
+        let Some(held) = slot.borrow().clone() else { return "starting".to_owned() };
         let Ok(viewer) = held.try_borrow() else { return "busy".to_owned() };
         match viewer.live.as_ref() {
             Some(live) => live.status().line(),
+            // A static `./board.bin` with no server behind it. Final, unlike `starting`.
             None => "off".to_owned(),
         }
     })

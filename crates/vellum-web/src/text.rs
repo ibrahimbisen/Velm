@@ -44,7 +44,6 @@ struct Key {
     /// written, and states the sharper half of the hazard: a *stale* slot draws the caret on
     /// one card while typing into another.
     slot: u16,
-    generation: u64,
     /// Font size in tenths of a **world** unit.
     ///
     /// World rather than device, so the key does not move with the camera. Keyed on a
@@ -55,16 +54,35 @@ struct Key {
     width_tenths: u32,
 }
 
+/// A shaped block, and which version of its item it was shaped from.
+///
+/// ⚠ **The generation is a *field*, not part of the key, and that distinction is the whole
+/// difference between a cache and a leak.** In the key, a changed item mints a new entry and
+/// leaves the old one behind — and nothing removes it while the item stays on screen, because
+/// `retain_visible` prunes by item. That was harmless while a board could not change: the
+/// stamp never moved. `crate::live` is what arms it — every merge calls
+/// `Projection::rebuild`, which restamps every item that changed — so a tab left open on a
+/// board somebody is editing accumulated one `Layout` per edit per visible item, for ever, in
+/// a linear memory that never returns to the OS.
+///
+/// As a field it *replaces*, which is what `vellum-app`'s `BlockKey` does and what this
+/// module's own siblings `shapes.rs` and `strokes.rs` already did. Only this one accumulated.
+struct Shaped {
+    generation: u64,
+    layout: Layout,
+}
+
 pub struct TextLayer {
     engine: TextEngine,
-    layouts: HashMap<Key, Layout>,
+    layouts: HashMap<Key, Shaped>,
     /// What an auto-fitted block resolved to, keyed on the item and the box it fits.
     ///
     /// Cached separately from the layout because it is *much* more expensive: a fit is a
     /// binary search that shapes the text about fourteen times, and it has to happen before
     /// the layout key can even be computed. Uncached it would run every frame, on every
     /// sticky on screen, for the life of the tab.
-    fitted: HashMap<(SceneId, u16, u64, u32, u32), f32>,
+    /// Keyed without the generation, for [`Shaped`]'s reason; the stamp rides in the value.
+    fitted: HashMap<(SceneId, u16, u32, u32), (u64, f32)>,
     /// Reused every frame. The glyph list is rebuilt per frame but its allocation is not.
     glyphs: Vec<(GlyphKey, GlyphImage)>,
     /// Blocks too small to shape, drawn as bars on the type's rhythm.
@@ -154,16 +172,6 @@ impl TextLayer {
         })
     }
 
-    /// Drop everything shaped for items that are no longer on screen.
-    ///
-    /// Without this the cache is a leak with a slow fuse: pan across a large board and every
-    /// block ever visible stays shaped, holding its glyph bitmaps, for the life of the tab —
-    /// and wasm linear memory never returns to the OS, so the peak becomes permanent.
-    /// ⚠ No early return on a size. It used to skip while `layouts.len() < 512`, and
-    /// `fitted` was gated on the same number — but a greeked block never inserts into
-    /// `layouts`, so on a fitted board `layouts` stays at **zero**, the guard fires every
-    /// frame, and `fitted` grows by one per auto-fitted item ever seen and is never released.
-    /// On a board with fewer than 512 text items neither map ever pruned at all.
     /// The shaper itself, for a layer that has to *measure* before it can lay anything out.
     ///
     /// ⚠ Handed out rather than duplicated, and that is the point. A mind map's geometry comes
@@ -176,6 +184,16 @@ impl TextLayer {
         &mut self.engine
     }
 
+    /// Drop everything shaped for items that are no longer on screen.
+    ///
+    /// Without this the cache is a leak with a slow fuse: pan across a large board and every
+    /// block ever visible stays shaped, holding its glyph bitmaps, for the life of the tab —
+    /// and wasm linear memory never returns to the OS, so the peak becomes permanent.
+    /// ⚠ No early return on a size. It used to skip while `layouts.len() < 512`, and
+    /// `fitted` was gated on the same number — but a greeked block never inserts into
+    /// `layouts`, so on a fitted board `layouts` stays at **zero**, the guard fires every
+    /// frame, and `fitted` grows by one per auto-fitted item ever seen and is never released.
+    /// On a board with fewer than 512 text items neither map ever pruned at all.
     pub fn retain_visible(&mut self, visible: &[SceneId]) {
         if self.layouts.is_empty() && self.fitted.is_empty() {
             return;
@@ -241,20 +259,23 @@ impl TextLayer {
         let key = Key {
             item,
             slot,
-            generation,
             size_tenths: (font_size * 10.0) as u32,
             width_tenths: (size[0] * 10.0) as u32,
         };
-        let layout = self.layouts.entry(key).or_insert_with(|| {
-            self.engine.layout(
+        // Reshaped when the item has changed under it, and **replaced rather than added**.
+        let stale = self.layouts.get(&key).is_none_or(|held| held.generation != generation);
+        if stale {
+            let layout = self.engine.layout(
                 text,
                 &LayoutParams {
                     font_size,
                     max_width: Some(size[0].max(1.0)),
                     ..Default::default()
                 },
-            )
-        });
+            );
+            self.layouts.insert(key, Shaped { generation, layout });
+        }
+        let layout = &self.layouts[&key].layout;
         // Rasterised at the size it will actually be drawn, which is what keeps a zoomed-in
         // glyph sharp rather than a magnified small one.
         // ⚠ The anchor is applied **after** shaping, because centring needs the laid-out
@@ -291,15 +312,17 @@ impl TextLayer {
         {
             return size;
         }
-        let key = (item, slot, generation, (size[0] * 10.0) as u32, (size[1] * 10.0) as u32);
-        if let Some(fitted) = self.fitted.get(&key) {
+        let key = (item, slot, (size[0] * 10.0) as u32, (size[1] * 10.0) as u32);
+        if let Some((stamp, fitted)) = self.fitted.get(&key)
+            && *stamp == generation
+        {
             return *fitted;
         }
         let area = vellum_text::FitBox::new(size[0].max(1.0), size[1].max(1.0));
         let params = LayoutParams { max_width: Some(area.width), ..Default::default() };
         let resolved =
             self.engine.fit_font_size(text, &params, area, &vellum_text::AutoFit::default());
-        self.fitted.insert(key, resolved);
+        self.fitted.insert(key, (generation, resolved));
         resolved
     }
 
@@ -338,7 +361,7 @@ impl TextLayer {
         self.glyphs.clear();
         let pending = std::mem::take(&mut self.pending);
         for (key, origin, zoom, _) in &pending {
-            let Some(layout) = self.layouts.get(key) else { continue };
+            let Some(layout) = self.layouts.get(key).map(|held| &held.layout) else { continue };
             let short = layout.glyphs().any(|glyph| {
                 let physical = glyph.physical((origin[0], origin[1]), *zoom).key;
                 atlas.slot(physical).is_none() && !atlas.is_blank(physical)
@@ -358,7 +381,7 @@ impl TextLayer {
 
         let mut drawn = 0;
         for (key, origin, zoom, color) in pending {
-            if let Some(layout) = self.layouts.get(&key) {
+            if let Some(layout) = self.layouts.get(&key).map(|held| &held.layout) {
                 list.push_layout(atlas, layout, origin, zoom, color);
                 drawn += 1;
             }

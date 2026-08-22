@@ -207,13 +207,13 @@
 
   <form class="panel" id="velm-connect" hidden>
     <label class="field" for="velm-server">Server address</label>
-    <!-- ⚠ `type="text"`, not `type="url"`. A bare `192.168.1.20:7777` fails the browser's own
+    <!-- ⚠ `type="text"`, not `type="url"`. A bare `192.168.1.20:8787` fails the browser's own
          url validation, and the form then refuses to submit behind a tooltip that says nothing
          about what is wrong — for the address most likely to be typed on a home network. -->
     <input id="velm-server" name="server" type="text" inputmode="url"
            autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"
            placeholder="velm.example.com">
-    <p class="hint">Where <code>velmd serve</code> is running. Its own default port is 7777.</p>
+    <p class="hint">Where <code>velmd serve</code> is running. Its own default port is 8787.</p>
 
     <label class="field" for="velm-passphrase">Passphrase</label>
     <input id="velm-passphrase" name="passphrase" type="password"

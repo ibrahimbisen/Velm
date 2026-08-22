@@ -814,19 +814,8 @@ impl ActiveState {
         self.forget_the_board_on_screen();
     }
 
-    // ----- link previews -----------------------------------------------------------
+    // ----- syncing with velmd -------------------------------------------------------
 
-    /// Applies everything the fetch pool has answered, once per frame.
-    ///
-    /// Each answer is folded over the card **field by field**, never wholesale: a page that
-    /// served a title and no image must not erase the provider name the host already gave, and
-    /// a card the user has since edited by hand must not be overwritten by a request that was
-    /// in flight while they did it. That is why the title is only written when the card has
-    /// none — a fetch fills gaps, it does not take over.
-    ///
-    /// One undo group for the batch. A fetch is not a thing the user did, so it should not cost
-    /// them a ⌘Z each — and grouping it means one ⌘Z puts the whole batch back if they dislike
-    /// what arrived.
     /// One sync tick: ask if it is time, then merge whatever has come back.
     ///
     /// Called every frame, next to [`Self::apply_link_fetches`], because it is the same
@@ -857,53 +846,127 @@ impl ActiveState {
     ///
     /// One `Option` test. `--sync-server` is not the default, so for anybody who has not
     /// asked for this the whole feature is a null check per frame and no thread.
+    /// How many consecutive failures to merge before receiving is paused and named.
+    ///
+    /// Three rather than one, because a single failure can be a truncated reply or a race,
+    /// and three rather than ten because each attempt costs a full projection rebuild.
+    const MERGE_ATTEMPTS: u32 = 3;
+
     pub(crate) fn apply_sync(&mut self) {
         if self.sync.is_none() {
             return;
         }
         self.attach_sync_to_hot_board();
 
-        // Asked first, and *outside* the group guard: a request is only a question, and
-        // pausing the conversation because somebody is mid-word would make a long edit look
-        // like a disconnection.
         if self.sync_is_due() {
-            if self.editor.sync_now()
-                && let Some(config) = self.sync.as_mut()
-            {
+            // ⚠ **`asked_at` moves whether or not the request went**, and that is not
+            // bookkeeping — it is what stops a silent hot loop. `Editor::sync_now` returns
+            // `false` *before* reaching `Sync::request` when `export_since` fails, so no
+            // backoff is armed inside `crate::sync`; without this the whole document would
+            // be re-exported on the very next frame, sixty times a second, logging a warning
+            // nobody is watching and never trying anything different.
+            self.editor.sync_now();
+            if let Some(config) = self.sync.as_mut() {
                 config.asked_at = Some(Instant::now());
             }
-            self.report_sync_failure();
         }
 
-        if self.busy_with_a_group() {
-            return;
-        }
-
-        for reply in self.editor.drain_sync() {
-            match reply {
-                crate::sync::SyncReply::Synced { updates, .. } => {
-                    // ⚠ `changes_the_board` rather than applying unconditionally. Once the
-                    // two sides agree every sync answers with nothing, and that is the steady
-                    // state rather than an error — but `apply_remote` goes through
-                    // `Editor::edit`, which reprojects the whole document and asks the
-                    // autosave writer for a delta. On a 1,300-item board, once every three
-                    // seconds, for an update that says nothing happened.
-                    if updates.is_empty() {
-                        continue;
-                    }
-                    if let Err(error) = self.editor.apply_remote(&updates) {
-                        self.failed("merging a change from the server", &error);
-                    } else {
-                        log::debug!("sync: merged {} bytes from the server", updates.len());
-                    }
+        // ⚠ **Drained every frame, before any guard, and this is a correction.**
+        //
+        // The first version drained *after* `busy_with_a_group`, reasoning that a reply left
+        // in the channel costs nothing. That is true of the reply and false of the
+        // conversation: `Sync::outstanding` is cleared **by** the drain, so one reply
+        // arriving during a held gesture wedged `is_ready()` and every later request was
+        // refused. Typing for four minutes stopped sync in both directions for four minutes;
+        // a caret left open while somebody walked away stopped it for good.
+        //
+        // What must still wait is the **apply**, and it waits in `SyncConfig::pending` where
+        // nothing can lose it. `crate::sync`'s header states the rule the old code was trying
+        // to honour — a reply drained and dropped is gone — and holding it is what honours it.
+        let arrived = self.editor.drain_sync();
+        if let Some(config) = self.sync.as_mut() {
+            for reply in arrived {
+                // `changes_the_board` rather than an inlined emptiness test. Once the two
+                // sides agree, every sync answers with nothing — the steady state, not an
+                // error — and queueing that would cost a full `Projection::rebuild` and an
+                // autosave delta on a 1,300-item board every period, for an update that says
+                // nothing happened. Its own doc comment asks to be the one derivation of
+                // this; inlining it here made that comment false.
+                if !reply.changes_the_board() {
+                    continue;
                 }
-                // Already logged and already backed off by `Sync::drain`. The toast is
-                // `report_sync_failure`'s job, so that a failure noticed here and a failure
-                // noticed there cannot say two different things.
-                crate::sync::SyncReply::Failed { .. } => {}
+                if let crate::sync::SyncReply::Synced { updates, .. } = reply {
+                    config.pending.push(updates);
+                }
             }
         }
         self.report_sync_failure();
+
+        // ⚠ **Not while a gesture is holding an undo group open.** The on-canvas caret and
+        // the eraser's sweep each hold one across many calls on purpose, so a typed word is
+        // one `⌘Z`. Trap 11 is what happens when something else opens one meanwhile — and
+        // unlike a command, a remote update is **not** something the user just asked for, so
+        // it waits rather than settling the edit. Ending somebody's half-typed sticky because
+        // another machine moved a frame is the worse bug.
+        if self.busy_with_a_group() {
+            return;
+        }
+        let Some(config) = self.sync.as_mut() else { return };
+        // Given up on: keep talking to the server — the version vector is still honest and a
+        // later update may merge fine — but stop reprojecting the board against bytes that
+        // have already failed three times. The queue is dropped rather than kept, or it grows
+        // without bound for the rest of the session.
+        if config.apply_failures >= Self::MERGE_ATTEMPTS {
+            config.pending.clear();
+            return;
+        }
+        let pending = std::mem::take(&mut config.pending);
+        for updates in pending {
+            match self.editor.apply_remote(&updates) {
+                Ok(()) => {
+                    log::debug!("sync: merged {} bytes from the server", updates.len());
+                    if let Some(config) = self.sync.as_mut() {
+                        config.apply_failures = 0;
+                    }
+                }
+                Err(error) => self.note_merge_failure(&error),
+            }
+        }
+    }
+
+    /// A remote update that would not merge.
+    ///
+    /// ⚠ **Through the same dedup a transport failure uses, and it did not used to be.**
+    /// This called `failed`, which toasts unconditionally — so the "once per distinct
+    /// sentence" rule the transport path is careful about did not cover this door at all.
+    /// And the loop is self-sustaining: `Sync::drain` clears the backoff on a `Synced` reply
+    /// *before* the caller applies it, because the round trip genuinely succeeded, and a
+    /// failed apply leaves the version vector where it was — so the server sends the same
+    /// bytes next period and they fail identically. A velmd built against an older
+    /// `vellum-doc` produced a toast every three seconds and a full `Projection::rebuild`
+    /// with it, for the life of the session.
+    ///
+    /// So: the sentence is deduped, and after [`Self::MERGE_ATTEMPTS`] consecutive failures the
+    /// applying stops and says so. **Stopping is the honest answer** — an update that will
+    /// not merge three times will not merge a fourth, and the alternative is a board that
+    /// silently reprojects itself for ever. Receiving resumes the moment one succeeds, which
+    /// it can, because the transport keeps running and a *later* update may be fine.
+    fn note_merge_failure(&mut self, error: &anyhow::Error) {
+        log::error!("sync: merging a change from the server: {error:#}");
+        let Some(config) = self.sync.as_mut() else { return };
+        config.apply_failures = config.apply_failures.saturating_add(1);
+        let detail = if config.apply_failures >= Self::MERGE_ATTEMPTS {
+            format!(
+                "a change from the server will not merge into this board ({error}). \
+                 Receiving is paused; the board on this machine is untouched."
+            )
+        } else {
+            format!("merging a change from the server: {error}")
+        };
+        if config.reported.as_deref() != Some(detail.as_str()) {
+            config.reported = Some(detail.clone());
+            self.shell.toast(Toast::error(format!("Sync: {detail}")));
+        }
     }
 
     /// Give the board on screen its round trip, if it has not got one.
@@ -970,6 +1033,19 @@ impl ActiveState {
         }
     }
 
+    // ----- link previews -------------------------------------------------------------
+
+    /// Applies everything the fetch pool has answered, once per frame.
+    ///
+    /// Each answer is folded over the card **field by field**, never wholesale: a page that
+    /// served a title and no image must not erase the provider name the host already gave, and
+    /// a card the user has since edited by hand must not be overwritten by a request that was
+    /// in flight while they did it. That is why the title is only written when the card has
+    /// none — a fetch fills gaps, it does not take over.
+    ///
+    /// One undo group for the batch. A fetch is not a thing the user did, so it should not cost
+    /// them a ⌘Z each — and grouping it means one ⌘Z puts the whole batch back if they dislike
+    /// what arrived.
     pub(crate) fn apply_link_fetches(&mut self) {
         // Ask for what is on screen and missing, then apply whatever has come back. In this
         // order so a card requested on one frame can land on the next.

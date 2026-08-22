@@ -486,10 +486,60 @@ impl Editor {
     /// edits, so `⌘Z` can never revert work that arrived from somewhere else. A local undo
     /// deleting a remote edit is the one way a CRDT can still lose somebody's work.
     pub fn apply_remote(&mut self, updates: &[u8]) -> Result<()> {
+        // ⚠ **RULE ZERO: one snapshot before anything from a network reaches this file.**
+        //
+        // `velmd` takes exactly this point before the first change any board ever receives
+        // from a browser, and the client needs it more, not less: these are the *originals*.
+        // `Board::apply` is documented non-undoable, so `⌘Z` cannot walk a bad merge back,
+        // and `edit` records straight through the autosave writer — by the time anything
+        // looks wrong it is already on disk. Without this the only way back from a sync
+        // pointed at the wrong server, or from two boards that happen to share a file stem,
+        // is a copy the user thought to make first.
+        //
+        // Once per board **ever**, not once per launch: the check is a scan of the board's
+        // own restore points for the label, which `BoardDb::restore_points` answers without
+        // reading a single snapshot's bytes.
+        self.take_restore_point_before_the_first_merge();
         self.edit(|board| {
             board.apply(updates)?;
             Ok(())
         })
+    }
+
+    /// What that snapshot is called.
+    ///
+    /// A **labelled** point rather than an automatic one, for the reason velmd gives for its
+    /// own: an automatic point is eligible for pruning, and this is the thing being kept.
+    /// The label is also how the check knows it has already been taken.
+    const BEFORE_SYNC: &'static str = "before the first change from another machine";
+
+    /// Snapshot the board, unless one is already there.
+    ///
+    /// **Reported and continued rather than propagated.** A failure here must not stop the
+    /// merge: the alternative to an unprotected sync is not a protected one, it is a board
+    /// that silently stops receiving — and the user would find out about that much later than
+    /// about a warning in the log. It is loud rather than silent for the same reason.
+    fn take_restore_point_before_the_first_merge(&mut self) {
+        let Some(autosave) = self.autosave.as_mut() else { return };
+        match autosave.restore_points() {
+            Ok(points) => {
+                if points.iter().any(|point| point.label.as_deref() == Some(Self::BEFORE_SYNC)) {
+                    return;
+                }
+            }
+            Err(error) => {
+                log::error!("sync: cannot read this board's restore points ({error}); \
+                             merging anyway, but there is no snapshot to go back to");
+                return;
+            }
+        }
+        match autosave.create_restore_point(&self.board, Self::BEFORE_SYNC) {
+            Ok(id) => log::info!("sync: restore point {id} taken before the first merge"),
+            Err(error) => log::error!(
+                "sync: could not take a restore point before merging ({error}); \
+                 merging anyway, but there is no snapshot to go back to"
+            ),
+        }
     }
 
     // ----- selection -------------------------------------------------------

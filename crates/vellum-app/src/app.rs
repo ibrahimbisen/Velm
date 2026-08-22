@@ -137,6 +137,24 @@ pub(crate) struct SyncConfig {
     pub(crate) asked_at: Option<Instant>,
     /// The last failure already put in front of the user.
     pub(crate) reported: Option<String>,
+    /// Updates that have arrived and are waiting for a gesture to end.
+    ///
+    /// ⚠ **Held here rather than left in the channel, and that is a correction rather than a
+    /// preference.** The first version guarded `busy_with_a_group` *before* draining, on the
+    /// reasoning that a reply left in the channel costs nothing — which is true of the reply
+    /// and false of the conversation: `Sync::outstanding` is cleared **by** the drain, so a
+    /// caret held open stopped every later request from going at all. Typing for four minutes
+    /// stopped sync in both directions for four minutes, and a caret left open while somebody
+    /// walked away stopped it indefinitely. The drain has to happen every frame; what has to
+    /// wait is the *apply*.
+    pub(crate) pending: Vec<Vec<u8>>,
+    /// Consecutive updates that would not merge.
+    ///
+    /// A remote update that fails to apply leaves the client's version vector where it was,
+    /// so the server sends the same bytes next period and they fail again — and each attempt
+    /// costs a full `Projection::rebuild` through `Editor::edit`'s error path. Counted so the
+    /// loop can be stopped and *named* rather than run for the life of the session.
+    pub(crate) apply_failures: u32,
 }
 
 pub(crate) struct ActiveState {
@@ -712,7 +730,7 @@ impl Vellum {
         // Refusing to start over it would take away the board library, which is the only
         // screen from which the mistake could be corrected.
         let sync = self.options.sync.clone().map(|config| {
-            let token = crate::options::sync_token().unwrap_or_default();
+            let token = crate::options::take_sync_token().unwrap_or_default();
             if token.is_empty() && !crate::options::is_loopback(&config.server) {
                 log::warn!(
                     "sync: {} is not a loopback address and ${} is not set, so every request \
@@ -722,7 +740,14 @@ impl Vellum {
                 );
             }
             log::info!("sync: {} every {}s", config.server, config.period);
-            SyncConfig { options: config, token, asked_at: None, reported: None }
+            SyncConfig {
+                options: config,
+                token,
+                asked_at: None,
+                reported: None,
+                pending: Vec::new(),
+                apply_failures: 0,
+            }
         });
 
         let mut state = ActiveState {

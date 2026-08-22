@@ -65,10 +65,11 @@ struct Contact {
     /// [`ratio`], and nowhere else.
     x: f64,
     y: f64,
-    /// Where this finger first landed, so a release can ask whether it is a tap or the end
-    /// of a drag. A pan that happens to finish over a card must not open it.
-    start_x: f64,
-    start_y: f64,
+    /// How far this finger has travelled since it landed, summed over every move.
+    ///
+    /// A tap is decided from this rather than from the distance between where it went down
+    /// and where it came up — see the release handler for why those are different questions.
+    travelled: f64,
 }
 
 /// How far a finger or a cursor may travel and still count as a tap. CSS pixels.
@@ -93,7 +94,7 @@ impl Contacts {
     /// A new contact, from `pointerdown` and nowhere else.
     fn press(&mut self, id: i32, x: f64, y: f64) {
         if !self.moved(id, x, y) {
-            self.down.push(Contact { id, x, y, start_x: x, start_y: y });
+            self.down.push(Contact { id, x, y, travelled: 0.0 });
             if self.down.len() >= 2 {
                 self.ever_multi = true;
             }
@@ -113,6 +114,7 @@ impl Contacts {
     fn moved(&mut self, id: i32, x: f64, y: f64) -> bool {
         match self.down.iter_mut().find(|c| c.id == id) {
             Some(existing) => {
+                existing.travelled += (x - existing.x).hypot(y - existing.y);
                 existing.x = x;
                 existing.y = y;
                 true
@@ -298,7 +300,11 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                     return;
                 }
                 // A pan that finishes over a card is not a request to open it.
-                if (contact.x - contact.start_x).hypot(contact.y - contact.start_y) > TAP_SLOP {
+                // ⚠ **Path length, not displacement.** A pan that wanders out and comes
+                // back near where it began has a displacement of nearly zero, so a
+                // straight-line test calls it a tap and opens whatever card it happens to
+                // finish over. The distance travelled cannot be undone by coming back.
+                if contact.travelled > TAP_SLOP {
                     return;
                 }
                 let ratio = ratio();
@@ -313,6 +319,18 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                         .scene()
                         .hit_test(world)
                         .and_then(|id| viewer.projection.get(id))
+                        // ⚠ **The same guard both paint passes apply, and it has to be here
+                        // too.** `Scene::hit_test` knows nothing about frames — `frame.rs`'s
+                        // own doc says a clipped item is still returned — so without this a
+                        // tap on visually empty board can open the page of a card that is not
+                        // drawn there. It is reachable: a frame *resized* past its children
+                        // on the Mac leaves them clipped and persisted (a resize does not
+                        // carry a frame's contents, deliberately), and opening a page is the
+                        // only verb this viewer has, so there is no harmless version of a
+                        // stray hit.
+                        .filter(|projected| {
+                            !vellum_project::frame::clipped_by_frame(projected, &viewer.projection)
+                        })
                         .and_then(|projected| crate::badges::pressed(projected, world))
                 };
                 // ⚠ **Opened here, synchronously inside the handler.** `window.open` needs

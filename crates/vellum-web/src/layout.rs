@@ -108,42 +108,16 @@ pub fn text_slot(projected: &Projected, text: Rgba, muted: Rgba) -> Option<TextS
             })
         }
 
-        // A card's words sit under its picture band, inset, at a size the card chooses —
-        // **explicitly, not auto-fitted**. A card's text is a label at a fixed scale, and
-        // auto-fitting it makes a short title enormous and a long one microscopic.
-        ItemKind::LinkPreview { .. } | ItemKind::Embed { .. } | ItemKind::Document { .. } => {
-            let pad = w * CARD_PADDING;
-            let band = if has_picture(&projected.item.kind) { h * CARD_IMAGE_FRACTION } else { pad };
-            let top = bounds.min.y + band + pad;
-            let height = (bounds.max.y - pad - top).max(1.0);
-            let size = card_font_size(projected).unwrap_or(11.0);
-            // ⚠ **The words yield to the ↗ badge, and only when they actually share a row.**
-            // On a card with no picture the text starts at the very top, where the badge is,
-            // so a full-width slot puts the title under the button. Paint order cannot save
-            // it and it is worth saying why: glyphs are flushed after the loop, in the screen
-            // view, so the title draws *over* the plate whichever is pushed first.
-            //
-            // Conditional rather than unconditional, which is `draw.rs`'s own rule for the
-            // same collision: a card *with* a picture starts its words far below the badge,
-            // and shortening every one of them makes every title on the board mysteriously
-            // narrow for a collision that cannot happen.
-            let width = match crate::badges::badge(projected) {
-                Some(badge) if badge.max.y > top => {
-                    (badge.min.x - pad * 0.5 - (bounds.min.x + pad)).max(1.0)
-                }
-                _ => (w - pad * 2.0).max(1.0),
-            };
-            Some(TextSlot {
-                rect: WorldRect::from_origin_size(
-                    vellum_scene::WorldPoint::new(bounds.min.x + pad, top),
-                    width,
-                    height,
-                ),
-                anchor: Anchor::TopLeft,
-                color: colour,
-                font_size: Some(size),
-            })
-        }
+        // ⚠ **A card's words are not reached from here, and the arm that used to try is
+        // gone.** `ItemKind::text()` answers `None` for `LinkPreview`, `Embed` and
+        // `Document`, and the caller's `let Some(styled) = kind.text() else { continue }`
+        // sits *above* this function — so the arm that stood here had never once executed,
+        // constants, comments, badge-collision logic and all. `crate::card` is where a card's
+        // three voices are decided now, and it is queued from its own loop.
+        //
+        // Deleted rather than left with a note, because a match arm that cannot be reached
+        // reads as the thing that drives the feature: the next person to change how a card
+        // is laid out would edit it and watch nothing happen.
 
         _ => projected.item.kind.text().map(|_| TextSlot {
             rect: bounds,
@@ -188,9 +162,7 @@ pub fn picture(projected: &Projected) -> Option<PictureSlot> {
     }
 }
 
-fn has_picture(kind: &ItemKind) -> bool {
-    matches!(kind, ItemKind::LinkPreview { thumbnail: Some(_), .. })
-}
+
 
 fn inset(rect: WorldRect, x: f64, y: f64) -> WorldRect {
     let (w, h) = ((rect.width() - x * 2.0).max(1.0), (rect.height() - y * 2.0).max(1.0));

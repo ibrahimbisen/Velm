@@ -117,6 +117,11 @@ pub fn import(from: &Path, data: &Path) -> anyhow::Result<()> {
                 target.display()
             );
         }
+        // RULE ZERO: `copy` truncates, so this is a destructive call wearing an innocent
+        // name — and the guard is the `bail!` immediately above, not this line. `target`
+        // cannot exist by the time we get here: an identical file was skipped earlier by
+        // hash, and a *differing* one is refused by name rather than replaced. So the only
+        // file this ever writes is one that was not there.
         std::fs::copy(&source, &target)
             .map_err(|e| anyhow::anyhow!("copying {}: {e}", entry.path))?;
         copied += 1;
@@ -189,7 +194,24 @@ pub fn export_blobs(board_path: &Path, blobs: &Path, out: &Path) -> anyhow::Resu
 
     std::fs::create_dir_all(out)?;
     let (mut copied, mut absent) = (0usize, 0usize);
+    let mut malformed = 0usize;
     for hash in wanted.keys() {
+        // ⚠ **Parsed, never trusted, because this string comes out of a document.**
+        //
+        // An `asset_id` is board content, and `POST /sync` lets a client merge whatever it
+        // likes into a board — so `asset_id = "../../../../tmp/x"` is a thing somebody can
+        // put there and then wait for an operator to run `velmd blobs`. Joined unparsed, that
+        // wrote a file outside `--out`. The HTTP route at `serve.rs`'s `blob` has always
+        // parsed strictly and is total; this path was the sibling that did not, which is
+        // feedback 35's rule exactly.
+        //
+        // `Hash::from_hex` accepts exactly 64 hex characters, so every traversal spelling —
+        // `..`, a separator, a NUL, an absolute path, a `~` — fails to parse rather than
+        // being filtered. That is the difference between a check and a guarantee.
+        if hash.parse::<vellum_store::Hash>().is_err() {
+            malformed += 1;
+            continue;
+        }
         // The store's own layout: two hex characters of shard, then the full hash.
         let Some(shard) = hash.get(..2) else { continue };
         let source = blobs.join(shard).join(hash);
@@ -201,6 +223,10 @@ pub fn export_blobs(board_path: &Path, blobs: &Path, out: &Path) -> anyhow::Resu
         if target.exists() {
             continue;
         }
+        // RULE ZERO: `copy` truncates, and the `exists` check above is what makes that
+        // harmless — nothing already in `--out` is ever written over. `out` is an export
+        // directory rather than a board directory, and the name is a content hash that has
+        // just been parsed, so a file that is there already holds exactly these bytes.
         std::fs::copy(&source, &target)?;
         copied += 1;
     }
@@ -208,6 +234,11 @@ pub fn export_blobs(board_path: &Path, blobs: &Path, out: &Path) -> anyhow::Resu
         "{} asset(s) referenced · {copied} copied · {absent} not in the store",
         wanted.len()
     );
+    // Named rather than silent: an id that is not a hash means either a board written by
+    // something else or an attempt at one of the paths above, and both are worth seeing.
+    if malformed > 0 {
+        println!("{malformed} asset id(s) were not valid hashes and were skipped");
+    }
     Ok(())
 }
 

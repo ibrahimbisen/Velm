@@ -65,7 +65,7 @@ function bareHost(hostname) {
  *
  * Two rules hang off this and they pull in opposite directions, which is why it is one
  * function: a browser will **not** block `http://localhost` as mixed content, and it **will**
- * grant it a secure context, so `http://localhost:7777` is the one http address where all of
+ * grant it a secure context, so `http://localhost:8787` is the one http address where all of
  * this simply works. Everything else on http is a page that loads and draws nothing
  * (`docs/08-web.md` §5).
  */
@@ -109,7 +109,7 @@ export function isPrivateHost(hostname) {
  * Turn whatever somebody typed into a base URL, or refuse.
  *
  * ⚠ **The scheme test requires `://`, and that is not pedantry.** `/^[a-z][a-z0-9+.-]*:/`
- * matches `localhost:7777` — `localhost` is a perfectly good scheme name — so a bare host and
+ * matches `localhost:8787` — `localhost` is a perfectly good scheme name — so a bare host and
  * port would have been parsed as a protocol and thrown away the port. Requiring the slashes is
  * what tells a scheme from a port.
  *
@@ -400,7 +400,7 @@ export function describeFailure(context) {
     return {
       want: 'server',
       title: 'That address answered, but it is not a Velm server.',
-      detail: `${host} did not answer /api/v1/health with a velmd version. Check the address, and the port — velmd's own default is 7777.`,
+      detail: `${host} did not answer /api/v1/health with a velmd version. Check the address, and the port — velmd's own default is 8787.`,
     };
   }
 
@@ -544,7 +544,7 @@ export function mount(options = {}) {
         detail:
           typed.reason === 'scheme'
             ? 'Only http:// and https:// addresses can hold boards.'
-            : 'Something like https://boards.example.com, or 192.168.1.20:7777 on your own network.',
+            : 'Something like https://boards.example.com, or 192.168.1.20:8787 on your own network.',
       });
       el.server.focus();
       return;

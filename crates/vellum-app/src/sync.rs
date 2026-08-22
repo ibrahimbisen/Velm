@@ -215,7 +215,7 @@ pub struct Sync {
 impl Sync {
     /// Starts the worker. It lives for the process and idles on an empty channel.
     ///
-    /// `server` is the origin, with or without a trailing slash — `http://127.0.0.1:7777` or
+    /// `server` is the origin, with or without a trailing slash — `http://127.0.0.1:8787` or
     /// `https://boards.example.com`. `token` is velmd's bearer token and **may be empty**: a
     /// server bound to loopback needs none, and velmd refuses to bind a public address
     /// without one, so "no token" is a legitimate configuration rather than a mistake.
@@ -756,8 +756,8 @@ mod tests {
     #[test]
     fn a_board_name_with_spaces_survives_the_url() {
         assert_eq!(
-            endpoint_for("http://127.0.0.1:7777", "BMW 2020 530i g30"),
-            "http://127.0.0.1:7777/api/v1/boards/BMW%202020%20530i%20g30/sync"
+            endpoint_for("http://127.0.0.1:8787", "BMW 2020 530i g30"),
+            "http://127.0.0.1:8787/api/v1/boards/BMW%202020%20530i%20g30/sync"
         );
         // A trailing slash on the configured origin must not double.
         assert_eq!(
