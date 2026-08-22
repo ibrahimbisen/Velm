@@ -531,6 +531,81 @@ that step for whichever provider you pick.
 
 ---
 
+## Part 6 — Let the Mac sync with the server
+
+Everything up to here gets your boards **onto** the server and into a browser. This is what
+keeps them in step afterwards, so a change made on the Mac appears in the browser and a change
+made in the browser comes back — without copying anything by hand again.
+
+**You only do this once.** After it, the Mac just works.
+
+⚠️ **Do Part 5 first.** This is the first thing in the whole guide that changes a board
+automatically, and a backup you have actually restored is what makes that safe to switch on.
+
+### Step 31 — Tell the Mac where the server is (YOU)
+
+Open **Terminal on your Mac** — not the server — and run these two lines, replacing the
+address with your own and the long token with the one from step 12:
+
+```bash
+echo 'export VELM_SYNC_TOKEN="paste-your-token-here"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+⚠️ **The token goes in an environment variable and there is deliberately no option for it.**
+Anything you type as a command-line option is visible to every other program on the machine,
+and this token is the only thing standing between a stranger and every board you own.
+
+### Step 32 — Start Velm with syncing on (YOU)
+
+```bash
+/Applications/Velm.app/Contents/MacOS/vellum-app --sync-server https://boards.YOURDOMAIN.com
+```
+
+**What should happen:** Velm opens normally. Nothing looks different — that is correct. Within
+about three seconds the board you have open and the one on the server have agreed with each
+other.
+
+**To check it worked:** move a sticky on the Mac, wait five seconds, then reload the board in
+your browser. It should have moved there too. Then do the reverse if you have a second
+computer.
+
+**If a red message appears saying `Sync: …`,** the sentence after the colon is the actual
+problem — `connection refused` means the server is not running or the address is wrong,
+`401` means the token does not match. It appears **once**, not every few seconds.
+
+### Step 33 — Make it the normal way you open Velm (YOU)
+
+Clicking the Velm icon in your Dock does **not** pass the option, so it opens without syncing.
+Two ways to fix that, and the first is simpler:
+
+**Either** make a small launcher: open **Script Editor**, paste this, and save it as an
+Application called `Velm` on your Desktop —
+
+```applescript
+do shell script "export VELM_SYNC_TOKEN='paste-your-token-here'; \
+open -a Velm --args --sync-server https://boards.YOURDOMAIN.com"
+```
+
+**Or** just run the Terminal line from step 32 whenever you want syncing, and click the icon
+when you do not. Both are fine; nothing breaks either way, because a board that has been
+offline for a week catches up the moment it next syncs.
+
+### What syncing does and does not do
+
+- **Nothing is ever deleted by syncing.** A Loro update can only *add* what it knows; it has
+  no way to remove what it has not seen. Two computers that disagree end up with both sets of
+  changes, never with one wiped.
+- **Undo stays yours.** Pressing ⌘Z on the Mac can never undo something done on another
+  computer. That is deliberate: a local undo deleting somebody else's work is the one way this
+  kind of syncing can still lose something.
+- **It waits while you are typing.** A change arriving from the server never interrupts a word
+  you are in the middle of; it lands the moment you finish.
+- **A board with no file has nothing to sync** — a bench board, or an import you have not
+  saved. It is simply left alone.
+- **Only the board in front syncs.** Boards in your other tabs catch up when you switch to
+  them, which takes about three seconds and needs nothing from you.
+
 ## The short list to remember
 
 - **The Mac's boards are never touched by any of this.** Keep them. Forever.
@@ -568,9 +643,13 @@ Written down so nothing above reads as a promise it does not keep:
 | Open your boards from any computer, over HTTPS | **built** |
 | iPad, Safari, one finger to pan and two to pinch | **built** (iPadOS 26+) |
 | Stickies, frames, text, pictures, pen strokes, connectors | **built** |
-| Shapes | **partly** — a filled box in the right colour and the right place; an ellipse or a flowchart form is not yet drawn as its own outline |
-| Bold, links and per-run text colour | **not built** — text draws in one weight and one colour |
-| Editing a board in a browser | **not built** — the desktop app only |
-| Two-way syncing between the Mac and the server | **not built** — Part 2 is how a change crosses today |
+| Shapes — all 41, including the flowchart forms | **built** |
+| Bold, links and per-run text colour | **built** |
+| Tables, charts, mind maps and kanban boards | **built** |
+| The ↗ button on a link card, and ▶ on a video card | **built** |
+| A list of your boards to pick from | **built** |
+| Two-way syncing between the Mac and the server | **built** — Part 6, and Part 2 is only the first crossing |
+| The browser keeping up on its own, without a reload | **built** |
+| Editing a board in a browser | **not built** — the desktop app only. This is on purpose: a browser tab can be closed by the phone or the iPad with no warning and no chance to save, and a tab holding the only recent copy of a board is exactly what must not happen |
 | The Agent Canvas in a browser | **not built**, and deferred by choice |
 | Miro import in a browser | **not built** — it needs the desktop app's importer |

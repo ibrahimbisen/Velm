@@ -289,23 +289,60 @@ The review's own six high findings, kept because each is a shape rather than a s
 - **A RULE ZERO guard that disabled itself** whenever `$HOME` was unset, which is every
   systemd unit. A guard whose failure mode is *permit* is not a guard.
 
-## 9. Still unproven
+## 9. What is built, what is not, and what is merely untested
 
-Treat these as unknown rather than done:
+⚠ **This section is a ledger with a date on it, and `CLAUDE.md` feedback 37 is the reason to
+say so: a ledger written by the session that built the thing was wrong in both directions.**
+Everything below was re-checked on 2026-08-22 by running it, not by reading it.
+
+### Built and measured
+
+- **Every item kind on a real board draws with its own geometry.** Ink, connectors, all 41 SDF
+  shapes, images, text, and — new — tables, charts, mind maps and kanban boards. Verified by
+  photographing the four widget demos in Brave beside the desktop app's own render of the same
+  board files: the bar/line/area/donut charts are indistinguishable, the kanban carries its
+  WIP limits, the mind map draws all four layout forms, the table auto-fits its columns.
+- **Per-run text styling survives**, through `vellum_project::runs::convert` — the same
+  conversion the desktop painter makes, in the crate both front ends share.
+- **The ↗ badge and the ▶ play button**, drawn *and* pressable. Measured on the `links`
+  fixture: ↗ on all five cards, ▶ on exactly one — the video — which is `plays_video` being a
+  host list rather than "has a thumbnail".
+- **Frame clipping**, in both the geometry and the text pass, from
+  `vellum_project::frame::clipped_by_frame`. Before this the two applications drew different
+  boards: an item dragged off a frame was hidden on the Mac and still drawn in a tab.
+- **A board picker** at `boards.html`, which is the front door that did not exist.
+- **Two-way sync.** Measured three ways against copies with a scratch `HOME`: 41 shapes placed
+  on the Mac took the server from 1089 to 1130 items; a stale copy synced up to 1130; and a
+  live Brave tab merged an edit made on the Mac with no reload — `velm sync: merged 1
+  update(s)`, fourteen times as the edits streamed in.
+
+### Deliberately not built
+
+- **The client never sends.** It receives changes and merges them; there is no delta parameter
+  anywhere in `live.rs`, so read-only is structural rather than conventional. This is the RULE
+  ZERO posture and not a gap to close casually — a tab the OS can kill with no flush, holding
+  the only recent copy of an irreplaceable board, is exactly what RULE ZERO forbids.
+- **The Agent Canvas is absent**, deferred by the user's own direction.
+
+### Untested rather than working
 
 - **iPad jetsam survival is unmeasured.** wasm linear memory never returns to the OS, so peak
   becomes permanent, and Safari can kill a background tab with no warning.
-- **The client is a reader.** No editing, no sync, so a board changed on the Mac has to be
-  copied across again for the server to see it. That is the RULE ZERO posture and not a gap to
-  close casually — a tab the OS can kill with no flush, holding the only recent copy of an
-  irreplaceable board, is exactly what RULE ZERO forbids.
-- **Per-run text styling is flattened.** `vellum_doc::StyledText` becomes one plain run, so
-  bold, links and per-run colour do not survive. `draw.rs` does the real conversion per item
-  kind, and that work belongs with the painter rather than here.
-- **Only two item kinds are drawn with their own geometry** — ink and connectors. Everything
-  else falls to `push_scene_item`'s one solid quad plus its picture and its words, which is
-  close for a sticky and a frame and wrong for the 41 SDF shapes and for a link card's real
-  three-voice layout.
-- **The Agent Canvas is absent**, deferred by the user's own direction.
 - **`velmd` has been run on macOS only.** Nothing in it is platform-specific and it is meant
   for Linux, but "meant for" is not "measured on".
+- **Nothing has been served over HTTPS from a real domain.** Every measurement here is
+  loopback, which is a secure context by exemption — so the one thing the whole hosting guide
+  turns on has not been exercised.
+- **The `?token=` in a board link lands in browser history.** A navigation cannot carry a
+  header, which is why the query form exists at all. `boards.html` scrubs it out of the
+  address bar with `replaceState`; it cannot scrub the entry.
+
+### One bug worth remembering, because of how it hid
+
+⚠ **`velmd` never percent-decoded a board id, so nearly every board answered 404.** A browser
+sends `encodeURIComponent`, so *"BMW 2020 530i g30"* arrived as `BMW%202020%20530i%20g30` and
+matched nothing. Measured before the fix: **404** on the encoded id, **200 and 931,984 bytes**
+on a one-word stem of the same board file. It survived because the development board had a
+one-word name — so the failure looked like a problem with *particular boards* rather than with
+every name that has a space in it, which is most of this user's. It was found by tracing
+sync's URL, not by using the client.
