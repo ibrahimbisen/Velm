@@ -473,9 +473,16 @@ impl Viewer {
             let Some(projected) = self.projection.get(item.id) else { continue };
             let Some(styled) = projected.item.kind.text() else { continue };
             let top_left = self.camera.world_to_screen(projected.bounds.min);
+            // ⚠ The box is in **world** units, not screen pixels, and this is the whole bug
+            // the first version had. Shaping with a world-unit font size against a
+            // screen-pixel wrap width means the wrap width moves with the zoom while the
+            // font size does not, so the text re-wraps at every zoom level and the block
+            // visibly changes size and position as you scroll. Shape once in world space;
+            // `push_layout`'s `scale` then magnifies the finished layout uniformly, which is
+            // how `vellum-app` has always done it.
             let size = [
-                (projected.bounds.width() as f32) * zoom,
-                (projected.bounds.height() as f32) * zoom,
+                projected.bounds.width() as f32,
+                projected.bounds.height() as f32,
             ];
             let font_size = projected
                 .item

@@ -34,10 +34,13 @@ use vellum_text::{GlyphImage, GlyphKey, Layout, LayoutParams, StyledText, TextEn
 struct Key {
     item: SceneId,
     generation: u64,
-    /// Font size in tenths of a pixel. Quantised because zoom is continuous: keying on the
-    /// exact `f32` would miss on every frame of a pinch and reshape the whole board.
+    /// Font size in tenths of a **world** unit.
+    ///
+    /// World rather than device, so the key does not move with the camera. Keyed on a
+    /// device size, a layout would be re-shaped on every frame of a zoom -- which is both
+    /// the cost the cache exists to avoid and, worse, a visible re-wrap.
     size_tenths: u32,
-    /// Wrap width, same quantisation and the same reason.
+    /// Wrap width, in world units for the same reason.
     width_tenths: u32,
 }
 
@@ -98,12 +101,14 @@ impl TextLayer {
         text: &StyledText,
         // Top-left of the text box, in the same camera-relative pixels the quads use.
         origin: [f32; 2],
-        // Box size in the same space, so wrapping matches what is on screen.
+        // Box size in **world** units. Shaping is zoom-independent; only the draw scales.
         size: [f32; 2],
         font_size: f32,
         zoom: f32,
         color: Rgba,
     ) -> bool {
+        // The skip test is in *device* pixels -- that is what "too small to read" means --
+        // even though everything shaped below is in world units.
         if text.is_empty() || font_size * zoom < MIN_DEVICE_FONT_SIZE {
             return false;
         }
