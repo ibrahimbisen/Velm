@@ -23,7 +23,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use vellum_render::{ImageSource, TextureId, TextureManager};

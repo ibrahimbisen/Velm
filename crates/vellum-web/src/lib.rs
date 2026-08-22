@@ -38,8 +38,16 @@ use vellum_project::project::Projection;
 use vellum_render::{DrawList, Renderer, Rgba, View};
 use vellum_scene::{Camera, ScreenSize, SceneItem};
 
+/// How much slack a fitted board leaves around itself, as a fraction of its own extent.
+///
+/// The same 0.02 `vellum_app::FIT_MARGIN` uses. Duplicated rather than imported because
+/// `vellum-app` does not compile for this target at all — and two bytes of constant is a
+/// better dependency than a crate with SQLite and a native menu bar in it.
+const FIT_MARGIN: f64 = 0.02;
+
 mod images;
 mod input;
+mod strokes;
 mod text;
 
 /// Everything a frame needs, once startup has resolved.
@@ -61,6 +69,7 @@ struct Viewer {
     clear: Rgba,
     text: text::TextLayer,
     images: images::ImageLayer,
+    strokes: strokes::StrokeLayer,
 }
 
 thread_local! {
@@ -160,7 +169,12 @@ async fn boot(canvas_id: &str, board_url: &str) -> Result<(), String> {
     let (width, height) = size_of(&canvas, &window);
     let mut camera = Camera::new(ScreenSize::new(width as f64, height as f64));
     if let Some(bounds) = projection.content_bounds() {
-        camera.fit_to_rect(bounds, 40.0);
+        // ⚠ **A fraction of the rect, not a margin in pixels.** This shipped as `40.0`,
+        // meaning eighty-one times the board's own size, which drove the fit below
+        // `MIN_ZOOM` and clamped — so every board opened at exactly 1.0% with its content
+        // in a small clump in the middle, and the round number is the tell. Native's
+        // `FIT_MARGIN` is 0.02 and this matches it, so a board opens the same way in both.
+        camera.fit_to_rect(bounds, FIT_MARGIN);
     }
 
     let format = surface
@@ -193,6 +207,7 @@ async fn boot(canvas_id: &str, board_url: &str) -> Result<(), String> {
         clear,
         text: text::TextLayer::new()?,
         images: images::ImageLayer::new("./blobs/"),
+        strokes: strokes::StrokeLayer::new(),
     }));
 
     // Prove the board actually drew, rather than trusting that it did.
@@ -208,12 +223,29 @@ async fn boot(canvas_id: &str, board_url: &str) -> Result<(), String> {
     input::attach(&canvas, Rc::clone(&viewer));
     VIEWER.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&viewer)));
 
+    // The status line names the camera as well as the count, and that is not decoration:
+    // every screenshot taken of this page afterwards is self-describing. A board that draws
+    // in one small clump is either a bad fit or a wide-but-empty extent, and those two look
+    // identical in a photograph and are told apart by one number.
+    let view = {
+        let viewer = viewer.borrow();
+        let bounds = viewer.projection.content_bounds();
+        match bounds {
+            Some(rect) => format!(
+                " · {:.1}% · board {:.0}x{:.0}",
+                viewer.camera.zoom() * 100.0,
+                rect.width(),
+                rect.height()
+            ),
+            None => String::new(),
+        }
+    };
     report(&match drawn {
         Some(painted) if painted > 0 => {
-            format!("{items} items · {painted} pixels painted · rendering")
+            format!("{items} items · {painted} pixels painted{view}")
         }
-        Some(_) => format!("{items} items · NOTHING PAINTED — the board is not drawing"),
-        None => format!("{items} items · could not read the frame back"),
+        Some(_) => format!("{items} items · NOTHING PAINTED — the board is not drawing{view}"),
+        None => format!("{items} items · could not read the frame back{view}"),
     });
     schedule_frame();
     Ok(())
@@ -470,33 +502,81 @@ impl Viewer {
         // which is decided once in `vellum_project::project` rather than here.
         visible.sort_by_key(|item| item.z);
         let zoom = self.camera.zoom() as f32;
+        let stroke_colour = vellum_project::theme::Theme::LIGHT.stroke;
         let mut on_screen = Vec::with_capacity(visible.len());
-        for item in &visible {
-            list.push_scene_item(item, &self.camera);
-            on_screen.push(item.id);
-        }
 
-        // Pictures, in the board view with the quads.
+        // **One loop, dispatching per kind.** The order these are pushed in *is* the paint
+        // order, so a second pass over the same items draws above every quad regardless of
+        // z — which is why the pictures and the strokes cannot be their own loops. `draw.rs`
+        // is one loop for exactly this reason.
         for item in &visible {
-            let Some(projected) = self.projection.get(item.id) else { continue };
-            let hash = match &projected.item.kind {
-                vellum_doc::ItemKind::Image { asset_id, .. } => asset_id.as_str(),
-                vellum_doc::ItemKind::LinkPreview { thumbnail: Some(hash), .. } => hash.as_str(),
-                _ => continue,
+            on_screen.push(item.id);
+            let Some(projected) = self.projection.get(item.id) else {
+                list.push_scene_item(item, &self.camera);
+                continue;
             };
-            let Some(texture) = self.images.texture(hash) else { continue };
-            let origin = self.camera.to_camera_relative(projected.bounds.min);
-            let size = [
-                (projected.bounds.width() as f32) * zoom,
-                (projected.bounds.height() as f32) * zoom,
-            ];
-            list.push_image(
-                texture,
-                vellum_render::ImageInstance::new(origin, size, vellum_render::UvRect::FULL),
-            );
+            match &projected.item.kind {
+                // ⚠ **Triangles, and deliberately no quad behind them.**
+                // `push_scene_item` draws one solid box per item in the item's dominant
+                // colour — the scene layer's honest fallback for a kind the caller has not
+                // taught the renderer about. For a sticky that is nearly the drawing; for a
+                // pen stroke it is a filled rectangle the size of the stroke's bounding box,
+                // which is what the browser was painting where the desktop paints a line.
+                vellum_doc::ItemKind::Ink { .. } => {
+                    self.strokes.push_ink(
+                        &mut list,
+                        &self.camera,
+                        item.id,
+                        &self.projection,
+                        stroke_colour,
+                    );
+                }
+                vellum_doc::ItemKind::Connector { .. } => {
+                    self.strokes.push_connector(
+                        &mut list,
+                        &self.camera,
+                        item.id,
+                        &self.projection,
+                        stroke_colour,
+                    );
+                }
+                _ => {
+                    list.push_scene_item(item, &self.camera);
+                    let hash = match &projected.item.kind {
+                        vellum_doc::ItemKind::Image { asset_id, .. } => Some(asset_id.as_str()),
+                        vellum_doc::ItemKind::LinkPreview { thumbnail: Some(h), .. } => {
+                            Some(h.as_str())
+                        }
+                        _ => None,
+                    };
+                    if let Some(hash) = hash
+                        && let Some(texture) = self.images.texture(hash)
+                    {
+                        let origin = self.camera.to_camera_relative(projected.bounds.min);
+                        let size = [
+                            (projected.bounds.width() as f32) * zoom,
+                            (projected.bounds.height() as f32) * zoom,
+                        ];
+                        list.push_image(
+                            texture,
+                            vellum_render::ImageInstance::new(
+                                origin,
+                                size,
+                                vellum_render::UvRect::FULL,
+                            ),
+                        );
+                    }
+                }
+            }
         }
 
         // Shape and queue every visible item's words.
+        //
+        // Queued here and flushed once, after the loop, rather than drawn in place. That
+        // puts every block in front of every box — including a box that is in front of it on
+        // the board. It is the one deliberate departure from `draw.rs`'s ordering, and it is
+        // the cheap half of a trade: glyphs live in the **screen** view while quads live in
+        // the board view, so drawing text in place ends the quad batch twice per item.
         for item in &visible {
             let Some(projected) = self.projection.get(item.id) else { continue };
             let Some(styled) = projected.item.kind.text() else { continue };
@@ -542,6 +622,7 @@ impl Viewer {
         list.use_view(screen);
         self.text.flush(&self.device, &self.queue, self.renderer.atlas_mut(), &mut list);
         self.text.retain_visible(&on_screen);
+        self.strokes.retain_visible(&on_screen);
 
         self.renderer.begin_frame();
         self.renderer.prepare(&self.device, &self.queue, &list);

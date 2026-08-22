@@ -19,8 +19,13 @@ crate-type = ["cdylib", "rlib"]
 #   vellum-project  document -> scene, extracted from vellum-app for exactly this
 #   vellum-scene    the R-tree, the camera, and what is on screen
 #   vellum-render   wgpu, asking for zero features and staying inside Limits::default()
+#   vellum-text     cosmic-text, with Inter bundled and the system scan a no-op here
+#   vellum-ink      Catmull-Rom smoothing and variable-width tessellation -- lyon, pure
+#   vellum-connect  routing and arrowheads -- lyon and serde, pure
 [dependencies]
 vellum-doc.workspace = true
+vellum-connect.workspace = true
+vellum-ink.workspace = true
 vellum-project.workspace = true
 vellum-render.workspace = true
 vellum-scene.workspace = true
