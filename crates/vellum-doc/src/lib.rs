@@ -42,8 +42,10 @@ pub mod error;
 pub mod geometry;
 pub mod item;
 pub mod text;
+pub mod version;
 
 pub use board::{Background, Board, Pattern, SCHEMA_VERSION, Version};
+pub use version::VersionError;
 pub use error::{DocError, Result};
 pub use geometry::{Align, Color, Crop, Placement, Point};
 pub use item::{

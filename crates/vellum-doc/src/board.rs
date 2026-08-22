@@ -316,7 +316,13 @@ const SCAFFOLD_ORIGIN: &str = "vellum-scaffold";
 /// Opaque on purpose: it wraps a Loro version vector, and the persistence layer
 /// should be able to store and replay these without depending on Loro directly.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Version(VersionVector);
+pub struct Version(
+    /// `pub(crate)` for [`crate::version`], which puts this on the wire for sync.
+    ///
+    /// Not `pub`: the "opaque on purpose" promise above is about callers *outside* this
+    /// crate, and every one of them stays exactly where they were.
+    pub(crate) VersionVector,
+);
 
 /// An infinite-canvas board.
 ///

@@ -25,5 +25,9 @@ vellum-connect.workspace = true
 vellum-doc.workspace = true
 vellum-render.workspace = true
 vellum-scene.workspace = true
+# `runs` converts the document's rich-text spans into the shaping engine's. Pure, and it
+# lives here rather than in either front end because both need it and trap 10 — a bold span
+# silently changing typeface — is a mistake nobody should have the chance to make twice.
+vellum-text.workspace = true
 vellum-ui.workspace = true
 wgpu.workspace = true

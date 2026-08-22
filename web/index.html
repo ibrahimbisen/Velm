@@ -158,6 +158,18 @@
       const blobSuffix = (id && token) ? `?token=${encodeURIComponent(token)}` : '';
       velm.start('canvas', boardUrl, blobBase, blobSuffix);
 
+      // The bar: back to the board list, the board's name, zoom in / out / fit.
+      // It gates its own controls on what the wasm module actually exports, so a build
+      // without `zoom_by`/`fit_board` draws no zoom cluster and binds no keys — a key that
+      // silently does nothing is the same broken promise as a button that does.
+      const { mountChrome } = await import('./chrome.js');
+      mountChrome(velm, {
+        canvas: document.getElementById('canvas'),
+        boardId: id,
+        boardTitle: null,
+        token,
+      });
+
       // A gesture fixture, on request. `?selftest=touch` drives real PointerEvents at the
       // real canvas and reports what the camera did — the only honest check of an input
       // path, and the only one that can be run on the iPad by the person holding it.

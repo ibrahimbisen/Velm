@@ -29,7 +29,7 @@ cargo build --profile web --target wasm32-unknown-unknown -p vellum-web
 mkdir -p web/dist
 wasm-bindgen --target web --no-typescript --out-dir web/dist \
   target/wasm32-unknown-unknown/web/vellum_web.wasm
-cp web/index.html web/selftest.js web/dist/
+cp web/index.html web/selftest.js web/chrome.js web/dist/
 
 echo "web/dist ready — $(du -h web/dist/vellum_web_bg.wasm | cut -f1) of wasm"
 echo "A board and its pictures are not built, they are exported:"

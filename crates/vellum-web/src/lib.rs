@@ -49,6 +49,7 @@ mod board;
 mod images;
 mod layout;
 mod input;
+mod shapes;
 mod strokes;
 mod text;
 
@@ -78,6 +79,7 @@ struct Viewer {
     background: vellum_doc::Background,
     text: text::TextLayer,
     images: images::ImageLayer,
+    shapes: shapes::ShapeLayer,
     strokes: strokes::StrokeLayer,
 }
 
@@ -125,6 +127,46 @@ fn report(message: &str) {
         let url = format!("/velm-report?{}", js_sys::encode_uri_component(message));
         let _ = window.fetch_with_str(&url);
     }
+}
+
+/// Zoom about the middle of the canvas — the bar's `+`/`−` buttons and the `+`/`-` keys.
+///
+/// The anchor is the viewport's centre rather than a pointer, because a button press has no
+/// pointer worth aiming at: the same split `PasteAim` draws natively between `⌘V` and an
+/// import. `Camera::viewport` is already in physical pixels — trap 4 — so unlike `input.rs`
+/// there is no device ratio to apply here; that module converts because a DOM event hands it
+/// CSS pixels and this one has no event.
+///
+/// A no-op, never a throw, when there is no board yet or a frame holds the viewer: the page
+/// disables its own controls until `camera_report` first answers, and a panic here would be
+/// an unhandled rejection inside a DOM listener rather than a message anybody sees.
+#[wasm_bindgen]
+pub fn zoom_by(factor: f64) {
+    VIEWER.with(|slot| {
+        if let Some(viewer) = slot.borrow().as_ref()
+            && let Ok(mut viewer) = viewer.try_borrow_mut()
+        {
+            let size = viewer.camera.viewport();
+            let middle = vellum_scene::ScreenPoint::new(size.width / 2.0, size.height / 2.0);
+            viewer.camera.zoom_by(factor, middle);
+        }
+    });
+}
+
+/// Fit the whole board on screen — the bar's middle button and the `0` key.
+///
+/// Literally the two lines `boot` runs, so "fit" means exactly the view the board opened at
+/// rather than something close to it. A board with no content bounds is left where it is.
+#[wasm_bindgen]
+pub fn fit_board() {
+    VIEWER.with(|slot| {
+        if let Some(viewer) = slot.borrow().as_ref()
+            && let Ok(mut viewer) = viewer.try_borrow_mut()
+            && let Some(bounds) = viewer.projection.content_bounds()
+        {
+            viewer.camera.fit_to_rect(bounds, FIT_MARGIN);
+        }
+    });
 }
 
 /// The camera, as a string, for a fixture to read.
@@ -277,6 +319,7 @@ async fn boot(
         background,
         text: text::TextLayer::new()?,
         images: images::ImageLayer::new(blob_base, blob_suffix),
+        shapes: shapes::ShapeLayer::new(),
         strokes: strokes::StrokeLayer::new(),
     }));
 
@@ -635,7 +678,8 @@ impl Viewer {
         // which is decided once in `vellum_project::project` rather than here.
         visible.sort_by_key(|item| item.z);
         let zoom = self.camera.zoom() as f32;
-        let stroke_colour = vellum_project::theme::Theme::LIGHT.stroke;
+        let theme = &vellum_project::theme::Theme::LIGHT;
+        let stroke_colour = theme.stroke;
         let mut on_screen = Vec::with_capacity(visible.len());
 
         // **One loop, dispatching per kind.** The order these are pushed in *is* the paint
@@ -663,6 +707,14 @@ impl Viewer {
                         &self.projection,
                         stroke_colour,
                     );
+                }
+                // ⚠ **And no quad behind it**, for the reason the ink arm above records: a
+                // shape's `push_scene_item` payload is a solid box over its whole bounding
+                // rectangle, and the silhouette lands in a later batch — so an ellipse, a
+                // diamond or a star would show a filled rectangle through every corner it
+                // does not fill. For a shape the box is the negation of the drawing.
+                vellum_doc::ItemKind::Shape { .. } => {
+                    self.shapes.push(&mut list, &self.camera, item.id, &self.projection, theme);
                 }
                 vellum_doc::ItemKind::Connector { .. } => {
                     self.strokes.push_connector(
@@ -740,19 +792,16 @@ impl Viewer {
             // `push_layout`'s `scale` then magnifies the finished layout uniformly, which is
             // how `vellum-app` has always done it.
             let size = [slot.rect.width() as f32, slot.rect.height() as f32];
-            // ⚠ `vellum_doc::StyledText` and `vellum_text::StyledText` are different types:
-            // the document's spans carry Miro's rich-text model, the engine's carry what
-            // cosmic-text needs. Flattening to plain here is a **known loss** -- bold, links
-            // and per-run colour do not survive it -- and it is the honest first step rather
-            // than a finished one. `draw.rs` does the real conversion per item kind; that
-            // work belongs with the painter.
-            let flattened = vellum_text::StyledText::plain(
-                styled.spans().iter().map(|s| s.text.as_str()).collect::<String>(),
-            );
+            // Real runs, not one flattened string. `vellum_project::runs::convert` is the
+            // same conversion `vellum-app`'s painter makes, in the crate both front ends
+            // share — so a bold span is bold in a browser for the same reason it is on the
+            // Mac, and trap 10's guard (cosmic-text does not fall back to a family's regular
+            // face, so a missing weight silently changes *typeface*) is applied once.
+            let converted = vellum_project::runs::convert(styled);
             self.text.queue(
                 item.id,
                 projected.generation,
-                &flattened,
+                &converted,
                 [top_left.x as f32, top_left.y as f32],
                 size,
                 slot.font_size,
@@ -769,6 +818,7 @@ impl Viewer {
         self.text.flush_greeked(&mut list);
         self.text.retain_visible(&on_screen);
         self.strokes.retain_visible(&on_screen);
+        self.shapes.retain_visible(&on_screen);
         // ⚠ **After** the list is built, never before. Eviction spares what was marked this
         // frame, and the marks happen while the list is built — so running it first makes
         // that guard vacuously true and lets it take a texture the list already references.

@@ -15,4 +15,5 @@
 pub mod connector;
 pub mod look;
 pub mod project;
+pub mod runs;
 pub mod theme;
