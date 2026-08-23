@@ -255,9 +255,25 @@ fn render(indexes: &[BoardIndex], filing: &Filing) -> String {
         // becomes a parse error in a browser that then shows an empty library. The folder name
         // is the user's typing too, and the id is a file stem, which on macOS may hold very
         // nearly anything.
+        // ⚠ **The board's own picture, as a blob hash — and it was very nearly left out.** A
+        // reviewer found the consumer already written on the client and unreachable, because
+        // nothing here emitted the key: `thumbnailUrl`, the `thumbnail` field and the whole
+        // `<img>` branch of a card's picture well were tested code with no data, so every card
+        // drew the placeholder for ever. This repository's signature defect, arrived at by two
+        // agents who were each individually right.
+        //
+        // A hash, not a URL: `/api/v1/blobs/{hash}` already exists and is already behind the
+        // same token, so building the address on the client keeps one definition of where a
+        // blob lives. `None` for a board that has never been open long enough to be captured,
+        // which the card draws as the placeholder it drew before.
+        let thumbnail = index
+            .thumbnail
+            .as_ref()
+            .map_or_else(|| "null".to_owned(), |hash| json_string(&hash.to_string()));
         rows.push(format!(
             "{{\"id\":{},\"title\":{},\"items\":{},\"modified\":{modified},\
-             \"starred\":{},\"space\":{space},\"trashed\":{trashed_at}}}",
+             \"starred\":{},\"space\":{space},\"trashed\":{trashed_at},\
+             \"thumbnail\":{thumbnail}}}",
             json_string(id),
             json_string(&index.title),
             index.item_count,

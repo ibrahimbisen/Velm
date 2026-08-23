@@ -43,7 +43,7 @@
 // # ⚠ What this client cannot do, and how that is said
 //
 // Velm's board library is also where a board is starred, filed, renamed, duplicated, trashed
-// and restored. **None of those verbs exists on `velmd`** — the whole HTTP surface is `GET`s
+// and restored. **Of those, `velmd` has create and rename (`manage.rs`) and no others** — the whole HTTP surface is `GET`s
 // plus `sync`, `import` and a create — so none of them is drawn here. Not drawn *disabled*:
 // omitted, except where the omission would itself be confusing, which is the trash. CLAUDE.md
 // names describing a gesture the user cannot perform as the worst failure in its own list, and
@@ -976,7 +976,7 @@ const CSS = `
   background: var(--wash, #F2F5F6); color: inherit;
   /* ⚠ 16px, not 13px. iOS zooms the whole page in when a field smaller than this takes focus,
      and it does not zoom back out — the same figure and the same reason as the connect form. */
-  font: 16px/1.4 inherit; font-family: inherit;
+  font-family: inherit; font-size: 16px; line-height: 1.4;
 }
 .velm-lib-search:focus-visible { outline: 2px solid var(--focus, #6FD6E6); outline-offset: -1px; }
 
@@ -1237,6 +1237,36 @@ const OPTIONAL_IDS = {
  * Everything it needs from the outside is an argument, so a harness can drive it; nothing runs
  * until it is called, so importing this module is free.
  */
+/**
+ * Read a JSON body under its own deadline.
+ *
+ * ⚠ **`request`'s timeout does not cover this, and its own comment said it did.** `fetch`
+ * resolves when the *headers* arrive; `request` clears the abort timer in a `finally` at that
+ * moment, so every `await response.json()` after it ran with a live signal that could never
+ * fire. A captive portal, a buffering proxy, wifi dropping mid-response, or velmd killed after
+ * it writes the head all leave the page on *"Asking…"* for ever — with the retry button still
+ * hidden, on a tablet with no console. That is the exact class `docs/08-web.md` §6 records
+ * three times, standing under the line that promises it cannot happen.
+ *
+ * `null` on anything that is not a JSON object, so every caller's existing "answered something
+ * this page could not read" branch keeps working unchanged.
+ */
+async function readJson(response, timeoutMs, win) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      response.json(),
+      new Promise((_, reject) => {
+        timer = win.setTimeout(() => reject(new Error('body timed out')), timeoutMs);
+      }),
+    ]);
+  } catch {
+    return null;
+  } finally {
+    if (timer !== null) win.clearTimeout(timer);
+  }
+}
+
 export function mount(options = {}) {
   const doc = options.document ?? document;
   const win = options.window ?? window;
@@ -1511,7 +1541,7 @@ export function mount(options = {}) {
 
     let payload;
     try {
-      payload = await list.response.json();
+      payload = await readJson(list.response, BOARDS_TIMEOUT_MS, win);
     } catch {
       payload = null;
     }
@@ -1568,7 +1598,7 @@ export function mount(options = {}) {
 
   async function velmdVersion(response) {
     try {
-      const body = await response.json();
+      const body = await readJson(response, HEALTH_TIMEOUT_MS, win);
       if (body && typeof body === 'object' && typeof body.velmd === 'string') return body.velmd;
     } catch {
       /* fall through */
@@ -1748,7 +1778,7 @@ export function mount(options = {}) {
     // why it did not work. It is also out while the server has no folders to group by.
     if (state.scope.kind === 'all' && library.spaces.length > 0) {
       tools.append(
-        toggle('list', 'Every board in one grid', state.grouping === 'flat', () => {
+        toggle('grid', 'Every board in one grid', state.grouping === 'flat', () => {
           state.grouping = 'flat';
           drawLibrary();
         }),
@@ -2318,7 +2348,7 @@ export function mount(options = {}) {
         return;
       }
       let made = null;
-      try { made = await answer.response.json(); } catch { made = null; }
+      made = await readJson(answer.response, BOARDS_TIMEOUT_MS, win);
       if (!made || typeof made.id !== 'string') {
         el.sub.textContent = 'Your server answered something this page could not read.';
         return;
