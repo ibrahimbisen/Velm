@@ -357,12 +357,19 @@ export async function runEditFixture(mod, canvas) {
     // ⚠ Through the **field**, not through the module. On a tablet this element is the only
     // reason a keyboard appears at all, and a fixture that skipped it would pass on a build
     // where nothing was ever appended to the document.
-    for (const ch of 'Velm') {
+    // ⚠ **The word is chosen so that a build where typing runs the shortcut table fails.**
+    // `n` is the sticky tool, `f` the frame, `s` the shape — feedback 40, where typing on a
+    // board armed tools and the click leaving the field placed one. A word of inert letters
+    // stays green through exactly that bug, which is why the desktop's own fixture types
+    // "Rear Seats" rather than "hello".
+    for (const ch of 'Fins') {
       field.dispatchEvent(new KeyboardEvent('keydown', { key: ch, bubbles: true, cancelable: true }));
     }
     await frame();
     const [, , cursor, , chars, group] = nums('velm_caret_report');
     check(chars === 4 && cursor === 4, `typing reached the document: ${chars} chars, cursor ${cursor}`);
+    const stillSelect = typeof mod.current_tool === 'function' ? mod.current_tool() : '?';
+    check(stillSelect === 'select', `and armed no tool, though f, n and s are all bindings (${stillSelect})`);
     check(group === 1, 'and the whole word is one undo group, not four');
     field.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
     await frame();
@@ -389,7 +396,7 @@ export async function runEditFixture(mod, canvas) {
   // ─────────────────────────── 5. find, on the word just typed ─────────────────────────────
   if (typeof mod.find === 'function') {
     let answer = {};
-    try { answer = JSON.parse(mod.find('Velm')); } catch (error) { answer = {}; }
+    try { answer = JSON.parse(mod.find('Fins')); } catch (error) { answer = {}; }
     const hits = Array.isArray(answer.matches) ? answer.matches.length : 0;
     check(hits > 0, `search found the word that was just typed (${hits} match(es))`);
   }

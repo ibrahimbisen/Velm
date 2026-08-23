@@ -1,4 +1,10 @@
-//! The read-only board server.
+//! The board server.
+//!
+//! ⚠ **It said "the read-only board server" for as long as it was one, and kept saying it
+//! through `/sync` and three more.** Four routes write now. What is still true — and is the
+//! sentence the old title was reaching for — is that **none of them can destroy a board**;
+//! that is stated properly under RULE ZERO below rather than compressed into a title that
+//! goes stale the next time a verb is added.
 //!
 //! Serves three things over one origin: the wasm client, the boards it reads, and the
 //! pictures on them. One origin is the whole hosting decision — it is what makes mixed
@@ -7,16 +13,22 @@
 //!
 //! # 🛑 RULE ZERO
 //!
-//! **Nothing here removes a file, and one route — and only one — changes a board.**
-//! `POST /api/v1/boards/{id}/sync` merges a client's Loro update into a board and saves it;
-//! every other handler is a `GET`. There is no `DELETE` and no route that can remove
-//! anything, and `tests/rule_zero.rs` greps this file along with the rest of the crate for
-//! any call that could unlink or move one.
+//! **Nothing here removes a file, and nothing here can destroy a board.** Four routes write,
+//! and each is safe for its own reason rather than by a shared rule:
 //!
-//! What makes the one writing route safe is the shape of what it applies: a Loro update is a
-//! **merge**, so it can add and it cannot remove what it did not add — and `sync.rs` takes a
-//! labelled restore point before the first change a board ever receives from the web, which
-//! is what makes even a merge reversible.
+//! - `POST /api/v1/boards/{id}/sync` **merges** a Loro update, so it can add and cannot
+//!   remove what it did not add — and `sync.rs` takes a labelled restore point before the
+//!   first change a board ever receives from the web, which makes even a merge reversible.
+//! - `POST /api/v1/import` and `POST /api/v1/boards` only ever **create**, at a stem nothing
+//!   is using, claimed with `create_new` — `O_CREAT | O_EXCL`, so the kernel refuses rather
+//!   than this program having to remember. See `manage.rs` for why landing on an existing
+//!   board would be worse than truncating one.
+//! - `POST /api/v1/boards/{id}/rename` changes a **title inside a document**. No file is ever
+//!   renamed: `.vellum` is what `BoardDb::open` insists on, and a board's id in this API *is*
+//!   its file stem, so renaming the file would 404 every tab already open on it.
+//!
+//! There is no `DELETE` and no route that can remove anything, and `tests/rule_zero.rs` greps
+//! this file along with the rest of the crate for any call that could unlink or move one.
 //!
 //! But read-only in the HTTP sense is not the whole promise, and this is the part worth
 //! being precise about: [`vellum_store::BoardDb::open`] **is not a read-only open**. It runs

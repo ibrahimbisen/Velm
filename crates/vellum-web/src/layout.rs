@@ -108,9 +108,14 @@ pub fn text_slot(projected: &Projected, text: Rgba, muted: Rgba) -> Option<TextS
         // and **never auto-fitted**, which is what made it enormous: auto-fit asks for the
         // largest size that fits the box, and a frame's box is the biggest thing on the board.
         ItemKind::Frame { title, .. } => {
-            if title.is_empty() {
-                return None;
-            }
+            // ⚠ **No early return for an empty title**, and that is not an oversight to tidy
+            // away. `TextLayer::queue` already skips a slot with no words in it, so nothing is
+            // shaped and nothing costs anything — but the *slot* has to exist, because a caret
+            // measures itself against the block that would be there. Refusing here is the
+            // desktop's feedback 25 exactly: the caret never appeared in an empty item, and the
+            // first keystroke gave it words, which gave it a block, which is what the caret had
+            // been waiting for.
+            let _ = title;
             let size = frame_title_size(h);
             Some(TextSlot {
                 rect: WorldRect::from_origin_size(

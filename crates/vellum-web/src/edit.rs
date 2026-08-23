@@ -1169,6 +1169,25 @@ pub fn velm_redo() -> bool {
 fn rewind(backwards: bool) -> bool {
     let Some(held) = viewer() else { return false };
     let Ok(mut viewer) = held.try_borrow_mut() else { return false };
+    // ⚠ **Before the document is rewound, and before the destructure.** Two gestures can be
+    // live across an undo and each breaks differently:
+    //
+    // - A **text session** holds an undo group open for its whole life, so undoing into one
+    //   rewinds *inside* the group it is still writing to — trap 11 from a direction the
+    //   `busy_with_a_group` guard cannot see, because nothing here dispatches a command.
+    // - A **handle drag** keeps the originals it captured at the press. Undo, then release,
+    //   and the release writes those originals straight back over what was just undone —
+    //   which reads as ⌘Z not working, on a board where it worked a second earlier.
+    //
+    // Neither is reachable through the textarea guard or the blur commit: the keyboard is on
+    // the field during an edit, and a grip drag has no field at all.
+    crate::caret::settle(&mut viewer);
+    {
+        // Split, because both fields belong to the same struct and the borrow checker will
+        // not take one through a method call on the other.
+        let crate::Viewer { handles, projection, .. } = &mut *viewer;
+        handles.cancel(projection);
+    }
     let crate::Viewer { edit, board, projection, push, .. } = &mut *viewer;
     if !edit.enabled() {
         return false;
@@ -1197,6 +1216,10 @@ fn rewind(backwards: bool) -> bool {
 pub fn velm_delete_selection() -> u32 {
     let Some(held) = viewer() else { return 0 };
     let Ok(mut viewer) = held.try_borrow_mut() else { return 0 };
+    // The item being typed into is the item about to be deleted, and its session is holding
+    // an undo group open over it. Ended first, or the delete joins that group and every
+    // grouped operation after it fails for the life of the tab.
+    crate::caret::settle(&mut viewer);
     let crate::Viewer { edit, board, projection, push, .. } = &mut *viewer;
     if !edit.enabled() {
         return 0;

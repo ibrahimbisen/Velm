@@ -260,10 +260,6 @@ impl Tool {
     #[must_use]
     pub const fn refusal(self) -> Option<&'static str> {
         match self {
-            Self::Text => Some(
-                "a text item is only its words, and this build has no on-canvas caret to \
-                 write them with",
-            ),
             Self::Image => Some("placing an image needs a file picker this build has not got"),
             _ => None,
         }
@@ -1070,9 +1066,15 @@ fn kind_for_tool(tool: Tool) -> Option<ItemKind> {
         Tool::Chart => Some(ItemKind::Chart { spec: encode_token(&default_chart(), "chart") }),
         Tool::Kanban => Some(ItemKind::Kanban { board: encode_token(&default_kanban(), "kanban") }),
         Tool::MindMap => Some(ItemKind::MindMap { model: default_mindmap_token() }),
+        // ⚠ **Wordless on purpose, and only safe now that there is a caret.** A text item is
+        // *only* its words: with none it draws nothing at all, so before `caret.rs` landed
+        // this tool was refused outright rather than shipped as a way to make invisible items.
+        // `pointer_up` drops a caret into it the moment it exists, which is what makes placing
+        // and typing one flow rather than two — and is the reason the placeholder every other
+        // kind carries would be wrong here.
+        Tool::Text => Some(ItemKind::Text { text: StyledText::default() }),
         Tool::Select
         | Tool::Hand
-        | Tool::Text
         | Tool::Pen
         | Tool::Eraser
         | Tool::Connector
@@ -1315,6 +1317,12 @@ pub fn pointer_up(viewer: &mut crate::Viewer) -> bool {
     if !viewer.edit.enabled() {
         return false;
     }
+    // ⚠ Kept from before the destructure, because the caret cannot be opened until it ends —
+    // `caret::begin` wants the whole `Viewer`, and everything below holds four of its fields.
+    let seeds_a_caret = matches!(
+        what,
+        Create::Item { tool: Tool::Sticky | Tool::Text | Tool::Shape | Tool::Frame, .. }
+    );
     let crate::Viewer { board, projection, edit, push, .. } = viewer;
 
     let outcome: Result<Option<DocId>, String> = match what {
@@ -1370,11 +1378,20 @@ pub fn pointer_up(viewer: &mut crate::Viewer) -> bool {
             // ⚠ **After `resettle`, never before.** `scene_id` reads the projection, and the
             // projection does not know the new item until it has been rebuilt — which
             // `add_one` has already done by the time this runs.
-            if let Some(scene) = projection.scene_id(doc) {
+            let placed = projection.scene_id(doc);
+            if let Some(scene) = placed {
                 edit.select_only(scene);
             }
             edit.sync(projection);
-            finish(true, board, push)
+            let changed = finish(true, board, push);
+            // ⚠ **The four kinds whose whole content is words**, and for `Tool::Text` it is
+            // not a convenience: a text item with none draws nothing at all, so placing one
+            // without a caret makes an invisible item. The desktop does the same thing for the
+            // same reason, with the placeholder selected so the first keystroke replaces it.
+            if seeds_a_caret && let Some(scene) = placed {
+                crate::caret::begin(viewer, scene, true);
+            }
+            changed
         }
         Ok(None) => false,
         Err(error) => {

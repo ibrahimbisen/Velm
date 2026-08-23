@@ -225,26 +225,41 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                         ));
                         // ⚠ **A ladder, and the order is the behaviour.**
                         //
-                        // The caret goes first because it is the only layer that has to act
-                        // when it does *not* claim the press: inside its own item it moves
-                        // the caret, and anywhere else it **ends the session**, which is what
-                        // closes the undo group it has been holding open since the first
-                        // keystroke. Everything below it therefore runs with no caret up.
+                        // An armed create tool first: it owns the press outright, which is
+                        // what "armed" means, and is why pressing over a selected item with
+                        // the sticky tool places a sticky rather than picking the item up.
                         //
-                        // Then an armed create tool, which owns the press outright — that is
-                        // what "armed" means, and it is why pressing over a selected item
-                        // with the sticky tool places a sticky rather than picking the item
-                        // up. Then the grips, which sit *on* an item's own outline, so a
-                        // press that reached the edit layer would move the item instead of
-                        // resizing it. Only then the selection.
+                        // Then the grips, which are eight device pixels and sit *on* an
+                        // item's own outline — so anything below them would move the item
+                        // instead of resizing it.
+                        //
+                        // ⚠ **The grips beat the caret, and that ordering was measured rather
+                        // than reasoned.** With the caret first, placing a sticky (which opens
+                        // one) and then reaching for its bottom-right grip put the press
+                        // *outside* the edited item — a grip straddles the corner — so the
+                        // session settled, the press fell through to the edit layer, and the
+                        // drag **moved the sticky** instead of resizing it. One cause, six
+                        // failed assertions, and every one of them looked like a different
+                        // feature being broken.
+                        //
+                        // The caret is last of the three because it is the only one that must
+                        // act when it does *not* claim: anywhere outside its own item it ends
+                        // the session, which is what closes the undo group it has held open
+                        // since the first keystroke. When one of the two above claims instead,
+                        // that ending has to be done for it — see below.
                         let aim = crate::handles::Aim {
                             coarse: event.pointer_type() == "touch",
                             device_ratio: ratio,
                         };
-                        let claimed = crate::caret::press(&mut viewer, at)
-                            || crate::tools::pointer_down(&mut viewer, at)
-                            || crate::handles::pointer_down(&mut viewer, at, aim);
-                        if !claimed {
+                        if crate::tools::pointer_down(&mut viewer, at)
+                            || crate::handles::pointer_down(&mut viewer, at, aim)
+                        {
+                            // ⚠ Claimed by a *new* gesture, so any text session has to end —
+                            // and it will not end itself, because the branch below is the one
+                            // that would have done it. Missing this leaves an undo group open
+                            // for the life of the tab.
+                            crate::caret::settle(&mut viewer);
+                        } else if !crate::caret::press(&mut viewer, at) {
                             // ⇧ adds to the selection rather than replacing it.
                             crate::edit::pointer_down(&mut viewer, at, event.shift_key());
                         }

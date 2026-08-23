@@ -1,7 +1,10 @@
-//! Two-way sync — the one route in this server that can change a board.
+//! Two-way sync — the only route that changes a board that already exists.
 //!
-//! Every other route in `velmd` is a `GET` that reads. This one takes what a browser has
-//! done and merges it into the board on disk, so it is worth being precise about what that
+//! ⚠ It was *the* writing route when this was written and is no longer: `paste.rs` and
+//! `manage.rs` write too. They only ever **create**, at a name nothing is using, so this
+//! stays the one place an existing board is altered — which is the distinction the old line
+//! was actually about. This one takes what a browser has done and merges it into the board on
+//! disk, so it is worth being precise about what that
 //! can and cannot cost, before any of it.
 //!
 //! # The protocol, in one round trip

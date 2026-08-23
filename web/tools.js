@@ -1896,6 +1896,35 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
     if (doc.hidden) commitCaret();
   };
 
+  // ⚠ **A finger's way in, and without it the caret is unreachable on the one device this
+  // client exists for.** `dblclick` is a mouse event: iOS synthesises it only after its own
+  // 300ms double-tap-to-zoom heuristic, and not at all on a canvas that has claimed the
+  // pointer. So a double *tap* is detected here, from the pointer stream that is already
+  // being listened to.
+  //
+  // The window is 320ms and the slop 24 physical pixels — both deliberately looser than a
+  // mouse's, because a finger lands somewhere slightly different each time and a second tap
+  // that misses is not a second tap, it is a deselect. `pointerType === 'touch'` gates it:
+  // letting a mouse through would give one gesture two openings and the second would fight
+  // the first.
+  let lastTap = null;
+  const onTapForCaret = (event) => {
+    if (event.pointerType !== 'touch' || !caretOpen()) return;
+    const now = event.timeStamp;
+    const near = lastTap
+      && now - lastTap.t < 320
+      && Math.hypot(event.clientX - lastTap.x, event.clientY - lastTap.y) < 24;
+    lastTap = near ? null : { t: now, x: event.clientX, y: event.clientY };
+    if (!near) return;
+    if (invoke('velm_caret_open_at', event.clientX, event.clientY) === true) {
+      field.value = '';
+      // ⚠ `preventScroll`, or iOS scrolls the whole page to bring an offscreen element into
+      // view — which moves the canvas out from under the board the caret just opened in.
+      field.focus({ preventScroll: true });
+    }
+  };
+  canvas.addEventListener('pointerup', onTapForCaret);
+
   canvas.addEventListener('dblclick', onDoubleClick);
   field.addEventListener('keydown', onFieldKeyDown);
   field.addEventListener('copy', onFieldCopy);
@@ -1967,6 +1996,7 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
       // The text session goes down before its keyboard does, or it holds an undo group open
       // on a board the palette has stopped being able to reach.
       commitCaret();
+      canvas.removeEventListener('pointerup', onTapForCaret);
       canvas.removeEventListener('dblclick', onDoubleClick);
       field.removeEventListener('keydown', onFieldKeyDown);
       field.removeEventListener('copy', onFieldCopy);
