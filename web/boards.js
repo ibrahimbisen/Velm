@@ -1003,6 +1003,7 @@ const CSS = `
   background: var(--accent-soft, #CAEBE7);
   color: var(--on-accent-soft, #0C675B);
 }
+
 .velm-lib-scope:focus-visible, .velm-lib-space:focus-visible,
 .velm-lib-toggle:focus-visible { outline: 2px solid var(--focus, #6FD6E6); outline-offset: 1px; }
 .velm-lib-count {
@@ -1091,6 +1092,15 @@ a.velm-lib-card:focus-visible, button.velm-lib-card:focus-visible {
   background: var(--accent-soft, #CAEBE7);
   box-shadow: inset 0 0 0 1px var(--accent, #00A38C);
   color: var(--on-accent-soft, #0C675B);
+}
+/* The unset star: the same square, no plate, no ring — just the outline glyph in the muted
+   ink the metadata row uses. It has to be quiet enough that a grid of unstarred boards does
+   not read as decorated, and present enough that the filled one is obviously a *state* of the
+   same control rather than a badge that only some cards have. */
+.velm-lib-star-off {
+  background: none;
+  box-shadow: none;
+  color: var(--faint, #7A8186);
 }
 
 /* ⚠ Regular weight, and that is not an oversight. \`library.rs\` asks for \`.strong()\` and egui
@@ -2111,20 +2121,27 @@ export function mount(options = {}) {
       box.append(img);
     }
 
-    if (board.starred) {
-      // ⚠ **Shown, not settable.** There is no route that stars a board, so this is a `<span>`
-      // and not a button: it takes no focus, answers no click and says what it means on hover.
-      // The desktop's own note applies unchanged — the filled star is the state, not the
-      // colour, because `docs/05` §6 requires the accent never to be the only carrier of
-      // meaning.
-      const star = doc.createElement('span');
-      star.className = 'velm-lib-star';
-      star.title = 'Starred in the Velm app';
-      star.setAttribute('role', 'img');
-      star.setAttribute('aria-label', 'Starred');
-      star.append(icon(doc, 'star', { filled: true, size: 11 }));
-      box.append(star);
-    }
+    // ⚠ **Every card carries a star, set or not — the unset one is the difference a reviewer
+    // called "the runner-up, and the one that repeats".** The Mac draws a faint outline star
+    // on every card and fills it on the starred ones, so what a full star *means* is legible
+    // from the card next to it. Drawing only the filled ones leaves a badge with nothing to be
+    // read against, and the page stops saying which boards are not starred — it just looks
+    // like some cards have a decoration.
+    //
+    // **Shown, not settable**, both ways: there is no route that stars a board, so this is a
+    // `<span>` and not a button — it takes no focus and answers no click. The unset one says
+    // so on hover, because a star-shaped thing that does nothing when pressed is worth one
+    // sentence of explanation. The *fill* is the state and the colour merely agrees with it,
+    // which is `docs/05` §6's rule that the accent is never the only carrier of meaning.
+    const star = doc.createElement('span');
+    star.className = board.starred ? 'velm-lib-star' : 'velm-lib-star velm-lib-star-off';
+    star.title = board.starred
+      ? 'Starred in the Velm app'
+      : 'Not starred. Starring is done in the Velm app.';
+    star.setAttribute('role', 'img');
+    star.setAttribute('aria-label', board.starred ? 'Starred' : 'Not starred');
+    star.append(icon(doc, 'star', { filled: board.starred, size: 11 }));
+    box.append(star);
     return box;
   }
 
