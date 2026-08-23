@@ -61,7 +61,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::{manage, paste, sync};
+use crate::{library_api, manage, paste, sync};
 use vellum_store::{BlobStore, BoardDb, Hash, list_boards};
 
 /// How many connections are served at once.
@@ -491,6 +491,11 @@ fn route(server: &Server, path: &str, query: &str, stream: &TcpStream) -> anyhow
             println!("client: {}", printable(&percent_decode(query)));
             respond(stream, 204, "text/plain", b"", origin)
         }
+        // The start screen's own route: the board list plus the two things the desktop shows
+        // beside it — which boards are starred and which folder each is in. A second route
+        // rather than four more keys on the one above, so a client written against the older
+        // shape keeps working byte for byte. See `library_api`'s header.
+        library_api::PATH => library_api::handle(server, stream),
         "/api/v1/boards" => {
             let body = {
                 let _guard =

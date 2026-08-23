@@ -5,291 +5,960 @@
      document: pinching it to read a long board name is the browser doing its job. -->
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Velm — your boards</title>
+
+<!--
+  ══════════════════════════════════════════════════════════════════════════════════════
+  THE MARKUP CONTRACT WITH `boards.js`
+  ══════════════════════════════════════════════════════════════════════════════════════
+
+  This page is the Mac board library — `crates/vellum-ui/src/library.rs`, which is the only
+  authority for every number below. Two halves and two owners, so the join is written down here
+  rather than discovered — and written from what the other half **does**, not from what it was
+  agreed it would do.
+
+  ── who draws what, as measured on 2026-08-22 ─────────────────────────────────────────
+  `boards.js` builds the sidebar's rows, the bands and every card **itself**, under its own
+  `velm-lib-*` class namespace, and injects `<style id="velm-library-style">` for them. So the
+  division is not the one you would guess from the file names:
+
+    this file   the two-column shell, the palette every one of those rules reads (see the
+                alias block in `:root`), the connect / message / warning / import chrome, and
+                the fallback markup below.
+    boards.js   everything inside `#velm-sidebar` and `#velm-boards`. ⚠ Its `connect()` calls
+                `replaceChildren()` on the nav, so the wordmark, the search field and the two
+                lists written below are **replaced on the first frame**. They are a contract
+                and a fallback, not what you will see.
+
+  Two ids are the whole join, and `boards.js` calls them `OPTIONAL_IDS` — it builds its own
+  when they are missing rather than throwing, which is right for a node this file owns:
+
+      #velm-sidebar   the nav it fills. Present here, so its markup is taken as authoritative
+                      and `#velm-boards` is left where it is.
+      #velm-title     the heading that names the scope — Recent, All boards, Starred,
+                      Recently deleted, or a folder's own name.
+
+  ── the shapes this file styles ───────────────────────────────────────────────────────
+  Kept whether or not `boards.js` uses them, because a build where only one of the two files
+  has moved must still draw a board library. The stylesheet, not the script, does the
+  uppercasing and the letterspacing on a band title and draws every glyph as a CSS mask — so
+  a caller supplies title-case strings and empty elements, and never an icon.
+
+      a.velm-card[href]                        one board
+        .velm-card-well                          108-unit picture slot; `img` optional
+        .velm-card-star                          shown only when the board is starred
+        strong  (or .velm-card-title)            one line, ellipsised
+        .velm-card-meta                          the metadata row
+          .velm-card-count                       "596 items" — monospace, tabular
+          .velm-card-when                        "3 days ago" / "deleted 3 days ago"
+          .velm-card-folder                      the folder chip, laid out from the right
+
+      button.velm-card.velm-folder             a pinned folder, at a card's own size
+        .velm-card-well  strong  .velm-card-meta > .velm-card-count   ("4 boards")
+
+      section.velm-band                        one band or one folder section
+        h2.velm-band-title                     "Recently opened" — CSS uppercases it
+        .velm-grid                             the wrapping grid of cards
+
+      button.velm-scope[aria-current="page"]   a sidebar row (scope **or** folder)
+        .velm-scope-label  .velm-count         label left, count right
+        add `.velm-space` for a folder, and `.is-pinned` for a pinned one (draws the pin)
+
+  ── ids, and why there are more of them than anything reads ───────────────────────────
+  `mount()` looks up every id in its own `IDS` table and **throws** when one is missing, which
+  blanks the page. The direction of failure is asymmetric: an id here that no `IDS` entry names
+  costs nothing, and an `IDS` entry with no id here costs the whole page. So every id below
+  exists whether or not the script has learned about it yet, and four of them start `hidden`
+  and stay hidden until something drives them — because a control that is drawn and does
+  nothing is this repository's signature defect, and the rule is stated outright: never offer a
+  gesture the user cannot perform.
+
+      #velm-search        the sidebar filter          — unhide when the filter is wired
+      #velm-folders       the FOLDERS section         — unhide when the library answer arrives
+      #velm-grouping      group-by-folder / flat      — unhide on All boards only, as the Mac
+      #velm-new-board     the accent New board button — unhide when a create route is wired
+  ══════════════════════════════════════════════════════════════════════════════════════
+-->
+
 <style>
-  /* Every colour here is `index.html`'s and `chrome.js`'s, deliberately, and not `theme.rs`'s
-     nearest equivalent: this design draws its structure with hairlines rather than shadows, so
-     two nearly-identical hairlines on one screen read as a mistake rather than as a system.
-     Light only — Velm has no dark mode and a picker that flips would not match the board it
-     opens. */
+  /* ════════════════════════════════════════════════════════════════════════════════════
+     The palette is `crates/vellum-ui/src/theme.rs`'s, under theme.rs's own role names.
+
+     ⚠ **This forks the page from `index.html` and `chrome.js`**, which hardcode a neighbouring
+     set — `#22282C`, `#E2E7EA`, `#F2F5F6` — and it is deliberate: those two draw board chrome
+     and this one *is* the Mac library, so a colour that disagrees with `theme.rs` disagrees
+     with the screenshot it is being compared against. Naming the fork rather than discovering
+     it: whoever unifies the three should move the other two here, not this one back.
+
+     ⚠ **The old `--paper` was MILK, not PAPER.** In `theme.rs` `PAPER` `#F2F2F2` is the
+     *board's* colour and `MILK` `#F7F9FA` is the page behind panels. Porting by name rather
+     than by role puts the canvas colour under a document. Role names make that impossible.
+
+     ⚠ **Light only, and there is no `prefers-color-scheme` block below on purpose.**
+     `ThemePreference::resolve` answers `Light` whatever it is asked — *"i want only light
+     mode"* — so a page that flipped to dark would not match the board it opens, and the dark
+     tokens that exist in `theme.rs` are unreachable there too.
+
+     ⚠ **This design draws its structure with a hairline where other designs use a shadow**,
+     and the light ramp's steps are 8/255 apart (feedback 22): the gaps *are* the structure.
+     There is no `box-shadow` in this file except where it stands in for an inside stroke, and
+     no radius larger than the 6 `radius::LARGE` names.
+     ════════════════════════════════════════════════════════════════════════════════════ */
   :root {
-    --ink: #22282C;
-    --ink-muted: #656D73;
-    --ink-faint: #8B959B;
-    --paper: #F7F9FA;
-    --card: #ffffff;
-    --line: #E2E7EA;
-    --wash: #F2F5F6;
-    --press: #E9EEF0;
-    --accent: #00A38C;
-    --focus: #6FD6E6;
+    /* Swatches, by the role `Palette` gives them (theme.rs:578-619). */
+    --backdrop: #F7F9FA;        /* MILK   — the page behind the grid */
+    --surface: #FCFDFE;         /* BONE   — a card, the sidebar, a panel */
+    --raised: #EBEEF0;          /* PEARL  — a folder tile's well */
+    --field: #E5EAED;           /* FROST  — `Palette::well`, the search field's ground */
+    --canvas: #F2F2F2;          /* PAPER  — a preview's letterbox: a board's own colour */
+    --hover: #DCEBEF;
+    --pressed: #D0E6EC;
+    --border: #E5EAED;          /* FROST  — every hairline on this page */
+    --text: #1A1D1F;            /* INK */
+    --muted: #5C656B;           /* INK_MUTED */
+    --faint: #8B959B;           /* INK_FAINT */
+    --accent: #00A38C;          /* SIGNAL_TEAL */
+    --on-accent: #1A1D1F;       /* charcoal on the teal is 5.3:1; white is 3.2:1 and fails AA */
+    --accent-soft: #CAEBE7;     /* mix(BONE, teal, 20) */
+    --on-accent-soft: #0C675B;  /* mix(teal, INK, 45) */
+    --info: #6FD6E6;            /* MONITOR_CYAN — hover, and only hover */
+    --info-soft: #E8F8FB;
+    --danger: #E65B58;          /* XR_RED — destruction, and nothing else */
+
+    /* ── Aliases `boards.js`'s own injected stylesheet reads ───────────────────────────
+       Measured, not assumed: `boards.js` builds the sidebar and every card itself under a
+       `velm-lib-*` namespace and injects `<style id="velm-library-style">`, whose rules are
+       written as `var(--ink-faint, #8B959B)` — the older spelling `index.html` and `chrome.js`
+       use, with a theme.rs value as the fallback. Defining them here is what makes the two
+       halves of this page one palette instead of two that happen to agree today: change a hex
+       above and the library follows, rather than drifting until somebody photographs it.
+
+       ⚠ **`--well` and `--wash` are deliberately left undefined, and that is the interesting
+       half.** `boards.js` spells the preview letterbox `var(--well, #F2F2F2)`, but `--well` is
+       `Palette::well` — FROST `#E5EAED`, the *search field* — and PAPER `#F2F2F2` is
+       `Palette::canvas`. Defining `--well` truthfully would silently repaint every preview
+       slot on the page the wrong colour, from a file that never mentions previews. An
+       undefined variable with a right fallback beats a defined one with a colliding meaning;
+       the name is the thing to fix, and it is not in this file. `--wash` has no theme.rs token
+       at all. */
+    --ink: var(--text);
+    --ink-muted: var(--muted);
+    --ink-faint: var(--faint);
+    --card: var(--surface);
+    --line: var(--border);
+    --focus: var(--info);
+
+    /* Metrics. `space::UNIT` is 4 and everything on that screen is a multiple of it. */
+    --unit: 4px;
+    --sidebar: 192px;           /* SIDEBAR_WIDTH, exact and not resizable */
+    --card-w: 236px;            /* CARD_WIDTH  = space::of(59) */
+    --card-h: 176px;            /* CARD_HEIGHT = space::of(44) */
+    --well-h: 108px;            /* the preview band = space::of(27) */
+    --gutter: 16px;             /* space::of(4) — **between** cards only. See the card. */
+    --pad: 8px;                 /* CARD_PADDING = space::of(2) */
+    --row: 24px;                /* a sidebar row = space::of(6) */
+    --r-small: 4px;             /* radius::SMALL  — a well, a row, a button */
+    --r-medium: 5px;            /* radius::MEDIUM — a card, a message */
+
+    /* Type. `theme::text::*`, and egui points are CSS pixels at scale 1. */
+    --t-label: 11px;            /* LABEL   — a date, a folder name, a section heading */
+    --t-numeric: 12px;          /* NUMERIC — every count, in the monospace family */
+    --t-body: 13px;             /* BODY    — a card title, a sidebar row */
+    --t-panel: 15px;            /* PANEL_TITLE */
+    --t-screen: 20px;           /* SCREEN_TITLE — the one heading on the page */
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+    /* ── Glyphs ────────────────────────────────────────────────────────────────────────
+       Masks rather than images, so every one takes its colour from a token: an `<img>` of a
+       teal star is a second place the accent is written down, and `docs/05` §6 has already
+       been burned by hand-copied colours twice. Drawn from `icon.rs`'s and `mark.rs`'s own
+       geometry — nothing here is a font character, for `draw.rs`'s reason: U+2605, U+1F4C1
+       and U+2197 are all outside the plain sans faces and draw tofu on a machine whose
+       fallback chain misses a symbols face.
+
+       ⚠ The stroke width is **absolute** on the Mac — `ICON_STROKE = 1.5` points whatever
+       the box — so a folder at 11px and a folder at 36px are not the same drawing scaled.
+       That is why there are two of them. */
+    --i-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48' fill='none' stroke='%23000' stroke-width='2.5' stroke-linecap='square'%3E%3Cpath d='M8 20V8h12M40 20V8h-12M40 28v12h-12M8 28v12h12'/%3E%3C/svg%3E");
+    --i-star: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23000'%3E%3Cpolygon points='12,1.92 14.4,8.71 21.58,8.88 15.89,13.27 17.93,20.16 12,16.08 6.07,20.16 8.11,13.27 2.42,8.88 9.6,8.71'/%3E%3C/svg%3E");
+    --i-folder: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='3.3'%3E%3Cpath d='M4 3h4a2 2 0 0 1 1.66.89l1 1.5a2 2 0 0 0 1.66.89H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z'/%3E%3C/svg%3E");
+    --i-folder-lg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='1'%3E%3Cpath d='M4 3h4a2 2 0 0 1 1.66.89l1 1.5a2 2 0 0 0 1.66.89H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z'/%3E%3C/svg%3E");
+    --i-pin: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='3'%3E%3Ccircle cx='12' cy='8.16' r='4.32'/%3E%3Cpath d='M7.2 12.48h9.6M12 12.48v8.16'/%3E%3C/svg%3E");
+    --i-search: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.6'%3E%3Ccircle cx='10.56' cy='10.56' r='6.24'/%3E%3Cpath d='M15.12 15.12l5.04 5.04'/%3E%3C/svg%3E");
+    --i-grid: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.7'%3E%3Cpath d='M8.16 2.4v19.2M15.84 2.4v19.2M2.4 8.16h19.2M2.4 15.84h19.2'/%3E%3C/svg%3E");
+  }
+
+  /* ⚠ **The one rule the page cannot work without.** `boards.js` drives every visibility
+     decision in the file through `el.X.hidden`, and an author `display` beats the user agent's
+     `[hidden] { display: none }` — so a `.btn` declared `display: inline-flex` is *visible*
+     while carrying the attribute, and Try again / Change server / Forget this device are all
+     on screen before a connection has failed. `find.js` and `tools.js` each carry this rule
+     for the same reason; this page did not, and every `display` added below is another way in.
+     `!important` because the whole point is that no later rule can win. */
+  [hidden] { display: none !important; }
+
+  * { box-sizing: border-box; }
+
+  /* A label that only a screen reader reads. The three places it is used are controls whose
+     whole content is a glyph — and a glyph drawn as a CSS mask carries no text at all, so
+     without this they are buttons with no accessible name. `clip-path` rather than
+     `display: none`, which takes an element out of the accessibility tree along with the
+     layout. */
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 
   html, body {
     margin: 0;
     min-height: 100%;
-    background: var(--paper);
-    color: var(--ink);
-    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    background: var(--backdrop);
+    color: var(--text);
+    /* `text::BODY` is 13 and `text::LINE_HEIGHT` is 1.4.
+       ⚠ The face is **not** the Mac's. `theme.rs` asks the app to install SF Pro and SF Mono
+       and nothing ever calls `set_fonts`, so the desktop library actually renders in epaint's
+       bundled Ubuntu-Light and Hack. Shipping a webfont to reproduce a fallback would be a new
+       file in `scripts/build-web.sh`'s fixed copy list and a heavier page to match a bug, so
+       this follows what `theme.rs` *intends* — the platform's own UI face. Type metrics are
+       therefore close, not identical, and a diff of two screenshots will show it in the
+       ellipsis position before anywhere else. */
+    font: var(--t-body)/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
     -webkit-text-size-adjust: 100%;
   }
 
-  main {
-    max-width: 1200px;
-    margin: 0 auto;
-    padding: 40px 24px 64px;
-    /* Keeps the page clear of an iPad's rounded corners and its home indicator. */
-    padding-left: max(24px, env(safe-area-inset-left));
+  /* ── The two panels ─────────────────────────────────────────────────────────────────
+     A 192-point sidebar on `surface` beside the boards on `backdrop`, with **no separator
+     line** — `show_separator_line(false)` on the Mac. The 5/255 between the two tokens is the
+     entire edge, which is the ramp doing its job; adding a border here would be the second
+     hairline this design spends its whole budget avoiding. */
+  .velm-shell {
+    display: flex;
+    align-items: stretch;
+    min-height: 100vh;
+    min-height: 100dvh;
+  }
+
+  .velm-sidebar {
+    flex: 0 0 var(--sidebar);
+    width: var(--sidebar);
+    background: var(--surface);
+    padding: 12px;                                  /* space::of(3), both axes */
+    padding-left: max(12px, env(safe-area-inset-left));
+  }
+  .velm-sidebar-inner { position: sticky; top: 12px; }
+
+  .velm-main {
+    flex: 1 1 auto;
+    /* ⚠ Without this a long board title or a wide grid makes the flex item refuse to shrink
+       and the whole document scrolls sideways — on a tablet, permanently. */
+    min-width: 0;
+    padding: 20px 24px 48px;                        /* Margin::symmetric(space::of(6), of(5)) */
     padding-right: max(24px, env(safe-area-inset-right));
-    padding-bottom: max(64px, env(safe-area-inset-bottom));
+    padding-bottom: max(48px, env(safe-area-inset-bottom));
   }
 
-  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; letter-spacing: -.01em; }
-  .sub { margin: 0; color: var(--ink-muted); font-size: 13px; }
-  .where {
-    margin: 2px 0 0;
-    color: var(--ink-faint);
-    /* §3: monospace for anything that names a machine, the same stack the status line uses. */
-    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
-    overflow-wrap: anywhere;
-  }
-  header { margin-bottom: 28px; }
-
-  /* A message and a warning are the same object: a bold line naming what happened and a
-     paragraph naming what to do about it. The warning is the softer of the two because the
-     thing it describes has not stopped anything yet. */
-  .message, .warning {
-    border-radius: 10px;
-    padding: 14px 16px;
-    margin: 0 0 20px;
-    max-width: 72ch;
-  }
-  .message { background: var(--card); border: 1px solid var(--line); }
-  .warning { background: var(--wash); border: 1px solid var(--line); }
-  .message strong, .warning strong { display: block; font-weight: 600; margin-bottom: 4px; }
-  .message p, .warning p { margin: 0; color: var(--ink-muted); font-size: 13px; }
-
-  .panel {
-    background: var(--card);
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    padding: 18px 16px;
-    margin: 0 0 24px;
-    max-width: 48ch;
-  }
-  .panel label.field { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
-  .panel label.field + input { margin-bottom: 4px; }
-  .panel input[type="text"], .panel input[type="password"] {
-    display: block;
-    width: 100%;
-    box-sizing: border-box;
-    /* 44px, Apple's own minimum — the same figure `chrome.js` sizes every control to, and for
-       the same reason: this is aimed with a finger. */
-    min-height: 44px;
-    padding: 0 12px;
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    background: var(--card);
-    color: inherit;
-    /* ⚠ 16px, not 13px. iOS zooms the whole page in when a field smaller than this takes
-       focus, and it does not zoom back out — so the picker ends up half off screen with the
-       keyboard up, which reads as the layout breaking. */
-    font: 16px/1.4 inherit;
-    font-family: inherit;
-  }
-  .panel input:focus-visible { outline: 2px solid var(--focus); outline-offset: -1px; border-color: var(--focus); }
-  .panel .hint { margin: 4px 0 16px; color: var(--ink-muted); font-size: 12px; }
-  .panel .check {
+  /* ── The wordmark ───────────────────────────────────────────────────────────────────
+     The Viewport mark, from `mark.rs`'s own grid: four corner brackets, the top-left one in
+     the accent because that is what gives the mark a reading direction. Inline rather than a
+     mask, because it is the one place two colours are the point. */
+  .velm-wordmark {
     display: flex;
     align-items: center;
-    gap: 10px;
-    /* The whole row is the target, not the 13px box inside it. */
-    min-height: 44px;
-    font-size: 13px;
-    cursor: pointer;
-    touch-action: manipulation;
-    -webkit-tap-highlight-color: transparent;
+    gap: var(--pad);
+    margin: 0 0 12px;
+    padding: 0 var(--pad);
+    font-size: var(--t-panel);
+    color: var(--text);
   }
-  .panel .check input { width: 18px; height: 18px; flex: none; accent-color: var(--accent); }
+  .velm-wordmark svg { flex: none; width: 20px; height: 20px; }
 
+  /* ── The sidebar's search ───────────────────────────────────────────────────────────── */
+  .velm-search { position: relative; margin: 0 0 var(--pad); }
+  .velm-search input {
+    width: 100%;
+    height: 32px;
+    padding: 0 var(--pad) 0 28px;
+    border: 0;
+    border-radius: var(--r-small);
+    background: var(--field);
+    color: var(--text);
+    /* ⚠ 16px, not 13px. iOS zooms the whole page in when a field smaller than this takes
+       focus and does not zoom back out, which reads as the layout breaking. It is the one
+       place on this page where the device beats the Mac's own number. */
+    font-size: 16px;
+    line-height: 1;
+    font-family: inherit;
+  }
+  .velm-search::before {
+    content: "";
+    position: absolute;
+    left: var(--pad);
+    top: 50%;
+    width: 14px;
+    height: 14px;
+    margin-top: -7px;
+    background: var(--faint);
+    -webkit-mask: var(--i-search) center/contain no-repeat;
+    mask: var(--i-search) center/contain no-repeat;
+    pointer-events: none;
+  }
+  .velm-search input:focus-visible { outline: 2px solid var(--info); outline-offset: -2px; }
+
+  /* ── A sidebar row: a scope, or a folder ────────────────────────────────────────────
+     24 points tall, the label left in `BODY` and the count right in the numeric face — and
+     the count stays `faint` even on the selected row, which is what `scope_row` does. */
+  .velm-scopes, .velm-spaces { list-style: none; margin: 0; padding: 0; }
+  .velm-scope {
+    display: flex;
+    align-items: center;
+    gap: var(--pad);
+    width: 100%;
+    min-height: var(--row);
+    padding: 0 var(--pad);                          /* rect.shrink2(space::of(2), 0) */
+    border: 0;
+    border-radius: var(--r-small);
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: var(--t-body);
+    text-align: left;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+    transition: background-color 120ms ease-out;
+  }
+  .velm-scope-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .velm-scope .velm-count {
+    margin-left: auto;
+    flex: none;
+    font: var(--t-numeric)/1 var(--mono);
+    color: var(--faint);
+  }
+  /* ⚠ Guarded, because :hover latches on a touchscreen: a tapped row keeps the wash until
+     something else is tapped, so the page shows a row as pointed-at that nothing is pointing
+     at. `chrome.js` carries the same guard for the same reason. */
+  @media (hover: hover) { .velm-scope:hover { background: var(--hover); } }
+  .velm-scope:active { background: var(--pressed); }
+  /* Written to catch `page`, `true` and `location` alike — the attribute has four legal
+     values and only `false` means *not this one*. */
+  .velm-scope[aria-current]:not([aria-current="false"]) {
+    background: var(--accent-soft);
+    color: var(--on-accent-soft);
+  }
+  .velm-scope:focus-visible { outline: 2px solid var(--info); outline-offset: -2px; }
+  /* A pin rather than a dot: `docs/04-ui-reference.md` §5 marks a pinned folder, and a mark
+     that looks like punctuation reads as a typo. It indents the name, exactly as the Mac's
+     `ROW_BUTTON` offset does. */
+  .velm-scope.is-pinned::before {
+    content: "";
+    flex: none;
+    width: 12px;
+    height: 12px;
+    background: var(--faint);
+    -webkit-mask: var(--i-pin) center/contain no-repeat;
+    mask: var(--i-pin) center/contain no-repeat;
+  }
+  .velm-scope[aria-current]:not([aria-current="false"])::before { background: var(--on-accent-soft); }
+
+  /* ⚠ 24 points is right on a mouse and wrong under a thumb. The Mac has no touch case; this
+     page's whole reason to exist is the machine that is not the Mac, so the row grows to
+     Apple's own 44 exactly where a finger is the pointer, and nowhere else. */
+  @media (pointer: coarse) {
+    .velm-scope { min-height: 44px; }
+    .velm-search input { height: 44px; }
+  }
+
+  .velm-rule { height: 1px; margin: var(--pad) 0; border: 0; background: var(--border); }
+
+  /* ⚠ One rule of `boards.js`'s own stylesheet is scoped `.velm-lib-side .velm-lib-note` — the
+     *"No folders yet"* line — and this nav does not carry that class, because
+     `layOutTheLibrary()` assigns it only on the branch that builds a nav from nothing. The
+     class is deliberately not added here: `.velm-lib-side` is a card-shaped panel at radius
+     10, and the Mac's sidebar is a flush panel edge with no border and no radius at all
+     (`show_separator_line(false)`), which is what this column already is. So the one orphaned
+     rule is restated against this file's own container instead. */
+  #velm-sidebar .velm-lib-note { margin: var(--pad) 0 0; font-size: var(--t-label); color: var(--faint); }
+
+  /* A section caption, in the sidebar and over a band. `section_label` uppercases, sizes to
+     LABEL, colours `muted` and letterspaces by 0.7 — so the script supplies "Recently opened"
+     and the stylesheet says it the way the Mac does. */
+  .velm-section, .velm-band-title {
+    margin: 12px 0 var(--unit);                     /* add_space(3) above, add_space(1) below */
+    font-size: var(--t-label);
+    font-weight: 400;
+    letter-spacing: 0.7px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .velm-section { padding: 0 var(--pad); }
+  .velm-empty-note {
+    margin: var(--unit) 0 0;
+    padding: 0 var(--pad);
+    font-size: var(--t-label);
+    color: var(--faint);
+  }
+
+  /* ── The main column's header ───────────────────────────────────────────────────────── */
+  .velm-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  h1 {
+    margin: 0;
+    font-size: var(--t-screen);
+    /* ⚠ **Regular, and it is not an omission.** `screen_title` and a card's title both call
+       `.strong()` and both then call `.color(palette.text)` — and in egui 0.35 `strong` is a
+       *colour* flag consulted only by `get_text_color`, where an explicit `text_color` is
+       tested first and wins (`widget_text.rs:481`). It never touches the font. Nor could it
+       help if it did: nothing installs a bold face, so `FontFamily::Proportional` is epaint's
+       bundled Ubuntu-Light and has exactly one weight. The Mac library is set end to end in
+       one weight, and 600 here would be the difference a screenshot comparison finds first. */
+    font-weight: 400;
+    letter-spacing: -0.01em;
+    color: var(--text);
+  }
+  .velm-head-actions { margin-left: auto; display: flex; align-items: center; gap: var(--pad); }
+  /* aria-live: on a tablet this line is the only thing that says a request is in flight. */
+  .sub { margin: var(--unit) 0 0; color: var(--muted); font-size: var(--t-body); }
+  .where {
+    margin: 2px 0 0;
+    color: var(--faint);
+    /* Monospace for anything that names a machine, the same stack every count uses. */
+    font: var(--t-numeric)/1.4 var(--mono);
+    overflow-wrap: anywhere;
+  }
+  header { margin-bottom: var(--gutter); }          /* add_space(4) under the header */
+
+  /* ── Buttons ────────────────────────────────────────────────────────────────────────── */
   .btn {
     appearance: none;
     -webkit-appearance: none;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    min-height: 44px;
-    min-width: 44px;
-    padding: 0 18px;
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    background: var(--card);
+    min-height: 32px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-small);
+    background: var(--surface);
     color: inherit;
     font: inherit;
-    font-weight: 500;
     cursor: pointer;
     text-decoration: none;
+    white-space: nowrap;
     /* §3: motion is functional and fast, 120-160ms, ease-out. */
     transition: background-color 120ms ease-out;
-    /* iOS otherwise paints its own grey flash over every state below. */
-    -webkit-tap-highlight-color: transparent;
-    /* Drops the 300ms a browser holds in case the tap was half a double-tap-to-zoom. */
-    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;       /* iOS paints its own grey flash otherwise */
+    touch-action: manipulation;                     /* drops the 300ms double-tap-to-zoom wait */
   }
-  /* ⚠ Guarded, because :hover latches on a touchscreen: a tapped button keeps the wash until
-     something else is tapped, so the page shows a control as pointed-at that nothing is
-     pointing at. `chrome.js` carries the same guard for the same reason. */
-  @media (hover: hover) {
-    .btn:hover { background: var(--wash); }
-    .velm-card:hover { border-color: var(--ink-faint); }
+  @media (hover: hover) { .btn:hover { background: var(--hover); } }
+  .btn:active { background: var(--pressed); }
+  .btn:focus-visible { outline: 2px solid var(--info); outline-offset: 2px; }
+  /* The one filled button on the screen, as on the Mac's header. `on_accent` is charcoal
+     rather than white because white on this teal is 3.2:1 and fails AA. */
+  .btn-accent { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  @media (hover: hover) { .btn-accent:hover { background: var(--accent); filter: brightness(1.06); } }
+  .btn-danger { color: var(--danger); }
+  /* A 24-point square, which is what `icon_button(…, space::of(6), …)` is. */
+  .velm-icon-btn {
+    min-height: var(--row);
+    width: var(--row);
+    padding: 0;
+    flex: none;
   }
-  .btn:active { background: var(--press); }
-  .btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .velm-icon-btn::before {
+    content: "";
+    width: 13px;
+    height: 13px;
+    background: var(--text);
+    -webkit-mask: var(--glyph) center/contain no-repeat;
+    mask: var(--glyph) center/contain no-repeat;
+  }
+  .velm-icon-btn[aria-pressed="true"] {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+  }
+  .velm-icon-btn[aria-pressed="true"]::before { background: var(--on-accent-soft); }
+  #velm-group-flat { --glyph: var(--i-grid); }
+  #velm-group-folders { --glyph: var(--i-folder-lg); }
+  #velm-grouping { display: flex; gap: var(--unit); }
+  @media (pointer: coarse) {
+    .btn { min-height: 44px; }
+    .velm-icon-btn { width: 44px; }
+  }
 
-  .grid {
-    display: grid;
-    gap: 12px;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  /* ── A message, a warning, the connect panel ────────────────────────────────────────
+     One object twice: a line naming what happened, and a paragraph naming what to do about
+     it. The warning is the softer of the two because the thing it describes has not stopped
+     anything yet. Radius 5 and a hairline — a card's own frame, since that is what every
+     raised thing on this screen is. */
+  .message, .warning, .panel {
+    border: 1px solid var(--border);
+    border-radius: var(--r-medium);
+    padding: 12px;
+    margin: 0 0 var(--gutter);
+    max-width: 72ch;
   }
+  .message, .panel { background: var(--surface); }
+  .warning { background: var(--info-soft); }
+  /* Bold here and regular on a card, deliberately: a card is the Mac library, where every
+     string is one weight (see the `h1`), and a message is this page's own chrome for a
+     condition the Mac has no equivalent of — there is no server to fail to reach. */
+  .message strong, .warning strong { display: block; font-weight: 600; margin-bottom: var(--unit); }
+  .message p, .warning p { margin: 0; color: var(--muted); font-size: var(--t-body); }
+  .warning strong + p + strong { margin-top: 12px; }   /* two warnings stack; see `show()` */
+
+  .panel { max-width: 48ch; }
+  .panel label.field { display: block; font-size: var(--t-body); margin-bottom: var(--unit); }
+  .panel input[type="text"],
+  .panel input[type="password"] {
+    display: block;
+    width: 100%;
+    min-height: 44px;
+    padding: 0 var(--pad);
+    border: 1px solid var(--border);
+    border-radius: var(--r-small);
+    background: var(--surface);
+    color: inherit;
+    /* ⚠ 16px, not 13px — see the search field. */
+    font-size: 16px;
+    line-height: 1.4;
+    font-family: inherit;
+  }
+  .panel input:focus-visible { outline: 2px solid var(--info); outline-offset: -1px; border-color: var(--info); }
+  .panel .hint { margin: var(--unit) 0 12px; color: var(--muted); font-size: var(--t-numeric); }
+  .panel .check {
+    display: flex;
+    align-items: center;
+    gap: var(--pad);
+    /* The whole row is the target, not the 18px box inside it. */
+    min-height: 44px;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .panel .check input { width: 18px; height: 18px; flex: none; accent-color: var(--accent); }
+  .panel code { font: var(--t-numeric)/1 var(--mono); }
+
+  /* ── Bands and the grid ─────────────────────────────────────────────────────────────
+     `columns_that_fit` is `floor((available + gutter) / (CARD_WIDTH + gutter))`, and
+     `repeat(auto-fill, …)` computes exactly that from the track's own maximum — so the wrap
+     point is the Mac's arithmetic rather than a restatement of it.
+
+     ⚠ The track is `minmax(0, 236px)` and not a bare `236px`: a fixed track cannot shrink, so
+     on a phone narrower than one card the grid would push the document sideways. This gives
+     the same column count at every width that has room and stops short of overflowing. */
+  .velm-grid {
+    display: grid;
+    gap: var(--gutter);
+    grid-template-columns: repeat(auto-fill, minmax(0, var(--card-w)));
+    align-items: start;
+  }
+  .velm-band { margin: 0; }
+  .velm-band + .velm-band { margin-top: 12px; }
+  .velm-band:first-child .velm-band-title { margin-top: 0; }
+
+  /* ⚠ A grid of its own when the script hands it bare cards. `render()` appended
+     `.velm-card` straight into `#velm-boards` before this page grew bands, and it is allowed
+     to again — a build where only one of the two files has been updated must still list the
+     boards rather than stacking them full width down the page. */
+  #velm-boards:has(> .velm-card) {
+    display: grid;
+    gap: var(--gutter);
+    grid-template-columns: repeat(auto-fill, minmax(0, var(--card-w)));
+    align-items: start;
+  }
+
+  /* ── A card ─────────────────────────────────────────────────────────────────────────
+     236 × 176 including its own hairline — `Frame::paint` strokes `Inside`, so `border-box`
+     is the exact translation and the content box is 218 × 158.
+
+     ⚠ The leading inside a card is **4**, not the 16 between cards. They were one value once
+     and it cost 24 points of every card's height, with the text floating in the middle
+     instead of hanging off the picture (feedback 22). A gutter and a leading are two
+     measurements that happen to look like one. */
   .velm-card {
     display: flex;
     flex-direction: column;
-    justify-content: center;
-    gap: 3px;
-    /* Comfortably past the 44px minimum: a board is the thing this page exists to hit. */
-    min-height: 68px;
-    padding: 14px 16px;
-    border-radius: 10px;
-    background: var(--card);
-    border: 1px solid var(--line);
+    gap: var(--unit);
+    position: relative;
+    max-width: var(--card-w);
+    height: var(--card-h);
+    padding: var(--pad);
+    border: 1px solid var(--border);
+    border-radius: var(--r-medium);
+    background: var(--surface);
     color: inherit;
+    font: inherit;
+    text-align: left;
     text-decoration: none;
-    transition: border-color 120ms ease-out;
+    overflow: hidden;
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
     -webkit-tap-highlight-color: transparent;
     touch-action: manipulation;
+    transition: border-color 120ms ease-out;
   }
-  .velm-card:active { background: var(--wash); }
-  /* The only accent on the page. In Velm it means *selection* or *the active tool*, and the
-     board you are about to open is the closest thing a list has to either. */
+  /* ⚠ Hover **replaces** the hairline — same rect, same radius, same width, `info` instead of
+     `border`. Not an added ring and not a shadow: a second box drawn around a card is what a
+     design with no shadows looks like when somebody reaches for one. */
+  @media (hover: hover) { .velm-card:hover { border-color: var(--info); } }
+  .velm-card:active { background: var(--backdrop); }
   .velm-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .velm-card strong {
-    font-weight: 600;
-    /* One line: a wrapping title makes its own card taller than its neighbours, which is the
-       raggedness feedback 22 spent a round removing from the desktop library. */
+  /* A card with no picture — which today is every card, see the well — centres what it has
+     rather than leaving 108 points of air at the top. */
+  .velm-card:not(:has(.velm-card-well)) { justify-content: center; }
+
+  /* The picture slot. Filled `canvas` and **not** `raised`: this is a picture of a board, so
+     the bars beside a board that does not fit have to be the colour a board is. */
+  .velm-card-well {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: var(--well-h);
+    border: 1px solid var(--border);
+    border-radius: var(--r-small);
+    background: var(--canvas);
+    overflow: hidden;
+  }
+  /* ⚠ Fit, never fill, and **never upscale** — `scale = min(w/tw, h/th, 1.0)`. A board is any
+     aspect ratio at all, and cropping a wide one to a card-shaped hole hides the part that
+     identifies it. `object-fit: cover` is right for a *link card's* banner and wrong here. */
+  .velm-card-well img {
+    display: block;
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+  }
+  /* No picture: the mono mark at 28, which is `mark::MINIMUM_SIZE` — below it the negative
+     space between the brackets closes and it stops reading as four brackets. */
+  .velm-card-well::after {
+    content: "";
+    width: 28px;
+    height: 28px;
+    background: var(--border);
+    -webkit-mask: var(--i-mark) center/contain no-repeat;
+    mask: var(--i-mark) center/contain no-repeat;
+  }
+  .velm-card-well:has(img)::after { display: none; }
+
+  /* Starred. ⚠ An **indicator**, not a button: `/api/v1/library` reports `starred` and there
+     is no route that sets it, so a star you could press here would be a control whose only
+     outcome is nothing happening. It reads the same as the Mac's set star — the filled glyph
+     is the state and the colour only agrees with it, per `docs/05` §6. Positioned against the
+     card, so it lands in the same place whether the script nests it in the well or beside it. */
+  .velm-card-star {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;                                    /* ROW_BUTTON = space::of(5) */
+    height: 20px;
+    border-radius: var(--r-small);
+    background: var(--accent-soft);
+    box-shadow: inset 0 0 0 1px var(--accent);      /* an inside stroke, not a shadow */
+  }
+  .velm-card-star::before {
+    content: "";
+    width: 11.2px;                                  /* the glyph takes 56% of the button */
+    height: 11.2px;
+    background: var(--on-accent-soft);
+    -webkit-mask: var(--i-star) center/contain no-repeat;
+    mask: var(--i-star) center/contain no-repeat;
+  }
+
+  .velm-card > strong, .velm-card-title {
+    /* Regular — see the `h1`. */
+    font-weight: 400;
+    font-size: var(--t-body);
+    line-height: 20px;
+    color: var(--text);
+    /* One line, always. A title that wrapped made its own card taller than the ones beside
+       it, which is the raggedness `CARD_HEIGHT` exists to remove. */
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .velm-card-meta { color: var(--ink-muted); font-size: 12px; }
+
+  .velm-card-meta {
+    display: flex;
+    align-items: center;
+    gap: var(--unit);
+    min-width: 0;
+    font-size: var(--t-label);
+    line-height: 19px;
+    color: var(--faint);
+  }
+  .velm-card-count { flex: none; font: var(--t-numeric)/1 var(--mono); }
+  .velm-card-when { flex: none; }
+  /* ⚠ Laid out from the **opposite edge**, so the count and the date keep the same column on
+     every card whether or not there is a folder to name — which is the whole reason the chip
+     shares this row instead of taking one of its own. Truncated, because a long folder name
+     is not worth pushing the date off its own row for. */
+  .velm-card-folder {
+    margin-left: auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+  }
+  .velm-card-folder::before {
+    content: "";
+    display: inline-block;
+    vertical-align: -1px;
+    width: 11px;
+    height: 11px;
+    margin-right: var(--unit);
+    background: var(--faint);
+    -webkit-mask: var(--i-folder) center/contain no-repeat;
+    mask: var(--i-folder) center/contain no-repeat;
+  }
+
+  /* A pinned folder, at a card's own size — the size is the point, since it shares a row with
+     starred boards and a tile of a different height would break the row the band exists to
+     be. It reads as a container through what fills it: the folder mark where a board has its
+     picture, on `raised` rather than a picture's own ground, and a count of boards. */
+  .velm-folder .velm-card-well { background: var(--raised); }
+  .velm-folder .velm-card-well::after {
+    width: 36px;                                    /* space::of(9) */
+    height: 36px;
+    background: var(--muted);
+    -webkit-mask-image: var(--i-folder-lg);
+    mask-image: var(--i-folder-lg);
+  }
+
+  .velm-empty { margin: 24px 0 0; color: var(--muted); }
+
+  /* ── Import ─────────────────────────────────────────────────────────────────────────── */
+  #velm-import { margin: 28px 0 0; max-width: 72ch; }
+  #velm-import h2 { font-size: var(--t-panel); font-weight: 400; margin: 0 0 var(--pad); }
+  #velm-import .steps { margin: 0 0 12px; padding-left: 20px; line-height: 1.7; }
+  /* ⚠ The two `var(--edge, …)` / `var(--raised, #fff)` fallbacks this used to carry named
+     tokens the page never defined, so the fallback was what rendered — and defining `--raised`
+     above would silently have restyled the drop zone to PEARL. Written against real tokens. */
+  .velm-import-drop {
+    min-height: 76px;
+    padding: var(--pad);
+    border: 1px dashed var(--border);
+    border-radius: var(--r-small);
+    background: var(--surface);
+    font: var(--t-numeric)/1.5 var(--mono);
+    overflow: hidden;
+    white-space: pre-wrap;
+  }
+  .velm-import-drop:empty::before { content: attr(data-empty); color: var(--faint); }
+  .velm-import-drop:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #velm-import-name {
+    display: block;
+    width: 100%;
+    max-width: 48ch;
+    margin: var(--pad) 0;
+    min-height: 44px;
+    padding: 0 var(--pad);
+    border: 1px solid var(--border);
+    border-radius: var(--r-small);
+    background: var(--surface);
+    color: inherit;
+    font-size: 16px;                                /* 16, for the iOS reason above */
+    line-height: 1.4;
+    font-family: inherit;
+  }
+  #velm-import-said[data-bad="true"] { color: var(--danger); }
 
   footer { margin-top: 32px; }
-  .note { color: var(--ink-muted); font-size: 12px; max-width: 68ch; margin: 0 0 16px; }
-  .footer-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+  .note { margin: 0 0 12px; color: var(--muted); font-size: var(--t-numeric); max-width: 72ch; }
+  .footer-actions { display: flex; flex-wrap: wrap; gap: var(--pad); }
 
   @media (prefers-reduced-motion: reduce) {
-    .btn, .velm-card { transition: none; }
+    .btn, .velm-card, .velm-scope { transition: none; }
   }
-  #velm-import { margin: 28px 0 0; }
-  #velm-import h2 { font-size: 15px; margin: 0 0 8px; }
-  #velm-import .steps { margin: 0 0 12px; padding-left: 20px; font-size: 13px; line-height: 1.7; }
-  .velm-import-drop {
-    min-height: 76px; padding: 10px 12px; border-radius: 8px;
-    border: 1px dashed var(--edge, #c9d1d6); background: var(--raised, #fff);
-    font: 12px/1.5 ui-monospace, monospace; overflow: hidden; white-space: pre-wrap;
+
+  /* ── Narrow ─────────────────────────────────────────────────────────────────────────
+     The Mac has no narrow case; a phone is the case this page exists for. The sidebar stops
+     being a column and becomes a band above the boards, keeping its own ground so the two
+     panels still read as two panels. */
+  @media (max-width: 760px) {
+    .velm-shell { display: block; }
+    .velm-sidebar {
+      width: auto;
+      border-bottom: 1px solid var(--border);
+      padding-left: max(12px, env(safe-area-inset-left));
+      padding-right: max(12px, env(safe-area-inset-right));
+    }
+    .velm-sidebar-inner { position: static; }
+    .velm-main { padding: 16px; padding-bottom: max(48px, env(safe-area-inset-bottom)); }
   }
-  .velm-import-drop:empty::before { content: attr(data-empty); opacity: .55; }
-  .velm-import-drop:focus { outline: 2px solid var(--accent, #00a38c); outline-offset: 1px; }
-  #velm-import-name { display: block; width: 100%; margin: 10px 0; padding: 8px 10px;
-    border-radius: 8px; border: 1px solid var(--edge, #c9d1d6); font: inherit; }
-  #velm-import-said[data-bad="true"] { color: #b3261e; }
+  /* One card per row under about a phone's width, rather than one 236-point card with a
+     stripe of empty page beside it. */
+  @media (max-width: 480px) {
+    .velm-grid, #velm-boards:has(> .velm-card) { grid-template-columns: minmax(0, 1fr); }
+    .velm-card { max-width: none; }
+  }
 </style>
 
-<main>
-  <header>
-    <h1>Your boards</h1>
-    <!-- aria-live: on a tablet this line is the only thing that says a request is in flight. -->
-    <p class="sub" id="velm-sub" aria-live="polite">Connecting…</p>
-    <p class="where" id="velm-where"></p>
-  </header>
+<div class="velm-shell">
+  <!-- ── The sidebar ────────────────────────────────────────────────────────────────────
+       Its rows are built by `boards.js` from `/api/v1/library`, so an unwired build shows the
+       mark and nothing else rather than four buttons that do nothing. -->
+  <nav class="velm-sidebar" id="velm-sidebar" aria-label="Boards">
+    <div class="velm-sidebar-inner">
+      <p class="velm-wordmark">
+        <!-- `mark.rs`: a 48-unit grid, brackets inset 8 with 12-unit arms at 2.5 stroke. The
+             top-left corner is the accented one, always — it is what gives the mark a reading
+             direction, so it is not a parameter. -->
+        <svg viewBox="0 0 48 48" fill="none" stroke-width="2.5" stroke-linecap="square"
+             aria-hidden="true" focusable="false">
+          <path d="M8 20V8h12" stroke="var(--accent)"/>
+          <path d="M40 20V8h-12M40 28v12h-12M8 28v12h12" stroke="var(--text)"/>
+        </svg>
+        velm
+      </p>
 
-  <div class="message" id="velm-message" role="alert" hidden>
-    <strong id="velm-message-title"></strong>
-    <p id="velm-message-detail"></p>
-  </div>
+      <!-- Hidden until `boards.js` filters on it. A search field that answers nothing is the
+           one control on the page whose failure is silent. -->
+      <div class="velm-search" id="velm-search" hidden>
+        <label class="visually-hidden" for="velm-search-field">Search boards</label>
+        <input id="velm-search-field" type="search" placeholder="Search boards"
+               autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
+      </div>
 
-  <div class="warning" id="velm-warning" hidden></div>
+      <!-- Recent · All boards · Starred · Recently deleted, in that order, each a
+           `button.velm-scope`. Recently deleted is **always** a row and never one that appears
+           when something is in it: a trash you can only find once you have lost something is
+           one nobody knows exists at the moment they need it. -->
+      <ul class="velm-scopes" id="velm-scopes"></ul>
 
-  <form class="panel" id="velm-connect" hidden>
-    <label class="field" for="velm-server">Server address</label>
-    <!-- ⚠ `type="text"`, not `type="url"`. A bare `192.168.1.20:8787` fails the browser's own
-         url validation, and the form then refuses to submit behind a tooltip that says nothing
-         about what is wrong — for the address most likely to be typed on a home network. -->
-    <input id="velm-server" name="server" type="text" inputmode="url"
-           autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"
-           placeholder="velm.example.com">
-    <p class="hint">Where <code>velmd serve</code> is running. Its own default port is 8787.</p>
-
-    <label class="field" for="velm-passphrase">Passphrase</label>
-    <input id="velm-passphrase" name="passphrase" type="password"
-           autocomplete="current-password" placeholder="Leave empty if the server has none">
-    <p class="hint">The <code>VELMD_TOKEN</code> the server was started with.</p>
-
-    <label class="check" for="velm-remember">
-      <input id="velm-remember" type="checkbox">
-      Remember the passphrase on this device
-    </label>
-    <p class="hint">
-      Off, the passphrase is forgotten when this tab closes — which is what you want on a
-      computer that is not yours. On, it stays until you press <em>Forget this device</em>.
-    </p>
-
-    <button class="btn" id="velm-connect-go" type="submit">Connect</button>
-  </form>
-
-  <div class="grid" id="velm-boards"></div>
-
-  <!--
-    Bringing a board across from Miro.
-
-    ⚠ It is a **textarea you paste into**, not a button that reads the clipboard. Two reasons,
-    and the second is the one that decided it. `navigator.clipboard.read()` raises a browser
-    permission prompt, which is a dialog the person did not agree to meet by pressing a button
-    labelled *import*. And a real paste hands over `text/html` — which is where Miro's payload
-    rides, delimited rather than prefixed — whereas the async clipboard API's HTML support is
-    uneven across exactly the browsers this client has to work in.
-
-    The import itself runs on the server: `vellum-import` reaches SQLite, and a tab cannot
-    fetch a link card's page anyway, because CORS refuses it.
-  -->
-  <section id="velm-import" hidden>
-    <h2>Bring a board from Miro</h2>
-    <ol class="steps">
-      <li>Open the board in Miro and press <strong>⌘A</strong>, then <strong>⌘C</strong>.</li>
-      <li>Click in the box below and press <strong>⌘V</strong>.</li>
-      <li>Give it a name, and press <em>Bring it across</em>.</li>
-    </ol>
-    <div class="velm-import-drop" id="velm-import-drop" contenteditable="true"
-         role="textbox" aria-label="Paste your Miro board here"
-         data-empty="Paste here — nothing is sent until you press the button."></div>
-    <input id="velm-import-name" type="text" autocomplete="off" placeholder="Board name">
-    <button class="btn" id="velm-import-go" type="button">Bring it across</button>
-    <p class="note" id="velm-import-said"></p>
-  </section>
-  <div class="footer-actions">
-    <button class="btn" id="velm-import-open" type="button" hidden>Bring a board from Miro</button>
-  </div>
-
-  <footer>
-    <p class="note">
-      Your boards live on your own server and are never uploaded anywhere else. A board opened
-      from here can be edited, and every change is pushed to your server as it is made.
-    </p>
-    <div class="footer-actions">
-      <button class="btn" id="velm-retry" type="button" hidden>Try again</button>
-      <button class="btn" id="velm-change" type="button" hidden>Change server</button>
-      <button class="btn" id="velm-forget" type="button" hidden>Forget this device</button>
+      <div id="velm-folders" hidden>
+        <hr class="velm-rule">
+        <p class="velm-section">Folders</p>
+        <!-- Pinned first, then the order the server gave — which is the order the user
+             arranged them in, and is not ours to re-sort. -->
+        <ul class="velm-spaces" id="velm-spaces"></ul>
+        <p class="velm-empty-note" id="velm-spaces-empty" hidden>No folders yet</p>
+      </div>
     </div>
-  </footer>
-</main>
+  </nav>
+
+  <main class="velm-main">
+    <header>
+      <div class="velm-head">
+        <!-- The scope's own name once there is one: Recent, All boards, Starred, Recently
+             deleted, or the folder's. Before a server has answered there is no scope, and
+             this is the page's name. -->
+        <h1 id="velm-title">Your boards</h1>
+        <div class="velm-head-actions">
+          <!-- ⚠ The grouping and view toggles are built by `boards.js` and prepended here,
+               not written in this file. They were markup once — a `#velm-grouping` pair,
+               shipped `hidden`, that nothing ever unhid, because the JS was building its own
+               beside it. Two controls for one appearance with one of them permanently inert is
+               the arrangement feedback 31 removed from the desktop; a comment naming where they
+               come from is worth more than a placeholder that lies about being one. -->
+          <button class="btn" id="velm-import-open" type="button" hidden>Import from Miro</button>
+          <!-- ⚠ Was `hidden` with a comment reading "unhide when a create route is wired". The
+               route **was** wired — `POST /api/v1/boards` — and the agent that wrote this could
+               not see it. That is this repository's signature defect wearing its politest
+               disguise: not code that is wrong, code that is switched off because somebody
+               assumed the other half did not exist. `boards.js` re-hides it against a server
+               that really has no create route, which is the honest gate. -->
+          <button class="btn btn-accent" id="velm-new-board" type="button">New board</button>
+        </div>
+      </div>
+      <!-- aria-live: on a tablet this line is the only thing that says a request is in flight. -->
+      <p class="sub" id="velm-sub" aria-live="polite">Connecting…</p>
+      <p class="where" id="velm-where"></p>
+    </header>
+
+    <div class="message" id="velm-message" role="alert" hidden>
+      <strong id="velm-message-title"></strong>
+      <p id="velm-message-detail"></p>
+    </div>
+
+    <div class="warning" id="velm-warning" hidden></div>
+
+    <form class="panel" id="velm-connect" hidden>
+      <label class="field" for="velm-server">Server address</label>
+      <!-- ⚠ `type="text"`, not `type="url"`. A bare `192.168.1.20:8787` fails the browser's own
+           url validation, and the form then refuses to submit behind a tooltip that says nothing
+           about what is wrong — for the address most likely to be typed on a home network. -->
+      <input id="velm-server" name="server" type="text" inputmode="url"
+             autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"
+             placeholder="velm.example.com">
+      <p class="hint">Where <code>velmd serve</code> is running. Its own default port is 8787.</p>
+
+      <label class="field" for="velm-passphrase">Passphrase</label>
+      <input id="velm-passphrase" name="passphrase" type="password"
+             autocomplete="current-password" placeholder="Leave empty if the server has none">
+      <p class="hint">The <code>VELMD_TOKEN</code> the server was started with.</p>
+
+      <label class="check" for="velm-remember">
+        <input id="velm-remember" type="checkbox">
+        Remember the passphrase on this device
+      </label>
+      <p class="hint">
+        Off, the passphrase is forgotten when this tab closes — which is what you want on a
+        computer that is not yours. On, it stays until you press <em>Forget this device</em>.
+      </p>
+
+      <button class="btn" id="velm-connect-go" type="submit">Connect</button>
+    </form>
+
+    <!-- The bands, or one grid. `boards.js` fills this: `section.velm-band` per band on the
+         Recent page and per folder on a grouped All boards, one `.velm-grid` inside each. -->
+    <div id="velm-boards"></div>
+
+    <!-- What this scope says when it is empty and the library is not. The Mac's own six
+         strings; the script chooses. -->
+    <p class="velm-empty" id="velm-empty" hidden></p>
+
+    <!--
+      Bringing a board across from Miro.
+
+      ⚠ It is a **textarea you paste into**, not a button that reads the clipboard. Two reasons,
+      and the second is the one that decided it. `navigator.clipboard.read()` raises a browser
+      permission prompt, which is a dialog the person did not agree to meet by pressing a button
+      labelled *import*. And a real paste hands over `text/html` — which is where Miro's payload
+      rides, delimited rather than prefixed — whereas the async clipboard API's HTML support is
+      uneven across exactly the browsers this client has to work in.
+
+      The import itself runs on the server: `vellum-import` reaches SQLite, and a tab cannot
+      fetch a link card's page anyway, because CORS refuses it.
+    -->
+    <section id="velm-import" hidden>
+      <h2>Bring a board from Miro</h2>
+      <ol class="steps">
+        <li>Open the board in Miro and press <strong>⌘A</strong>, then <strong>⌘C</strong>.</li>
+        <li>Click in the box below and press <strong>⌘V</strong>.</li>
+        <li>Give it a name, and press <em>Bring it across</em>.</li>
+      </ol>
+      <div class="velm-import-drop" id="velm-import-drop" contenteditable="true"
+           role="textbox" aria-label="Paste your Miro board here"
+           data-empty="Paste here — nothing is sent until you press the button."></div>
+      <input id="velm-import-name" type="text" autocomplete="off" placeholder="Board name">
+      <button class="btn" id="velm-import-go" type="button">Bring it across</button>
+      <p class="note" id="velm-import-said"></p>
+    </section>
+
+    <footer>
+      <p class="note">
+        Your boards live on your own server and are never uploaded anywhere else. A board opened
+        from here can be edited, and every change is pushed to your server as it is made.
+      </p>
+      <div class="footer-actions">
+        <button class="btn" id="velm-retry" type="button" hidden>Try again</button>
+        <button class="btn" id="velm-change" type="button" hidden>Change server</button>
+        <button class="btn" id="velm-forget" type="button" hidden>Forget this device</button>
+      </div>
+    </footer>
+  </main>
+</div>
 
 <script type="module">
   // Nothing runs on import: `boards.js` is a module of pure helpers plus one `mount`, which is
