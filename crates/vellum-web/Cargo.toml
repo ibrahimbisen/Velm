@@ -32,6 +32,10 @@ vellum-ink.workspace = true
 # and with it `ureq` and `ring`, is not in this build. `crates/vellum-web` must never fetch.
 vellum-link.workspace = true
 vellum-project.workspace = true
+# Taking a board out of the tab. Pure — a scene of its own plus an SVG and a CSV writer, no
+# filesystem and no network — which is what lets the browser share the desktop's exporter
+# rather than growing a second one that would disagree about what a board looks like on paper.
+vellum-export.workspace = true
 # The four pure layout crates behind the structured widgets. None of them does any I/O --
 # a table's column widths, a chart's axis ticks, a kanban's lane packing and a tidy tree are
 # all arithmetic over measured text -- so they cross to wasm untouched, the way the rest of

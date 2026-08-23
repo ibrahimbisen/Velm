@@ -5747,6 +5747,7 @@ dependencies = [
  "vellum-chart",
  "vellum-connect",
  "vellum-doc",
+ "vellum-export",
  "vellum-flow",
  "vellum-ink",
  "vellum-link",

@@ -188,6 +188,19 @@
   @media (prefers-reduced-motion: reduce) {
     .btn, .velm-card { transition: none; }
   }
+  #velm-import { margin: 28px 0 0; }
+  #velm-import h2 { font-size: 15px; margin: 0 0 8px; }
+  #velm-import .steps { margin: 0 0 12px; padding-left: 20px; font-size: 13px; line-height: 1.7; }
+  .velm-import-drop {
+    min-height: 76px; padding: 10px 12px; border-radius: 8px;
+    border: 1px dashed var(--edge, #c9d1d6); background: var(--raised, #fff);
+    font: 12px/1.5 ui-monospace, monospace; overflow: hidden; white-space: pre-wrap;
+  }
+  .velm-import-drop:empty::before { content: attr(data-empty); opacity: .55; }
+  .velm-import-drop:focus { outline: 2px solid var(--accent, #00a38c); outline-offset: 1px; }
+  #velm-import-name { display: block; width: 100%; margin: 10px 0; padding: 8px 10px;
+    border-radius: 8px; border: 1px solid var(--edge, #c9d1d6); font: inherit; }
+  #velm-import-said[data-bad="true"] { color: #b3261e; }
 </style>
 
 <main>
@@ -234,10 +247,41 @@
 
   <div class="grid" id="velm-boards"></div>
 
+  <!--
+    Bringing a board across from Miro.
+
+    ⚠ It is a **textarea you paste into**, not a button that reads the clipboard. Two reasons,
+    and the second is the one that decided it. `navigator.clipboard.read()` raises a browser
+    permission prompt, which is a dialog the person did not agree to meet by pressing a button
+    labelled *import*. And a real paste hands over `text/html` — which is where Miro's payload
+    rides, delimited rather than prefixed — whereas the async clipboard API's HTML support is
+    uneven across exactly the browsers this client has to work in.
+
+    The import itself runs on the server: `vellum-import` reaches SQLite, and a tab cannot
+    fetch a link card's page anyway, because CORS refuses it.
+  -->
+  <section id="velm-import" hidden>
+    <h2>Bring a board from Miro</h2>
+    <ol class="steps">
+      <li>Open the board in Miro and press <strong>⌘A</strong>, then <strong>⌘C</strong>.</li>
+      <li>Click in the box below and press <strong>⌘V</strong>.</li>
+      <li>Give it a name, and press <em>Bring it across</em>.</li>
+    </ol>
+    <div class="velm-import-drop" id="velm-import-drop" contenteditable="true"
+         role="textbox" aria-label="Paste your Miro board here"
+         data-empty="Paste here — nothing is sent until you press the button."></div>
+    <input id="velm-import-name" type="text" autocomplete="off" placeholder="Board name">
+    <button class="btn" id="velm-import-go" type="button">Bring it across</button>
+    <p class="note" id="velm-import-said"></p>
+  </section>
+  <div class="footer-actions">
+    <button class="btn" id="velm-import-open" type="button" hidden>Bring a board from Miro</button>
+  </div>
+
   <footer>
     <p class="note">
-      Your boards live on your own server and are never uploaded anywhere else. Editing is not
-      available in a browser yet — the desktop app is still where a board is changed.
+      Your boards live on your own server and are never uploaded anywhere else. A board opened
+      from here can be edited, and every change is pushed to your server as it is made.
     </p>
     <div class="footer-actions">
       <button class="btn" id="velm-retry" type="button" hidden>Try again</button>

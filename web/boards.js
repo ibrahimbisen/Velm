@@ -487,6 +487,12 @@ const IDS = {
   // button is a loud failure rather than a form nobody without a keyboard can send.
   submit: 'velm-connect-go',
   boards: 'velm-boards',
+  importOpen: 'velm-import-open',
+  importPanel: 'velm-import',
+  importDrop: 'velm-import-drop',
+  importName: 'velm-import-name',
+  importGo: 'velm-import-go',
+  importSaid: 'velm-import-said',
   where: 'velm-where',
   change: 'velm-change',
   forget: 'velm-forget',
@@ -519,6 +525,7 @@ export function mount(options = {}) {
   let server = resolveServer(win, store, params.get('server'));
   const storedToken = store.getToken(server.base) || null;
   let token = params.get('token') || storedToken || null;
+  wireImport();
 
   // ⚠ A token that arrived in the URL is taken out of the address bar, and is stored **only
   // when there is nothing to overwrite**.
@@ -776,6 +783,11 @@ export function mount(options = {}) {
       el.boards.append(card(board, id));
     }
 
+    // The importer is offered only once a server has actually answered — it is the only verb
+    // on this page that writes, and offering it beside a failed connection would be a button
+    // whose one outcome is an error.
+    if (el.importOpen) el.importOpen.hidden = false;
+
     if (!server.local) checkRemoteClient();
   }
 
@@ -819,6 +831,98 @@ export function mount(options = {}) {
       },
       !el.warning.hidden,
     );
+  }
+
+  /**
+   * Bringing a board across from Miro.
+   *
+   * ⚠ **The payload is taken from a real paste event, and it is the `text/html` flavour.**
+   * Miro's clipboard payload is delimited — `<--(miro-data-v1)…(/miro-data-v1)-->` — and it
+   * rides in HTML, so reading `text/plain` gets a page of words and no board. Taking it from
+   * the event rather than from `navigator.clipboard.read()` also means no permission prompt:
+   * a paste *is* the person's consent, expressed as a gesture rather than as a dialog.
+   *
+   * The `contenteditable` is a receptacle for the event and nothing else — its own DOM is
+   * never read, and the paste is prevented from ever landing in it, because a 1.1 MB board
+   * rendered as HTML in the page is megabytes of layout for something nobody looks at.
+   */
+  let pasted = null;
+  function wireImport() {
+    if (!el.importOpen || !el.importPanel) return;
+    const said = (message, bad) => {
+      if (!el.importSaid) return;
+      el.importSaid.textContent = message;
+      el.importSaid.dataset.bad = bad ? 'true' : 'false';
+    };
+    el.importOpen.addEventListener('click', () => {
+      el.importPanel.hidden = false;
+      el.importOpen.hidden = true;
+      if (el.importDrop) el.importDrop.focus();
+    });
+    if (el.importDrop) {
+      el.importDrop.addEventListener('paste', (event) => {
+        event.preventDefault();
+        const data = event.clipboardData;
+        if (!data) return;
+        const html = data.getData('text/html') || '';
+        // The delimiter, checked here so the person hears about a wrong paste immediately
+        // rather than after a round trip. The server checks it too — this is a courtesy, not
+        // the gate, and it says so because a check in a page is never a check.
+        if (!html.includes('miro-data-v1')) {
+          pasted = null;
+          said('That paste does not look like a Miro board. Select the board in Miro with ⌘A, then ⌘C.', true);
+          return;
+        }
+        pasted = html;
+        said(`Ready — ${Math.round(html.length / 1024)} KB of board. Give it a name.`, false);
+      });
+    }
+    if (el.importGo) {
+      el.importGo.addEventListener('click', async () => {
+        if (!pasted) {
+          said('Nothing pasted yet.', true);
+          return;
+        }
+        const name = (el.importName && el.importName.value.trim()) || 'Miro import';
+        el.importGo.disabled = true;
+        said('Bringing it across — this reads every widget, so it takes a moment.', false);
+        // ⚠ The passphrase in a header, never the query string, for the reason the board list
+        // gives: a URL is in history and in every access log between here and the server.
+        const headers = { 'content-type': 'text/html; charset=utf-8' };
+        if (token) headers.authorization = `Bearer ${token}`;
+        const url = `${apiUrl(server.base, 'import')}?title=${encodeURIComponent(name)}`;
+        // Its own timeout, and a generous one: the server decodes ~600 widgets and writes a
+        // board. The page-wide BOARDS_TIMEOUT_MS is for a list and would abort a real import
+        // that was working perfectly.
+        const answer = await request(url, { method: 'POST', headers, body: pasted }, 120_000);
+        el.importGo.disabled = false;
+        if (answer.error) {
+          said(answer.timedOut
+            ? 'That took too long. The board may still have arrived — reload this page to see.'
+            : 'Could not reach your server.', true);
+          return;
+        }
+        if (!answer.response.ok) {
+          said(`Your server refused it (${answer.response.status}).`, true);
+          return;
+        }
+        let made = null;
+        try { made = await answer.response.json(); } catch { made = null; }
+        if (!made || typeof made.id !== 'string') {
+          said('Your server answered something this page could not read.', true);
+          return;
+        }
+        const short = made.degraded
+          ? `${made.items} items, ${made.degraded} of them simplified`
+          : `${made.items} items`;
+        said(`Brought "${made.title}" across — ${short}. Reloading the list…`, false);
+        pasted = null;
+        // Reloaded rather than a card appended by hand: the list is drawn from the server's
+        // own answer, and building a second way to add a row to it is a second thing that can
+        // be wrong about what is on the server.
+        win.setTimeout(() => win.location.reload(), 1200);
+      });
+    }
   }
 
   function openConnectForm(opts = {}) {

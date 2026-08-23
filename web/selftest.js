@@ -394,6 +394,22 @@ export async function runEditFixture(mod, canvas) {
     check(hits > 0, `search found the word that was just typed (${hits} match(es))`);
   }
 
+  // ─────────────────────────── 6. the board comes out of the tab ──────────────────────────
+  if (typeof mod.export_board === 'function') {
+    const svg = mod.export_board('svg');
+    // Three separate claims, because a non-empty string satisfies none of them on its own: it
+    // is really SVG, it carries this board's geometry, and it carries the word just typed —
+    // which is what proves the exporter read the *live* document rather than the file on disk.
+    check(svg.startsWith('<?xml') || svg.startsWith('<svg'), `SVG export is SVG (${svg.length} bytes)`);
+    check(svg.includes('<path') || svg.includes('<rect'), 'and it carries geometry');
+    const csv = mod.export_board('csv');
+    check(csv.split('\n').length > 100, `spreadsheet export has ${csv.split('\n').length} rows`);
+    const holes = typeof mod.export_placeholders === 'function' ? mod.export_placeholders() : -1;
+    check(holes >= 0, `and it says up front that ${holes} picture(s) export as placeholders`);
+  } else {
+    failed.push('export_board is missing, so the Download rows would draw disabled');
+  }
+
   const line = failed.length === 0
     ? `edit fixture: all ${notes.length} checks passed — ${notes.join('; ')}`
     : `edit fixture FAILED ${failed.length} of ${failed.length + notes.length}: ${failed.join('; ')}`;

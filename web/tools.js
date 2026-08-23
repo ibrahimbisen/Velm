@@ -173,6 +173,20 @@ const ROWS = {
   cut: { label: 'Cut', via: [['cut_selection']] },
   copy: { label: 'Copy', via: [['copy_selection']] },
   paste: { label: 'Paste', via: [['paste']] },
+  // ⚠ The only two rows whose **answer** is the point. Every other verb here acts on the
+  // board and returns nothing worth keeping; these two return the file. `download` is what
+  // tells `runRow` to hand it over rather than drop it on the floor — which is what a row
+  // written in the ordinary shape would silently have done.
+  exportSvg: {
+    label: 'Download as SVG',
+    via: [['export_board', () => 'svg']],
+    download: { name: 'board.svg', media: 'image/svg+xml', warnsAboutPictures: true },
+  },
+  exportCsv: {
+    label: 'Download as spreadsheet',
+    via: [['export_board', () => 'csv']],
+    download: { name: 'board.csv', media: 'text/csv;charset=utf-8' },
+  },
   duplicate: { label: 'Duplicate', via: [['duplicate_selection']] },
   delete: { label: 'Delete', via: [['delete_selection']], danger: true },
   // ⚠ Two routes, in the order the crate on disk actually answers. `style.rs` takes the four
@@ -215,7 +229,11 @@ const ROWS = {
 /// rows are offered.
 export function menuRows(target, summary) {
   if (target === 'canvas') {
-    return ['paste', 'sep', 'selectAll'];
+    // ⚠ Export is a **canvas** verb, not a selection one, and the asymmetry is deliberate:
+    // both formats emit `Scope::Board`, so offering them over a selection would promise a
+    // partial export this door does not make. The desktop reaches selection-scoped export
+    // through a menu that can say which it is doing; this one cannot, so it does one thing.
+    return ['paste', 'sep', 'exportSvg', 'exportCsv', 'sep', 'selectAll'];
   }
   const out = ['cut', 'copy', 'duplicate', 'delete', 'sep', 'front', 'back', 'sep'];
   const locked = summary && summary.locked ? summary.locked : { state: 'absent' };
@@ -659,6 +677,10 @@ const EXPORTS = {
   style_selection: ['style_selection', 'velm_style_selection'],
   context_target: ['context_target', 'velm_context_target'],
   select_all: ['select_all', 'velm_select_all'],
+  /// Taking the board out of the tab. Both optional: a build without them draws the rows
+  /// disabled with a tooltip, which is how a reader finds out what this build cannot do.
+  export_board: ['export_board', 'velm_export_board'],
+  export_placeholders: ['export_placeholders', 'velm_export_placeholders'],
   delete_selection: ['delete_selection', 'velm_delete_selection'],
   cut_selection: ['cut_selection', 'velm_cut_selection'],
   copy_selection: ['copy_selection', 'velm_copy_selection'],
@@ -1017,8 +1039,8 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
     closeMenu();
     const taken = route(row);
     if (!taken) return;
-    if (taken.arg === undefined) mod[taken.fn]();
-    else mod[taken.fn](taken.arg);
+    const answer = taken.arg === undefined ? mod[taken.fn]() : mod[taken.fn](taken.arg);
+    if (row.download) deliver(answer, row.download);
   }
 
   function buildMenu(target, model) {
@@ -1063,6 +1085,69 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
     node.style.left = `${Math.min(Math.max(GAP, x), maxX)}px`;
     node.style.top = `${Math.min(Math.max(GAP, y), maxY)}px`;
   }
+
+  /// Say something to the person, through the page's own status line.
+  ///
+  /// ⚠ Deliberately not a `window.alert`, and not silence either. An alert is modal and steals
+  /// the keyboard, which on a tablet also dismisses the caret; silence is how a person finds
+  /// out an export was partial by opening the file. The status line is already the page's one
+  /// channel for this — it is what says `Starting…` and what the render proof writes into —
+  /// and it is looked at, because it is where the item count lives.
+  const say = (message) => {
+    const line = doc.getElementById('velm-status');
+    if (line) {
+      line.hidden = false;
+      line.textContent = message;
+    } else {
+      console.log(message);
+    }
+  };
+
+  /// Hand the browser a file.
+  ///
+  /// ⚠ `URL.revokeObjectURL` is not optional housekeeping. A blob URL pins its bytes for the
+  /// life of the *document*, and an SVG of a 1,300-item board is megabytes — so a session
+  /// spent exporting would hold every export it ever made, in a tab whose linear memory never
+  /// returns to the operating system anyway. The timeout is because revoking synchronously
+  /// races the download the click just started.
+  const handOver = (text, name, media) => {
+    const url = URL.createObjectURL(new Blob([text], { type: media }));
+    const link = doc.createElement('a');
+    link.href = url;
+    link.download = name;
+    link.style.display = 'none';
+    doc.body.append(link);
+    link.click();
+    link.remove();
+    win.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  };
+
+  /// Take what an export row answered and give it to the browser.
+  ///
+  /// Separate from the row's own invocation because the caveat depends on the file: a
+  /// spreadsheet carries no pictures on any platform, so warning about them there would be
+  /// a warning about nothing.
+  const deliver = (text, spec) => {
+    // ⚠ Empty means nothing came out — no viewer yet, an empty board, an emitter that
+    // refused. Handing over a zero-byte file with the right name is the shape this
+    // application refuses everywhere else: it looks exactly like success until it is opened.
+    if (typeof text !== 'string' || text.length === 0) {
+      say('Nothing came out — this board has nothing to export.');
+      return;
+    }
+    handOver(text, spec.name, spec.media);
+    const missing = spec.warnsAboutPictures ? Number(invoke('export_placeholders') || 0) : 0;
+    // Said after the download rather than as a dialog before it: the file is the honest thing
+    // to hand over, and the caveat is about the pictures alone.
+    if (missing > 0) {
+      say(
+        `Downloaded. ${missing} picture${missing === 1 ? '' : 's'} exported as placeholders — ` +
+        'a browser holds them as textures, not as bytes, so there are no pixels here to write.',
+      );
+    } else {
+      say(`Downloaded ${spec.name}.`);
+    }
+  };
 
   function openMenu(x, y) {
     closePopover();

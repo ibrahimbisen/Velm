@@ -85,6 +85,7 @@ mod board;
 mod card;
 mod caret;
 mod clip;
+mod download;
 mod edit;
 mod find;
 mod live;
