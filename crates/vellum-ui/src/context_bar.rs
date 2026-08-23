@@ -56,26 +56,6 @@ use vellum_doc::{Align, CardMode, Color};
 /// look for every time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
-    /// Start or stop the selected agents. One control, showing the verb that applies —
-    /// the same rule the lock button follows, and for the same reason: a pair where one
-    /// is always greyed out is noise on a bar this short.
-    AgentRun,
-    /// Raw or clean — feature 2's per-node half, as the one-press form of it.
-    AgentRaw,
-    /// Which provider and model this node runs on — feature 16. Named on the bar rather
-    /// than hidden behind the `⋮`, because it is the thing you check before starting a
-    /// long run, and because on this bar it is also where the billing is stated.
-    AgentProvider,
-    /// A note's scope: shared with every agent, or one agent's own.
-    NoteScope,
-    /// Show a note's `.md` file. A note is a real file, and that is the whole feature.
-    NoteReveal,
-    /// Whether a file tree shows what git ignores.
-    TreeIgnored,
-    /// Whether a browser node's page may run an engine.
-    BrowserLive,
-    /// Open a browser node's page in the user's own browser.
-    BrowserOpen,
     /// A card's display form: Row, Card or Large.
     CardMode,
     /// Open the one selected card's page.
@@ -98,9 +78,11 @@ pub enum Control {
     /// coverage band and cannot be dashed, and ink has never asked to be.
     LineStyle,
     Routing,
-    /// The terminator at the near end. Beside [`Self::EndArrow`] because on an agent link an
-    /// arrowhead is not decoration — it is which way messages may travel — and a link pointing
-    /// the other way could not be made from this bar at all.
+    /// The terminator at the near end.
+    ///
+    /// Beside [`Self::EndArrow`] because without it a connector can be pointed one way and
+    /// both ways from this bar and **not** the other way — and the docked panel, which is
+    /// the only other place it lives, is off by default.
     StartArrow,
     /// The terminator at the far end, which is the one anybody changes.
     EndArrow,
@@ -139,44 +121,17 @@ pub fn controls(model: &PanelModel) -> Vec<Control> {
         return out;
     }
 
-    // The Agent Canvas band leads, and it is derived exactly as every other band is: from
-    // the properties the selection has, never from `ItemFacet::Agent`. A fifth node kind
-    // arriving with a blank bar is what a `match` on the kind buys.
-    if model.has_agent() {
-        out.push(Control::AgentRun);
-        out.push(Control::AgentRaw);
-        out.push(Control::AgentProvider);
-    }
-    if model.has_note() {
-        out.push(Control::NoteScope);
-        // Only when there is one note and it has a file behind it. A button that reveals
-        // nothing is worse than no button.
-        if model.note_path().is_some() {
-            out.push(Control::NoteReveal);
-        }
-    }
-    if model.has_file_tree() {
-        out.push(Control::TreeIgnored);
-    }
-    if model.has_browser() {
-        out.push(Control::BrowserLive);
-        if model.browser_url().is_some() {
-            out.push(Control::BrowserOpen);
-        }
-    }
-
-    // A card next: its display form is the property somebody selected it to change.
-    let card_from = out.len();
+    // A card leads: its display form is the property somebody selected it to change.
+    //
+    // No separator guard here, unlike the two bands below, and that is a fact rather than an
+    // oversight — this is the first band, so there is never anything in front of it to be
+    // ruled off from. `paint_from` and `text_from` keep theirs because a card can precede
+    // them.
     if !model.card_mode.is_absent() {
         out.push(Control::CardMode);
         if model.link_url.is_some() {
             out.push(Control::OpenPage);
             out.push(Control::CopyLink);
-        }
-        // An agent and a link card can be selected together, and a rule between the two
-        // bands is what stops that reading as one run of unrelated buttons.
-        if card_from > 0 {
-            out.insert(card_from, Control::Separator);
         }
     }
 
@@ -424,266 +379,6 @@ fn draw(
             ui.add_space(space::UNIT * 1.5);
         }
 
-        // ----- the Agent Canvas band -----------------------------------------
-        //
-        // Every one of these emits a `Command` or an `AgentEdit` the menu and the panel
-        // already emit, so the bar adds no third way for a value to be set.
-        Control::AgentRun => {
-            // One button showing the verb that applies, exactly as the lock does. Offering
-            // Run *and* Stop would mean one of them is always greyed out, which is noise on
-            // a bar this short; both are still rows in Edit ▸ Agent for the mixed case,
-            // where neither label is the whole truth.
-            let running = matches!(model.agent_running, Field::Uniform(true));
-            let command =
-                if running { crate::Command::StopAgent } else { crate::Command::RunAgent };
-            let available = command.availability(cmd_ctx);
-            let icon = if running { Icon::Stop } else { Icon::Play };
-            let response = ui
-                .add_enabled_ui(available.is_enabled(), |ui| {
-                    icon_button(ui, palette, icon, CONTROL, running)
-                })
-                .inner;
-            match available.reason() {
-                Some(why) => {
-                    response.on_disabled_hover_text(format!("{} — {why}", command.label()));
-                }
-                None => {
-                    // The command's own sentence, not its label. A tooltip reading "Run"
-                    // over a button already drawn as ▶ is the kind that teaches people to
-                    // ignore tooltips — and this is the control the whole layer turns on.
-                    // One derivation with the menu row's, so the two cannot drift.
-                    let hint = command
-                        .note()
-                        .map_or_else(|| command.label().to_owned(), |note| {
-                            format!("{} — {note}", command.label())
-                        });
-                    if response.on_hover_text(hint).clicked() {
-                        events.command(command);
-                    }
-                }
-            }
-        }
-
-        Control::AgentRaw => {
-            // The **resolved** mode, not the stored one: a node inheriting a raw default is
-            // showing raw, and a button that read the stored `Option` would offer to turn on
-            // what is already on. Single selection resolves through the summary; a
-            // multi-selection can only fold what is stored, which is the honest answer for
-            // several nodes whose defaults may differ.
-            let raw = model.agent.as_ref().map_or_else(
-                || {
-                    matches!(
-                        model.agent_display,
-                        Field::Uniform(Some(vellum_agent::DisplayMode::Raw))
-                    )
-                },
-                |agent| agent.effective_display() == vellum_agent::DisplayMode::Raw,
-            );
-            let response = ui.add(
-                egui::Button::selectable(raw, "Raw")
-                    .frame(true)
-                    .min_size(Vec2::splat(CONTROL)),
-            );
-            if response
-                .on_hover_text(if raw {
-                    "Showing every tool call and reasoning step — click for the answer only"
-                } else {
-                    "Showing the answer only — click for every tool call and reasoning step"
-                })
-                .clicked()
-            {
-                events.command(crate::Command::ToggleAgentRaw);
-            }
-        }
-
-        Control::AgentProvider => {
-            // The name is the control, as the typeface's is: an icon would say "provider"
-            // without saying *which*, and which is the entire question. The hover carries
-            // the billing, which is the thing worth knowing before a long run —
-            // `ProviderChoice::summary`'s word, never one composed here.
-            let current = match &model.agent_provider {
-                Field::Absent => return None,
-                Field::Mixed => crate::widgets::MIXED.to_owned(),
-                Field::Uniform(None) => "Inherit".to_owned(),
-                Field::Uniform(Some(choice)) => choice.provider.label().to_owned(),
-            };
-            let billing = model
-                .agent
-                .as_ref()
-                .map_or_else(String::new, crate::AgentSummary::provider_summary);
-            let combo = egui::ComboBox::from_id_salt("velm-bar-agent-provider")
-                .selected_text(current)
-                .width(space::of(26))
-                .height(space::of(50))
-                .show_ui(ui, |ui| {
-                    let inheriting = matches!(model.agent_provider, Field::Uniform(None));
-                    if ui.selectable_label(inheriting, "Inherit the board's default").clicked() {
-                        events.push(UiEvent::Agent(crate::AgentEdit::Provider(None)));
-                    }
-                    for provider in vellum_agent::Provider::ALL {
-                        let on = matches!(
-                            &model.agent_provider,
-                            Field::Uniform(Some(choice)) if choice.provider == provider
-                        );
-                        if ui.selectable_label(on, provider.label()).clicked() {
-                            // The same carry-forward the panel does, and for the same reason:
-                            // this control changes *which provider*, and a typed model name
-                            // or a local endpoint is not something a provider click asked to
-                            // throw away. Building a fresh `ProviderChoice` here made the bar
-                            // and the panel disagree about what a provider change costs —
-                            // silently, since neither says what it discarded.
-                            let previous = match &model.agent_provider {
-                                Field::Uniform(Some(choice)) => Some(choice.clone()),
-                                _ => None,
-                            };
-                            let mut next = vellum_agent::ProviderChoice::new(provider);
-                            next.model = previous.as_ref().and_then(|c| c.model.clone());
-                            if provider.default_base_url().is_none() {
-                                next.base_url = previous.and_then(|c| c.base_url);
-                            }
-                            events.push(UiEvent::Agent(crate::AgentEdit::Provider(Some(next))));
-                        }
-                    }
-                });
-            // **Always a tooltip, with the billing appended when it is known.** It used to be
-            // the billing *or nothing*, and `provider_summary` is empty for a node the
-            // runtime has not attached a session to — which is every freshly placed agent. So
-            // the commonest state of the commonest control on the bar was the one with
-            // nothing to hover, and a combo reading "Inherit" says neither what it inherits
-            // nor from where.
-            let hint = if billing.is_empty() {
-                // Two things this used to get wrong, both of the same kind: it named
-                // *Preferences > Agents > Providers*, a level deeper than the menu goes, and
-                // it said changing something there moves inheriting nodes — but that submenu
-                // signs providers in, and there is no app-wide *default provider* setting for
-                // Inherit to follow. Inherit resolves to Velm's own built-in default. A
-                // tooltip that sends someone to a menu path that does not exist, for a
-                // setting that does not exist, costs them the time to go and look.
-                "Which model this agent runs on. *Inherit* uses Velm's default provider; \
-                 sign providers in under Preferences ▸ Providers."
-                    .to_owned()
-            } else {
-                format!("{billing}\n\nChange it here for this node only.")
-            };
-            combo.response.on_hover_text(hint);
-        }
-
-        Control::NoteScope => {
-            let private = matches!(model.note_private, Field::Uniform(true));
-            let button = egui::Button::selectable(private, if private { "Private" } else { "Shared" })
-                .frame(true)
-                .min_size(Vec2::splat(CONTROL));
-            // Both directions are reachable now. The bar used to disable *Shared* under a
-            // sentence telling the user to "connect it to one agent" — a gesture nothing
-            // implemented, so following the instruction did nothing and the note stayed
-            // shared for ever. The connector was the right idea and it is what the menu
-            // below reads: `NoteSummary::connected` is the agents on the other end of a line
-            // the user drew.
-            let connected: &[crate::AgentLink] =
-                model.note.as_ref().map_or(&[], |note| note.connected.as_slice());
-            if private {
-                if ui
-                    .add(button)
-                    .on_hover_text("One agent only — click to share it with every agent")
-                    .clicked()
-                {
-                    events.push(UiEvent::Agent(crate::AgentEdit::NoteScope(
-                        vellum_agent::NoteScope::Shared,
-                    )));
-                }
-            } else if connected.is_empty() {
-                // Still disabled — and now for a reason that names a gesture that exists.
-                ui.add_enabled(false, button).on_disabled_hover_text(
-                    "Shared with every agent on this board. Draw a connector from it to one \
-                     agent to make it that agent's own.",
-                );
-            } else {
-                // A menu, not a toggle: *private* is "private to whom", and with two lines
-                // drawn a button would have to guess which agent was meant.
-                egui::ComboBox::from_id_salt("velm-bar-note-scope")
-                    .selected_text("Shared")
-                    .width(CONTROL * 2.5)
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(true, "Shared with every agent").clicked() {
-                            events.push(UiEvent::Agent(crate::AgentEdit::NoteScope(
-                                vellum_agent::NoteScope::Shared,
-                            )));
-                        }
-                        for link in connected {
-                            if ui
-                                .selectable_label(false, format!("Private to {}", link.label))
-                                .clicked()
-                            {
-                                events.push(UiEvent::Agent(crate::AgentEdit::NoteScope(
-                                    vellum_agent::NoteScope::Private { agent: link.id.clone() },
-                                )));
-                            }
-                        }
-                    })
-                    .response
-                    .on_hover_text("Who may read and write this note");
-            }
-        }
-
-        Control::NoteReveal => {
-            if let Some(path) = model.note_path()
-                && icon_button(ui, palette, Icon::Folder, CONTROL, false)
-                    .on_hover_text(format!("Show {path}"))
-                    .clicked()
-            {
-                events.push(UiEvent::RevealPath(path.into()));
-            }
-        }
-
-        Control::TreeIgnored => {
-            let on = matches!(model.tree_show_ignored, Field::Uniform(true));
-            if ui
-                .add(
-                    egui::Button::selectable(on, "Ignored")
-                        .frame(true)
-                        .min_size(Vec2::splat(CONTROL)),
-                )
-                .on_hover_text(if on {
-                    "Showing files git ignores — click to hide them"
-                } else {
-                    "Hiding files git ignores — click to show them"
-                })
-                .clicked()
-            {
-                events.push(UiEvent::Agent(crate::AgentEdit::ShowIgnored(!on)));
-            }
-        }
-
-        Control::BrowserLive => {
-            let allowed = model.browser.as_ref().is_none_or(|b| b.allowed);
-            let live = matches!(model.browser_live, Field::Uniform(true));
-            let button = egui::Button::selectable(live, if live { "Loaded" } else { "Load" })
-                .frame(true)
-                .min_size(Vec2::splat(CONTROL));
-            let response = ui.add_enabled(allowed, button);
-            if allowed {
-                if response.clicked() {
-                    events.push(UiEvent::Agent(crate::AgentEdit::BrowserLive(!live)));
-                }
-            } else {
-                // Two yeses, and this is the outer one refusing. Named, with where the
-                // switch is, rather than a button that does nothing when pressed.
-                response.on_disabled_hover_text(
-                    "Browser nodes are off — turn them on in Preferences ▸ Browser nodes",
-                );
-            }
-        }
-
-        Control::BrowserOpen => {
-            if let Some(url) = model.browser_url()
-                && icon_button(ui, palette, Icon::Import, CONTROL, false)
-                    .on_hover_text(format!("Open {url} in your browser"))
-                    .clicked()
-            {
-                events.push(UiEvent::OpenLink(url.to_owned()));
-            }
-        }
-
         Control::CardMode => {
             let options = [
                 crate::widgets::Segment::text(CardMode::Link, "Row"),
@@ -779,12 +474,10 @@ fn draw(
             }
         }
 
-        // The start arrow, offered beside the end one because on an **agent link** the
-        // arrowhead is not decoration: `agent::link_kind` reads the two ends to decide which
-        // way messages may flow, so an arrow at the start is how a link is pointed the other
-        // way — and it existed only in the docked properties panel, which is off by default.
-        // A user working from the floating bar could make a forward link and a bidirectional
-        // one and had no way to make a backward one at all.
+        // The start arrow, offered beside the end one because without it a connector cannot
+        // be turned round from this bar at all: the end arrow alone makes a forward line and
+        // a plain one, and reversing it means reaching for the docked properties panel — which
+        // is off by default, so in practice it means not reversing it.
         Control::StartArrow => {
             let current = model.start_arrow.value().copied().unwrap_or(Arrowhead::None);
             let next = if current == Arrowhead::None {
@@ -797,8 +490,7 @@ fn draw(
                 .on_hover_text(if on {
                     "Remove the arrowhead at this end"
                 } else {
-                    "Add an arrowhead at this end. Between two agents, an arrow is which way \
-                     messages may travel."
+                    "Add an arrowhead at this end"
                 })
                 .clicked()
             {
@@ -1130,87 +822,6 @@ mod tests {
         }
     }
 
-    fn agent() -> SelectionItem {
-        let own = vellum_agent::AgentRules::default();
-        SelectionItem {
-            agent: Some(crate::AgentSummary {
-                chat_theme: None,
-                chat_opacity: 255,
-                has_chat_background: false,
-                role: "Reviewer".to_owned(),
-                role_kind: vellum_agent::RoleKind::Worker,
-                provider: None,
-                inherited_provider: vellum_agent::ProviderChoice::new(
-                    vellum_agent::Provider::Claude,
-                ),
-                display: None,
-                inherited_display: vellum_agent::DisplayMode::Clean,
-                working_dir: None,
-                project_dir: None,
-                worktree: crate::WorktreeState::Off,
-                schedule: None,
-                territory: None,
-                spawn_cap: 0,
-                context: Vec::new(),
-                running: false,
-                rules: vellum_agent::rules::resolve(
-                    &vellum_agent::RuleFile::default(),
-                    &vellum_agent::RuleFile::default(),
-                    &own,
-                    "Reviewer",
-                ),
-                own_rules: own,
-                connected: Vec::new(),
-                accepts_messages: true,
-                voice: false,
-                voice_available: false,
-            }),
-            ..bare(1, ItemFacet::Agent)
-        }
-    }
-
-    fn note() -> SelectionItem {
-        SelectionItem {
-            note: Some(crate::NoteSummary {
-                path: "notes/plan.md".to_owned(),
-                scope: vellum_agent::NoteScope::Shared,
-                owner: None,
-                conflicted: false,
-                links: 0,
-                on_disk: true,
-                title: "Plan".to_owned(),
-                connected: Vec::new(),
-            }),
-            ..bare(1, ItemFacet::Note)
-        }
-    }
-
-    fn browser(url: &str) -> SelectionItem {
-        SelectionItem {
-            browser: Some(crate::BrowserSummary {
-                url: url.to_owned(),
-                title: String::new(),
-                live: false,
-                allowed: false,
-            }),
-            ..bare(1, ItemFacet::Browser)
-        }
-    }
-
-    fn file_tree() -> SelectionItem {
-        SelectionItem {
-            file_tree: Some(crate::FileTreeSummary {
-                root: String::new(),
-                project_dir: None,
-                agent: None,
-                agent_id: None,
-                connected: Vec::new(),
-                show_ignored: false,
-            }),
-            ..bare(1, ItemFacet::FileTree)
-        }
-    }
-
     fn of(selection: &[SelectionItem]) -> Vec<Control> {
         controls(&PanelModel::derive(selection))
     }
@@ -1272,79 +883,6 @@ mod tests {
         );
     }
 
-    /// An agent's bar: run, raw/clean, the provider — then the two every selection gets.
-    ///
-    /// The three are what `docs/07-agent-canvas.md`'s node is reached for: is it going, how
-    /// much is it showing me, and what is it costing. Everything else about an agent is a
-    /// row behind the `⋮` or in the inspector, which is the same split a link card gets.
-    #[test]
-    fn an_agent_gets_run_output_and_its_provider() {
-        let bar = of(&[agent()]);
-        assert_eq!(
-            bar,
-            vec![
-                Control::AgentRun,
-                Control::AgentRaw,
-                Control::AgentProvider,
-                Control::Separator,
-                // An agent node has no fill and no stroke, so the bar is the only way to
-                // its alpha — the same rule that gives an image one.
-                Control::Opacity,
-                Control::Separator,
-                Control::Lock,
-                Control::More,
-            ]
-        );
-    }
-
-    /// The three companion kinds get their own small sets, and none of them gets an
-    /// agent's. This is the assertion a `match` on the facet would let drift: a note is not
-    /// an agent, and a control offered on the wrong kind is one that edits nothing.
-    #[test]
-    fn a_note_a_tree_and_a_browser_get_their_own_controls() {
-        let note = of(&[note()]);
-        assert!(note.contains(&Control::NoteScope));
-        assert!(note.contains(&Control::NoteReveal), "the file is the whole feature");
-        assert!(!note.contains(&Control::AgentRun), "{note:?}");
-
-        let tree = of(&[file_tree()]);
-        assert!(tree.contains(&Control::TreeIgnored));
-        assert!(!tree.contains(&Control::NoteScope), "{tree:?}");
-
-        let page = of(&[browser("https://example.test/")]);
-        assert!(page.contains(&Control::BrowserLive));
-        assert!(page.contains(&Control::BrowserOpen));
-        assert!(!page.contains(&Control::AgentRaw), "a browser node has no output mode");
-
-        // …and a browser node that has never been given an address offers no way to open
-        // one, exactly as a card with no URL does not.
-        let blank = of(&[browser("")]);
-        assert!(blank.contains(&Control::BrowserLive));
-        assert!(!blank.contains(&Control::BrowserOpen), "{blank:?}");
-    }
-
-    /// A board with no agent nodes must get the interface it had. The negative half of the
-    /// band above, and the cheapest possible check of `docs/07-agent-canvas.md` §0's second
-    /// rule as it applies to the chrome.
-    #[test]
-    fn nothing_agent_shaped_appears_on_an_ordinary_selection() {
-        for selection in [vec![sticky()], vec![ink()], vec![connector()], vec![card(None)]] {
-            let bar = of(&selection);
-            for agentish in [
-                Control::AgentRun,
-                Control::AgentRaw,
-                Control::AgentProvider,
-                Control::NoteScope,
-                Control::NoteReveal,
-                Control::TreeIgnored,
-                Control::BrowserLive,
-                Control::BrowserOpen,
-            ] {
-                assert!(!bar.contains(&agentish), "{agentish:?} reached {bar:?}");
-            }
-        }
-    }
-
     /// Every selection can be locked and every selection has more to offer than fits,
     /// so these two are the invariant — and they are last, so they never move.
     #[test]
@@ -1354,10 +892,7 @@ mod tests {
             vec![ink()],
             vec![connector()],
             vec![card(None)],
-            vec![agent()],
-            vec![note()],
-            vec![file_tree()],
-            vec![browser("https://example.test/")],
+            vec![image()],
         ] {
             let bar = of(&selection);
             assert_eq!(
@@ -1456,16 +991,14 @@ mod tests {
             vec![ink()],
             vec![connector()],
             vec![card(Some("https://example.com"))],
+            vec![image()],
             vec![sticky(), ink()],
             vec![sticky(), connector(), card(None)],
-            vec![agent()],
-            vec![note()],
-            vec![file_tree()],
-            vec![browser("https://example.test/")],
-            // The two bands that can genuinely coexist: an agent and a link card selected
-            // together, which is what the rule between them exists for.
-            vec![agent(), card(Some("https://example.com"))],
-            vec![agent(), note(), sticky()],
+            // A card beside things that paint and things with words: the case the
+            // `paint_from` and `text_from` guards exist for, since the card band runs in
+            // front of both of them.
+            vec![card(Some("https://example.com")), sticky()],
+            vec![card(None), ink()],
         ] {
             let bar = of(&selection);
             assert_ne!(bar.first(), Some(&Control::Separator), "leading rule in {bar:?}");

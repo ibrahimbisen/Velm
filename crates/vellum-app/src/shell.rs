@@ -84,9 +84,9 @@ pub struct Facts<'a> {
     /// because egui lays out in them while `ScreenPoint` is physical everywhere in this
     /// crate (trap 4). `None` when nothing is selected.
     pub selection_rect: Option<egui::Rect>,
-    /// Whether a text session on the canvas owns the keyboard — the on-canvas caret, a
-    /// note's body, or an agent's prompt row. See `vellum_ui::ChromeState::text_session`,
-    /// which carries the whole reason this has to be told rather than asked.
+    /// Whether a text session on the canvas owns the keyboard — the on-canvas caret. See
+    /// `vellum_ui::ChromeState::text_session`, which carries the whole reason this has to be
+    /// told rather than asked.
     pub text_session: bool,
 }
 
@@ -119,38 +119,6 @@ pub enum Ask {
     /// with a ⓘ saying why it matters. Answering *Continue* runs what `ImportFromMiro`
     /// used to run straight away.
     ImportSteps,
-    /// A delete that would take one or more agent nodes with it.
-    ///
-    /// Carries no ids: the answer is acted on against whatever is selected when it comes
-    /// back, which is the same selection the dialog described a moment earlier — nothing can
-    /// change the selection while a modal is up. That is `EmptyTrash`'s reasoning, and it is
-    /// what keeps this from going stale against an undo that happened in between.
-    DeleteAgentNodes,
-    /// The rules editor was opened on one agent node.
-    AgentRules(vellum_doc::ItemId),
-    /// A worktree removal was confirmed for this agent node.
-    RemoveWorktree(vellum_doc::ItemId),
-    /// A web address was asked for, to attach to this agent node as context.
-    ///
-    /// Carries the node because the answer arrives as a bare string and a modal can outlive
-    /// the selection that raised it — the same correlation problem `AgentRules` solves the
-    /// same way.
-    AttachLink(vellum_doc::ItemId),
-    /// The rules editor was opened on an **inherited** layer — the global file, or the
-    /// project's — rather than on a node.
-    ///
-    /// Carries the layer for the same reason [`Self::SignIn`] carries the provider: the dialog
-    /// is the same `Dialog::Rules` in both cases and does not know which file it is editing,
-    /// so the correlation between "what I asked" and "what came back" lives here. Without it
-    /// the answer would be applied to whichever agent happened to be selected — writing the
-    /// user's global rules into one node's own layer, silently.
-    RuleLayer(vellum_agent::Layer),
-    /// The schedule editor was opened on one agent node.
-    AgentSchedule(vellum_doc::ItemId),
-    /// A provider's API key was asked for. Carries which provider, because the dialog does
-    /// not: `Dialog::SignIn` is told only *whether* a key already exists, never which
-    /// provider's key it is being handed back — that correlation is this enum's whole job.
-    SignIn(vellum_agent::Provider),
 }
 
 /// The chrome and everything it needs between frames.
@@ -169,22 +137,6 @@ pub struct Shell {
     /// the renderer does.
     selection: Vec<SelectionItem>,
     selection_key: (u64, usize, u64),
-    /// What each AI provider looks like from this machine: installed, credentialled, and
-    /// one line saying what was found.
-    ///
-    /// **Cached, because answering it walks `PATH` for three binaries and reads the
-    /// credentials file.** Doing that once per frame would be a filesystem round trip
-    /// behind every frame of an idle board, which is precisely the idle cost this
-    /// application exists not to have. Refreshed by [`Shell::refresh_providers`] when a
-    /// sign-in changes something, which is the only time the answer can move.
-    providers: Vec<vellum_ui::ProviderStatus>,
-    /// The whisper binary found on this machine, if any — Preferences ▸ Voice's status line.
-    ///
-    /// ⚠ **Probed once and cached, exactly as `providers` is.** `Speech::detect_local` walks
-    /// `PATH` looking for a file; doing that while building a menu would be a directory scan
-    /// per frame the menu is open. It is a fact about the machine, so a session is the right
-    /// lifetime — the same reasoning `provider_status` records for itself.
-    local_transcriber: Option<String>,
     cards: Vec<BoardCard>,
     fonts: Vec<String>,
     find_matches: Option<(usize, usize)>,
@@ -244,11 +196,7 @@ impl Shell {
             ..ViewState::default()
         };
 
-        let providers = library.provider_status();
-        let local_transcriber = library.speech().detect_local();
         let mut shell = Self {
-            providers,
-            local_transcriber,
             // Filled in by the first `run`. Default until then, which greys every row —
             // correct, since there is nothing to act on before the first frame.
             command_context: vellum_ui::CommandContext::default(),
@@ -542,12 +490,6 @@ impl Shell {
         self.chrome.sticky_color()
     }
 
-    /// Which of the three agent roles the next placed agent node takes, from the agent
-    /// tool's flyout.
-    pub fn agent_role(&self) -> vellum_agent::RoleKind {
-        self.chrome.agent_role()
-    }
-
     /// Offers the picker the families the shaper can actually use.
     ///
     /// **Only families with faces**, which the hardcoded list did not promise: it named
@@ -589,10 +531,12 @@ impl Shell {
             // opening something over the top. Here anyway, because it shares their whole
             // reason for existing: it is a surface only a click can otherwise reach, and
             // `--screenshot` photographs a window nobody is touching.
-            // `settings`, or `settings:agents` / `settings:providers` for one of its tabs.
-            // A tab is reached by a click and nothing else, so without the suffix two of the
-            // three pages could not be photographed at all — which is the whole argument
-            // `--show` already makes for the seven flyouts.
+            //
+            // `settings`, or `settings:<tab>` for one of its pages. The suffix is kept even
+            // while there is one page to name, because a tab is reached by a click and
+            // nothing else: the moment a second page exists it is unphotographable without
+            // this, which is the whole argument `--show` already makes for the seven
+            // flyouts. An unrecognised name answers `false` so the caller can warn.
             _ if what == "settings" || what.starts_with("settings:") => {
                 let tab = what.strip_prefix("settings:").unwrap_or("general");
                 let Some(tab) = vellum_ui::SettingsTab::ALL
@@ -611,11 +555,6 @@ impl Shell {
         true
     }
 
-    /// Re-probe for a local transcriber. See [`Shell::local_transcriber`].
-    pub fn refresh_local_transcriber(&mut self) {
-        self.local_transcriber = self.library.speech().detect_local();
-    }
-
     pub fn toast(&mut self, toast: Toast) {
         self.chrome.toast(&self.ctx, toast);
     }
@@ -632,28 +571,6 @@ impl Shell {
         self.next_dialog += 1;
         self.pending.push((id, about));
         self.chrome.ask(dialog(id));
-    }
-
-    /// Re-probes which providers are reachable and which have a key.
-    ///
-    /// Called after a sign-in rather than per frame: answering walks `PATH` for three
-    /// binaries and reads the credentials file, and this is the only moment the answer can
-    /// have changed.
-    pub fn refresh_providers(&mut self) {
-        self.providers = self.library.provider_status();
-    }
-
-    /// What the last probe found, without re-probing.
-    ///
-    /// Read at launch to decide whether a delegated CLI is actually on this machine — see
-    /// `ActiveState::agent_launch_spec`. Probing there instead would spawn a process per
-    /// start for an answer that was taken at the last sign-in and cannot have changed without
-    /// one.
-    pub fn provider_status(
-        &self,
-        provider: vellum_agent::Provider,
-    ) -> Option<&vellum_ui::ProviderStatus> {
-        self.providers.iter().find(|status| status.provider == provider)
     }
 
     /// The modal that is up, without consuming it.
@@ -947,7 +864,6 @@ impl Shell {
                 chrome,
                 cards,
                 selection,
-                providers,
                 screen,
                 tool,
                 view,
@@ -956,24 +872,8 @@ impl Shell {
                 ..
             } = self;
 
-            // Taken before the struct so the `String` outlives the borrow it is handed as.
-            let speech_model = self.library.speech().model_file.clone();
             let view_state = ViewState { zoom: facts.zoom, ..*view };
             let state = ChromeState {
-                default_provider: self.library.default_provider(),
-                default_chat_theme: self.library.default_chat_theme(),
-                // The Agent Canvas settings, all four application-wide rather than per board.
-                // A grid is a drawing aid you want everywhere (feedback 31's reasoning); so
-                // is the mode agent output is shown in, whether a browser engine may run at
-                // all, and whether coding agents get their own checkout.
-                default_display: self.library.default_display_mode(),
-                browser_nodes: self.library.browser_nodes(),
-                worktrees: self.library.worktrees(),
-                providers: providers.as_slice(),
-                speech: self.library.speech().preference,
-                local_transcriber: self.local_transcriber.as_deref(),
-                speech_model: speech_model.as_deref(),
-                speech_hosted: self.library.speech().hosted_is_configured(),
                 link_previews: self.library.link_previews(),
                 align_objects: self.library.align_objects(),
                 snap_to_grid: self.library.snap_to_grid(),
@@ -1068,20 +968,6 @@ impl Shell {
     }
 
     /// Puts the renderer's material in step with the palette and the OS.
-    /// The floating chrome's rectangles, in **logical** points.
-    ///
-    /// Exposed for `crate::browser_engine`, which needs to know what a native child view
-    /// would end up on top of. `glass_surfaces` is the right list because it is *exactly* the
-    /// chrome that floats over the board rather than beside it — the same list the blur pass
-    /// uses, so the two cannot come to disagree about what is floating.
-    pub fn floating_chrome(&self) -> impl Iterator<Item = egui::Rect> + '_ {
-        self.chrome
-            .glass_surfaces()
-            .iter()
-            .map(|surface| surface.rect)
-            .filter(|rect| rect.is_positive())
-    }
-
     pub fn configure_glass(&self, glass: &mut GlassRenderer) {
         glass.set_scale_factor(self.pixels_per_point);
         glass.set_mode(if self.chrome.translucency() {

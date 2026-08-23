@@ -24,7 +24,8 @@ and the Mac's copy stays exactly as it is afterwards as a permanent fallback.
                        │    the Velm app  (velm.wasm)     │
         ──── HTTPS ──► │    your boards   (SQLite)        │
                        │    your images   (blob store)    │
-                       │  one token guards the last two   │
+                       │    your accounts (accounts.json) │
+                       │  you sign in; the Mac has a key  │
                        └──────────────────────────────────┘
     ▲          ▲          ▲
   iPad      Windows     any computer
@@ -39,9 +40,30 @@ about public pages talking to private machines.
 It also means there is nothing to trust but your own server. The app is not hosted by anyone
 else; your boards are not copied anywhere else.
 
+### Who can see what
+
+**Each person gets their own account** — a username and a password, on your server and
+nowhere else. There is no Velm account, no signing in with Google, nothing to register with
+anybody.
+
+- **The first account is the owner**, and it is given every board that is already on the
+  server — the ones you copy across in Part 2. You make it in step 15, *before* the server is
+  reachable from anywhere, and that ordering is the whole point: whoever creates the first
+  account owns every board on the machine.
+- **The owner is the only admin.** It can make accounts for other people (step 23); nobody
+  else can.
+- **A board has exactly one owner** and is visible to that account alone. A board somebody
+  creates or imports in their browser belongs to them.
+- **⚠️ So a second person signs in and sees an empty list.** That is correct rather than
+  broken. A board can carry a list of other accounts it is shared with — but as of
+  2026-08-22 nothing in the interface writes one, so today each account sees the boards it
+  owns and no others. The table at the end of this file says the same thing.
+- **Removing an account never removes a board.** Its boards revert to the owner. Nothing in
+  this guide, on any path, deletes a board.
+
 ---
 
-## Before you start — five things we need from you
+## Before you start — six things we need from you
 
 Tell us these and the rest of this guide gets more specific. Guessing wrong here wastes a day.
 
@@ -59,6 +81,10 @@ Tell us these and the rest of this guide gets more specific. Guessing wrong here
    setting changes that.
 5. **Do you own a domain name?** You need one, or a free subdomain from a dynamic-DNS
    provider. A bare IP address will not do — see the box below.
+6. **Who else will use it?** Everyone who opens a board signs in with their own username and
+   password, so we need to know how many people and what usernames they want. You set each
+   person's first password and tell it to them — as of 2026-08-22 there is no page for
+   somebody to change their own afterwards, so pick theirs as carefully as your own.
 
 ### ⚠️ Why a plain IP address will not work
 
@@ -78,7 +104,7 @@ Both are free. Part 4 does it.
 - You own a domain, or can get a free subdomain.
 
 If your server is a NAS, a Mac or a Windows box, tell us — the shape is identical but steps
-12 and 25 (starting things automatically) are different.
+12 and 28 (starting things automatically) are different.
 
 ---
 
@@ -239,16 +265,23 @@ rustup target add wasm32-unknown-unknown
 ./scripts/build-web.sh
 ```
 
-Then make the secret that stands between a stranger and every board you own. It is a long
-random string rather than a passphrase you invent, because you will never type it — the token
-lives in the bookmark you save in step 19, and opening the address without it shows an empty
-list rather than your boards:
+Then make the **machine key**. It is a long random string rather than a passphrase you
+invent, because no person ever types it: it is what the Mac's sync uses (step 32), what the
+restore drill uses (step 30), and what a `?token=` link carries. It is compared in constant
+time, so there is nothing to guess at and nothing to learn from how long a wrong guess takes.
+
+⚠️ **This is not your account and it does not replace one.** People sign in with a username
+and a password (steps 15 and 21); the token is for programs. Both are accepted — accounts are
+a second key, not a replacement lock — and a server with neither is a server with no gate at
+all, which is what step 14 and the box at the end of Part 4 are about.
+
+Make the key:
 
 ```
 mkdir -p /srv/velm/secret && chmod 700 /srv/velm/secret
 openssl rand -hex 32 > /srv/velm/secret/token
 chmod 600 /srv/velm/secret/token
-cat /srv/velm/secret/token          # copy this; you need it in step 19
+cat /srv/velm/secret/token          # copy this; you need it in steps 30 and 32
 ```
 
 Now install the service. Replace `<you>` with your username on the server:
@@ -302,6 +335,10 @@ The first answers `{"velmd":"…","ok":true}` — health is deliberately outside
 "the server is not running" and "my token is wrong" are two different answers rather than one.
 The second lists your boards. Without the token it answers `401`, which is the point.
 
+That bearer token keeps working exactly as it always has — accounts were added beside it, not
+in front of it. It is what you hand the Mac in step 32 so it can sync, and nothing about
+signing in changes it.
+
 `--addr 127.0.0.1` means it currently answers **only on the server itself**. That is
 deliberate. Part 4 is how it becomes reachable, with a certificate in front.
 
@@ -320,16 +357,80 @@ no gate at all. Try it if you like:
 > that you have any boards. That split is not a compromise: a web page cannot attach a header
 > to its own script and wasm requests, so a client behind the gate could not load itself.
 
+**15. YOU — make the first account, now, while the server is still unreachable.**
+
+velmd is listening on `127.0.0.1` and nothing outside the machine can reach it. That is the
+moment to claim the owner account, and the reason is worth one sentence: **whoever creates
+the first account owns every board on the server.** Doing it now means there is no window,
+however short, in which somebody else could get there first — the same reasoning as step 14.
+
+From **your own machine**, open a tunnel to the server and leave it running:
+
+```
+ssh -N -L 8787:127.0.0.1:8787 <you>@<your-server>
+```
+
+Then open this in a browser on your own machine:
+
+```
+http://127.0.0.1:8787/signin
+```
+
+Because the server has no accounts yet, that page offers to **create the first one** instead
+of asking you to sign in: *Choose a username*, *Choose a password*, *And again*, then **Create
+this account**. The password must be at least 12 characters and there are no rules about
+capitals or symbols — length is the only thing that makes one hard to guess. That account is
+the owner, it is the only admin, and it can see every board you copied across in Part 2.
+
+**Nothing is written into your boards to arrange that**, which is worth one sentence because
+it is why this step cannot hurt them: a board with no ownership recorded simply belongs to the
+first account. The `.vellum` files are not opened, not touched and not changed by any of it.
+
+> `http://` is safe on `127.0.0.1` and it is the one exception browsers make to the rule in
+> the box near the top: a page served from your own machine counts as a secure address, so
+> the cookie that keeps you signed in is accepted. A bare `http://192.168.…` address is
+> **not** that exception — see step 21.
+
+**Choose that password with real care.** It is the key to every board you own, it is the only
+secret in this guide that a person types, and it is therefore the only one anyone can guess
+at. Generate it with a password manager, or use four or five unrelated words, and use it
+nowhere else. It is stored as an Argon2id hash and never as the password itself, which makes
+each guess expensive — expensive, not impossible. See Part 4b.
+
+**16. AUTOMATIC** — prove it, on the server or through that same tunnel, replacing the two
+placeholders with what you just chose:
+
+```
+curl -s -c /tmp/velm-cookies -o /dev/null -w '%{http_code}\n' \
+     -X POST http://127.0.0.1:8787/api/v1/session \
+     -H 'Content-Type: application/json' \
+     -d '{"username":"<your-username>","password":"<your-password>"}'
+
+curl -s -b /tmp/velm-cookies http://127.0.0.1:8787/api/v1/whoami
+rm -f /tmp/velm-cookies
+```
+
+The first prints `204`. The second prints `{"username":"<your-username>","admin":true}`, and
+`admin` being `true` is what says this account is the owner — only the first account gets it.
+
+> ⚠️ **Neither command sends the token, and that is deliberate.** A browser signing in cannot
+> send one: a form posts a cookie, not a header you configured. So if signing in ever came to
+> *require* the token, sign-in would be broken for every person on every device — while a
+> check that helpfully carried the token went on passing. This check has to fail exactly
+> then, so it carries nothing.
+
+Close the tunnel with Ctrl-C when both answers look right.
+
 ---
 
 ## Part 4 — Put it on the internet, safely
 
-**15. YOU** — point a domain at the server. In your domain registrar's DNS settings, add an
+**17. YOU** — point a domain at the server. In your domain registrar's DNS settings, add an
 **A record** for something like `boards.<your-domain>` pointing at the server's public IP
 address. If the server is at home, you will also need to forward **port 443 only** to it on
 your router. Do not forward port 8787 or port 22.
 
-**16. YOU** — install Caddy. It gets a real certificate from Let's Encrypt automatically and
+**18. YOU** — install Caddy. It gets a real certificate from Let's Encrypt automatically and
 renews it forever, with no further work from you:
 
 ```
@@ -341,8 +442,8 @@ curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
 sudo apt update && sudo apt install -y caddy
 ```
 
-**17. YOU** — tell Caddy about Velm. Replace `boards.<your-domain>` with the name you
-set up in step 15:
+**19. YOU** — tell Caddy about Velm. Replace `boards.<your-domain>` with the name you
+set up in step 17:
 
 ```
 sudo tee /etc/caddy/Caddyfile >/dev/null <<'EOF'
@@ -362,45 +463,108 @@ curl -s https://boards.<your-domain>/api/v1/health
 
 Seeing JSON here, over `https://`, means the hard part is done.
 
-**18. AUTOMATIC — there is nothing to configure here, and that is the point.** velmd serves
+**20. AUTOMATIC — there is nothing to configure here, and that is the point.** velmd serves
 the Velm app *and* your boards from the same address, so the browser never treats one as
 talking to the other. That single decision is what makes CORS, mixed content and Chrome's
 Private Network Access rules all stop applying at once. There is an `--app-origin` flag for
 the day you want to host the app somewhere else; you do not need it.
 
-**19. YOU** — open `https://boards.<your-domain>/?token=<the token from step 12>` on any
-computer. You will see **Your boards**. Click one.
+**21. YOU** — open `https://boards.<your-domain>/` on any computer. That is the home page;
+follow its **Sign in** button, or go straight to `https://boards.<your-domain>/signin`. Sign
+in with the account you made in step 15. You will see **Your boards**. Click one.
 
-The list is every board *file* on the server, so it includes anything sitting in the desktop
-app's **Recently deleted** — nothing is ever removed from disk, which is deliberate. Empty
-Recently deleted on the Mac first if you would rather not see them, then re-run Part 2.
+> ⚠️ **If that page offers to *create* an account rather than asking you to sign in, stop.**
+> It is saying the server has no accounts — so either it is not the server you set up in step
+> 15, or its account file has been lost or replaced. Do not create one and carry on: whoever
+> creates the first account owns every board on the machine, and you want to know why that is
+> being offered to you before you answer it.
 
-Then bookmark that link. There is no login form and no session to expire: the link *is* the
-key, and the browser remembers it. Anyone you send that link to can read your boards, so send
-it the way you would send a house key.
+The list is every board *file* on the server that your account owns, which after step 15 is
+all of them — so it includes anything sitting in the desktop app's **Recently deleted**:
+nothing is ever removed from disk, which is deliberate. Empty Recently deleted on the Mac
+first if you would rather not see them, then re-run Part 2.
 
-**20. YOU** — open the same link on the iPad, in Safari. **iPadOS must be 26 or newer** —
-Safari only gained WebGPU in 26, and on anything older the page loads and the board does not
-draw. One finger pans, two fingers pinch to zoom.
+Then bookmark `https://boards.<your-domain>/`. The browser stays signed in, so the bookmark is
+all you need. **A session ends after 12 hours of not being used, and after 30 days however much
+it is used** — so being asked to sign in again is the design working, not a fault. The first
+number is why a tablet left on a shelf is signed out; the second is why a device that walks off
+does not stay signed in for ever.
+
+⚠️ **Signing in works at the `https://` address and at `http://127.0.0.1`, and nowhere else.**
+The cookie that keeps you signed in is marked so the browser only ever sends it back over a
+connection it trusts, and a bare `http://192.168.…` address is not one. That address could not
+have drawn a board anyway, for the reason in the box near the top — but this is a second,
+separate reason not to try it.
+
+**The `?token=` link still works**, and it is not the way in for a person:
+`https://boards.<your-domain>/?token=<the token from step 12>` opens the boards with no
+sign-in at all, which is how the restore drill in step 30 gets in. **Anyone you send that link
+to can read every board on the server**, so send it the way you would send a house key — and
+for a person, make them an account instead (step 23).
+
+**22. YOU** — open `https://boards.<your-domain>/` on the iPad, in Safari, and sign in there
+too. **iPadOS must be 26 or newer** — Safari only gained WebGPU in 26, and on anything older
+the page loads and the board does not draw. One finger pans, two fingers pinch to zoom.
 
 > To check the touch handling on your own device rather than taking this document's word for
-> it, add `&selftest=touch` to the link. It drives five gestures through the page's own event
-> handlers and prints a PASS or FAIL line with the numbers it measured.
+> it: open a board, then add `&selftest=touch` to the end of the address you are on. It has a
+> `?board=…` in it already, which is why that is an `&`. The page drives five gestures through
+> its own event handlers and prints a PASS or FAIL line with the numbers it measured.
 
-**21. AUTOMATIC — what you will and will not be able to do.** The browser client is a
-**reader**. You can open any board from any computer, pan, zoom, and see your stickies, frames,
-pictures, pen strokes and connectors. You **cannot yet edit a board in a browser** — the
-desktop app is still the only place a board changes, and until two-way syncing is built, a
-board edited on the Mac has to be copied across again (Part 2) for the server to see the
-change.
+**23. YOU — one account per person, if anybody else needs in.** Skip this if it is only you.
 
-That is deliberate rather than unfinished. A browser tab can be killed by the operating system
-with no warning and no chance to save; a client that could edit would, at that moment, be
-holding the only recent copy of a board that cannot be re-imported.
+**There is no page for this yet**, so it is two commands per person, run on the server as the
+owner. The first signs you in and keeps the cookie; the second makes the account:
+
+```
+curl -s -c /tmp/velm-cookies -o /dev/null \
+     -X POST http://127.0.0.1:8787/api/v1/session \
+     -H 'Content-Type: application/json' \
+     -d '{"username":"<your-username>","password":"<your-password>"}'
+
+curl -s -b /tmp/velm-cookies \
+     -X POST http://127.0.0.1:8787/api/v1/accounts \
+     -H 'Content-Type: application/json' \
+     -d '{"username":"<their-username>","password":"<a password you generate>"}'
+
+curl -s -b /tmp/velm-cookies http://127.0.0.1:8787/api/v1/accounts
+rm -f /tmp/velm-cookies
+```
+
+The last line lists the usernames on the server, and it is the check: both names should be
+there. **It answers with usernames and nothing else** — never a password, and never the hash
+of one. The hashes stay in the file; there is no request that hands one out.
+
+Generate their password rather than inventing it (`openssl rand -base64 18` is fine) and give
+it to them in person or by voice, not by email. As of 2026-08-22 there is no page for somebody
+to change their own password, so theirs deserves the same care as yours.
+
+⚠️ **They will sign in and see an empty list, and that is correct.** A board belongs to
+whoever owns it, and yours are yours. They can make their own boards and import their own Miro
+boards in the browser, and those are theirs. Sharing one of *your* boards with them is in the
+model and has no gesture yet — the table at the end of this file says so.
+
+**24. AUTOMATIC — what you can do in a browser.** Open any board you own from any computer,
+pan, zoom, read your stickies, frames, pictures, pen strokes and connectors — and **change
+them**: select, move, style, delete, type, undo, search, export, and paste a Miro board in to
+make a new one. The desktop app is no longer the only place a board changes.
+
+⚠️ **This file used to say the opposite, and what changed is not the risk.** A browser tab can
+be closed by a phone or an iPad with no warning and no chance to save, and a tab holding the
+only recent copy of a board is exactly what must not happen. So it never holds one. Every edit
+is sent as it is made — no Save button, no timer. The board of record is the server's, which
+runs real SQLite and flushes properly. velmd takes a labelled restore point before the first
+change any board ever receives from a browser. And an edit can only ever *add*: the merge it
+uses has no way to remove what it has not seen. The worst case is losing the last couple of
+seconds that had not been acknowledged, never a damaged board.
+
+A board opened from a plain file with no server behind it draws **no editing interface at
+all** — an interface whose effects would die with the tab is a promise this client must not
+make.
 
 ### ⚠️ The one mistake that would undo all of this
 
-When you put the reverse proxy in front (step 25), velmd ends up listening on
+When you put the reverse proxy in front (steps 18 and 19), velmd ends up listening on
 `127.0.0.1` — the proxy talks to it, nothing else does. That is correct and it is what
 the steps above tell you to do.
 
@@ -409,6 +573,11 @@ refuses to start on a public address without a token, and it says so loudly. It 
 *not* refuse to start on `127.0.0.1` without one, because that is how you run it on your
 own laptop while testing. So a server behind a proxy with no token set starts perfectly,
 says nothing is wrong, and serves every board you own to anyone who finds the address.
+
+⚠️ **Having accounts is not a reason to skip the token.** They are a second key, not a
+replacement lock; the refusal above and everything in this box are written in terms of
+`VELMD_TOKEN`, and the Mac's sync needs it regardless (step 32). Set it, and check the `auth`
+line below after every change to the unit.
 
 velmd catches the common case itself: a request that arrives through a proxy, on a server
 with no token, is refused with a message naming the problem. If you see that message, it
@@ -433,7 +602,7 @@ exposes every board you own.
 
 ⚠️ **That refusal is a backstop, not the gate — the token is the gate.** velmd recognises a
 proxy by the headers one normally adds (`X-Forwarded-For` and its two relatives), and Caddy
-set up as in step 25 sends them. Several other arrangements do not: `nginx` with a bare
+set up as in step 19 sends them. Several other arrangements do not: `nginx` with a bare
 `proxy_pass`, a load balancer in TCP mode, `stunnel`, and an SSH tunnel (`ssh -R`) all
 forward without adding anything. **On any of those, a tokenless velmd answers normally and
 serves every board.**
@@ -444,14 +613,14 @@ safe once anything at all is forwarding to velmd.
 
 ### Part 4b — Hardening, now that it is reachable from anywhere
 
-**22. YOU** — turn on automatic security updates:
+**25. YOU** — turn on automatic security updates:
 
 ```
 sudo apt install -y unattended-upgrades
 sudo dpkg-reconfigure --priority=low unattended-upgrades
 ```
 
-**23. YOU** — close everything except what is needed:
+**26. YOU** — close everything except what is needed:
 
 ```
 sudo ufw allow 22/tcp
@@ -460,14 +629,46 @@ sudo ufw --force enable
 ```
 
 velmd has **no delete route at all** — there is no request anyone can send it, with or without
-the token, that removes or changes a board file. Every route that returns anything is a `GET` — it also
-answers a browser's `OPTIONS` preflight with an empty 204 — and a test in its own source tree
-fails the build if code that could unlink or move a file is ever added to it.
+the token, that removes a board file, and a test in its own source tree fails the build if code
+that could unlink or move one is ever added.
 
-It does **not** rate-limit wrong tokens, and it does not need to: the token is 32 random bytes
-and it is compared in constant time, so there is nothing to guess at and nothing to learn from
-how long a wrong guess takes. If you would rather have a limiter anyway, Caddy can do it in
-front — but do not tell yourself you have one when you have not.
+⚠️ **It is not read-only, though, and this paragraph used to say it was.** Three routes change
+what is on disk and none of them can destroy a board: a browser's edits *merge* into one, and a
+merge cannot subtract what it has not seen; the two that make a board only ever create one, at
+a name nothing was using, claimed in a way where the operating system refuses rather than velmd
+having to remember. Renaming a board changes a name inside the document and never a filename.
+velmd prints all of this when it starts — read it once, and believe that rather than this file.
+
+**A wrong token needs no rate limit; a wrong password does, and has one.** The token is 32
+random bytes compared in constant time — there is nothing to guess at and nothing to learn from
+how long a wrong guess takes. **A password is not 32 random bytes**, so signing in is limited
+three ways: one second at least between two checks of the same username, whatever address they
+come from; ten failures from one address in fifteen minutes and that address is refused; and
+only ever one password check running in the whole server at a time, because verifying an
+Argon2id hash costs 19 MiB and is by far the most expensive thing this server can be asked to
+do by somebody with no token.
+
+**There is deliberately no lockout**, and that is a decision rather than an omission: any rule
+of the form *"N failures on this account and it is shut"* hands a stranger the power to lock
+you out of your own boards from anywhere, for free. Nothing here can stop a correct password
+working for longer than one second.
+
+⚠️ **A per-address budget is defeated by having many addresses, by definition.** So if this
+server is on the internet and you want more, the place for it is the proxy — Caddy knows who
+the client is in a way velmd behind it cannot. Standard Caddy has **no** `rate_limit`
+directive; it needs a plugin and therefore a custom build, so ask before writing one into the
+Caddyfile and reloading. In the meantime the thing that actually protects the account is the
+password: **generated, or four or five unrelated words, and used nowhere else.**
+
+**Removing an account never removes a board.** The boards it owned revert to the owner account,
+and nothing on disk is touched. Losing an account is losing a way in, never a board — which is
+the same rule as everywhere else in this guide, and it is not negotiable.
+
+**Your accounts are a file, and the backups already carry it.** `accounts.json` sits in the
+directory `--data` names (`/srv/velm/data/boards` here), so the nightly copy in Part 5 takes it
+with the boards. It holds usernames and Argon2id hashes and never a password, so a copy of it
+is not a copy of anybody's password. It is velmd's own file: it is **not** the desktop app's
+`library.json`, which velmd never writes.
 
 ---
 
@@ -477,9 +678,9 @@ Your boards are now in two places: the Mac (frozen, untouched) and the server (l
 changing). Only the server changes, so only the server needs backing up — but it needs it
 properly, because it now holds your newest work.
 
-**24. YOU** — attach a **second** disk and mount it.
+**27. YOU** — attach a **second** disk and mount it.
 
-**25. YOU** — turn on a nightly backup. Replace `<you>` and the disk path:
+**28. YOU** — turn on a nightly backup. Replace `<you>` and the disk path:
 
 ```
 sudo tee /usr/local/bin/velm-backup >/dev/null <<'EOF'
@@ -528,7 +729,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now velmd-backup.timer
 ```
 
-**26. AUTOMATIC** — run one now, by hand, and read what it says:
+**29. AUTOMATIC** — run one now, by hand, and read what it says:
 
 ```
 sudo systemctl start velmd-backup.service
@@ -539,7 +740,7 @@ journalctl -u velmd-backup.service -n 40
 a manifest taken from the live directory a moment earlier. You want **`0 mismatches · 0
 missing`**. Anything else: stop and ask, before touching anything.
 
-**27. YOU — the drill. Do this once, now.** A backup nobody has ever restored is a guess, not
+**30. YOU — the drill. Do this once, now.** A backup nobody has ever restored is a guess, not
 a backup. Restore last night's copy into a scratch folder and open a board from it:
 
 ```
@@ -552,7 +753,7 @@ VELMD_TOKEN=$(cat /srv/velm/secret/token) ~/velm/target/release/velmd serve \
 
 Then, **from your own machine**, open a tunnel to the server and point a browser at it. Use
 whatever address you normally `ssh` to — if the server is at home that is its address on your
-local network, **not** `boards.<your-domain>`: step 15 deliberately forwards port 443 only, so
+local network, **not** `boards.<your-domain>`: step 17 deliberately forwards port 443 only, so
 port 22 is not reachable from outside.
 
 ```
@@ -562,14 +763,23 @@ ssh -N -L 8788:127.0.0.1:8788 <you>@<your-server>
 # a page served from your own machine is always treated as secure.
 ```
 
+You can sign in there with your normal account instead of using the token link — the backup
+carries `accounts.json` across with everything else, so the copy knows who you are.
+
 If a board opens and looks right, your backups work. Stop the second server with Ctrl-C
 afterwards.
 
 > ⚠️ **A restore drill reads the backup; it must never write to it.** `velmd serve` opens
 > boards with SQLite, which writes a small `-wal` file beside each one — harmless on a copy
 > you are testing, and the reason this drill points at the *backup* and never at the Mac.
+>
+> ⚠️ **Look, do not touch.** A browser can edit a board now (step 24), and this tab is pointed
+> at your backup — so anything you drag there changes the *backup copy* rather than your live
+> board. **Nothing will ever tell you.** Each night's backup goes into its own dated folder and
+> is verified against a manifest taken that night, so no later check ever re-reads this one:
+> the damage would be silent and permanent. Open a board, look at it, close it.
 
-**28. YOU — offsite, when you are ready.** A fire or a burglary takes both disks in the same
+**31. YOU — offsite, when you are ready.** A fire or a burglary takes both disks in the same
 minute. An encrypted weekly copy to cheap online storage covers that. Ask and we will write
 that step for whichever provider you pick.
 
@@ -581,22 +791,21 @@ Everything up to here gets your boards **onto** the server and into a browser. T
 keeps them in step afterwards, so a change made on the Mac appears in the browser — on every
 computer you have one open on — without copying anything by hand again.
 
-⚠️ **It goes one way, on purpose.** The browser *receives* changes and never sends any,
-because a tab can be closed by the phone or the iPad with no warning and no chance to save.
-A tab holding the only recent copy of one of your boards is exactly what must not happen.
-The desktop app is still where a board is changed; the table at the end of this file says the
-same thing.
+⚠️ **It goes both ways, and this paragraph used to say it did not.** A change made on the Mac
+appears in the browser, and a change made in a browser reaches the Mac. What has not changed is
+the reason that is safe: a tab sends every edit as it is made, so it is never holding the only
+recent copy of anything, and a merge can only add. Step 24 has the whole of it.
 
 **You only do this once.** After it, the Mac just works.
 
 ⚠️ **Do Part 5 first.** This is the first thing in the whole guide that changes a board
 automatically, and a backup you have actually restored is what makes that safe to switch on.
 
-### Step 31 — Tell the Mac where the server is (YOU)
+### Step 32 — Tell the Mac where the server is (YOU)
 
 Open **Terminal on your Mac** — not the server — and run these two lines, replacing the long
 token with the one from step 12. (The server's address is not needed here; it goes on the
-command in step 32.)
+command in step 33.)
 
 ```bash
 echo 'export VELM_SYNC_TOKEN="paste-your-token-here"' >> ~/.zshrc
@@ -607,7 +816,7 @@ source ~/.zshrc
 Anything you type as a command-line option is visible to every other program on the machine,
 and this token is the only thing standing between a stranger and every board you own.
 
-### Step 32 — Start Velm with syncing on (YOU)
+### Step 33 — Start Velm with syncing on (YOU)
 
 ```bash
 /Applications/Velm.app/Contents/MacOS/Velm --sync-server https://boards.YOURDOMAIN.com
@@ -625,7 +834,7 @@ computer.
 problem — `connection refused` means the server is not running or the address is wrong,
 `401` means the token does not match. It appears **once**, not every few seconds.
 
-### Step 33 — Make it the normal way you open Velm (YOU)
+### Step 34 — Make it the normal way you open Velm (YOU)
 
 Clicking the Velm icon in your Dock does **not** pass the option, so it opens without syncing.
 Two ways to fix that, and the second is simpler:
@@ -646,7 +855,7 @@ an app that looks like it is syncing and is not. Tested on this machine: run thi
 finds the token; the token has to travel down to a *child process*, which is what `nohup …`
 makes it.
 
-**Or** just run the Terminal line from step 32 whenever you want syncing, and click the icon
+**Or** just run the Terminal line from step 33 whenever you want syncing, and click the icon
 when you do not. Both are fine; nothing breaks either way, because a board that has been
 offline for a week catches up the moment it next syncs.
 
@@ -680,7 +889,13 @@ Mac's own folder.
   programs writing one board file at the same time is the one thing that genuinely corrupts
   one. `velmd serve` refuses that directory by name rather than trusting this sentence.
 - **Never expose the server without `VELMD_TOKEN` set** (step 12). velmd refuses to start
-  that way, before the socket opens — but know why the refusal is there.
+  that way, before the socket opens — but know why the refusal is there. Having accounts is
+  not a reason to skip it: they are a second key, not a replacement lock.
+- **Whoever makes the first account owns every board on the server.** Make yours before the
+  server is reachable from anywhere else (step 15), and never answer an offer to create a
+  first account on a server that already had one — find out why it is asking first.
+- **`accounts.json` is backed up with your boards and holds no passwords**, only usernames
+  and Argon2id hashes. It is velmd's file, not the desktop app's `library.json`.
 - If something looks wrong, **stop and ask before tidying anything up.** Nothing here is
   urgent enough to risk a board over.
 
@@ -689,9 +904,13 @@ Mac's own folder.
 ```
 /srv/velm/data/              the data directory copied from the Mac
 /srv/velm/data/boards/       your boards, one .vellum file each  ← --data points HERE
+/srv/velm/data/boards/accounts.json
+                             your accounts, written by velmd: usernames and Argon2id
+                             hashes, never passwords. One JSON object per line — a log
+                             that is only ever appended to. Backed up with the boards
 /srv/velm/data/blobs/        your images, stored once each by content
 /srv/velm/data/archives/     your Miro .rtb backups, carried across with everything else
-/srv/velm/secret/token       the 32 random bytes that guard all of it
+/srv/velm/secret/token       the 32 random bytes the Mac's sync and the ?token= link use
 /srv/velm/secret/velmd.env   the same value, in the form systemd reads
 /srv/velm/incoming/          the untouched copy that came from the Mac
 ~/velm/web/dist/             the browser client, built by scripts/build-web.sh
@@ -700,7 +919,9 @@ Mac's own folder.
 
 ## What is built, and what is not
 
-Written down so nothing above reads as a promise it does not keep:
+Written down so nothing above reads as a promise it does not keep. **Checked on 2026-08-22** —
+a list like this is a claim with a date on it, and two of the rows below said **not built**
+for months about things that had shipped, while reading as fact:
 
 | | |
 |---|---|
@@ -715,6 +936,12 @@ Written down so nothing above reads as a promise it does not keep:
 | Two-way syncing between the Mac and the server | **built** — Part 6, and Part 2 is only the first crossing |
 | The browser keeping up on its own, without a reload | **built** |
 | A "Live" indicator, so you can tell when it has stopped keeping up | **built** |
-| Editing a board in a browser | **not built** — the desktop app only. This is on purpose: a browser tab can be closed by the phone or the iPad with no warning and no chance to save, and a tab holding the only recent copy of a board is exactly what must not happen |
+| Editing a board in a browser — select, move, style, delete, type, undo, search, export | **built** — see step 24 for why that is safe, which is a mechanism and not a promise |
+| Miro import in a browser | **built** — paste a Miro board into the import box and it becomes a new board, owned by you |
+| Each person with their own username and password | **built** — steps 15 and 23 |
+| The first account owning the boards that were already on the server | **built** — step 15, and it is why that step comes before the server is reachable |
+| Making an account for somebody else | **built**, as one command — step 23. There is no page for it |
+| Sharing one of your boards with another account | **not built** — a board carries a share list in the model and nothing writes one yet, so today each account sees only the boards it owns |
+| Changing your own password | **not built** — the owner sets each person's password (step 23) and there is no page to change it afterwards |
+| Removing an account | **not built** — and no removal of an account ever removes a board: they revert to the owner |
 | The Agent Canvas in a browser | **not built**, and deferred by choice |
-| Miro import in a browser | **not built** — it needs the desktop app's importer |

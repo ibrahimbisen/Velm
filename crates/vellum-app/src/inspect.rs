@@ -73,144 +73,17 @@ use crate::project::Projection;
 ///
 /// Order follows the selection, which follows paint order, so the panel's headline
 /// and its single-item case describe what the user sees on top.
-pub fn selection_items(
-    projection: &Projection,
-    selection: &[SceneId],
-    agents: &AgentFacts<'_>,
-) -> Vec<SelectionItem> {
+pub fn selection_items(projection: &Projection, selection: &[SceneId]) -> Vec<SelectionItem> {
     selection
         .iter()
         .filter_map(|id| projection.get(*id))
-        .map(|projected| describe(projected.doc_id, &projected.item, agents))
+        .map(|projected| describe(projected.doc_id, &projected.item))
         .collect()
 }
 
-/// The things about an agent node that are **not in the document** and that the panel still
-/// has to show.
-///
-/// A resolved rule cascade reads three files, "is it running" is a question for the session
-/// pool, and "which agents can this one hand off to" is a walk of the connectors. None of
-/// them can be answered from an [`Item`](vellum_doc::Item), and all of them are needed before
-/// the chrome can draw a single agent row.
-///
-/// Carried as borrowed closures rather than as data because the answers are wanted for the
-/// **selected** items only — usually one — while the data behind them is board-sized. Building
-/// a map of every agent's resolved rules to describe the one that is selected would read every
-/// rules file on the machine to draw one panel.
-///
-/// Every closure has a defensible answer when the app has nothing to say, so
-/// [`AgentFacts::unknown`] gives a panel that is honest rather than absent — which is what
-/// lets `inspect.rs`'s own tests, and any future fixture, describe an agent node without
-/// standing up a session pool.
-pub struct AgentFacts<'a> {
-    /// The board's project directory, which is what an unset working directory means.
-    pub project_dir: Option<String>,
-    /// What a node that never chose a display mode resolves to.
-    pub inherited_display: vellum_agent::DisplayMode,
-    /// What a node that never chose a provider resolves to.
-    pub inherited_provider: vellum_agent::ProviderChoice,
-    /// Whether browser nodes are permitted app-wide. Distinct from a node's own `live`.
-    pub browser_nodes_allowed: bool,
-    /// Whether this **binary** can capture audio at all — `vellum-agent`'s `voice` feature,
-    /// forwarded by `vellum-app` and off by default.
-    ///
-    /// A build fact rather than a preference, which is why it is here beside
-    /// [`Self::browser_nodes_allowed`] rather than on the node: `cfg!(feature = "voice")` is
-    /// the answer and only the crate that is compiled with the flag can read it. The panel
-    /// draws the control either way and names the feature when it cannot act — a control
-    /// that is simply missing tells the user nothing about why.
-    pub voice_available: bool,
-    /// Whether this node has a live session right now.
-    pub running: &'a dyn Fn(ItemId) -> bool,
-    /// The agents this one may hand off to, along a connector.
-    pub connected: &'a dyn Fn(ItemId) -> Vec<vellum_ui::AgentLink>,
-    /// The three-layer cascade, resolved for this node.
-    pub rules: &'a dyn Fn(ItemId, &vellum_agent::AgentModel) -> vellum_agent::ResolvedRules,
-    /// A readable name for an item id, for a private note's owner and a tree's agent.
-    ///
-    /// Without this a row prints `42@7` at somebody, which tells them nothing.
-    pub label_of: &'a dyn Fn(&str) -> Option<String>,
-    /// Whether a note's file exists, and whether a conflict file sits beside it.
-    ///
-    /// Both are questions about the filesystem rather than about the token, which is why they
-    /// are asked through a closure at all, and **both must be asked**. The honest answer to
-    /// the pair is `vellum_agent::NoteStore::state_of`, which resolves the stored path the way
-    /// every other reader of one does and looks for `<slug>.velm-conflict.md` beside it; the
-    /// closure in `app.rs` is where it is given, and this comment is the contract rather than
-    /// a report of what that closure currently contains.
-    ///
-    /// ⚠ **The second half used to be a literal `false`**, defended by an argument that was
-    /// true when it was written — `NoteStore::save` is the only thing that *writes* a conflict
-    /// file and nothing calls `save` — and that was never the whole question. A conflict file
-    /// is a file: an agent's own `note_write` can put one there, and one can survive from a
-    /// session or a tool that is long gone. So the constant was answering *"nothing in this
-    /// process has made one"* to a question that asks *"is there one"*, which is the
-    /// `locked: false` trap exactly — a stand-in kept correct by a fact in another crate,
-    /// where the change that falsifies it breaks no test here.
-    pub note_state: &'a dyn Fn(&str) -> (bool, bool),
-    /// How many other notes this one links to, **as the file on disk says right now**.
-    ///
-    /// A closure for the same reason `note_state` is one: a frame may not read a file, and the
-    /// runtime is the half that already has. The document token's own `links` list is written
-    /// once, when the note is created — every reload since then has updated the runtime's copy
-    /// and nothing else — so a panel reading the token showed the count the note had when it
-    /// was made, which for a note created from a title is always zero. A row that says
-    /// "Links to 0 other notes" under a note full of links is a row nobody can trust twice.
-    pub note_links: &'a dyn Fn(&str) -> usize,
-}
-
-impl AgentFacts<'_> {
-    /// The facts as they are when nobody has any: nothing running, nothing connected, an
-    /// empty cascade, no project.
-    ///
-    /// Honest rather than absent — a panel drawn from these says "no rules set" and "not
-    /// running", both of which are true of a board that has just been opened.
-    pub fn unknown() -> Self {
-        Self {
-            project_dir: None,
-            inherited_display: vellum_agent::DisplayMode::default(),
-            inherited_provider: vellum_agent::ProviderChoice::new(
-                vellum_agent::Provider::default(),
-            ),
-            browser_nodes_allowed: false,
-            // A build fact, read from the crate that carries the flag rather than assumed:
-            // `unknown()` describes an app with nothing to say, and what this binary was
-            // compiled with is not one of the things it does not know.
-            voice_available: cfg!(feature = "voice"),
-            running: &|_| false,
-            connected: &|_| Vec::new(),
-            // Built through the real resolver with three empty layers rather than a
-            // hand-made empty value: `resolve` is the only thing that knows what an
-            // unset cascade looks like, and a second answer here could disagree with it.
-            rules: &|_, _| {
-                vellum_agent::rules::resolve(
-                    &vellum_agent::RuleFile::default(),
-                    &vellum_agent::RuleFile::default(),
-                    &vellum_agent::AgentRules::default(),
-                    "",
-                )
-            },
-            label_of: &|_| None,
-            note_state: &|_| (false, false),
-            note_links: &|_| 0,
-        }
-    }
-}
-
 /// One item, as the panel sees it.
-pub fn describe(
-    id: ItemId,
-    item: &vellum_doc::Item,
-    agents: &AgentFacts<'_>,
-) -> SelectionItem {
+pub fn describe(id: ItemId, item: &vellum_doc::Item) -> SelectionItem {
     SelectionItem {
-        agent: agent_of(id, item, agents),
-        // Both take the item's id now, and both need it for the same reason: what a note or
-        // a tree *belongs to* is the agent on the other end of a connector, and that is a
-        // question about this node's place on the board rather than about its token.
-        note: note_of(id, &item.kind, agents),
-        file_tree: file_tree_of(id, &item.kind, agents),
-        browser: browser_of(&item.kind, agents),
         id,
         facet: facet_of(&item.kind),
         placement: item.placement,
@@ -225,129 +98,6 @@ pub fn describe(
         connector: connector_of(&item.kind),
         link: link_of(&item.kind),
     }
-}
-
-/// An agent node, for the panel's Agent section.
-///
-/// The **role comes from the item's own text**, not from the token — that is where it lives,
-/// which is what makes it searchable and editable through the paths that already exist. A
-/// node nobody has named reports an empty role rather than the placeholder it was born with,
-/// so a row can offer to name it instead of pretending it is named.
-fn agent_of(
-    id: ItemId,
-    item: &vellum_doc::Item,
-    agents: &AgentFacts<'_>,
-) -> Option<vellum_ui::AgentSummary> {
-    let ItemKind::Agent { model, label } = &item.kind else { return None };
-    let config = crate::agent::decode(model);
-    let rules = (agents.rules)(id, &config);
-    Some(vellum_ui::AgentSummary {
-        role: label.to_plain(),
-        role_kind: config.role_kind,
-        provider: config.provider.clone(),
-        inherited_provider: agents.inherited_provider.clone(),
-        display: config.display,
-        inherited_display: agents.inherited_display,
-        // The **stored** theme, not the resolved one: a tick has to tell "this node is set
-        // to Claude" from "this node inherits, and the default happens to be Claude".
-        chat_theme: config.chat_theme,
-        chat_opacity: config.chat_opacity.unwrap_or(u8::MAX),
-        has_chat_background: config.chat_background.is_some(),
-        working_dir: config.working_dir.clone(),
-        project_dir: agents.project_dir.clone(),
-        // Three states rather than a bool and a path, because the fourth combination —
-        // "no worktree, but here is its path" — means nothing. See `WorktreeState`.
-        worktree: match (config.worktree, config.worktree_path.as_deref()) {
-            // A path with the switch off is a checkout nothing will use and nothing would
-            // otherwise offer to remove. See `WorktreeState::Orphaned`.
-            (false, Some(path)) => vellum_ui::WorktreeState::Orphaned(path.to_owned()),
-            (false, None) => vellum_ui::WorktreeState::Off,
-            (true, None) => vellum_ui::WorktreeState::Pending,
-            (true, Some(path)) => vellum_ui::WorktreeState::At(path.to_owned()),
-        },
-        schedule: config.schedule.clone(),
-        territory: config.territory,
-        // The cap already in force, resolved here so the panel never has to turn `None`
-        // into a number and therefore cannot turn it into a different one.
-        spawn_cap: config.effective_spawn_cap(),
-        context: config.context.clone(),
-        running: (agents.running)(id),
-        rules,
-        own_rules: config.rules.clone(),
-        connected: (agents.connected)(id),
-        accepts_messages: config.accepts_messages,
-        voice: config.voice,
-        voice_available: agents.voice_available,
-    })
-}
-
-/// A note node, for the panel's Note section.
-///
-/// Two fields here exist to make a gesture reachable rather than to describe the token.
-/// **`title`** is what the file name is proposed from, so the panel can offer
-/// `engine-bay.md` instead of demanding a name — and it is the node's own words, which is
-/// where a note's title lives. **`connected`** is the agents joined to it by a connector,
-/// which is the only way a note can be made *private*: the scope names an owner, and which
-/// agent owns a note is the line the user drew.
-fn note_of(
-    id: ItemId,
-    kind: &ItemKind,
-    agents: &AgentFacts<'_>,
-) -> Option<vellum_ui::NoteSummary> {
-    let ItemKind::AgentNote { model, title } = kind else { return None };
-    let note = crate::note::decode(model);
-    let (on_disk, conflicted) = (agents.note_state)(&note.path);
-    Some(vellum_ui::NoteSummary {
-        title: title.to_plain(),
-        connected: (agents.connected)(id),
-        // The owner is resolved to a *label* here. The scope carries an item id, and a row
-        // that prints `42@7` at somebody has told them nothing.
-        owner: match &note.scope {
-            vellum_agent::NoteScope::Private { agent } => (agents.label_of)(agent),
-            vellum_agent::NoteScope::Shared => None,
-        },
-        scope: note.scope.clone(),
-        links: (agents.note_links)(&note.path),
-        path: note.path,
-        conflicted,
-        on_disk,
-    })
-}
-
-/// A file tree, for the panel's File tree section.
-///
-/// The owner is reported **twice on purpose**: `agent` is the label a row shows and
-/// `agent_id` is what a write has to carry. Two nodes may both be called *Reviewer*, so a
-/// picker that emitted the label would scope the tree to whichever one the app looked up
-/// first — and the two would disagree the moment somebody renamed a node.
-fn file_tree_of(
-    id: ItemId,
-    kind: &ItemKind,
-    agents: &AgentFacts<'_>,
-) -> Option<vellum_ui::FileTreeSummary> {
-    let ItemKind::FileTree { model } = kind else { return None };
-    let tree = crate::filetree::decode(model);
-    Some(vellum_ui::FileTreeSummary {
-        agent: tree.agent.as_deref().and_then(|id| (agents.label_of)(id)),
-        agent_id: tree.agent.clone(),
-        connected: (agents.connected)(id),
-        project_dir: agents.project_dir.clone(),
-        root: tree.root,
-        show_ignored: tree.show_ignored,
-    })
-}
-
-/// A browser node. **Both** switches are reported, because they are different statements —
-/// one is a permission the app grants and the other is an instruction this page was given.
-fn browser_of(kind: &ItemKind, agents: &AgentFacts<'_>) -> Option<vellum_ui::BrowserSummary> {
-    let ItemKind::Browser { model } = kind else { return None };
-    let page = crate::browser::decode(model);
-    Some(vellum_ui::BrowserSummary {
-        url: page.url,
-        title: page.title,
-        live: page.live,
-        allowed: agents.browser_nodes_allowed,
-    })
 }
 
 /// The link properties of a card, for the panel's Link section.
@@ -386,13 +136,29 @@ pub const fn facet_of(kind: &ItemKind) -> ItemFacet {
         ItemKind::MindMap { .. } => ItemFacet::MindMap,
         ItemKind::Kanban { .. } => ItemFacet::Kanban,
         ItemKind::Group => ItemFacet::Group,
-        // The Agent Canvas kinds. A worker, an orchestrator and the meta agent share one
-        // facet: they carry the same controls and differ only in which are offered, which
-        // the controls decide for themselves — see `ItemFacet::Agent`.
-        ItemKind::Agent { .. } => ItemFacet::Agent,
-        ItemKind::FileTree { .. } => ItemFacet::FileTree,
-        ItemKind::AgentNote { .. } => ItemFacet::Note,
-        ItemKind::Browser { .. } => ItemFacet::Browser,
+        // ⚠ These four kinds are **format, not feature**. The layer that made them is
+        // archived; `vellum-doc` keeps the variants for ever, because a board that ever held
+        // one must still parse, still round-trip and still save byte for byte — RULE ZERO,
+        // which outranks tidiness. So this arm cannot be deleted, and it must not be an
+        // `unreachable!()`: `panic = "abort"` in release turns an unreachable arm into a dead
+        // application on the frame such a board becomes visible.
+        //
+        // They answer [`ItemFacet::Other`], which is the same minimal answer any item this
+        // panel cannot edit gets — a headline, a position and size, the padlock, and no
+        // sections at all. Nothing else in this file needs an arm for them: `fill_of`,
+        // `stroke_of`, `text_of`, `connector_of` and `link_of` each decline a kind they do
+        // not know, and these are now four more of those.
+        //
+        // **`Other` rather than a facet that already exists, and that is the load-bearing
+        // half.** A facet is not only a label, it is a gate: `vellum_ui::chrome` derives
+        // `any_group` from `facet == ItemFacet::Group`, so reusing `Group` here would enable
+        // Ungroup on an item that is not one. A control that does nothing is precisely what
+        // archiving a feature is supposed to remove, and a variant nothing matches on cannot
+        // grow one by accident.
+        ItemKind::Agent { .. }
+        | ItemKind::FileTree { .. }
+        | ItemKind::AgentNote { .. }
+        | ItemKind::Browser { .. } => ItemFacet::Other,
     }
 }
 
@@ -933,7 +699,7 @@ mod tests {
 
     fn items(board: &Board, ids: &[ItemId]) -> Vec<SelectionItem> {
         ids.iter()
-            .map(|id| describe(*id, &board.item(*id).unwrap(), &AgentFacts::unknown()))
+            .map(|id| describe(*id, &board.item(*id).unwrap()))
             .collect()
     }
 
@@ -946,6 +712,48 @@ mod tests {
         assert_eq!(
             facet_of(&ItemKind::Image { asset_id: "h".into(), crop: None }),
             ItemFacet::Image
+        );
+    }
+
+    /// The layer that made these four `ItemKind`s is archived — it is kept whole under
+    /// `archive/`, not deleted — and the kinds themselves are not, and never will be.
+    ///
+    /// `vellum-doc` keeps them so that a board which ever held one still parses, still
+    /// round-trips and still saves byte for byte — RULE ZERO. This is that promise at the
+    /// panel's door: such an item has to **describe**, safely, with none of the archived
+    /// machinery in the process, rather than panicking or being quietly skipped.
+    ///
+    /// Asserted on [`ItemFacet::Other`] specifically, not merely on "some facet". A facet
+    /// that gates something — `Group` gates Ungroup, through `chrome`'s `any_group` — would
+    /// put a control on a legacy item that cannot act, which is the one thing archiving a
+    /// feature is meant to remove. The last assertion is the same rule applied to the words:
+    /// the panel's headline must not advertise a feature the app no longer has.
+    #[test]
+    fn an_archived_layers_item_still_describes_and_offers_nothing() {
+        let (board, ids) = board_with(vec![
+            ItemKind::Agent { model: "{}".into(), label: StyledText::plain("Reviewer") },
+            ItemKind::FileTree { model: "{}".into() },
+            ItemKind::AgentNote { model: "{}".into(), title: StyledText::plain("plan") },
+            ItemKind::Browser { model: "{}".into() },
+        ]);
+        for described in items(&board, &ids) {
+            assert_eq!(described.facet, ItemFacet::Other);
+            assert!(described.fill.is_none(), "no fill section");
+            assert!(described.border.is_none(), "no border section");
+            assert!(described.text.is_none(), "no typography section");
+            assert!(described.connector.is_none(), "no connector section");
+            assert!(described.link.is_none(), "no link section");
+            // What it keeps is what any unstyleable item keeps: it is selectable, it can be
+            // moved and resized, and it can be locked. Opacity is the one style every kind
+            // carries, so it is reported here exactly as it is for a group.
+            assert!(described.opacity.is_some());
+            assert!(!described.locked);
+        }
+
+        let noun = ItemFacet::Other.noun();
+        assert!(
+            !["Agent", "File tree", "Note", "Browser"].contains(&noun),
+            "the panel header must not name an archived feature: {noun}"
         );
     }
 
@@ -1003,7 +811,7 @@ mod tests {
         assert_eq!(item.style.stroke, Some(navy), "the painter reads this field");
         assert_eq!(item.style.stroke_width, Some(6.0));
         // Round trip: what was written is what the panel reads back.
-        let described = describe(ids[0], &item, &AgentFacts::unknown()).border.unwrap();
+        let described = describe(ids[0], &item).border.unwrap();
         assert_eq!((described.color, described.width), (navy, 6.0));
 
         // "No border" is a transparent stroke, not an absent one — an absent one inherits
@@ -1224,7 +1032,7 @@ mod tests {
 
         // Reported before anything is touched: the two ends read differently, which is
         // what makes the picker's two rows independent.
-        let described = describe(ids[0], &board.item(ids[0]).unwrap(), &AgentFacts::unknown()).connector.unwrap();
+        let described = describe(ids[0], &board.item(ids[0]).unwrap()).connector.unwrap();
         assert_eq!(described.start_anchor, AnchorSide::Centre);
         assert_eq!(described.end_anchor, AnchorSide::Left);
 
@@ -1262,7 +1070,7 @@ mod tests {
     #[test]
     fn an_unattached_end_reports_free_and_refuses_a_side() {
         let (mut board, ids) = board_with(vec![wire()]);
-        let described = describe(ids[0], &board.item(ids[0]).unwrap(), &AgentFacts::unknown()).connector.unwrap();
+        let described = describe(ids[0], &board.item(ids[0]).unwrap()).connector.unwrap();
         assert_eq!(described.start_anchor, AnchorSide::Free);
         assert_eq!(described.end_anchor, AnchorSide::Free);
 
@@ -1294,7 +1102,7 @@ mod tests {
         ]);
 
         for id in &ids {
-            let described = describe(*id, &board.item(*id).unwrap(), &AgentFacts::unknown());
+            let described = describe(*id, &board.item(*id).unwrap());
             assert_eq!(described.facet, ItemFacet::Link, "a card is not an Image");
             let link = described.link.expect("a card has link properties");
             assert_eq!(link.mode, CardMode::Card, "the default");
@@ -1309,7 +1117,7 @@ mod tests {
         ));
         for id in &ids {
             assert_eq!(
-                describe(*id, &board.item(*id).unwrap(), &AgentFacts::unknown()).link.unwrap().mode,
+                describe(*id, &board.item(*id).unwrap()).link.unwrap().mode,
                 CardMode::Large
             );
         }
@@ -1323,7 +1131,7 @@ mod tests {
 
         // And the panel's Link section appears for them, with one URL when one is selected.
         let items: Vec<vellum_ui::SelectionItem> =
-            ids.iter().map(|id| describe(*id, &board.item(*id).unwrap(), &AgentFacts::unknown())).collect();
+            ids.iter().map(|id| describe(*id, &board.item(*id).unwrap())).collect();
         let both = PanelModel::derive(&items);
         assert!(both.has_link());
         assert_eq!(both.link_url, None, "Open acts on one page, not forty");
@@ -1335,7 +1143,7 @@ mod tests {
     #[test]
     fn a_non_card_has_no_link_section() {
         let (board, ids) = board_with(vec![sticky("a")]);
-        let described = describe(ids[0], &board.item(ids[0]).unwrap(), &AgentFacts::unknown());
+        let described = describe(ids[0], &board.item(ids[0]).unwrap());
         assert!(described.link.is_none());
         assert!(!PanelModel::derive(&[described]).has_link());
     }
@@ -1410,7 +1218,7 @@ mod tests {
 
         let items: Vec<vellum_ui::SelectionItem> = ids
             .iter()
-            .map(|id| describe(*id, &board.item(*id).unwrap(), &AgentFacts::unknown()))
+            .map(|id| describe(*id, &board.item(*id).unwrap()))
             .collect();
         assert!(items[0].locked, "the locked one reports locked");
         assert!(!items[1].locked, "the other does not");

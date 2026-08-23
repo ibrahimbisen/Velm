@@ -27,7 +27,6 @@ vellum-doc.workspace = true
 # `cargo test -p vellum-ui` alone, which compiles the pure half. Nothing tests that
 # configuration, so a `vellum_agent::session::` call added here would pass CI and fail for
 # whoever builds this crate on its own.
-vellum-agent.workspace = true
 # The shape flyout draws real silhouettes from the catalogue, so adding a shape to
 # `vellum-shapes` adds it to the picker with no change here.
 vellum-shapes.workspace = true

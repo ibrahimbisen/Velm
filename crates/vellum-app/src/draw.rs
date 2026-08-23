@@ -48,11 +48,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 use crate::time::Instant;
 
-use vellum_agent::{DisplayMode, Status, TranscriptEvent};
-// `vellum_agent::filetree::View` and `vellum_render::View` are both `View`, and this file
-// uses the second one on every frame. Renamed on the way in rather than written out at each
-// use, so the one that means "a draw list's coordinate space" keeps the bare name.
-use vellum_agent::filetree::View as TreeView;
 use vellum_connect::Router;
 use vellum_doc::{
     Align, CardMode, ItemKind, Pattern, Style, StyledText as DocText, TextSpan as DocSpan,
@@ -95,8 +90,6 @@ use vellum_scene::{Camera, ItemId as SceneId, ScreenPoint, WorldPoint};
 use vellum_shapes::{Shape, Size, TessellationOptions as ShapeTessellation};
 use vellum_text::{FitBox, GlyphImage, GlyphKey};
 
-use crate::agent::{AgentLayout, Rect as NodeRect};
-use crate::agent_view::AgentView;
 use crate::assets::{self, Assets};
 use crate::connector;
 use crate::project::{Projected, Projection};
@@ -229,20 +222,6 @@ pub struct DrawContext<'a> {
     /// targets itself and could then disagree with the line it is drawing about where the
     /// line begins.
     pub connector_grips: Option<((f64, f64), (f64, f64))>,
-    /// The chat theme a node with no choice of its own draws in — Preferences ▸ Agents.
-    ///
-    /// Resolved by the app because it lives in the library sidecar, which `vellum-agent`
-    /// must not know about and the painter cannot read. `DisplayMode`'s arrangement exactly.
-    pub default_chat_theme: vellum_agent::ChatTheme,
-    /// The display mode a node with no choice of its own is drawn in — the same arrangement,
-    /// for the same reason, and it was the arrangement that was missing.
-    ///
-    /// ⚠ Two places resolved `None` against `DisplayMode::default()` — the enum's own value,
-    /// which is not the user's. Both are reached only by a node the runtime has not attached a
-    /// session to, so with the app-wide default set to Raw a freshly placed agent drew its
-    /// toggle in Clean until the moment it first ran, and then changed under the user. The
-    /// value follows `default_chat_theme` from the same sidecar so the two cannot drift.
-    pub default_display: DisplayMode,
     /// The marquee in flight, in physical pixels.
     pub marquee: Option<(ScreenPoint, ScreenPoint)>,
     /// The pen stroke being drawn right now, if the button is down.
@@ -260,13 +239,6 @@ pub struct DrawContext<'a> {
     /// comes up, so without this the board is unchanged for the whole gesture and the item
     /// appears from nowhere at the end of it.
     pub placing: Option<Placing>,
-    /// The agents running on this board, as the painter sees them.
-    ///
-    /// A snapshot filled once per frame by `crate::agent_runtime`, never the sessions
-    /// themselves — see [`crate::agent_view`] for why the painter is deliberately given
-    /// something it cannot start a turn with. Empty on every board that has no agent nodes,
-    /// which is what keeps this layer free for boards that do not use it.
-    pub agents: &'a crate::agent_view::AgentViews,
     /// The alignment guides the gesture in flight is reporting, in **world** units.
     ///
     /// Miro's *Align objects*. Resolved by the app together with the correction they
@@ -302,158 +274,11 @@ pub struct DrawContext<'a> {
     /// writes nothing to the document until the button comes up, so without it the
     /// drag is invisible and the card appears to jump on release.
     pub card_drop: Option<[(f64, f64); 4]>,
-    /// Every orchestrator's region, and the one being swept right now.
-    ///
-    /// Resolved by the app — see [`crate::actions::ActiveState::territories`] — for `guides`'
-    /// reason: whose region it is, whether it is the selected one and whether a gesture is
-    /// redrawing it are questions about the selection and about `Input`, neither of which the
-    /// painter is allowed to read. **Empty on every board with no orchestrator on it**, which
-    /// is the early-out the two loops below both take.
-    pub territories: Vec<TerritoryTint>,
     /// Where the minimap goes, in physical pixels — `[x, y, width, height]`. `None`
     /// hides it. Supplied by the caller rather than derived here because it has to
     /// clear the floating chrome, and only the caller knows where that is.
     pub minimap: Option<[f32; 4]>,
 }
-
-/// An orchestrator's region, ready to paint.
-///
-/// Owned rather than borrowed, like [`Placing`]: it is rebuilt each frame from a selection
-/// and a live gesture, and the `label` is a `String` composed from the node's own text.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TerritoryTint {
-    /// Centre and extent in **world** units — `[x, y, width, height]`, the shape
-    /// [`vellum_agent::Territory`] and `vellum_doc::Placement` both are, so nothing has to
-    /// convert between a corner and a centre on the way here. That conversion is exactly
-    /// where an off-by-half-a-box error lives.
-    pub region: [f64; 4],
-    /// Whose region it is, as the node is named on the board.
-    ///
-    /// **This is the answer to *"the orchestrator for that area should somehow be
-    /// visible"***. With every region drawn at once rather than only the selected one, the
-    /// chip is the only thing on screen saying which of several rectangles belongs to which
-    /// node — so it stopped being decoration the moment the list grew past one.
-    pub label: String,
-    /// The node itself. Used as the text cache's key, so a label is shaped once and retired
-    /// with the item — see [`crate::text::TextCache::retain`] — and to find the selected
-    /// node's own region.
-    pub scene: SceneId,
-    /// The same node's document id, which is what an armed sweep remembers.
-    ///
-    /// Both are carried because they answer different questions and neither derives the
-    /// other cheaply: a `SceneId` is rebuilt by every reprojection, and the arm has to
-    /// survive one.
-    pub doc: vellum_doc::ItemId,
-    /// The projection generation the label was composed against, so a renamed node reshapes
-    /// and a panning board does not.
-    pub generation: u64,
-    /// How loudly this one is drawn.
-    pub emphasis: TerritoryEmphasis,
-}
-
-/// Which of the three things a region on screen is.
-///
-/// One enum rather than two booleans, because the three are exclusive and a pair of flags
-/// admits a fourth state — *swept but not selected* — that nothing can produce and that the
-/// alpha table would have to invent an answer for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerritoryEmphasis {
-    /// A region that is simply there. The faintest, and the commonest: with every region
-    /// drawn at all times this is what a board full of orchestrators looks like, and
-    /// anything louder would recolour the canvas.
-    Standing,
-    /// Its owner is the current selection — *"this is the one you are looking at"*.
-    Selected,
-    /// The rectangle under the pointer, right now. The strongest, because during the one
-    /// gesture where it matters most which rectangle is which, the answer must not be
-    /// "they look the same".
-    Sweeping,
-}
-
-impl TerritoryEmphasis {
-    /// The wash and the edge, as a pair, so the two can never be looked up separately and
-    /// come from different rungs.
-    const fn alphas(self) -> (f32, f32) {
-        match self {
-            Self::Standing => (TERRITORY_FILL_ALPHA_STANDING, TERRITORY_EDGE_ALPHA_STANDING),
-            Self::Selected => (TERRITORY_FILL_ALPHA, TERRITORY_EDGE_ALPHA),
-            Self::Sweeping => (TERRITORY_FILL_ALPHA_LIVE, TERRITORY_EDGE_ALPHA_LIVE),
-        }
-    }
-}
-
-impl TerritoryTint {
-    /// The region as two screen corners, in physical pixels, top-left first.
-    ///
-    /// One function, asked by both the paint and the label's placement, for the rule
-    /// `card_layout` and `draw::kanban_runs` already exist to enforce: a second copy of a
-    /// rectangle's arithmetic is a label that sits where the tint is not.
-    fn screen_rect(&self, camera: &Camera) -> ((f32, f32), (f32, f32)) {
-        let [x, y, width, height] = self.region;
-        let a = camera.world_to_screen(WorldPoint::new(x - width / 2.0, y - height / 2.0));
-        let b = camera.world_to_screen(WorldPoint::new(x + width / 2.0, y + height / 2.0));
-        (
-            (a.x.min(b.x) as f32, a.y.min(b.y) as f32),
-            (a.x.max(b.x) as f32, a.y.max(b.y) as f32),
-        )
-    }
-}
-
-/// The territory label, laid out and placed. Screen pixels throughout.
-struct TerritoryLabel {
-    key: BlockKey,
-    /// The text block's top-left, which is what `PlacedGlyph::physical` adds its offsets to.
-    origin: (f32, f32),
-    /// The plate behind it — `[x, y, width, height]`.
-    plate: [f32; 4],
-}
-
-/// The slot a territory's label is cached under, on the node that owns the region.
-///
-/// **The top of the space, and it is safe by construction rather than by luck.** Every other
-/// slot comes from `0..Painter::slots_of(..)`, which is exclusive and whose own arithmetic
-/// saturates at `u16::MAX` — so the largest slot any item can ever use is `u16::MAX - 1`.
-/// Keying on the node's own `SceneId` is what makes the label retire with the node:
-/// `TextCache::retain` drops every entry whose item has left the board, and a synthetic id
-/// would be a layout that leaked for the life of the process.
-const TERRITORY_LABEL_SLOT: u16 = u16::MAX;
-
-/// The label's size in **device** pixels — see [`Painter::territory_label`] for why this is
-/// not a world size.
-const TERRITORY_LABEL_SIZE: f32 = 12.0;
-/// Air around the label's words, in device pixels.
-const TERRITORY_LABEL_PAD: f32 = 6.0;
-/// How far the plate sits inside the region's corner, in device pixels.
-const TERRITORY_LABEL_INSET: f32 = 8.0;
-/// The plate's corner radius. A hair rounder than a hairline, so it reads as a chip.
-const TERRITORY_LABEL_RADIUS: f32 = 4.0;
-
-/// How much of the accent a stored region washes the board with.
-///
-/// A **wash**, not a tint you could mistake for a fill: a territory routinely covers most of
-/// the board, and anything strong enough to read as an object at that size would recolour
-/// the whole canvas. Read against the near-white `paper` this design settled on, the edge is
-/// what says where the region is and the wash only says which side of it you are on.
-const TERRITORY_FILL_ALPHA: f32 = 0.05;
-/// The same, while the rectangle is being swept. Stronger, because the gesture is the one
-/// moment the fill *is* the feedback.
-const TERRITORY_FILL_ALPHA_LIVE: f32 = 0.10;
-/// The same, for a region whose owner is not selected — which since the regions became
-/// always-on is every region on the board nearly all of the time.
-///
-/// **Half the selected wash, not the same.** A territory routinely covers most of the board
-/// and there may be several; at the selected value they stack into a recoloured canvas, and
-/// the middle rung of [`TerritoryEmphasis`] stops meaning anything.
-const TERRITORY_FILL_ALPHA_STANDING: f32 = 0.025;
-/// The dashed edge, against a board of stickies. Above a guide's 0.45 because a territory is
-/// a boundary rather than a hint, and well under a selection ring's 1.0 because it is not
-/// an object's outline — see `push_territory`.
-const TERRITORY_EDGE_ALPHA: f32 = 0.60;
-const TERRITORY_EDGE_ALPHA_LIVE: f32 = 0.90;
-/// The edge of a region nobody has selected. Still clearly a boundary — this is the whole
-/// point of drawing it at all — and well under the selected one, so picking an orchestrator
-/// visibly answers *"which of these is yours"*.
-const TERRITORY_EDGE_ALPHA_STANDING: f32 = 0.30;
 
 /// Where the caret is, what is selected, and the string both index into.
 ///
@@ -528,15 +353,6 @@ pub enum PlacingLook {
     /// The form the shape flyout has armed — drawn through the same SDF path the placed
     /// shape uses, so an ellipse previews as an ellipse rather than as its bounding box.
     Shape(Shape),
-    /// The four Agent Canvas nodes: the surface card with its hairline, which is exactly
-    /// what each of them is built on.
-    ///
-    /// Its own look rather than [`PlacingLook::Ghost`] because the answer *is* known here —
-    /// an agent, a note, a file tree and a browser are all a bordered card before anything
-    /// fills them — and feedback 23's rule is that a preview which disagrees with what it
-    /// previews is worse than none, since it is believed. The corollary holds too: a
-    /// preview that could tell the truth and does not is a smaller version of the same fault.
-    Card,
     /// Everything whose final look is not known until it exists: a table, a chart, a mind
     /// map, a kanban, a text box. An accent ghost, like the marquee — it reports the box
     /// honestly and does not pretend to be a picture of the result.
@@ -754,14 +570,6 @@ pub struct Painter {
     mindmaps: HashMap<SceneId, CachedMindMap>,
     /// Laid-out kanban boards, one frame at a time. See [`CachedKanban`].
     kanbans: HashMap<SceneId, CachedKanban>,
-    /// The Agent Canvas nodes' pieces — transcript runs, tree rows, option cards.
-    ///
-    /// Unlike every other cache here this is keyed on a **frame counter** as well as on the
-    /// projection, because what an agent node draws is not in the document: see
-    /// [`CachedNode::frame`].
-    nodes: HashMap<SceneId, CachedNode>,
-    /// Bumped once per [`Painter::paint`]. See [`CachedNode::frame`].
-    frame: u64,
     /// Tessellated silhouettes for the shapes an SDF cannot express.
     ///
     /// Keyed on the LOD band as well as the item, like the ink cache: the mesh's
@@ -824,8 +632,6 @@ impl Painter {
             tables: HashMap::new(),
             mindmaps: HashMap::new(),
             kanbans: HashMap::new(),
-            nodes: HashMap::new(),
-            frame: 0,
             router: Router::default(),
             order: Vec::new(),
             glyphs: Vec::new(),
@@ -911,7 +717,6 @@ impl Painter {
             self.tables.clear();
             self.mindmaps.clear();
             self.kanbans.clear();
-            self.nodes.clear();
             self.shapes.clear();
             return;
         }
@@ -924,7 +729,6 @@ impl Painter {
         self.tables.retain(|id, _| projection.get(*id).is_some());
         self.mindmaps.retain(|id, _| projection.get(*id).is_some());
         self.kanbans.retain(|id, _| projection.get(*id).is_some());
-        self.nodes.retain(|id, _| projection.get(*id).is_some());
         self.shapes.retain(|key, _| projection.get(key.id).is_some());
     }
 
@@ -946,12 +750,6 @@ impl Painter {
         list.clear();
         self.text_spent = Duration::ZERO;
         self.text_deferred = 0;
-        // An Agent Canvas node's contents are not in the document, so nothing the projection
-        // knows about moves when an agent speaks. This counter is what retires last frame's
-        // layout of one — see [`CachedNode::frame`]. Wrapping, because a counter that
-        // saturated would silently stop invalidating after 2^64 frames rather than loudly.
-        self.frame = self.frame.wrapping_add(1);
-
         // Images the decode workers finished, onto the GPU — **before** the list that
         // references them is built, so one that arrived since the last frame is drawn
         // this frame rather than next. This is the only place that holds the device, the
@@ -989,15 +787,6 @@ impl Painter {
         // to finish before a single glyph is pushed, because `push_layout` looks
         // slots up rather than requesting them.
         self.prepare_text(device, queue, renderer.atlas_mut(), ctx, &mut stats);
-
-        // The orchestrator's region, **behind everything** — `docs/07-agent-canvas.md` §9.
-        // After the grid and before the items: a territory is a wash *on* the board's
-        // surface rather than part of it, and a tint under the grid would put dots on top of
-        // the one thing that says which part of the board an agent owns.
-        //
-        // After `prepare_text`, because the label goes through the same atlas every other
-        // glyph does and `push_layout` looks slots up rather than requesting them.
-        self.push_territory(list, ctx, renderer.atlas(), screen);
 
         // Pass two: geometry and glyphs, strictly in paint order.
         for index in 0..self.order.len() {
@@ -1073,7 +862,7 @@ impl Painter {
             if clipped_by_frame(projected, ctx.projection) {
                 continue;
             }
-            for slot in 0..self.slots_of(id, projected, projected.generation, ctx) {
+            for slot in 0..self.slots_of(id, projected, projected.generation) {
                 let block = match self.block(id, projected, slot, ctx) {
                     Some(Painted::Glyphs(block)) => block,
                     // A greeked block rasterises nothing — that is the point of it.
@@ -1100,255 +889,12 @@ impl Painter {
             }
         }
 
-        // The territory labels. **Not items**, so they are not in `self.order` and cannot be
-        // reached by the loop above — and a region can be on screen while the node that owns
-        // it is culled, which is precisely when a label saying whose region this is earns its
-        // place. That case stopped being an edge one when the regions became always-on:
-        // several orchestrators' rectangles overlapping is exactly when the chips are the
-        // only way to tell them apart. Rasterised at scale 1.0 for the reason
-        // [`Painter::territory_label`] gives.
-        //
-        // Cloned rather than borrowed: `territory_label` needs `&mut self` for the text
-        // cache, and `ctx.territories` would otherwise be borrowed across it. Empty on every
-        // board with no orchestrator, so the allocation is not one an ordinary board makes.
-        if !ctx.territories.is_empty() {
-            for tint in ctx.territories.clone() {
-                let Some(label) = self.territory_label(ctx, &tint) else { continue };
-                let missing = self.text.layout_of(label.key).is_some_and(|layout| {
-                    layout.glyphs().any(|glyph| {
-                        let key = glyph.physical(label.origin, 1.0).key;
-                        atlas.slot(key).is_none() && !atlas.is_blank(key)
-                    })
-                });
-                if missing {
-                    self.text.rasterise_into(label.key, label.origin, 1.0, &mut self.glyphs);
-                }
-            }
-        }
-
         if !self.glyphs.is_empty()
             && let Err(error) = atlas.prepare(device, queue, &self.glyphs)
         {
             // Not fatal: the frame draws with whatever is resident, which is text
             // with holes in it rather than no frame at all.
             log::warn!("glyph atlas: {error}");
-        }
-    }
-
-    /// Lays out the territory's label and works out where on screen it goes.
-    ///
-    /// # Why this is not an item's block
-    ///
-    /// [`Painter::block`] positions text from `projected.rect()` and an [`Anchor`], which is
-    /// the right machinery for words that belong *inside* a box. A territory's label belongs
-    /// to a rectangle that is not an item, is very often larger than the screen, and has to
-    /// stay the same size at every zoom — none of which `block` can express. Teaching it a
-    /// case with no `Projected` behind it would put a special arm in the one function every
-    /// kind on the board goes through.
-    ///
-    /// # Laid out in **device** pixels, and pushed at scale 1.0
-    ///
-    /// Everything else here is shaped in world units and multiplied by the zoom at push
-    /// time, which is right for text that is part of the board. This is chrome: it must be
-    /// the same 12 px at a fitted 4% and at 8×, the way a guide's dash cadence and the
-    /// selection ring's weight already are. Shaping at the device size and pushing with
-    /// `scale = 1.0` is how that is spelled — the alternative, dividing a world size by the
-    /// zoom, reshapes the label on every frame of a zoom gesture and fills the atlas.
-    ///
-    /// # The label is clamped into the region *and* into the viewport
-    ///
-    /// A region is usually bigger than the window and its top-left corner is usually off
-    /// screen, so a label pinned to that corner is a label nobody ever sees — which is the
-    /// whole of what it was for. It slides along the region's own edges to stay in view, and
-    /// never leaves the region, so it cannot come to sit over a neighbouring orchestrator's.
-    ///
-    /// # It takes the tint rather than reading it off the context
-    ///
-    /// There are several regions on screen now, not one, so *"the territory's label"* is no
-    /// longer a question the context can answer on its own. Passing the tint is also what
-    /// keeps the two callers — the glyph-preparation pass and the paint — asking about the
-    /// **same** region in the same order, which is the `card_layout` rule: a second copy of a
-    /// layout is a label rasterised for one rectangle and drawn against another.
-    fn territory_label(
-        &mut self,
-        ctx: &DrawContext<'_>,
-        tint: &TerritoryTint,
-    ) -> Option<TerritoryLabel> {
-        if tint.label.trim().is_empty() {
-            return None;
-        }
-        let key = BlockKey::new(tint.scene, TERRITORY_LABEL_SLOT);
-        let style = vellum_doc::Style {
-            font_size: Some(f64::from(TERRITORY_LABEL_SIZE)),
-            ..vellum_doc::Style::default()
-        };
-        // The node's own projection generation, which is exactly what moves when its role
-        // label changes and exactly what does *not* move while the board is panned or a
-        // rectangle is being swept. The `pending` flag deliberately does not enter here: the
-        // words are the same either way, and folding it in would reshape the label twice per
-        // gesture to produce the identical layout.
-        let words = tint.label.clone();
-        let (layout, _) = self.text.layout(key, tint.generation, &style, None, || {
-            vellum_text::StyledText::plain(words)
-        });
-        let extent = (layout.extent.width, layout.extent.height);
-
-        let (min, max) = tint.screen_rect(ctx.camera);
-        let viewport = ctx.camera.viewport();
-        let plate = (
-            extent.0 + TERRITORY_LABEL_PAD * 2.0,
-            extent.1 + TERRITORY_LABEL_PAD,
-        );
-        // Inside the region's corner, then slid to stay on screen — but never past the
-        // region's far edge, so a label that cannot fit inside its own region sits at the
-        // corner rather than floating somewhere it does not describe.
-        let slide = |near: f32, far: f32, size: f32, limit: f32| {
-            let inset = near + TERRITORY_LABEL_INSET;
-            inset.max(0.0).min((far - size - TERRITORY_LABEL_INSET).max(inset)).min(
-                (limit - size).max(0.0),
-            )
-        };
-        let x = slide(min.0, max.0, plate.0, viewport.width as f32);
-        let y = slide(min.1, max.1, plate.1, viewport.height as f32);
-
-        Some(TerritoryLabel {
-            key,
-            // The glyphs sit inside the plate, and `Layout`'s own origin is the block's
-            // top-left, which is why the pad is added rather than subtracted.
-            origin: (x + TERRITORY_LABEL_PAD, y + TERRITORY_LABEL_PAD / 2.0),
-            plate: [x, y, plate.0, plate.1],
-        })
-    }
-
-    /// The orchestrator's region: a wash, a dashed edge and a label saying whose it is.
-    ///
-    /// **Screen view throughout, and that is the decision.** A region is a rectangle in
-    /// world units and the fill could as easily be pushed in the board view — but the edge
-    /// and the label cannot: a world-unit dash is a solid line when zoomed out and three
-    /// dashes across the window when zoomed in (`push_dashed`, and `push_grid` before it),
-    /// and a world-sized label is illegible at a fitted 4% and a banner at 8×. Drawing all
-    /// three in one view means one batch and one arithmetic, rather than a fill that agrees
-    /// with an edge only when nothing has been rounded.
-    ///
-    /// A region is axis-aligned and never rotated, so converting its two corners to screen
-    /// is exact — the conversion that would *not* be is the one this deliberately avoids by
-    /// carrying a centre and an extent all the way from `vellum_agent::Territory`.
-    ///
-    /// **Dashed rather than solid**, for feedback 25a's reason applied to a second kind of
-    /// chrome: a solid accent hairline is what a selection ring and a shape's border are, so
-    /// an edge drawn that way reads as belonging to an object. Nothing else on this canvas
-    /// is dashed except a connector that was asked to be, and a territory is the one thing
-    /// on the board that is not an object at all.
-    fn push_territory(
-        &mut self,
-        list: &mut DrawList,
-        ctx: &DrawContext<'_>,
-        atlas: &GlyphAtlas,
-        screen: u32,
-    ) {
-        // Sorted so the loudest is drawn last and therefore on top. Without it a standing
-        // region that happens to come later in the projection washes over the one being
-        // swept, and the whole three-rung emphasis says nothing.
-        let mut order: Vec<&TerritoryTint> = ctx.territories.iter().collect();
-        order.sort_by_key(|tint| match tint.emphasis {
-            TerritoryEmphasis::Standing => 0,
-            TerritoryEmphasis::Selected => 1,
-            TerritoryEmphasis::Sweeping => 2,
-        });
-        for tint in order {
-            self.push_one_territory(list, ctx, atlas, screen, tint);
-        }
-    }
-
-    /// One region. Split out of [`Self::push_territory`] so the loop above holds the
-    /// ordering decision and this holds the drawing, rather than one function holding both.
-    fn push_one_territory(
-        &mut self,
-        list: &mut DrawList,
-        ctx: &DrawContext<'_>,
-        atlas: &GlyphAtlas,
-        screen: u32,
-        tint: &TerritoryTint,
-    ) {
-        let (min, max) = tint.screen_rect(ctx.camera);
-        let viewport = ctx.camera.viewport();
-        let (view_w, view_h) = (viewport.width as f32, viewport.height as f32);
-
-        // Entirely off screen: nothing to draw, and — the part that matters — nothing to
-        // *dash*, since an edge a long way outside the window would otherwise emit a run of
-        // quads nobody can see. The same clip `push_dashed` applies along its own axis,
-        // applied here across both. This became load-bearing rather than tidy when every
-        // region started drawing at once: a board of eight orchestrators is eight of these.
-        if max.0 <= 0.0 || max.1 <= 0.0 || min.0 >= view_w || min.1 >= view_h {
-            return;
-        }
-
-        list.use_view(screen);
-        let theme = ctx.theme;
-        let (fill_alpha, edge_alpha) = tint.emphasis.alphas();
-
-        // The wash, clipped to the window. A region is routinely hundreds of screens wide
-        // and a quad that big is a quad the rasteriser has to clip anyway; doing it here
-        // keeps the numbers finite, which is what stops a zoomed-in board handing the GPU
-        // coordinates it cannot represent.
-        let clipped = [
-            min.0.max(0.0),
-            min.1.max(0.0),
-            (max.0.min(view_w) - min.0.max(0.0)).max(0.0),
-            (max.1.min(view_h) - min.1.max(0.0)).max(0.0),
-        ];
-        if clipped[2] > 0.0 && clipped[3] > 0.0 {
-            list.push_quad(QuadInstance::solid(
-                [clipped[0], clipped[1]],
-                [clipped[2], clipped[3]],
-                theme.accent.with_alpha(fill_alpha),
-            ));
-        }
-
-        // The four edges, each only when it is actually in the window. A hairline, and a
-        // hair over one pixel so it survives the rounding either way — the guides' rule.
-        let colour = theme.accent.with_alpha(edge_alpha);
-        let weight = HAIRLINE.max(1.0);
-        for (across, axis) in [
-            (min.0, crate::snap::Axis::Vertical),
-            (max.0, crate::snap::Axis::Vertical),
-            (min.1, crate::snap::Axis::Horizontal),
-            (max.1, crate::snap::Axis::Horizontal),
-        ] {
-            let limit = if axis == crate::snap::Axis::Vertical { view_w } else { view_h };
-            if across < 0.0 || across > limit {
-                continue;
-            }
-            let (a, b) = match axis {
-                crate::snap::Axis::Vertical => (
-                    ScreenPoint::new(f64::from(across), f64::from(min.1)),
-                    ScreenPoint::new(f64::from(across), f64::from(max.1)),
-                ),
-                crate::snap::Axis::Horizontal => (
-                    ScreenPoint::new(f64::from(min.0), f64::from(across)),
-                    ScreenPoint::new(f64::from(max.0), f64::from(across)),
-                ),
-            };
-            push_dashed(list, ctx, axis, a, b, colour, weight);
-        }
-
-        // The label. A pale plate with an accent hairline rather than accent-on-accent:
-        // charcoal on the teal is 5.3:1 and white on it is 3.2:1, so a filled accent plate
-        // would have to carry `on_accent` — which this canvas palette does not have, and
-        // inventing one here would be a fifth copy of a colour three files already share.
-        let Some(label) = self.territory_label(ctx, tint) else { return };
-        list.use_view(screen);
-        list.push_quad(
-            QuadInstance::solid(
-                [label.plate[0], label.plate[1]],
-                [label.plate[2], label.plate[3]],
-                theme.surface,
-            )
-            .with_corner_radius(TERRITORY_LABEL_RADIUS)
-            .with_border(colour, weight),
-        );
-        if let Some(layout) = self.text.layout_of(label.key) {
-            list.push_layout(atlas, layout, [label.origin.0, label.origin.1], 1.0, theme.text);
         }
     }
 
@@ -1822,205 +1368,42 @@ impl Painter {
                 stats.kanbans += 1;
             }
 
-            // The four Agent Canvas kinds — `docs/07-agent-canvas.md` features 1, 2 and 14.
+            // ⚠ **The archived layer's residue, and it is deliberately not a panic.**
             //
-            // One arm, because all four are a card with pieces laid on it and every piece
-            // comes from [`NodePaint`]; what differs is the *chrome*, which is matched on
-            // below. Four arms would have put the card, the plate loop and the image loop in
-            // four places that then have to agree about all three.
+            // These four kinds were the Agent Canvas's nodes. That layer is in `archive/`
+            // and nothing in this application offers it any more — but `vellum_doc::ItemKind`
+            // still understands all four, because RULE ZERO says a board that ever held one
+            // must still load, still round-trip and still save byte for byte. So this arm has
+            // to exist for the match to be exhaustive, and what it does matters:
+            //
+            // - **Not `unreachable!()` and not `panic!()`.** `[profile.release]` sets
+            //   `panic = "abort"`, and this runs inside the paint loop — so either would kill
+            //   the application on the frame such a board scrolled into view, and again on
+            //   relaunch, because a board reopens at the same camera. That is
+            //   `strip_site_affix`'s abort (feedback 30) waiting to happen a second time.
+            // - **Not nothing, either.** An item that draws nothing is an item the user can
+            //   select, drag and delete while seeing only a ring — which is exactly what
+            //   feedback 39 diagnosed and it took two rounds to see.
+            //
+            // So: the honest minimum — a plain card, which is what
+            // `DrawList::push_scene_item` already falls back to for a kind with no drawing of
+            // its own. The item's own `style.fill`, rotation and opacity are honoured
+            // because those are the *document's*, not the archived layer's. `Agent` and
+            // `AgentNote` additionally carry a `StyledText` of their own, and `Painter::block`
+            // draws it — see the residue arm there.
             ItemKind::Agent { .. }
             | ItemKind::FileTree { .. }
             | ItemKind::AgentNote { .. }
             | ItemKind::Browser { .. } => {
                 let hairline = (f64::from(HAIRLINE) / camera.zoom()) as f32;
-                let (w, h) = projected.item.placement.scaled_size();
-                // A node's rectangles are in the item's own space with its top-left at
-                // `(0, 0)` and are **already scaled**, and this list is in the board view
-                // where a unit is a world unit — so placing one is a plain addition and
-                // nothing needs a scale factor. Multiplying by `camera.zoom()` here is the
-                // mistake `card_layout`'s own note records, and it looks *nearly* right.
-                let at = |rect: NodeRect| {
-                    (
-                        [position[0] + rect.x as f32, position[1] + rect.y as f32],
-                        [rect.width as f32, rect.height as f32],
-                    )
-                };
-
-                // **This node's own palette**, if it is an agent and has chosen a chat theme.
-                // One substitution, and every colour below follows — the card, the wells, the
-                // primary and muted text, the accent rail — because they all resolve through
-                // a `&Theme` already. `Theme::for_chat` answers `theme` unchanged for
-                // `ChatTheme::Velm`, so a board that has never chosen one pays a compare.
-                let theme = chat_theme_of(&projected.item.kind, ctx).map_or(theme, |chat| theme.for_chat(chat));
-                // …and how see-through its paper is. The **paper only**: `opacity` fades the
-                // whole item including the words, which at anything under about 60% is a
-                // transcript nobody can read. This is what *"adjust the transparency"* means
-                // on a surface whose entire job is to carry text.
-                let paper = opacity * chat_opacity_of(&projected.item.kind);
-
-                // The card first. It is what all four are built on, and it is what makes a
-                // freshly placed node a real, selectable, movable box before anything at all
-                // has filled it.
                 let fill = projected.item.style.fill.map_or(theme.surface, theme::convert);
-                push_node_card(list, position, size, fill, rotation, paper, &theme, hairline);
-
-                // The user's own picture behind the transcript, if this node has one —
-                // *"put my own themes a picture as a theme"*. Between the card and the
-                // plates, so the wells and the words still sit on top of it, and it inherits
-                // the card's radius so it cannot square off the corners it fills.
-                if let Some(blob) = chat_background_of(&projected.item.kind)
-                    && let Some((texture, source)) =
-                        assets.texture(device, queue, renderer.textures_mut(), blob)
-                {
-                    renderer.textures_mut().mark(texture, 0.0);
-                    list.push_image(
-                        texture,
-                        // Cropped, never stretched — feedback 23. A wallpaper is whatever
-                        // shape the file was and a node is whatever shape it was dragged to.
-                        ImageInstance::new(
-                            position,
-                            size,
-                            cover_uv(source, (f64::from(size[0]), f64::from(size[1]))),
-                        )
+                list.push_quad(
+                    QuadInstance::solid(position, size, fill)
                         .with_corner_radius(CARD_RADIUS)
+                        .with_border(theme.border, hairline)
                         .with_rotation(rotation)
-                        .with_opacity(paper),
-                    );
-                    // A scrim, in the theme's own paper. This is what makes an arbitrary
-                    // picture safe where an arbitrary *colour* is not: the ink's contrast is
-                    // against the paper above the image rather than against the image, so a
-                    // photograph cannot make the transcript unreadable. It is also why the
-                    // picture is a per-node choice and the colours are four presets.
-                    list.push_quad(
-                        QuadInstance::solid(position, size, fill.with_alpha(BACKGROUND_SCRIM))
-                            .with_corner_radius(CARD_RADIUS)
-                            .with_rotation(rotation)
-                            .with_opacity(paper),
-                    );
-                }
-
-                // Plates under the words, then pictures, then the chrome on top. Copied out
-                // of the cache first because `assets` borrows the renderer and this borrow
-                // of `self` would otherwise still be live across it.
-                let (plates, images, twisties) = {
-                    let paint = self.node_paint(id, projected, ctx);
-                    (paint.plates.clone(), paint.images.clone(), paint.twisties.clone())
-                };
-                for plate in &plates {
-                    push_node_plate(list, at(plate.rect), *plate, rotation, paper, &theme, hairline);
-                }
-                for image in &images {
-                    let (origin, extent) = at(image.rect);
-                    match assets.texture(device, queue, renderer.textures_mut(), &image.blob) {
-                        Some((texture, source)) => {
-                            renderer.textures_mut().mark(texture, 0.0);
-                            list.push_image(
-                                texture,
-                                // Cropped to its band rather than stretched into it. An
-                                // agent's screenshot is whatever shape its window was and the
-                                // band is not, so `UvRect::FULL` here is feedback 23's *"the
-                                // images are all distoreted"* waiting to happen a second time.
-                                ImageInstance::new(
-                                    origin,
-                                    extent,
-                                    cover_uv(source, (image.rect.width, image.rect.height)),
-                                )
-                                .with_corner_radius(CARD_RADIUS * 0.75)
-                                .with_rotation(rotation)
-                                .with_opacity(opacity),
-                            );
-                        }
-                        None => {
-                            stats.images_pending += 1;
-                            push_placeholder(list, origin, extent, rotation, opacity, &theme);
-                        }
-                    }
-                }
-
-                // Everything below is positioned from the **unrotated** box and spun in
-                // place, which is the convention every structured widget here follows: a
-                // rotated table draws its grid straight, and the press path agrees with what
-                // is on screen rather than with what would be tidier.
-                match &projected.item.kind {
-                    ItemKind::Agent { model, .. } => {
-                        let laid = crate::agent::layout(w, h);
-                        // The status the runtime reports, or `Idle` for a node it has not
-                        // attached a session to — which is what a freshly placed agent is.
-                        let view = ctx.agents.get(id);
-                        let status = view.map_or(Status::Idle, |view| view.status);
-                        let colour = status_colour(status, &theme);
-                        if laid.too_small {
-                            push_compact_stripe(list, position, size, colour, rotation, opacity);
-                        } else {
-                            push_status_dot(
-                                list,
-                                at(laid.status),
-                                colour,
-                                view.is_some_and(AgentView::needs_attention),
-                                rotation,
-                                opacity,
-                            );
-                            let raw = match view {
-                                Some(view) => matches!(view.mode, DisplayMode::Raw),
-                                // No session yet, so the node's own configuration answers —
-                                // resolved through `agent::display_mode`, which is the one
-                                // place `None` means "follow the app-wide default".
-                                None => matches!(
-                                    crate::agent::display_mode(
-                                        &crate::agent::decode(model),
-                                        ctx.default_display,
-                                    ),
-                                    DisplayMode::Raw
-                                ),
-                            };
-                            push_mode_toggle(
-                                list, at(laid.mode), raw, rotation, opacity, &theme, hairline,
-                            );
-                            push_run_button(
-                                list,
-                                at(laid.run),
-                                status.is_busy(),
-                                rotation,
-                                opacity,
-                                &theme,
-                                hairline,
-                            );
-                        }
-                    }
-
-                    ItemKind::FileTree { .. } => {
-                        for (rect, expanded) in &twisties {
-                            push_twisty(list, at(*rect), *expanded, rotation, opacity, &theme);
-                        }
-                    }
-
-                    ItemKind::Browser { .. } => {
-                        let laid = crate::browser::layout(w, h);
-                        if !laid.too_small {
-                            push_reload_button(
-                                list, at(laid.reload), rotation, opacity, &theme, hairline,
-                            );
-                            // **The card's own badge, not a second drawing of one.** Same
-                            // plate, same three-quad `↗` — see `push_open_badge` for why the
-                            // arrow is geometry rather than U+2197 — so the one button on the
-                            // board that leaves the application looks the same wherever it
-                            // appears, and there is one hitbox to keep honest rather than two.
-                            let pixel = (1.0 / camera.zoom()) as f32;
-                            push_open_badge(
-                                list,
-                                at(laid.open_external),
-                                rotation,
-                                opacity,
-                                &theme,
-                                ctx.hovered_badge == Some(id),
-                                pixel,
-                            );
-                        }
-                    }
-
-                    // A note draws its title and body as runs and needs no chrome.
-                    _ => {}
-                }
+                        .with_opacity(opacity),
+                );
             }
 
             // A group is a container, not a drawing. `vellum_doc::ItemKind::Group`
@@ -2097,8 +1480,8 @@ impl Painter {
                 list.push_meshes(start..end);
             }
 
-            ItemKind::Connector { color, start, end, .. } => {
-                let Some(mut routed) = connector::route(
+            ItemKind::Connector { color, .. } => {
+                let Some(routed) = connector::route(
                     &projected.item.kind,
                     &projected.item.placement,
                     |target| ctx.projection.placement_of(target),
@@ -2114,71 +1497,7 @@ impl Painter {
                     tolerance: (0.5 / camera.zoom()).clamp(0.05, 64.0),
                 };
 
-                // **What this line means is derived, never stored** — `docs/07` §3, and
-                // `crate::agent::link_kind` is the single derivation, asked here rather than
-                // reproduced. A stored "this is an agent link" flag would be a second source
-                // of truth that can disagree with the endpoints it describes, which this
-                // repository has already paid for twice.
-                //
-                // Gated on `AgentViews::has_agents`, which is the promise that a board with
-                // no agents on it costs exactly what it did before this layer existed: one
-                // boolean per connector rather than two projection lookups.
-                //
-                // **`has_agents`, not `is_empty`.** The views map holds only the nodes that
-                // are *visible*, so a connector on screen whose two agent endpoints are both
-                // off screen would fall to `Plain` and the line would change style as the
-                // user panned — which is worse than either style, because it reads as the
-                // link being lost.
-                let link = if !ctx.agents.has_agents() {
-                    crate::agent::LinkKind::Plain
-                } else {
-                    let kind_of = |end: &vellum_doc::ConnectorEnd| {
-                        end.target
-                            .and_then(|target| ctx.projection.scene_id(target))
-                            .and_then(|scene| ctx.projection.get(scene))
-                            .map(|projected| &projected.item.kind)
-                    };
-                    crate::agent::link_kind(
-                        kind_of(start),
-                        kind_of(end),
-                        start.arrowhead,
-                        end.arrowhead,
-                    )
-                };
-
-                let mut line = color.map_or(theme.stroke, theme::convert);
-                if let Some((dash, tint)) = agent_link_look(link, &theme) {
-                    // The user's own colour still wins if they set one — a connector they
-                    // deliberately made red stays red — but a link that has never been
-                    // coloured takes the one that says which relationship it is.
-                    if color.is_none() {
-                        line = tint;
-                    }
-                    // **The cadence rides on the thickness**, because `vellum_connect`
-                    // derives its dash pattern from it (`LineStyle::dash_pattern`). Setting
-                    // the thickness in device pixels therefore makes the *pattern* screen-
-                    // constant as well as the weight, which is the whole requirement: a
-                    // world-unit cadence is a solid smear at a fitted 4% zoom and three
-                    // dashes across the window at 8×, exactly as `push_grid` records for the
-                    // board's own dots. It also keeps the arrowhead — which scales with
-                    // thickness — a constant size, and arrowheads are how `docs/07` §3 says
-                    // direction is expressed, so losing them was never an option. Doing our
-                    // own dashing would have.
-                    routed.style.thickness = AGENT_LINK_WIDTH / camera.zoom();
-                    routed.style.line = dash;
-                    // …unless that would cost more dashes than a frame should spend. A link
-                    // between two far-apart agents is mostly off screen and `vellum_connect`
-                    // has no viewport to clip against, so the cadence is dropped rather than
-                    // stretched: still the link's colour, still legible as an agent link, and
-                    // a rhythm nobody can see says nothing worth thousands of triangles.
-                    // `GUIDE_MAX_DASHES` is the same backstop for the same arithmetic.
-                    if let Some(pattern) = dash.dash_pattern(routed.style.thickness) {
-                        let period = pattern.on + pattern.off;
-                        if period > 0.0 && routed.path.length() / period > AGENT_LINK_MAX_DASHES {
-                            routed.style.line = vellum_connect::LineStyle::Solid;
-                        }
-                    }
-                }
+                let line = color.map_or(theme.stroke, theme::convert);
 
                 let Ok(mesh) = vellum_connect::tessellate(&routed.path, &routed.style, &options)
                 else {
@@ -2187,9 +1506,9 @@ impl Painter {
                 let transform = list.meshes_mut().push_transform(MeshTransform::at(
                     camera.to_camera_relative(WorldPoint::new(mesh.origin.x, mesh.origin.y)),
                 ));
-                // `first`/`last` rather than `start`/`end`, which are this arm's two
-                // `ConnectorEnd`s: shadowing them would compile and would make the next
-                // reader check twice which one a name meant.
+                // `first`/`last` rather than `start`/`end`: this arm used to bind the
+                // connector's own two `ConnectorEnd`s under those names, and shadowing them
+                // compiled while making the next reader check twice which one a name meant.
                 let first = list.meshes().indices().len() as u32;
                 list.meshes_mut().push_connector(
                     &mesh,
@@ -2198,22 +1517,6 @@ impl Painter {
                 );
                 let last = list.meshes().indices().len() as u32;
                 list.push_meshes(first..last);
-
-                // The message in flight, on top of the line it is travelling. Only ever
-                // asked of a link that *is* one, and only when something is actually in
-                // flight — `AgentViews::pulses` is empty on an idle board, which is what
-                // makes this a lookup in a vector of length zero rather than an animation.
-                if link.is_agent_link()
-                    && let Some(pulse) = ctx.agents.pulse(id)
-                {
-                    push_link_pulse(
-                        list,
-                        ctx,
-                        &routed.path.flatten(options.tolerance),
-                        pulse,
-                        line,
-                    );
-                }
             }
 
             // Both card kinds draw the same way, which is the point of them carrying the same
@@ -2380,21 +1683,8 @@ impl Painter {
         // they occupy rather than scaled by the camera; greeked bars stay in the board
         // view, where they coalesce with the geometry above instead of paying for the
         // view flip.
-        // The prompt row's caret, resolved **once** rather than per slot. Gated on the view
-        // carrying one, which is true for at most one node on the board — so no ordinary item
-        // is asked to build a `NodePaint` it does not have.
-        let mut prompt_slot = None;
-        if ctx.agents.get(id).is_some_and(|view| view.caret.is_some()) {
-            prompt_slot = self.node_paint(id, projected, ctx).prompt_slot();
-        }
-        for slot in 0..self.slots_of(id, projected, projected.generation, ctx) {
-            // Either caret, as one `TextCursor`. An agent's prompt row is a text surface like
-            // any other and gets the same caret, the same selection wash and the same blink —
-            // a second implementation drawn only for prompts is two things to keep in step.
-            let caret = ctx
-                .editing
-                .filter(|c| c.scene == id && c.slot == slot)
-                .or_else(|| prompt_cursor(id, slot, prompt_slot, ctx));
+        for slot in 0..self.slots_of(id, projected, projected.generation) {
+            let caret = ctx.editing.filter(|c| c.scene == id && c.slot == slot);
             match self.block(id, projected, slot, ctx) {
                 Some(Painted::Glyphs(block)) => {
                     list.use_view(screen);
@@ -2542,13 +1832,6 @@ impl Painter {
         {
             return self.kanban_run_block(id, projected, slot, ctx);
         }
-        // An agent's transcript, a note's body, a tree's rows, a browser's address: all
-        // flattened into one run list, so a slot is an index into it exactly as a kanban's
-        // is. See [`NodeRun`].
-        if is_node(&projected.item.kind) && slot >= CELL_SLOT_BASE {
-            return self.node_run_block(id, projected, slot, ctx);
-        }
-
         // Set by the card arm below; unused by every other kind.
         let mut card_line_budget = usize::MAX;
         // Set by the frame-title arm below; zero — meaning "no floor" — for every other kind.
@@ -2605,16 +1888,24 @@ impl Painter {
                 )
             }
 
-            // **An agent's role and a note's title are the item's own `StyledText`**, which
-            // is precisely what `docs/07` §2 keeps them beside the token for: it puts both
-            // inside search, the on-canvas caret and `Board::set_text` with no new path.
-            // Everything else either node draws is a run, because it is not the user's text.
+            // ⚠ **The archived layer's residue, in the one place it still has words.**
+            //
+            // The Agent Canvas is in `archive/`, but `vellum_doc::ItemKind` still understands
+            // its four kinds (RULE ZERO — the format outlives the feature), and two of them
+            // carry a `StyledText` of their own: an agent's role and a note's title. That was
+            // deliberate when they were written — it is what put both inside search, the
+            // on-canvas caret and `Board::set_text` with no new path — and it is exactly what
+            // makes them still drawable now that everything else those nodes showed is gone.
+            //
+            // Centred and auto-fitted, like a sticky's: the layout that used to place a role
+            // against a header rectangle went with the header. A plain card with its one
+            // label in the middle of it is the honest picture of what the document holds.
             //
             // The caret exception is the sticky's, and it has to be restated rather than
             // assumed — feedback 25 is the record of what happens when an exception is taught
             // at two call sites out of three: an empty slot holding the cursor must still
             // produce a block, or there is no origin to draw the caret against and
-            // double-clicking a blank role does nothing at all.
+            // double-clicking a blank label does nothing at all.
             (
                 ItemKind::Agent { label: words, .. } | ItemKind::AgentNote { title: words, .. },
                 BlockKey::PRIMARY,
@@ -2622,23 +1913,15 @@ impl Painter {
                 if words.is_empty() && !caret_here {
                     return None;
                 }
-                let size = placement.scaled_size();
-                let font = node_font_size(size.0);
-                let (x, y, box_w, box_h) = node_title_box(&projected.item.kind, size, font);
                 (
-                    FitBox::new(box_w.max(1.0) as f32, box_h.max(1.0) as f32),
-                    Anchor::Inset(x, y),
+                    text::sticky_fit(width, height),
+                    Anchor::Centred,
                     projected
                         .item
                         .style
                         .text_color
                         .map_or(theme.text, theme::convert),
-                    Style {
-                        font_size: Some(font * ROLE_SCALE),
-                        line_height: Some(NODE_LINE_HEIGHT),
-                        align: Some(Align::Left),
-                        ..projected.item.style.clone()
-                    },
+                    projected.item.style.clone(),
                 )
             }
 
@@ -3060,21 +2343,7 @@ impl Painter {
     /// of those, and a **mind map** one per visible node, because each is an
     /// independently positioned, independently styled block — which is exactly what a
     /// slot is for.
-    fn slots_of(
-        &mut self,
-        id: SceneId,
-        projected: &Projected,
-        generation: u64,
-        ctx: &DrawContext<'_>,
-    ) -> u16 {
-        // The four Agent Canvas kinds flatten their labels the way a kanban does, so a slot
-        // is an index into a run list. `ctx` is here for them alone: what they draw comes
-        // from a per-frame snapshot rather than from the document, so the count cannot be
-        // derived from the item.
-        if is_node(&projected.item.kind) {
-            let runs = self.node_paint(id, projected, ctx).runs();
-            return CELL_SLOT_BASE.saturating_add(u16::try_from(runs).unwrap_or(u16::MAX));
-        }
+    fn slots_of(&mut self, id: SceneId, projected: &Projected, generation: u64) -> u16 {
         match &projected.item.kind {
             ItemKind::Table { .. } => {
                 let cells = self.table_layout(id, projected, generation).layout.cells.len();
@@ -3240,133 +2509,6 @@ impl Painter {
             origin: ScreenPoint::new(device.x.round(), device.y.round()),
             font_size,
             color: if run.muted { theme.text_muted } else { theme.text },
-            // A widget's internals draw at the camera's own zoom. Only a frame's title
-            // floors its magnification — see `Block::scale`.
-            scale: ctx.camera.zoom() as f32,
-        }))
-    }
-
-    /// An Agent Canvas node's pieces, built at most once per frame per node.
-    ///
-    /// # Why this cache is keyed on a frame counter and nothing else is
-    ///
-    /// Every other layout cache here compares [`Projected::generation`], because everything
-    /// else a widget draws *is* in the document and a change to it moves that stamp. An
-    /// agent's transcript is not: `docs/07` §4 keeps it in a disposable sidecar precisely so
-    /// that agent output never enters the Loro document, and a note's body is a `.md` file on
-    /// disk. So the document is silent when the thing on screen changes, and a
-    /// generation-keyed cache would draw the previous sentence forever.
-    ///
-    /// One rebuild per visible node per frame is the honest cost of that, and it is bounded
-    /// by the viewport rather than by the board — an off-screen node is never asked, which is
-    /// `docs/07` §5d's rule that culling stops the *drawing* and never the process.
-    fn node_paint(
-        &mut self,
-        id: SceneId,
-        projected: &Projected,
-        ctx: &DrawContext<'_>,
-    ) -> &NodePaint {
-        let size = projected.item.placement.scaled_size();
-        let generation = projected.generation;
-        let frame = self.frame;
-        let signature = node_signature(&projected.item.kind, ctx.agents.get(id));
-        let stale = self.nodes.get(&id).is_none_or(|cached| {
-            cached.frame != frame
-                || cached.generation != generation
-                || cached.size != size
-                || cached.signature != signature
-        });
-        if stale {
-            let paint =
-                build_node_paint(&projected.item.kind, ctx.agents.get(id), ctx, id, size);
-            self.nodes.insert(id, CachedNode { frame, generation, size, signature, paint });
-        }
-        &self.nodes[&id].paint
-    }
-
-    /// One run of an Agent Canvas node's text, as a block.
-    ///
-    /// A slot is an index into the node's flattened run list, so this knows nothing about
-    /// transcripts, tree rows or option cards — the same division [`KanbanRun`] makes, and
-    /// for the same reason: two flattenings of the same list is a caret that appears on one
-    /// card and types into its neighbour.
-    fn node_run_block(
-        &mut self,
-        id: SceneId,
-        projected: &Projected,
-        slot: u16,
-        ctx: &DrawContext<'_>,
-    ) -> Option<Painted> {
-        let index = usize::from(slot - CELL_SLOT_BASE);
-        let placement = projected.item.placement;
-        let theme = ctx.theme;
-
-        // Copied out before the engine is borrowed to shape, as every other indexed path
-        // here does: the run list lives in `self.nodes` and the shaping needs `self.text`.
-        let (run, has_caret) = {
-            let paint = self.node_paint(id, projected, ctx);
-            (paint.run(index)?.clone(), paint.prompt_slot() == Some(slot))
-        };
-        // **An empty run still gets a block when the caret is in it**, which is feedback 25's
-        // rule — `Painter::block` skipping a wordless slot is right for a board of blank notes
-        // and catastrophic while a caret is in one, because no block means no origin and
-        // `push_caret` has nothing to measure from. That fix was applied to a table cell and a
-        // kanban card and to nothing else; this is the fourth field it turns out to need.
-        if run.text.trim().is_empty() && !has_caret {
-            return None;
-        }
-
-        // A run's rectangle is in the item's own space with the item's top-left at the
-        // origin, so the world position is one addition — the table's and the kanban's rule.
-        let (item_w, item_h) = placement.scaled_size();
-        let origin = WorldPoint::new(
-            placement.x - item_w / 2.0 + run.rect.x,
-            placement.y - item_h / 2.0 + run.rect.y,
-        );
-
-        let style = Style {
-            font_size: Some(run.font_size),
-            line_height: Some(NODE_LINE_HEIGHT),
-            align: Some(run.align),
-            ..Style::default()
-        };
-        let fit = FitBox::new(run.rect.width.max(1.0) as f32, run.rect.height.max(1.0) as f32);
-        let colour = tone_colour(run.tone, &theme);
-        let zoom = ctx.camera.zoom();
-
-        // **Greeked rather than dropped, and greeked per run.** A kanban card returns `None`
-        // below the threshold, which is right for a handful of short labels on a coloured
-        // box; a transcript is nothing *but* text, so a node that dropped it would be an
-        // empty rectangle on a zoomed-out board — the exact failure `Painted::Greeked` was
-        // added for, since `ItemKind::Text` has no geometry to fall back on either. One bar
-        // per run is what a stack of short paragraphs looks like from far away, and the
-        // count is bounded by the run list, which is bounded by the node's own box.
-        if run.font_size * zoom < f64::from(MIN_DEVICE_FONT_SIZE) {
-            return Some(Painted::Greeked(Greek {
-                origin,
-                column: run.rect.width,
-                align: run.align,
-                color: colour,
-                lines: GreekLines::Single {
-                    width: run.rect.width,
-                    height: greek_bar_height(run.font_size * NODE_LINE_HEIGHT, zoom),
-                },
-            }));
-        }
-
-        let key = BlockKey::new(id, slot);
-        // **The run's own stamp, not the projection's generation** — see [`NodeRun::stamp`].
-        // Mixed with the generation so that moving or resizing the item still invalidates,
-        // which the content hash alone would not.
-        let stamp = run.stamp ^ projected.generation;
-        let text = vellum_text::StyledText::plain(&run.text);
-        let (_, font_size) = self.text.layout(key, stamp, &style, Some(fit), || text.clone());
-
-        let device = ctx.camera.world_to_screen(origin);
-        Some(Painted::Glyphs(Block {
-            origin: ScreenPoint::new(device.x.round(), device.y.round()),
-            font_size,
-            color: colour,
             // A widget's internals draw at the camera's own zoom. Only a frame's title
             // floors its magnification — see `Block::scale`.
             scale: ctx.camera.zoom() as f32,
@@ -3545,7 +2687,10 @@ impl Painter {
 /// Miro's four blue dots, on whichever item is wearing them this frame.
 ///
 /// *"in miro there are these 4 blue dots around the picture … and when i hold and draw i
-/// should be able to connect it to other agents sticky notes or agents or pictures."*
+/// should be able to connect it to other … sticky notes or … pictures."* (The elisions are
+/// the archived layer's kinds — the feature that offered them is gone, though the kinds
+/// themselves are still in the document. The ports were never about them and work on
+/// everything that remains.)
 ///
 /// Drawn in the **board** view for `push_handles`' reason: the ports sit on the item as it
 /// is drawn, including when it is turned, and every size is divided by the zoom so they stay
@@ -3899,10 +3044,9 @@ struct Block {
     /// then tests. Measured before writing the fix; it looked like the fix had no effect.
     ///
     /// `DrawList::push_layout` applies its `scale` purely as glyph magnification and transforms
-    /// the origin separately, which is the seam `territory_label` already uses from the other
-    /// end — it passes `1.0` in the screen view. So the layout is shaped once at a world size
-    /// and simply drawn larger. No cache key changes, nothing re-shapes, and a zoom gesture
-    /// costs exactly what it did.
+    /// the origin separately, and that seam is what this exploits: the layout is shaped once
+    /// at a world size and simply drawn larger. No cache key changes, nothing re-shapes, and a
+    /// zoom gesture costs exactly what it did.
     scale: f32,
 }
 
@@ -4904,2066 +4048,6 @@ fn card_text(kind: &ItemKind, slot: u16, line_budget: usize) -> vellum_text::Sty
 // them alibaba.com. Miro draws one of the two; we drew both, and the user photographed a card
 // saying the same sixty-word sentence twice.
 
-// ── The Agent Canvas ─────────────────────────────────────────────────────────
-//
-// Four kinds — an agent, a note, a file tree, a browser — and one way of drawing them.
-// `docs/07-agent-canvas.md` is the contract; what follows is the painting half of features
-// 1, 2, 3 and 14.
-//
-// # Every rectangle comes from the node's own `layout()`
-//
-// `crate::agent::layout`, `crate::note::layout`, `crate::filetree::layout` and
-// `crate::browser::layout` are each called by the press path as well as by this file —
-// `ActiveState::node_part_under` is the one place that asks. Nothing here computes a position
-// of its own for anything that can be pressed: the `draw::kanban_runs` / `CardLayout::badge`
-// rule, which this repository has paid for twice, a second copy of a layout being a click that
-// lands where the paint is not.
-//
-// ⚠ **This paragraph was written before it was true.** For three waves only the *agent* layout
-// had a caller: `NoteLayout::hit`, `BrowserLayout::hit` and `filetree::row_at` were each
-// written, tested and reached from nothing, so a note's footer, a browser's Reload, its
-// address, its *Open externally* button — which `crate::browser` calls "the whole answer when
-// no engine is running" — and **every disclosure triangle on every file tree** were drawn and
-// could not be pressed. A tree could not be expanded at all. A comment asserting a call that
-// does not happen is the `locked: false` trap in prose; if a fifth kind is added here, check
-// it against the press path rather than against this paragraph.
-//
-// A file tree needs one thing more than a layout, which is why [`NodePaint::tree_rows`]
-// exists: the rows that were *drawn* are not the rows the tree holds — `visible_rows()` bounds
-// them and one is held back for the "n more" line — so the press path asks `tree_paint` for
-// the rectangles it actually painted rather than asking `row_at` for a row that is not on
-// screen.
-//
-// The one place that rule is *widened* rather than obeyed is [`NodePaint`], which flattens a
-// transcript into positioned runs, pictures and option cards. It is `pub(crate)` and pure for
-// exactly the reason `kanban_runs` is: the press path has to be able to ask the same function
-// which option card a point is over.
-//
-// # A layout is asked for the node's **scaled** size
-//
-// `layout()`'s own comment says its arguments are the item's size *before* the placement's
-// scale and leaves applying the scale to the painter. Applying it by asking for the scaled
-// size — rather than laying out unscaled and multiplying every rectangle afterwards — is what
-// makes `too_small` mean what it says: a node scaled to a fifth really is too small to hold a
-// header, and a layout that decided otherwise would hand back controls nobody can hit. **The
-// press path must ask the same way**, or the two disagree by exactly the scale factor.
-
-/// The body size an Agent Canvas node draws at, in world units, at
-/// [`NODE_REFERENCE_WIDTH`]. `docs/05-design-language.md` §5's body size, which is also what a
-/// link card is set in.
-const NODE_FONT_SIZE: f64 = 13.0;
-
-/// The width [`NODE_FONT_SIZE`] is calibrated against — `crate::agent::DEFAULT_SIZE.0`, which
-/// that constant's own comment sizes for about sixty characters to the line at 13 units.
-const NODE_REFERENCE_WIDTH: f64 = 520.0;
-
-/// Line spacing inside a node, as a multiple of the font size.
-///
-/// The card's, not prose's: a transcript is a stack of short paragraphs and labels. The two
-/// have to be the same number because an option card *is* a card drawn inside a node.
-const NODE_LINE_HEIGHT: f64 = CARD_LINE_HEIGHT;
-
-/// The mean advance of a proportional face, as a fraction of the font size.
-///
-/// Used to estimate how many characters fit on a line **without shaping any of them**, which
-/// is the only way to decide how tall a transcript entry is before deciding whether it is
-/// worth shaping at all. `card_layout` already relies on the same figure and records that it
-/// is good to within a few percent on a proportional face.
-///
-/// It is *not* good for CJK or emoji, which are about twice this wide — so the estimate
-/// under-counts lines and a run could overflow its box. That is why every run is also
-/// **clipped by character count** to what its own box was measured for: the clip is what
-/// stands between a wrong estimate and text pouring out of the node, exactly as it does on a
-/// card.
-const NODE_MEAN_ADVANCE: f64 = 0.5;
-
-/// The most lines any single run will hold before it is ellipsised.
-///
-/// A bound on the *measurement*, not a design choice: `wrap_estimate` takes the head of the
-/// string before it asks how long it is, so this is what stops a fifty-megabyte answer costing
-/// its own length on the paint path.
-const MAX_TEXT_LINES: usize = 64;
-
-/// A node's text size at its own width, so the painter and the press path agree on one number.
-///
-/// The same shape as [`card_font_size`], and for the same reason: a node dragged out to four
-/// times its default size should carry text legible from wherever it was dragged to. Clamped
-/// at 1.0 below, so a node made *narrower* keeps 13-unit type and simply fits fewer words
-/// rather than shrinking its words until nothing is legible at any zoom.
-pub(crate) fn node_font_size(width: f64) -> f64 {
-    NODE_FONT_SIZE * (width / NODE_REFERENCE_WIDTH).clamp(1.0, 6.0)
-}
-
-/// The role label's size, as a multiple of the node's body size.
-const ROLE_SCALE: f64 = 1.0;
-/// The line under the role — what the agent is doing, or what it runs on.
-const SUBTITLE_SCALE: f64 = 0.82;
-/// Scaffolding: a tool call, a thought, a turn boundary, a file's own name.
-const SCAFFOLD_SCALE: f64 = 0.88;
-
-/// The most lines one transcript entry is given before it is ellipsised.
-///
-/// A bound rather than a budget. An agent can emit a single ten-thousand-word answer, and a
-/// node whose newest entry filled the whole box would push everything else off the top —
-/// including the question it is answering. Eight lines is a paragraph, which is as much as
-/// anyone reads on a canvas before opening the transcript properly.
-const MAX_ENTRY_LINES: usize = 8;
-
-/// The most transcript entries laid out for one node.
-///
-/// The real bound is the box — entries are measured from the newest backwards and stop when it
-/// is full — and this is the backstop for a node dragged out to ten thousand units tall, where
-/// "what fits" is hundreds. `crate::agent_view` already bounds the *tail*; this bounds the
-/// **drawing**, which is a different limit and the one that decides the frame's cost.
-const MAX_ENTRIES: usize = 40;
-
-/// The most option cards drawn side by side.
-///
-/// Feature 14 is *"here are three UI directions I built"*. Four is one more than that; past it
-/// each card is narrower than its own title and the row stops being scannable. The rest are
-/// counted in a line underneath rather than silently dropped.
-const MAX_OPTION_CARDS: usize = vellum_agent::transcript::MAX_CHOICES;
-
-/// How much of an option card is picture, when any of the choices carries one.
-const OPTION_IMAGE_FRACTION: f64 = 0.56;
-
-/// A transcript picture's height as a fraction of the transcript's width.
-///
-/// 9:16, which is the shape a screenshot of a window most often is. The texture is drawn
-/// through [`cover_uv`] into whatever this reserves, so the band's aspect decides the crop and
-/// never the picture's — the fix feedback 23 records for link cards, arrived at here before it
-/// could be got wrong a second time.
-const NODE_IMAGE_ASPECT: f64 = 0.5625;
-
-/// How a run of text on a node is coloured.
-///
-/// A *role*, not a colour. The palette is applied where the run is drawn, so the layout stays
-/// pure and can be built — and tested — with no `Theme` in the room. That is the division
-/// `KanbanRun::muted` already makes, widened because a transcript has more than two voices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Tone {
-    /// The agent's answer, a note's body, a file's name. What you are here to read.
-    Primary,
-    /// Scaffolding: a tool call, a thought, a turn boundary, a footer.
-    Muted,
-    /// Another agent speaking. Not this agent's own words, and a board where the two look
-    /// alike is one you cannot follow.
-    Accent,
-    /// A failure. The one thing a user in Clean mode most needs to see, which is why
-    /// `TranscriptEvent::visible_in_clean_mode` refuses to hide it.
-    Failed,
-    /// A question only a person can answer.
-    NeedsYou,
-}
-
-/// One run of text a node draws, and where.
-///
-/// The same shape as [`KanbanRun`] and for the same reason: how many labels a node draws
-/// depends on its data, so a slot's meaning is an index into a flattened list rather than
-/// arithmetic over events.
-#[derive(Debug, Clone)]
-pub(crate) struct NodeRun {
-    /// In the item's own space, top-left at `(0, 0)`, already scaled.
-    rect: NodeRect,
-    text: String,
-    font_size: f64,
-    tone: Tone,
-    align: Align,
-    /// What the text cache is keyed on for this run.
-    ///
-    /// **A transcript's words are not in the document**, so `Projected::generation` — which
-    /// only moves when the *item* changes — cannot speak for them: a node whose agent said
-    /// something new would keep drawing the previous sentence, at the same slot, forever. The
-    /// cache compares stamps for equality and nothing else, so a stamp derived from the run's
-    /// own content is a legitimate answer to a question the document cannot answer.
-    stamp: u64,
-}
-
-/// A tinted rectangle drawn behind a node's text.
-#[derive(Debug, Clone, Copy)]
-struct NodePlate {
-    rect: NodeRect,
-    tone: PlateTone,
-    radius: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlateTone {
-    /// A recess — the prompt row, a file tree's list, an address bar.
-    Well,
-    /// A surface floating on the node: an option card, a browser's page stand-in.
-    Card,
-    /// The option card the user picked.
-    Chosen,
-    /// An error's wash.
-    Failed,
-    /// A question's wash.
-    NeedsYou,
-    /// The narrow bar beside a message that came from another agent.
-    Rail,
-}
-
-/// A picture inside a node, by content hash into the shared blob store.
-///
-/// Addressed exactly as a pasted screenshot is — `docs/07` §4 — so deduplication and the
-/// 268MB residency budget come for free and nothing new is cached anywhere.
-#[derive(Debug, Clone)]
-struct NodeImage {
-    rect: NodeRect,
-    blob: String,
-}
-
-/// One selectable option an agent offered — feature 14.
-///
-/// `pub(crate)` with public geometry because **the press path resolves a click against this
-/// same list**, through [`NodePaint::option_at`]. Reproducing the arithmetic there instead is
-/// the `kanban_runs` failure in a new place: a card that lights up under the pointer while the
-/// click selects its neighbour.
-///
-/// The press path reads `rect`, `choice` and `chosen`. **`event` is recorded and not read**,
-/// and the lint is allowed for that one field: it names which `TranscriptEvent::Options` a
-/// card belongs to, which is what a future *"which question was this"* needs and is free to
-/// record while the list is being built. Writing the geometry only when the click arrives is
-/// the alternative, and it is the mistake that made `opens_context_menu` a defect.
-#[derive(Debug, Clone)]
-pub(crate) struct OptionCard {
-    /// The card's box in the item's own space, already scaled.
-    pub(crate) rect: NodeRect,
-    /// **Which question this card answers**, by the prompt that asked it.
-    ///
-    /// ⚠ This was the card's index into `AgentView::events` and was `#[allow(dead_code)]` —
-    /// dead because that index cannot cross the seam it needed to: the view is the
-    /// mode-filtered, `VIEW_EVENTS`-bounded list, and `choose_option` searches the node's
-    /// whole ring, which is numbered differently. So a click carried only its choice *id*,
-    /// and with two unanswered option sets on one node — an agent that asked twice, which is
-    /// exactly what a long run does — a shared id like `yes` answered whichever the search
-    /// reached first rather than the card that was pressed.
-    ///
-    /// The prompt is an identity that survives the seam because it is *in* the event on both
-    /// sides. Not a generated id, because these events are also read back off disk, where
-    /// nothing would have assigned one.
-    pub(crate) prompt: String,
-    /// `Choice::id`, sent back verbatim when the user picks this one.
-    pub(crate) choice: String,
-    /// Already chosen, so the row records an answer rather than offering one again.
-    pub(crate) chosen: bool,
-}
-
-/// The two answers to a permission request: where they are drawn, and where they are pressed.
-///
-/// **One pair of rectangles, read twice.** The painter fills them in the same statement that
-/// records them, and `ActiveState::press_in_transcript` resolves a click against this list
-/// rather than repeating the arithmetic — the `kanban_runs` rule, which here has been broken
-/// in both directions and the second one was worse:
-///
-/// - A permission *drawn* and not *answered* leaves the agent blocked for ever behind a
-///   button, which is the inert control this codebase refuses to ship. That is what the
-///   comment this replaces was about, and it is the failure that did **not** happen.
-/// - A permission *answered* and not *drawn* is what shipped: the row was reserved and the
-///   chips pushed with no plate and no words, so a blank strip across the body of the card
-///   allowed on the left half and denied on the right — and the press arm returns `true`, so
-///   the node could not even be selected by clicking there.
-///
-/// "Measured now, painted later" is not half a feature; it is a hot zone with nothing on it.
-#[derive(Debug, Clone)]
-pub(crate) struct PermissionChips {
-    /// `RequestId`'s string, which is what an answer is sent back with.
-    pub(crate) request: String,
-    pub(crate) allow: NodeRect,
-    pub(crate) deny: NodeRect,
-}
-
-/// Everything an Agent Canvas node draws that is not its own card.
-///
-/// Built once per frame per **visible** node — an off-screen one is never asked, because the
-/// R-tree never hands it to the paint loop, which is `docs/07` §5d's rule that a culled agent
-/// keeps running and stops being drawn.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct NodePaint {
-    runs: Vec<NodeRun>,
-    plates: Vec<NodePlate>,
-    images: Vec<NodeImage>,
-    options: Vec<OptionCard>,
-    permissions: Vec<PermissionChips>,
-    /// A file tree's disclosure triangles: the box, and whether the directory is open.
-    twisties: Vec<(NodeRect, bool)>,
-    /// A file tree's rows, so the press path can resolve a click against the rows that were
-    /// actually **drawn**.
-    ///
-    /// The `kanban_runs` rule, and it is sharper here than anywhere else in this file: the
-    /// painter draws `visible_rows()` of them, holds one back for the *"n more"* line, and
-    /// numbers them from a scroll offset. A press path that re-derived any of those three
-    /// would expand the wrong directory — or, as it was, expand none at all.
-    tree_rows: Vec<TreeRowHit>,
-    /// Which run is the prompt row, when that row has the keyboard.
-    ///
-    /// `None` for every node that is not being typed into, which is all of them but one. The
-    /// index is into [`NodePaint::runs`] and is turned into a text *slot* by
-    /// [`NodePaint::prompt_slot`], so the painter's caret lands on the run whose string the
-    /// caret's offsets actually index.
-    prompt_run: Option<usize>,
-}
-
-/// One drawn file-tree row, as the press path needs it.
-#[derive(Debug, Clone)]
-pub(crate) struct TreeRowHit {
-    /// The whole row, in the item's own space.
-    pub(crate) rect: NodeRect,
-    /// The disclosure triangle, for a directory. `None` for a file.
-    pub(crate) twisty: Option<NodeRect>,
-    /// The entry's path relative to the tree's root — the form `FileTreeModel::expanded`
-    /// stores, so expanding is a call rather than a conversion.
-    pub(crate) relative: String,
-    /// The absolute path, for revealing or opening the file.
-    pub(crate) path: std::path::PathBuf,
-    pub(crate) is_dir: bool,
-}
-
-impl NodePaint {
-    /// Which option card a point in the item's own space is over, if any.
-    ///
-    /// The press path's question, answered from the rectangles the painter drew.
-    pub(crate) fn option_at(&self, x: f64, y: f64) -> Option<&OptionCard> {
-        self.options.iter().find(|card| card.rect.contains(x, y))
-    }
-
-    /// Every card, for the tests that check they tile without overlapping.
-    #[cfg(test)]
-    pub(crate) fn options(&self) -> &[OptionCard] {
-        &self.options
-    }
-
-    pub(crate) fn permissions(&self) -> &[PermissionChips] {
-        &self.permissions
-    }
-
-    /// How many text slots this node claims.
-    pub(crate) fn runs(&self) -> usize {
-        self.runs.len()
-    }
-
-    /// The text slot the prompt row's caret belongs in, if this node's row has the keyboard.
-    ///
-    /// A *slot*, not a run index, because that is what `Painter::block` and
-    /// [`crate::draw::TextCursor`] speak — and deriving it here rather than at the two call
-    /// sites is what keeps the `CELL_SLOT_BASE` offset in one place.
-    pub(crate) fn prompt_slot(&self) -> Option<u16> {
-        let index = u16::try_from(self.prompt_run?).ok()?;
-        index.checked_add(CELL_SLOT_BASE)
-    }
-
-    /// Every tree row that was **drawn**, in order.
-    ///
-    /// `pub(crate)` for the same reason `kanban_runs` is: a caller that wants to aim at a row
-    /// — the press path, or a `--demo` fixture driving a real press at one — must ask the
-    /// list the painter produced rather than rebuild it from `row_rect` and a bound.
-    pub(crate) fn tree_rows(&self) -> &[TreeRowHit] {
-        &self.tree_rows
-    }
-
-    /// Which drawn tree row a point in the item's own space is over, and whether it landed on
-    /// the disclosure triangle.
-    ///
-    /// The press path's question, answered from the rectangles the painter drew — see
-    /// [`TreeRowHit`].
-    pub(crate) fn tree_row_at(&self, x: f64, y: f64) -> Option<(&TreeRowHit, bool)> {
-        let row = self.tree_rows.iter().find(|row| row.rect.contains(x, y))?;
-        let on_twisty = row.twisty.is_some_and(|box_| box_.contains(x, y));
-        Some((row, on_twisty))
-    }
-
-    fn run(&self, index: usize) -> Option<&NodeRun> {
-        self.runs.get(index)
-    }
-
-    fn shift(&mut self, dy: f64) {
-        for run in &mut self.runs {
-            run.rect.y += dy;
-        }
-        for plate in &mut self.plates {
-            plate.rect.y += dy;
-        }
-        for image in &mut self.images {
-            image.rect.y += dy;
-        }
-        for card in &mut self.options {
-            card.rect.y += dy;
-        }
-        for chips in &mut self.permissions {
-            chips.allow.y += dy;
-            chips.deny.y += dy;
-        }
-        for (rect, _) in &mut self.twisties {
-            rect.y += dy;
-        }
-        for row in &mut self.tree_rows {
-            row.rect.y += dy;
-            if let Some(twisty) = row.twisty.as_mut() {
-                twisty.y += dy;
-            }
-        }
-    }
-
-    fn absorb(&mut self, other: Self) {
-        // **`runs` first, and the offset taken before it.** An absorbed paint's run indices
-        // move by however many runs are already here, so anything that *names* an index —
-        // `prompt_run`, and `OptionCard::event`'s neighbour `prompt_slot` — has to be
-        // rebased. Today only `agent_paint` sets `prompt_run`, and it sets it on the paint
-        // doing the absorbing rather than on one being absorbed; this keeps that true if a
-        // later caller does the opposite.
-        let offset = self.runs.len();
-        if self.prompt_run.is_none() {
-            self.prompt_run = other.prompt_run.map(|index| index + offset);
-        }
-        self.runs.extend(other.runs);
-        self.plates.extend(other.plates);
-        self.images.extend(other.images);
-        self.options.extend(other.options);
-        self.permissions.extend(other.permissions);
-        self.twisties.extend(other.twisties);
-        self.tree_rows.extend(other.tree_rows);
-    }
-
-    /// Adds a run, clipped to what its own box was measured for.
-    ///
-    /// The clip is not tidiness: it is the only thing standing between an under-estimated
-    /// line count — which [`NODE_MEAN_ADVANCE`] guarantees for CJK and emoji — and text drawn
-    /// out through the bottom of the node and across the board, which is a fault this file has
-    /// already recorded twice on link cards.
-    fn text(&mut self, rect: NodeRect, text: &str, font_size: f64, tone: Tone, align: Align) {
-        if rect.is_empty() || font_size <= 0.0 || text.trim().is_empty() {
-            return;
-        }
-        let line = font_size * NODE_LINE_HEIGHT;
-        // **The nudge is not defensive.** These heights are built by multiplying a line height
-        // by a line count, so a box sized for exactly three lines arrives as 52.649999999999
-        // against a line of 17.55 and `floor` answers two. `card_layout`'s `whole_lines` has
-        // the same epsilon for the same reason, measured on a real card.
-        let fits = ((rect.height / line) + 1e-6).floor().max(1.0) as usize;
-        let (clipped, _) = wrap_estimate(text, rect.width, font_size, fits);
-        if clipped.trim().is_empty() {
-            return;
-        }
-        let stamp = fnv1a(clipped.as_bytes(), rect.width.to_bits() ^ font_size.to_bits());
-        self.runs.push(NodeRun { rect, text: clipped, font_size, tone, align, stamp });
-    }
-
-    /// Adds a run holding a **field's exact string**, unclipped, and answers where it went.
-    ///
-    /// [`NodePaint::text`] ellipsises to what the box was measured for, which is right for a
-    /// transcript — an agent's answer is as long as it likes — and wrong for a field with a
-    /// caret in it: the caret's offsets index the buffer, so a shaped string that has been cut
-    /// short puts the caret at the wrong character, or past the end of the string entirely.
-    /// `crate::draw`'s kanban path already keeps the raw value beside the drawn one for
-    /// exactly this, and this is the same split by a shorter route.
-    ///
-    /// It also pushes an **empty** run, which `text` refuses to do. That is feedback 25 — the
-    /// caret that would not appear in an empty sticky — arriving in a fourth place: no run
-    /// means no block, no block means no origin, and `push_caret` has nothing to measure from.
-    fn field(&mut self, rect: NodeRect, text: &str, font_size: f64, tone: Tone, align: Align) -> usize {
-        let stamp = fnv1a(text.as_bytes(), rect.width.to_bits() ^ font_size.to_bits());
-        self.runs.push(NodeRun {
-            rect,
-            text: text.to_owned(),
-            font_size,
-            tone,
-            align,
-            stamp,
-        });
-        self.runs.len() - 1
-    }
-
-    fn plate(&mut self, rect: NodeRect, tone: PlateTone, radius: f32) {
-        if !rect.is_empty() {
-            self.plates.push(NodePlate { rect, tone, radius });
-        }
-    }
-}
-
-/// A 64-bit FNV-1a, seeded.
-///
-/// **Not BLAKE3**, for the reason `docs/07` §4 gives about the transcript directory's own key:
-/// this names a cache entry, nothing verifies it, and a collision costs one frame of stale
-/// text rather than anything anyone could exploit. It is also the only hash affordable on the
-/// paint path — it runs over every run of every visible node.
-fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ seed;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// How many lines `text` needs in a box `width` wide at `size`, and the text clipped to what
-/// those lines can hold.
-///
-/// Estimated from [`NODE_MEAN_ADVANCE`] rather than measured, and the order is the point: this
-/// decides *what to shape*, so measuring it would be the shaping pass it exists to avoid.
-///
-/// **Everything is bounded by characters before it is bounded by anything else.** Transcript
-/// text is the least controlled string in the application — it is whatever a third-party
-/// process wrote — and `[profile.release]` sets `panic = "abort"`, so `strip_site_affix`'s two
-/// aborts (feedback 30) are the standing precedent. `chars()` throughout, and the head is
-/// taken *before* the length is asked for, so a fifty-megabyte answer costs the budget rather
-/// than its own length.
-fn wrap_estimate(text: &str, width: f64, size: f64, max_lines: usize) -> (String, usize) {
-    if width <= 0.0 || size <= 0.0 {
-        return (String::new(), 0);
-    }
-    let per_line = ((width / (size * NODE_MEAN_ADVANCE)).floor() as usize).max(1);
-    let cap = max_lines.clamp(1, MAX_TEXT_LINES);
-    let budget = per_line.saturating_mul(cap);
-    // One character past the budget, so "did this have to be cut" is answerable without
-    // walking the rest of the string.
-    let head: String = text.chars().take(budget.saturating_add(1)).collect();
-    // Newlines count: an agent's answer arrives with them, and an estimate that ignored them
-    // would report a four-paragraph reply as one line of the same character count.
-    let lines: usize = head
-        .lines()
-        .map(|line| line.chars().count().div_ceil(per_line).max(1))
-        .sum::<usize>()
-        .max(1);
-    let lines = lines.min(cap);
-    (ellipsise(&head, per_line.saturating_mul(lines)), lines)
-}
-
-/// One transcript entry, built at `y = 0` so it can be placed once its height is known.
-struct Entry {
-    paint: NodePaint,
-    height: f64,
-}
-
-/// A column of runs stacked down a box, in the item's own space.
-struct Column {
-    paint: NodePaint,
-    x: f64,
-    width: f64,
-    y: f64,
-    font: f64,
-}
-
-impl Column {
-    fn new(x: f64, width: f64, font: f64) -> Self {
-        Self { paint: NodePaint::default(), x, width, y: 0.0, font }
-    }
-
-    /// Adds a paragraph and returns how tall it came out.
-    fn paragraph(&mut self, text: &str, scale: f64, tone: Tone, max_lines: usize) -> f64 {
-        let size = self.font * scale;
-        let line = size * NODE_LINE_HEIGHT;
-        let (_, lines) = wrap_estimate(text, self.width, size, max_lines);
-        if lines == 0 {
-            return 0.0;
-        }
-        let height = line * lines as f64;
-        self.paint.text(
-            NodeRect::new(self.x, self.y, self.width, height),
-            text,
-            size,
-            tone,
-            Align::Left,
-        );
-        self.y += height;
-        height
-    }
-
-    fn gap(&mut self, by: f64) {
-        self.y += by;
-    }
-
-    fn finish(self) -> Entry {
-        Entry { paint: self.paint, height: self.y }
-    }
-}
-
-/// Where one transcript entry's pieces go, given its width and the room left for it.
-///
-/// One `match` rather than a function per event kind, so *"a tool call is a muted line and a
-/// message is a railed block"* is a rule stated once rather than six functions that happen to
-/// agree about padding.
-fn transcript_entry(
-    // The event's position in the view, which nothing reads now that an option card carries
-    // its question instead of an index into a list `choose_option` does not share. Kept as a
-    // parameter rather than removed from the signature: it is the natural place for any
-    // future per-entry identity, and the caller already has it.
-    _index: usize,
-    event: &TranscriptEvent,
-    x: f64,
-    width: f64,
-    font: f64,
-    room: f64,
-) -> Entry {
-    let rail = font * 0.25;
-    let indent = font * 0.75;
-    let pad = font * 0.4;
-    // How many lines of body a box `height` tall can hold. Taken from the room actually left
-    // rather than from the node's whole transcript box, so an entry can never be measured
-    // against space it has not got — which is what puts the last line of one outside the node.
-    let lines_in = |height: f64| {
-        let line = font * NODE_LINE_HEIGHT;
-        if line <= 0.0 { 1 } else { ((height / line).floor() as usize).max(1) }
-    };
-    let prose_lines = lines_in(room).min(MAX_ENTRY_LINES);
-    // A plated entry loses its own padding before it counts lines, for the same reason.
-    let plated_lines = lines_in(room - pad * 2.0).min(MAX_ENTRY_LINES);
-    let mut column = Column::new(x, width, font);
-
-    match event {
-        // Prose the agent addressed to the user. This *is* the answer, so it is the one thing
-        // in the transcript set in the primary ink at the full body size.
-        TranscriptEvent::Text { text } => {
-            column.paragraph(text, 1.0, Tone::Primary, prose_lines);
-        }
-
-        // Scaffolding, one muted line each. `headline` is the away-mode digest's own wording,
-        // reused rather than restated: two spellings of *"ran bash"* is two places for the
-        // vocabulary to drift, and that function is already bounded and already panic-safe on
-        // multi-byte text — which matters more here than anywhere, since this is where a tool's
-        // raw output arrives.
-        TranscriptEvent::Thought { .. }
-        | TranscriptEvent::ToolCall { .. }
-        | TranscriptEvent::ToolResult { .. }
-        | TranscriptEvent::Terminal { .. }
-        | TranscriptEvent::TurnStarted { .. }
-        | TranscriptEvent::TurnEnded { .. }
-        | TranscriptEvent::PermissionAnswer { .. } => {
-            column.paragraph(&event.headline(), SCAFFOLD_SCALE, Tone::Muted, 1);
-        }
-
-        // Another agent talking, or this one talking to another. Attributed in the accent and
-        // railed, because `docs/07` §6's whole point is that a wired-up board is followable:
-        // a message drawn like the agent's own words would make two nodes read as one
-        // conversation with no author.
-        TranscriptEvent::Message { from, text }
-        | TranscriptEvent::MessageSent { to: from, text } => {
-            let sent = matches!(event, TranscriptEvent::MessageSent { .. });
-            // **Words, not an arrow.** `→` is U+2192 and this file has been burned twice by
-            // assuming a character is in whatever face `font_family: None` resolves to (trap
-            // 10, and the `↗` and `▶` that had to become geometry). *from* and *to* are two
-            // characters longer and cannot draw as tofu on anybody's machine.
-            let who = if sent { format!("to {}", from.name) } else { format!("from {}", from.name) };
-            let mut body = Column::new(x + rail + indent, (width - rail - indent).max(1.0), font);
-            body.paragraph(&who, SUBTITLE_SCALE, Tone::Accent, 1);
-            body.paragraph(text, 1.0, Tone::Primary, prose_lines);
-            let mut entry = body.finish();
-            entry.paint.plate(NodeRect::new(x, 0.0, rail, entry.height), PlateTone::Rail, 0.0);
-            // Shifted onto the column before it is absorbed. A no-op today, because this is
-            // the only content in its entry — and the line that keeps it true if anything is
-            // ever put above it, which is how a plate ends up half a paragraph out of place.
-            entry.paint.shift(column.y);
-            column.paint.absorb(entry.paint);
-            column.y += entry.height;
-        }
-
-        // A failure, on its own wash. Prominent deliberately: Clean mode is exactly where a
-        // silent failure reads as an agent that simply never replied.
-        TranscriptEvent::Error { message } => {
-            let mut body = Column::new(x + pad, (width - pad * 2.0).max(1.0), font);
-            body.gap(pad);
-            body.paragraph(message, 1.0, Tone::Failed, plated_lines);
-            body.gap(pad);
-            let mut entry = body.finish();
-            entry
-                .paint
-                .plate(NodeRect::new(x, 0.0, width, entry.height), PlateTone::Failed, CARD_RADIUS);
-            entry.paint.shift(column.y);
-            column.paint.absorb(entry.paint);
-            column.y += entry.height;
-        }
-
-        // A question the agent is blocked on. It has to read as something *waiting* rather than
-        // as something that happened — the agent is stopped until a person acts, and nothing
-        // else in a transcript is.
-        TranscriptEvent::PermissionRequest { id, summary, detail } => {
-            let chip = font * NODE_LINE_HEIGHT * 1.4;
-            let mut body = Column::new(x + pad, (width - pad * 2.0).max(1.0), font);
-            body.gap(pad);
-            body.paragraph("Waiting for your answer", SUBTITLE_SCALE, Tone::NeedsYou, 1);
-            body.paragraph(summary, 1.0, Tone::Primary, plated_lines.min(2));
-            if !detail.trim().is_empty() {
-                body.paragraph(detail, SCAFFOLD_SCALE, Tone::Muted, 1);
-            }
-            // **The answers, drawn from the two rectangles the press path reads.** Not two
-            // sets of arithmetic that agree today: [`PermissionChips`] carries these very
-            // rects, so a button cannot come to be drawn where a press does not land — the
-            // `kanban_runs` rule, and the one this row broke in the other direction. It was
-            // shipped measured-but-unpainted, which made the reserved band a blank strip that
-            // *answered* a permission: the left half allowed and the right half denied, and
-            // the arm returns `true`, so the node could not even be selected there.
-            let chip_w = ((body.width - pad) / 2.0).max(1.0);
-            let allow = NodeRect::new(body.x, body.y + pad, chip_w, chip);
-            let deny = NodeRect::new(body.x + chip_w + pad, body.y + pad, chip_w, chip);
-            body.gap(pad + chip + pad);
-            let mut entry = body.finish();
-            entry.paint.permissions.push(PermissionChips {
-                request: id.0.clone(),
-                allow,
-                deny,
-            });
-            entry.paint.plate(
-                NodeRect::new(x, 0.0, width, entry.height),
-                PlateTone::NeedsYou,
-                CARD_RADIUS,
-            );
-            // **After the wash, because plates are drawn in the order they are pushed.**
-            // `push_node_plate` walks `NodePaint::plates` in order, so a chip painted with the
-            // body would come out *under* the question's own tint. Runs are a separate pass and
-            // are always above both, which is why only the plates have to be ordered.
-            //
-            // Allow wears the accent border an *option card the user picked* wears and deny the
-            // plain card: nothing new is invented for two buttons, and the same plate vocabulary
-            // the rest of the node uses is what makes them read as pressable.
-            entry.paint.plate(allow, PlateTone::Chosen, CARD_RADIUS);
-            entry.paint.plate(deny, PlateTone::Card, CARD_RADIUS);
-            // The label's own box is inset so its single line sits in the middle of the chip
-            // rather than against its top edge — `NodePaint::text` lays a run out from the top
-            // of the box it is given, and a plate 1.4 lines tall with the word at the top reads
-            // as a mistake rather than as a button.
-            let label = font * NODE_LINE_HEIGHT;
-            let lift = ((chip - label) / 2.0).max(0.0);
-            entry.paint.text(
-                NodeRect::new(allow.x, allow.y + lift, allow.width, label),
-                "Allow",
-                font,
-                Tone::Accent,
-                Align::Center,
-            );
-            entry.paint.text(
-                NodeRect::new(deny.x, deny.y + lift, deny.width, label),
-                "Deny",
-                font,
-                Tone::Primary,
-                Align::Center,
-            );
-            entry.paint.shift(column.y);
-            column.paint.absorb(entry.paint);
-            column.y += entry.height;
-        }
-
-        // A picture the agent produced. Its band has a fixed aspect and the texture does not,
-        // so it goes through `cover_uv` — feedback 23, which is the one thing that stops every
-        // screenshot on the board being scaled by a different amount on each axis.
-        TranscriptEvent::Image { blob, caption } => {
-            // **Clamped to the room left, and its caption's room taken off first.** The band's
-            // aspect is a preference and the node's box is not: a 9:16 band on a 500-wide node
-            // is 280 units tall, which is most of a default transcript and all of a short one.
-            // Clamping costs nothing because the picture is drawn through `cover_uv` — a
-            // shorter band crops rather than squashes, which is the whole point of that
-            // function.
-            let caption_room = if caption.is_some() {
-                font * 0.2 + font * SUBTITLE_SCALE * NODE_LINE_HEIGHT
-            } else {
-                0.0
-            };
-            let height =
-                (width * NODE_IMAGE_ASPECT).min((room - caption_room).max(1.0)).max(1.0);
-            column.paint.images.push(NodeImage {
-                rect: NodeRect::new(x, 0.0, width, height),
-                blob: blob.clone(),
-            });
-            column.y += height;
-            if let Some(caption) = caption {
-                column.gap(font * 0.2);
-                column.paragraph(caption, SUBTITLE_SCALE, Tone::Muted, 1);
-            }
-        }
-
-        // Feature 14: *"here are three UI directions I built"*.
-        TranscriptEvent::Options { prompt, choices, chosen } => {
-            column.paragraph(prompt, 1.0, Tone::Primary, 2);
-            column.gap(font * 0.3);
-            let shown = choices.len().min(MAX_OPTION_CARDS);
-            if shown > 0 {
-                let gap = font * 0.5;
-                // Floored at a unit rather than at a legible width, deliberately: a floor big
-                // enough to be readable is a floor that makes the row wider than the node on a
-                // narrow one, which paints outside the item. A row of cards too narrow to read
-                // is a row you zoom in on; a row that has left the node is a bug.
-                let card_w = ((width - gap * (shown - 1) as f64) / shown as f64).max(1.0);
-                let card_pad = font * 0.35;
-                // The band is reserved for the *row*, not per card. A row where one card is
-                // taller than its neighbours because it happens to carry a picture reads as
-                // broken rather than as three answers to one question.
-                let has_image = choices.iter().take(shown).any(|choice| choice.image.is_some());
-                let band = if has_image { (card_w * OPTION_IMAGE_FRACTION).max(1.0) } else { 0.0 };
-                let title_h = font * NODE_LINE_HEIGHT * 2.0;
-                let body_h = font * SUBTITLE_SCALE * NODE_LINE_HEIGHT * 2.0;
-                let card_h = band + card_pad * 2.0 + title_h + body_h;
-                for (slot, choice) in choices.iter().take(shown).enumerate() {
-                    let left = x + slot as f64 * (card_w + gap);
-                    let rect = NodeRect::new(left, column.y, card_w, card_h);
-                    let picked = chosen.as_deref() == Some(choice.id.as_str());
-                    column.paint.plate(
-                        rect,
-                        if picked { PlateTone::Chosen } else { PlateTone::Card },
-                        CARD_RADIUS,
-                    );
-                    if let Some(hash) = &choice.image {
-                        column.paint.images.push(NodeImage {
-                            rect: NodeRect::new(left, column.y, card_w, band),
-                            blob: hash.clone(),
-                        });
-                    }
-                    let inner_x = left + card_pad;
-                    // Floored at **zero**, not at one: a card narrower than its own padding
-                    // has no room for words, and `NodePaint::text` reads a zero-width box as
-                    // "draw nothing". Flooring at one instead would put a one-unit run outside
-                    // the card it belongs to, which is `card_layout`'s `FitBox::new(w.max(1.0))`
-                    // overflow arriving by the route meant to close it.
-                    let inner_w = (card_w - card_pad * 2.0).max(0.0);
-                    let mut inner = column.y + band + card_pad;
-                    column.paint.text(
-                        NodeRect::new(inner_x, inner, inner_w, title_h),
-                        &choice.title,
-                        font,
-                        if picked { Tone::Accent } else { Tone::Primary },
-                        Align::Left,
-                    );
-                    inner += title_h;
-                    if let Some(text) = &choice.body {
-                        column.paint.text(
-                            NodeRect::new(inner_x, inner, inner_w, body_h),
-                            text,
-                            font * SUBTITLE_SCALE,
-                            Tone::Muted,
-                            Align::Left,
-                        );
-                    }
-                    column.paint.options.push(OptionCard {
-                        rect,
-                        prompt: prompt.clone(),
-                        choice: choice.id.clone(),
-                        chosen: picked,
-                    });
-                }
-                column.y += card_h;
-            }
-            if choices.len() > shown {
-                column.paragraph(
-                    &format!("and {} more", choices.len() - shown),
-                    SUBTITLE_SCALE,
-                    Tone::Muted,
-                    1,
-                );
-            }
-        }
-    }
-
-    column.finish()
-}
-
-/// An agent node's transcript, its header sub-line and its prompt row, flattened.
-///
-/// # The newest entry is the one that survives
-///
-/// Entries are measured from the **end backwards** and stop when the box is full, then laid
-/// out forwards from the first that fitted. Laying out oldest-first and cutting the overflow
-/// is the obvious version and is wrong for a live transcript: the thing that just happened is
-/// the thing being watched, and it would be the first casualty. What *is* cut is said so, on
-/// screen — the same rule `AgentView::truncated` exists for one layer up.
-///
-/// What a node says while it is listening, or while its audio is with a transcriber.
-///
-/// The elapsed seconds are shown rather than a level meter: a meter needs the samples, which
-/// are on the capture thread and deliberately never cross to the painter, and *how long have I
-/// been talking* is the thing that actually matters against
-/// [`vellum_agent::voice::MAX_UTTERANCE_SECONDS`].
-///
-/// The transcribing line **names the backend**, which is not decoration: it is the one moment
-/// the user can tell whether their voice stayed on the machine or went to somebody's API, and
-/// leaving them to guess is the wrong default for a feature that opens a microphone.
-fn voice_line(status: &crate::voice::VoiceStatus) -> String {
-    match status {
-        crate::voice::VoiceStatus::Listening { held_ms } => {
-            format!("Listening… {}s — let go of ⌥D to put it in the prompt", held_ms / 1000)
-        }
-        crate::voice::VoiceStatus::Transcribing { backend } => {
-            format!("Transcribing with {backend}…")
-        }
-    }
-}
-
-/// Pure, and free rather than a method, for `kanban_runs`' reason: the press path calls it too.
-pub(crate) fn agent_paint(view: &AgentView, laid: &AgentLayout, font: f64) -> NodePaint {
-    let mut paint = NodePaint::default();
-    // A compact node is one target and draws one thing — its role, through the item's own text
-    // slot. `AgentLayout::hit` already refuses to offer a control at this size, and a
-    // transcript nobody can read is quads nobody can use.
-    if laid.too_small {
-        return paint;
-    }
-
-    // The line under the role. **What it is doing beats what it runs on**: `detail` is live —
-    // *"ran 3 tools"*, *"claude is not installed"* — and `subtitle` is configuration that has
-    // not changed since the node was made. There is room for one line, and the live one is the
-    // one worth having; the provider is in the inspector, derived from the same
-    // `agent::subtitle` this falls back to, so the two cannot disagree.
-    if !laid.role.is_empty() {
-        let size = font * SUBTITLE_SCALE;
-        let line = size * NODE_LINE_HEIGHT;
-        let top = laid.role.y + laid.role.height - line;
-        // **Voice beats both**, for the same reason `detail` beats `subtitle` one step down:
-        // there is room for one line and the live one is the one worth having. *Is it hearing
-        // me* is the only question a person holding a key down has, and until this the answer
-        // was drawn nowhere at all — see `AgentView::voice`.
-        let spoken = view.voice.as_ref().map(voice_line);
-        let text = match spoken.as_deref() {
-            Some(spoken) => spoken,
-            None if view.detail.trim().is_empty() => &view.subtitle,
-            None => &view.detail,
-        };
-        // Accent while the microphone is open, so a listening node is legible across the
-        // board rather than reading as one more grey subtitle among a dozen.
-        let tone = match (&view.voice, view.status) {
-            (Some(_), _) => Tone::Accent,
-            (None, Status::Error) => Tone::Failed,
-            (None, _) => Tone::Muted,
-        };
-        paint.text(
-            NodeRect::new(laid.role.x, top, laid.role.width, line),
-            text,
-            size,
-            tone,
-            Align::Left,
-        );
-    }
-
-    // The prompt row: a well, and either what is being typed, what was half-typed earlier, or
-    // an invitation.
-    //
-    // The draft is held by the runtime rather than by the caret precisely so it survives
-    // clicking away from the node — `AgentView::draft` says why — so drawing it is what makes
-    // that promise visible rather than merely true.
-    if !laid.prompt.is_empty() {
-        paint.plate(laid.prompt, PlateTone::Well, CARD_RADIUS);
-        let pad = font * 0.4;
-        let line = font * NODE_LINE_HEIGHT;
-        let inner = NodeRect::new(
-            laid.prompt.x + pad,
-            laid.prompt.y + (laid.prompt.height - line).max(0.0) / 2.0,
-            (laid.prompt.width - pad * 2.0).max(1.0),
-            line.min(laid.prompt.height),
-        );
-        match view.caret {
-            // **The keyboard is in this row.** Three things change together and all three are
-            // load-bearing: the string is the buffer's own and is *unclipped* (the caret's
-            // offsets index it, so an ellipsised copy puts the caret at the wrong character);
-            // the run is pushed even when it is empty (feedback 25 — no run, no block, and
-            // `push_caret` has nothing to measure from); and the placeholder is suppressed,
-            // because "Ask this agent to do something" is not what the buffer holds and
-            // drawing it would put the caret inside a sentence the user is not typing.
-            Some(_) => {
-                paint.prompt_run =
-                    Some(paint.field(inner, &view.draft, font, Tone::Primary, Align::Left));
-            }
-            None => {
-                let (text, tone) = if view.draft.trim().is_empty() {
-                    ("Ask this agent to do something", Tone::Muted)
-                } else {
-                    (view.draft.as_str(), Tone::Primary)
-                };
-                paint.text(inner, text, font, tone, Align::Left);
-            }
-        }
-    }
-
-    let box_ = laid.transcript;
-    if box_.is_empty() {
-        return paint;
-    }
-
-    let gap = font * 0.45;
-    // **The notice's line is reserved before anything is measured, not squeezed in after.**
-    // Reserving it afterwards is the version that was written first and it puts the last entry
-    // exactly one line outside the node — measured against the whole box, then pushed down by
-    // a line nobody had budgeted for. Reserving it always costs a line of slack on a
-    // transcript that turns out to fit, which is invisible, and the alternative is a two-pass
-    // measurement to learn something the first pass has to guess anyway.
-    let notice = font * SUBTITLE_SCALE * NODE_LINE_HEIGHT;
-    let available = (box_.height - notice).max(0.0);
-
-    // Measured newest-first, so `entries` comes out reversed — which is why it is turned round
-    // before anything is placed.
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut used = 0.0;
-    let mut elided = view.truncated || view.events.len() > MAX_ENTRIES;
-    for (index, event) in view.events.iter().enumerate().rev().take(MAX_ENTRIES) {
-        let entry =
-            transcript_entry(index, event.as_ref(), box_.x, box_.width, font, available - used);
-        if entry.height <= 0.0 {
-            continue;
-        }
-        // An entry that cannot fit the node at all is skipped rather than drawn over the edge.
-        // Prose can never reach this — it is measured in whole lines against the room left —
-        // but an option row and a permission plate have a *minimum* height, and a node too
-        // short to hold one has to say so rather than paint outside itself.
-        //
-        // The epsilon is the one `card_layout`'s `whole_lines` already carries and for the
-        // same measured reason: an entry clamped to *exactly* the room left is built by
-        // subtracting a height and adding it back, so it arrives a fraction of a ULP over and
-        // an exact `>` throws away the picture it had just been sized to hold.
-        const SLACK: f64 = 1e-6;
-        if entry.height > available + SLACK {
-            elided = true;
-            continue;
-        }
-        let next = used + entry.height + if entries.is_empty() { 0.0 } else { gap };
-        if next > available + SLACK && !entries.is_empty() {
-            elided = true;
-            break;
-        }
-        used = next;
-        entries.push(entry);
-    }
-    entries.reverse();
-
-    let mut y = box_.y;
-    if elided {
-        // Said on the node rather than implied by a scrollbar there is not. A transcript that
-        // silently begins in the middle is one the reader believes is the whole story, which
-        // is the failure `AgentView::truncated` exists to prevent one layer up.
-        //
-        // *Some* rather than *earlier*: what is dropped is nearly always the oldest, but an
-        // option row too tall for a short node is dropped wherever it sits, and a line that
-        // said "earlier" would be wrong about it.
-        let size = font * SUBTITLE_SCALE;
-        paint.text(
-            NodeRect::new(box_.x, y, box_.width, notice),
-            "some output is not shown",
-            size,
-            Tone::Muted,
-            Align::Left,
-        );
-        y += notice;
-    }
-    for (position, mut entry) in entries.into_iter().enumerate() {
-        if position > 0 {
-            y += gap;
-        }
-        entry.paint.shift(y);
-        y += entry.height;
-        paint.absorb(entry.paint);
-    }
-    paint
-}
-
-/// A note node's body and footer.
-///
-/// The **title** is not here: it is the item's own `StyledText`, so it goes through the named
-/// primary slot and takes the caret, the search index and `Board::set_text` with no new path —
-/// which is exactly why `ItemKind::AgentNote` keeps it beside the token rather than inside it.
-pub(crate) fn note_paint(
-    model: &vellum_agent::NoteModel,
-    body: Option<&str>,
-    laid: &crate::note::NoteLayout,
-    font: f64,
-) -> NodePaint {
-    let mut paint = NodePaint::default();
-    if laid.too_small {
-        return paint;
-    }
-
-    if !laid.body.is_empty() {
-        match body.map(str::trim).filter(|text| !text.is_empty()) {
-            Some(text) => paint.text(laid.body, text, font, Tone::Primary, Align::Left),
-            // Nothing here is inert: a node with no content says which of the two states it is
-            // in, and the two have different remedies.
-            None => {
-                let line = (font * NODE_LINE_HEIGHT).min(laid.body.height);
-                let waiting = if model.path.trim().is_empty() {
-                    "This note has no file yet"
-                } else {
-                    "This note's file has not been read yet"
-                };
-                paint.text(
-                    NodeRect::new(laid.body.x, laid.body.y, laid.body.width, line),
-                    waiting,
-                    font,
-                    Tone::Muted,
-                    Align::Left,
-                );
-            }
-        }
-    }
-
-    if !laid.footer.is_empty() {
-        // The file's name at one end and the scope at the other, so the scope keeps the same
-        // column whatever the file is called — the arrangement the board library's own card
-        // metadata row had to be rebuilt into (feedback 22) for exactly this reason.
-        let size = font * SUBTITLE_SCALE;
-        let chip = (laid.footer.width * 0.4).min(size * 6.0);
-        paint.text(
-            NodeRect::new(
-                laid.footer.x,
-                laid.footer.y,
-                (laid.footer.width - chip).max(1.0),
-                laid.footer.height,
-            ),
-            crate::note::file_name(&model.path),
-            size,
-            Tone::Muted,
-            Align::Left,
-        );
-        paint.text(
-            NodeRect::new(
-                laid.footer.x + laid.footer.width - chip,
-                laid.footer.y,
-                chip,
-                laid.footer.height,
-            ),
-            crate::note::scope_label(&model.scope),
-            size,
-            Tone::Muted,
-            Align::Right,
-        );
-    }
-    paint
-}
-
-/// A file tree's header and the rows that fit.
-///
-/// **Only `TreeLayout::visible_rows()` of them**, which is the rule the whole canvas rests on
-/// seen from its sharpest angle: a `target/` directory holds forty thousand entries, and a node
-/// that shaped what exists rather than what is on screen would stall the frame it was placed
-/// on. `vellum_agent::filetree` has already bounded the *read*; this bounds the **drawing**,
-/// and the two limits are different on purpose.
-pub(crate) fn tree_paint(
-    model: &vellum_agent::FileTreeModel,
-    view: Option<&TreeView>,
-    laid: &crate::filetree::TreeLayout,
-    font: f64,
-    // How many rows are scrolled off the top.
-    //
-    // ⚠ **The list used to draw the first `visible_rows()` and stop**, so on any tree with
-    // more entries than fitted, everything below was unreachable: no gesture existed to
-    // reach it, and the node's own *"n more"* line named a number the user could do nothing
-    // about. Held app-side (`AgentRuntime::tree_scroll`) rather than in the document: a
-    // scroll position is not board content, and putting one in the CRDT would add an undo
-    // step per wheel notch.
-    //
-    // The press path passes the **same** offset, and resolves clicks against the rectangles
-    // this function records rather than re-deriving them — so a scrolled row is pressed
-    // where it is drawn, by construction.
-    scroll: usize,
-) -> NodePaint {
-    let mut paint = NodePaint::default();
-    if laid.too_small {
-        return paint;
-    }
-
-    if !laid.header.is_empty() {
-        // `note::file_name` rather than a second last-component split. It exists because a
-        // path can carry any character a filesystem allows and this codebase has aborted twice
-        // on byte-slicing at a found index; a tree's root is the same string in the same
-        // danger, so it gets the same function.
-        let root = if model.root.trim().is_empty() {
-            "Project root"
-        } else {
-            crate::note::file_name(&model.root)
-        };
-        paint.text(laid.header, root, font, Tone::Primary, Align::Left);
-    }
-
-    if laid.list.is_empty() {
-        return paint;
-    }
-    paint.plate(laid.list, PlateTone::Well, CARD_RADIUS);
-
-    let Some(view) = view else {
-        let line = (font * NODE_LINE_HEIGHT).min(laid.list.height);
-        paint.text(
-            NodeRect::new(laid.list.x, laid.list.y, laid.list.width, line),
-            "This tree has not been read yet",
-            font * SUBTITLE_SCALE,
-            Tone::Muted,
-            Align::Left,
-        );
-        return paint;
-    };
-
-    let fits = laid.visible_rows();
-    // Clamped here rather than where it is stored: the row count changes as directories open
-    // and close, and a stale offset must degrade to "the last screenful" instead of an empty
-    // list. `saturating_sub` gives 0 for a tree that now fits entirely.
-    let scroll = scroll.min(view.rows.len().saturating_sub(fits));
-    // One row is kept back for the count of what did not fit, so the node's last row is never a
-    // file the reader believes is the last file.
-    let more = view.rows.len() > scroll + fits || view.truncated;
-    let shown = if more { fits.saturating_sub(1) } else { fits };
-    for (index, row) in view.rows.iter().skip(scroll).take(shown).enumerate() {
-        let rect = crate::filetree::row_rect(laid.list, index, 0);
-        let twisty = row
-            .entry
-            .is_dir
-            .then(|| crate::filetree::twisty_rect(rect, row.depth));
-        if let Some(twisty) = twisty {
-            paint.twisties.push((twisty, row.expanded));
-        }
-        // Recorded for the press path, from the rectangle that was just drawn. Three things
-        // decide which row is where — `visible_rows()`, the row held back for the *"n more"*
-        // line, and the scroll offset — and a press path that re-derived any of them would
-        // expand the wrong directory. See `NodePaint::tree_rows`.
-        paint.tree_rows.push(TreeRowHit {
-            rect,
-            twisty,
-            relative: row.entry.relative.clone(),
-            path: row.entry.path.clone(),
-            is_dir: row.entry.is_dir,
-        });
-        let left = crate::filetree::label_x(rect, row.depth);
-        paint.text(
-            NodeRect::new(left, rect.y, (rect.x + rect.width - left).max(1.0), rect.height),
-            &row.entry.name,
-            font * SCAFFOLD_SCALE,
-            // A gitignored entry is drawn quietly rather than hidden. It is only returned at
-            // all when the tree was *asked* to show ignored files, so the user has said they
-            // want to see it, and greying it is what tells them why it is unusual.
-            if row.entry.ignored { Tone::Muted } else { Tone::Primary },
-            Align::Left,
-        );
-    }
-    if more && shown < view.rows.len() {
-        paint.text(
-            crate::filetree::row_rect(laid.list, shown, 0),
-            &format!("{} more", view.rows.len() - shown),
-            font * SCAFFOLD_SCALE,
-            Tone::Muted,
-            Align::Left,
-        );
-    }
-    paint
-}
-
-/// A browser node's address and, in place of a page, the reason there is not one.
-///
-/// `crate::browser::viewport_message` decides the wording — from the two switches
-/// `should_run_engine` reads **and** from what the engine pool says about this particular page
-/// — so the node, the runtime and the inspector cannot come to disagree about whether a page
-/// is live. The failure that join prevents is an engine running behind a card that says there
-/// is not one.
-pub(crate) fn browser_paint(
-    model: &vellum_agent::BrowserModel,
-    reason: Option<String>,
-    laid: &crate::browser::BrowserLayout,
-    font: f64,
-) -> NodePaint {
-    let mut paint = NodePaint::default();
-    if laid.too_small {
-        return paint;
-    }
-
-    if !laid.address.is_empty() {
-        paint.plate(laid.address, PlateTone::Well, CARD_RADIUS);
-        let pad = font * 0.35;
-        let line = font * NODE_LINE_HEIGHT;
-        let inner = NodeRect::new(
-            laid.address.x + pad,
-            laid.address.y + (laid.address.height - line).max(0.0) / 2.0,
-            (laid.address.width - pad * 2.0).max(1.0),
-            line.min(laid.address.height),
-        );
-        let (text, tone) = if model.url.trim().is_empty() {
-            ("Enter an address", Tone::Muted)
-        } else {
-            (model.url.as_str(), Tone::Primary)
-        };
-        paint.text(inner, text, font * SUBTITLE_SCALE, tone, Align::Left);
-    }
-
-    if laid.viewport.is_empty() {
-        return paint;
-    }
-    paint.plate(laid.viewport, PlateTone::Card, CARD_RADIUS);
-
-    // **The page's own surface is not this pass's to draw.** An engine composites outside wgpu
-    // — `docs/01-architecture.md` §1 is why there may not be one at all — so what is drawn
-    // either way is the page's *name*, and a dormant node reads as the page it points at rather
-    // than as an empty rectangle.
-    let pad = font * 0.8;
-    let mut column =
-        Column::new(laid.viewport.x + pad, (laid.viewport.width - pad * 2.0).max(1.0), font);
-    column.gap(pad);
-    let name =
-        if model.title.trim().is_empty() { model.url.as_str() } else { model.title.as_str() };
-    column.paragraph(name, 1.0, Tone::Primary, 2);
-    if let Some(reason) = reason.as_deref() {
-        column.gap(font * 0.3);
-        column.paragraph(reason, SUBTITLE_SCALE, Tone::Muted, 2);
-    }
-    let mut entry = column.finish();
-    entry.paint.shift(laid.viewport.y);
-    paint.absorb(entry.paint);
-    paint
-}
-
-/// `vellum_ui::Palette::LIGHT.warning` — `#8A5D0B`.
-///
-/// Three decimals, the spelling `Theme::with_accent` already uses for the same reason: it is
-/// what a `const fn` can take (`Rgba::from_rgb8` is not one) and `Rgba::pack` rounds, so three
-/// decimals land on the byte exactly. The test below is what says so rather than this comment.
-const STATUS_NEEDS_YOU: Rgba = Rgba::new(0.541, 0.365, 0.043, 1.0);
-
-/// `vellum_ui::Palette::LIGHT.danger` — the `xr-red` `#E65B58` that kept destruction when the
-/// teal took selection off it.
-const STATUS_FAILED: Rgba = Rgba::new(0.902, 0.357, 0.345, 1.0);
-
-/// The colour a status dot is drawn in.
-///
-/// **Idle and working come from the palette; the other two do not, and cannot.**
-/// `crate::theme::Theme` carries no destructive or cautionary token — the board has never
-/// needed one — while `vellum_ui::Palette` has carried both since the accent was split off the
-/// coral (feedback 22). They are spelled out above and pinned to that palette by a test, which
-/// is the arrangement `Theme::with_accent` already uses for exactly this reason: a hand-copied
-/// constant in another crate is `inspect.rs`'s `THEME_BORDER` trap, and the *test* is what
-/// makes it safe rather than the comment.
-///
-/// # Working wears the accent, and the accent is a setting
-///
-/// `Accent::Red` **is** `Palette::danger`, so a user who chose the coral gets a working dot and
-/// a failed dot in one colour. That collision is why the distinction is not carried by hue at
-/// all: the two states that want a *person* — needs-you and failed — draw a halo ring around
-/// the dot, and the two that do not never do. See [`push_status_dot`].
-fn status_colour(status: Status, theme: &Theme) -> Rgba {
-    match status {
-        Status::Idle => theme.text_muted,
-        Status::Running => theme.accent,
-        Status::WaitingForPermission => STATUS_NEEDS_YOU,
-        Status::Error => STATUS_FAILED,
-    }
-}
-
-/// How much of its own paper a node lays over a background picture.
-///
-/// High on purpose. The picture is decoration and the transcript is the point, so this is
-/// tuned so that ink on the scrim clears its contrast target over **any** image, including a
-/// white one and a black one. Turning it down is how you get a personalised node you cannot
-/// read; the lever for "I want to see more of my picture" is the node's own opacity.
-const BACKGROUND_SCRIM: f32 = 0.86;
-
-/// The chat theme an agent node draws in, or `None` for anything that is not one.
-///
-/// The **resolved** theme — the node's own choice, or the app-wide default when it has not
-/// made one — through `crate::agent::chat_theme`, which is the single place that fallback is
-/// spelled. Only `ItemKind::Agent`: a note, a file tree and a browser are not transcripts,
-/// and dressing them in a chat theme would make "ChatGPT" a statement about a directory
-/// listing.
-fn chat_theme_of(kind: &ItemKind, ctx: &DrawContext<'_>) -> Option<vellum_agent::ChatTheme> {
-    let ItemKind::Agent { model, .. } = kind else { return None };
-    Some(crate::agent::chat_theme(&crate::agent::decode(model), ctx.default_chat_theme))
-}
-
-fn chat_opacity_of(kind: &ItemKind) -> f32 {
-    let ItemKind::Agent { model, .. } = kind else { return 1.0 };
-    crate::agent::chat_opacity(&crate::agent::decode(model))
-}
-
-fn chat_background_of(kind: &ItemKind) -> Option<&str> {
-    let ItemKind::Agent { model, .. } = kind else { return None };
-    // Borrowed out of the token's own JSON rather than decoded, which would allocate an
-    // `AgentModel` per node per frame for a string that is usually absent. The key is
-    // `AgentModel::chat_background`'s serde name; a test pins the two together.
-    crate::agent::background_hash(model)
-}
-
-/// What a [`Tone`] means against a palette.
-fn tone_colour(tone: Tone, theme: &Theme) -> Rgba {
-    match tone {
-        Tone::Primary => theme.text,
-        Tone::Muted => theme.text_muted,
-        Tone::Accent => theme.accent,
-        Tone::Failed => STATUS_FAILED,
-        Tone::NeedsYou => STATUS_NEEDS_YOU,
-    }
-}
-
-/// How present a plate's wash is behind the words on it.
-///
-/// Low: `docs/05-design-language.md` §3a's rule that legibility beats the material applies to a
-/// tint exactly as it does to glass, and an error whose wash made its own message harder to
-/// read would be the wrong half kept.
-const PLATE_WASH: f32 = 0.10;
-
-/// One of a node's tinted rectangles.
-fn push_node_plate(
-    list: &mut DrawList,
-    at: ([f32; 2], [f32; 2]),
-    plate: NodePlate,
-    rotation: f32,
-    opacity: f32,
-    theme: &Theme,
-    hairline: f32,
-) {
-    let (origin, extent) = at;
-    if extent[0] <= 0.0 || extent[1] <= 0.0 {
-        return;
-    }
-    let quad = QuadInstance::solid(
-        origin,
-        extent,
-        match plate.tone {
-            PlateTone::Well => theme.canvas,
-            PlateTone::Card | PlateTone::Chosen => theme.frame_fill,
-            PlateTone::Failed => STATUS_FAILED.with_alpha(PLATE_WASH),
-            PlateTone::NeedsYou => STATUS_NEEDS_YOU.with_alpha(PLATE_WASH),
-            PlateTone::Rail => theme.accent,
-        },
-    )
-    .with_corner_radius(plate.radius)
-    .with_rotation(rotation)
-    .with_opacity(opacity);
-    let quad = match plate.tone {
-        PlateTone::Card => quad.with_border(theme.border, hairline),
-        // The picked option keeps the accent it was picked with, so a row that has been
-        // answered says which answer it got without having to be read.
-        PlateTone::Chosen => quad.with_border(theme.accent, hairline.max(1.0) * 2.0),
-        _ => quad,
-    };
-    list.push_quad(quad);
-}
-
-/// The status dot, and the halo that says a person is wanted.
-///
-/// **The halo carries the meaning, not the colour.** `status_colour` explains why: the accent
-/// is a user setting and one of its three values collides with the failure colour, so a
-/// distinction drawn in hue alone would quietly stop existing for anyone who chose the coral.
-/// A ring is legible against every one of them, and it says the right thing — *only the two
-/// blocked states want a person* — as a property of the mark rather than of the palette.
-fn push_status_dot(
-    list: &mut DrawList,
-    at: ([f32; 2], [f32; 2]),
-    colour: Rgba,
-    attention: bool,
-    rotation: f32,
-    opacity: f32,
-) {
-    let (origin, extent) = at;
-    let side = extent[0].min(extent[1]);
-    if side <= 0.0 {
-        return;
-    }
-    if attention {
-        let halo = side * 1.9;
-        list.push_quad(
-            QuadInstance::solid(
-                [origin[0] - (halo - extent[0]) / 2.0, origin[1] - (halo - extent[1]) / 2.0],
-                [halo, halo],
-                Rgba::TRANSPARENT,
-            )
-            .with_border(colour.with_alpha(colour.a * 0.5), (side * 0.22).max(0.5))
-            .with_corner_radius(halo * 0.5)
-            .with_rotation(rotation)
-            .with_opacity(opacity),
-        );
-    }
-    list.push_quad(
-        QuadInstance::solid(origin, [side, side], colour)
-            .with_corner_radius(side * 0.5)
-            .with_rotation(rotation)
-            .with_opacity(opacity),
-    );
-}
-
-/// The raw/clean toggle: bars on a plate, three for Raw and one for Clean.
-///
-/// **Bars rather than the words.** The control is 22 world units square and no word fits in it
-/// — and a *character* is not an option, because trap 10 is that anything outside a plain sans
-/// face draws as tofu and every glyph that would say this (`⚙`, `≡`, `☰`) is exactly that. The
-/// bars say what the two modes mean anyway: Raw is everything the agent did, Clean is the
-/// answer alone.
-fn push_mode_toggle(
-    list: &mut DrawList,
-    at: ([f32; 2], [f32; 2]),
-    raw: bool,
-    rotation: f32,
-    opacity: f32,
-    theme: &Theme,
-    hairline: f32,
-) {
-    let (origin, extent) = at;
-    let side = extent[0].min(extent[1]);
-    if side <= 0.0 {
-        return;
-    }
-    list.push_quad(
-        QuadInstance::solid(origin, extent, if raw { theme.accent } else { theme.surface })
-            .with_corner_radius(side * 0.25)
-            .with_border(theme.border, hairline)
-            .with_rotation(rotation)
-            .with_opacity(opacity),
-    );
-
-    let ink = if raw { theme.surface } else { theme.text_muted };
-    let bars = if raw { 3 } else { 1 };
-    let weight = (side * 0.11).max(hairline);
-    let width = side * 0.5;
-    let pitch = side * 0.22;
-    let first = origin[1] + extent[1] / 2.0 - pitch * (bars - 1) as f32 / 2.0 - weight / 2.0;
-    for bar in 0..bars {
-        list.push_quad(
-            QuadInstance::solid(
-                [origin[0] + (extent[0] - width) / 2.0, first + bar as f32 * pitch],
-                [width, weight],
-                ink,
-            )
-            .with_corner_radius(weight * 0.5)
-            .with_rotation(rotation)
-            .with_opacity(opacity),
-        );
-    }
-}
-
-/// Run, or stop while a turn is in flight — one button and two meanings, because they are
-/// never both available and two buttons would leave one permanently dead.
-///
-/// A triangle and a square, both geometry. The triangle goes through the mesh batch for
-/// `push_play_button`'s reason: it is not expressible as axis-aligned rectangles, `▶` is U+25B6
-/// and outside every plain sans face, and the mesh pipeline is the multisampled one, so its
-/// diagonals come out smooth rather than stepped.
-fn push_run_button(
-    list: &mut DrawList,
-    at: ([f32; 2], [f32; 2]),
-    busy: bool,
-    rotation: f32,
-    opacity: f32,
-    theme: &Theme,
-    hairline: f32,
-) {
-    let (origin, extent) = at;
-    let side = extent[0].min(extent[1]);
-    if side <= 0.0 {
-        return;
-    }
-    list.push_quad(
-        QuadInstance::solid(origin, extent, if busy { theme.accent } else { theme.surface })
-            .with_corner_radius(side * 0.5)
-            .with_border(if busy { theme.accent } else { theme.border }, hairline)
-            .with_rotation(rotation)
-            .with_opacity(opacity),
-    );
-
-    let ink = if busy { theme.surface } else { theme.accent };
-    let centre = [origin[0] + extent[0] * 0.5, origin[1] + extent[1] * 0.5];
-    if busy {
-        // Stop: a square, which a quad expresses exactly and a mesh would only complicate.
-        let bar = side * 0.32;
-        list.push_quad(
-            QuadInstance::solid([centre[0] - bar / 2.0, centre[1] - bar / 2.0], [bar, bar], ink)
-                .with_corner_radius(bar * 0.15)
-                .with_rotation(rotation)
-                .with_opacity(opacity),
-        );
-        return;
-    }
-
-    let reach = side * 0.22;
-    let nudge = reach * 0.18;
-    // **Relative to the centre, because the transform below translates by it.** Spelling these
-    // absolutely is what flung `push_play_button`'s triangle to twice its own offset, which the
-    // user photographed as a stray play mark floating above a card.
-    let tip = [reach + nudge, 0.0];
-    let top = [-reach + nudge, -reach];
-    let bottom = [-reach + nudge, reach];
-    let transform =
-        list.meshes_mut().push_transform(MeshTransform::scale_rotate_at(1.0, rotation, centre));
-    let first = list.meshes().indices().len() as u32;
-    list.meshes_mut().push_indexed(
-        &[top, tip, bottom],
-        &[0, 1, 2],
-        ink.with_alpha(ink.a * opacity),
-        transform,
-    );
-    let last = list.meshes().indices().len() as u32;
-    list.push_meshes(first..last);
-}
-
-/// The browser's reload control: a broken ring with a head on it.
-///
-/// `↻` is U+21BB and outside the plain sans faces (trap 10), so the mark is drawn — a
-/// three-quarter ring, made by laying a plate the colour of the node over the middle of a
-/// filled circle, plus a small triangle for the arrow's head. Cheaper than tessellating an
-/// annulus, and every piece of it is a quad or one triangle.
-fn push_reload_button(
-    list: &mut DrawList,
-    at: ([f32; 2], [f32; 2]),
-    rotation: f32,
-    opacity: f32,
-    theme: &Theme,
-    hairline: f32,
-) {
-    let (origin, extent) = at;
-    let side = extent[0].min(extent[1]);
-    if side <= 0.0 {
-        return;
-    }
-    let ring = side * 0.62;
-    let weight = (side * 0.11).max(hairline);
-    let centre = [origin[0] + extent[0] * 0.5, origin[1] + extent[1] * 0.5];
-    list.push_quad(
-        QuadInstance::solid(
-            [centre[0] - ring / 2.0, centre[1] - ring / 2.0],
-            [ring, ring],
-            Rgba::TRANSPARENT,
-        )
-        .with_border(theme.text_muted, weight)
-        .with_corner_radius(ring * 0.5)
-        .with_rotation(rotation)
-        .with_opacity(opacity),
-    );
-    // The gap in the ring, and the head sitting in it. The gap is painted in the node's own
-    // surface rather than left out, because a `QuadInstance` border is a whole ring.
-    let gap = weight * 2.4;
-    list.push_quad(
-        QuadInstance::solid(
-            [centre[0] + ring / 2.0 - weight, centre[1] - gap / 2.0],
-            [weight * 2.0, gap],
-            theme.surface,
-        )
-        .with_rotation(rotation)
-        .with_opacity(opacity),
-    );
-    let head = weight * 1.6;
-    let transform = list.meshes_mut().push_transform(MeshTransform::scale_rotate_at(
-        1.0,
-        rotation,
-        [centre[0] + ring / 2.0, centre[1]],
-    ));
-    let first = list.meshes().indices().len() as u32;
-    list.meshes_mut().push_indexed(
-        &[[-head, -head], [head, -head], [0.0, head * 0.6]],
-        &[0, 1, 2],
-        theme.text_muted.with_alpha(theme.text_muted.a * opacity),
-        transform,
-    );
-    let last = list.meshes().indices().len() as u32;
-    list.push_meshes(first..last);
-}
-
-/// A file tree's disclosure triangle: pointing right when shut, down when open.
-///
-/// Geometry rather than `▸`/`▾`, which are U+25B8 and U+25BE and outside the plain sans faces
-/// this application can rely on (trap 10).
-fn push_twisty(
-    list: &mut DrawList,
-    at: ([f32; 2], [f32; 2]),
-    expanded: bool,
-    rotation: f32,
-    opacity: f32,
-    theme: &Theme,
-) {
-    let (origin, extent) = at;
-    let side = extent[0].min(extent[1]);
-    if side <= 0.0 {
-        return;
-    }
-    let centre = [origin[0] + extent[0] * 0.5, origin[1] + extent[1] * 0.5];
-    let reach = side * 0.28;
-    let points = if expanded {
-        [[-reach, -reach * 0.6], [reach, -reach * 0.6], [0.0, reach * 0.8]]
-    } else {
-        [[-reach * 0.6, -reach], [-reach * 0.6, reach], [reach * 0.8, 0.0]]
-    };
-    let ink = theme.text_muted;
-    let transform =
-        list.meshes_mut().push_transform(MeshTransform::scale_rotate_at(1.0, rotation, centre));
-    let first = list.meshes().indices().len() as u32;
-    list.meshes_mut().push_indexed(
-        &points,
-        &[0, 1, 2],
-        ink.with_alpha(ink.a * opacity),
-        transform,
-    );
-    let last = list.meshes().indices().len() as u32;
-    list.push_meshes(first..last);
-}
-
-/// The stripe a node too small for its own header wears instead of a status dot.
-///
-/// `AgentLayout` reports no `status` rectangle at that size — it reports none of its controls —
-/// so a dot here would be a position this file invented, which is the one thing the shared
-/// layout exists to forbid. A stripe down the node's own left edge is derived from `bounds` and
-/// says the only thing there is room to say.
-fn push_compact_stripe(
-    list: &mut DrawList,
-    position: [f32; 2],
-    size: [f32; 2],
-    colour: Rgba,
-    rotation: f32,
-    opacity: f32,
-) {
-    let width = (size[0] * 0.06).clamp(0.5, size[0].max(0.5));
-    list.push_quad(
-        QuadInstance::solid(position, [width, size[1]], colour)
-            .with_corner_radius(width * 0.5)
-            .with_rotation(rotation)
-            .with_opacity(opacity),
-    );
-}
-
-/// The card every Agent Canvas node is built on.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one card, and every caller passes the same facts the four kinds share"
-)]
-fn push_node_card(
-    list: &mut DrawList,
-    position: [f32; 2],
-    size: [f32; 2],
-    fill: Rgba,
-    rotation: f32,
-    opacity: f32,
-    theme: &Theme,
-    hairline: f32,
-) {
-    list.push_quad(
-        QuadInstance::solid(position, size, fill)
-            .with_corner_radius(CARD_RADIUS)
-            .with_border(theme.border, hairline)
-            .with_rotation(rotation)
-            .with_opacity(opacity),
-    );
-}
-
-/// The body a note node draws.
-///
-/// **Not wired yet, and this is the whole of the join.** A note's content is a `.md` file on
-/// disk (`docs/07` §8) and nothing on the paint path may touch a filesystem, so the body has to
-/// arrive the way an agent's transcript does — read once per frame by the runtime and handed to
-/// the painter as a snapshot. Until `crate::agent_view` grows that map this answers `None`, and
-/// `note_paint` draws a line saying so rather than an empty box.
-fn note_body<'a>(ctx: &DrawContext<'a>, id: SceneId) -> Option<&'a str> {
-    ctx.agents.note(id)
-}
-
-/// The rows a file tree draws.
-///
-/// The same join as [`note_body`], and the same reason: `vellum_agent::filetree::visible` reads
-/// directories, which is not something a frame may do. Until the runtime supplies it this
-/// answers `None` and the node says it has not been read.
-fn tree_view<'a>(ctx: &DrawContext<'a>, id: SceneId) -> Option<&'a TreeView> {
-    ctx.agents.tree(id)
-}
-
-/// Whether browser nodes are permitted at all.
-///
-/// The app's own preference, carried on `AgentViews` because the painter has no library to
-/// ask. `docs/07` §0 rule 3 has browser nodes off by default, so on a default installation
-/// every node draws `placeholder_reason`'s *"Browser nodes are off — turn them on in
-/// Preferences"*, which is exactly what it should say. (This used to add that the preference
-/// was "not plumbed through to the painter yet". It is — `ActiveState::rebuild_agent_views`
-/// sets it every frame.)
-const fn browser_nodes_enabled(ctx: &DrawContext<'_>) -> bool {
-    ctx.agents.browser_nodes()
-}
-
-/// What an Agent Canvas node's pieces were built against, so a frame can tell whether it still
-/// holds the right ones.
-#[derive(Debug)]
-struct CachedNode {
-    /// The frame counter [`Painter::paint`] bumps.
-    ///
-    /// **This is what makes a live transcript redraw**, and it is why the entry is not keyed on
-    /// the projection's generation the way every other cache in this file is: an agent's output
-    /// is not in the document, so nothing about the document moves when it changes.
-    frame: u64,
-    generation: u64,
-    size: (f64, f64),
-    /// A coarse content signature, so a caller that does **not** go through `paint` — a test
-    /// calling `block` twice with a changed view — still sees the change. The frame counter is
-    /// the real invalidation; this is the guard for the paths that never bump it.
-    signature: u64,
-    paint: NodePaint,
-}
-
-/// A cheap signature over what a node draws.
-///
-/// Deliberately coarse: it is asked once per `block` call, so hashing every transcript event
-/// here would be quadratic in the run count. The frame counter beside it in [`CachedNode`] is
-/// what actually forces a rebuild; this only has to catch a change that happens without one.
-fn node_signature(kind: &ItemKind, view: Option<&AgentView>) -> u64 {
-    let token = match kind {
-        ItemKind::Agent { model, .. }
-        | ItemKind::AgentNote { model, .. }
-        | ItemKind::FileTree { model }
-        | ItemKind::Browser { model } => model.as_str(),
-        _ => "",
-    };
-    let mut hash = fnv1a(token.as_bytes(), 0);
-    if let Some(view) = view {
-        hash = fnv1a(view.detail.as_bytes(), hash);
-        hash = fnv1a(view.draft.as_bytes(), hash);
-        hash = fnv1a(view.subtitle.as_bytes(), hash);
-        hash = fnv1a(
-            &[
-                view.status as u8,
-                u8::from(view.truncated),
-                u8::from(matches!(view.mode, DisplayMode::Raw)),
-            ],
-            hash,
-        );
-        // **Whether the prompt row has the keyboard, not just what is in it.** The draft above
-        // covers the characters; this covers the *state change* — arriving in the row with an
-        // empty buffer, or leaving it — which alters the run without altering a byte of text,
-        // and would otherwise draw a placeholder where the caret is.
-        hash = fnv1a(&[u8::from(view.caret.is_some())], hash);
-        // ⚠ **And the voice line, which changes once a second while nothing else does.** The
-        // elapsed count is the only thing on a listening node that moves, so a signature blind
-        // to it leaves the node reading *"Listening… 0s"* for the whole of a press on any path
-        // that does not bump the frame counter. Hashed as the drawn string rather than as a
-        // discriminant, because that string is what is on screen — the same reason `detail` is
-        // hashed above and not the status it was derived from.
-        if let Some(spoken) = view.voice.as_ref().map(voice_line) {
-            hash = fnv1a(spoken.as_bytes(), hash);
-        }
-        hash = fnv1a(&view.events.len().to_le_bytes(), hash);
-        // The newest entry is the one that streams, and it is the one whose *identity* the rest
-        // of this signature cannot see: a tail that gained an event and lost one off the front
-        // has the same length it had.
-        if let Some(last) = view.events.last() {
-            hash = fnv1a(last.headline().as_bytes(), hash);
-        }
-    }
-    hash
-}
-
-/// The pieces one Agent Canvas node draws, laid out for its kind.
-fn build_node_paint(
-    kind: &ItemKind,
-    view: Option<&AgentView>,
-    ctx: &DrawContext<'_>,
-    id: SceneId,
-    size: (f64, f64),
-) -> NodePaint {
-    let (width, height) = size;
-    let font = node_font_size(width);
-    match kind {
-        ItemKind::Agent { model, .. } => {
-            // A node with no view is one the runtime has not attached a session to yet. It
-            // still knows what it is *configured* to run on, from its own token — so it draws
-            // its provider line rather than nothing, and the moment a session appears the live
-            // detail replaces it in the same place.
-            let fallback;
-            let view = match view {
-                Some(view) => view,
-                None => {
-                    fallback = AgentView {
-                        subtitle: crate::agent::subtitle(&crate::agent::decode(model)),
-                        // The same resolution the toggle above makes, so a node with no
-                        // session yet paints its transcript area and its badge in one mode.
-                        mode: crate::agent::display_mode(
-                            &crate::agent::decode(model),
-                            ctx.default_display,
-                        ),
-                        ..AgentView::default()
-                    };
-                    &fallback
-                }
-            };
-            agent_paint(view, &crate::agent::layout(width, height), font)
-        }
-        ItemKind::AgentNote { model, .. } => note_paint(
-            &crate::note::decode(model),
-            note_body(ctx, id),
-            &crate::note::layout(width, height),
-            font,
-        ),
-        ItemKind::FileTree { model } => tree_paint(
-            &crate::filetree::decode(model),
-            tree_view(ctx, id),
-            &crate::filetree::layout(width, height),
-            font,
-            ctx.agents.tree_scroll(id),
-        ),
-        ItemKind::Browser { model } => {
-            let browser = crate::browser::decode(model);
-            let enabled = browser_nodes_enabled(ctx);
-            browser_paint(
-                &browser,
-                // The configuration **and** the pool's own word for this page. Asking only
-                // `placeholder_reason` — which is what this did — leaves a node whose page
-                // would not load, or which has been panned half off the canvas, drawing
-                // nothing under its own address to say so.
-                crate::browser::viewport_message(&browser, enabled, ctx.agents.browser_note(id)),
-                &crate::browser::layout(width, height),
-                font,
-            )
-        }
-        _ => NodePaint::default(),
-    }
-}
-
-/// Where an agent's role, or a note's title, is drawn.
-///
-/// Both are the item's own `StyledText` and both go through `BlockKey::PRIMARY`, so the box
-/// comes from the node's own layout rather than from a rule invented in `block`. The role takes
-/// only the *top* line of its rectangle — `agent_paint` places the subtitle from the same
-/// rectangle's foot, and the two have to be derived from one number or they overlap.
-fn node_title_box(kind: &ItemKind, size: (f64, f64), font: f64) -> (f64, f64, f64, f64) {
-    let (w, h) = size;
-    match kind {
-        ItemKind::Agent { .. } => {
-            let laid = crate::agent::layout(w, h);
-            let rect = laid.role;
-            let height = if laid.too_small {
-                rect.height
-            } else {
-                (font * ROLE_SCALE * NODE_LINE_HEIGHT).min(rect.height)
-            };
-            (rect.x, rect.y, rect.width, height)
-        }
-        ItemKind::AgentNote { .. } => {
-            let rect = crate::note::layout(w, h).title;
-            (rect.x, rect.y, rect.width, rect.height)
-        }
-        // A file tree and a browser carry no `StyledText` at all — `ItemKind::text` says so —
-        // so nothing ever asks this for one.
-        _ => (0.0, 0.0, w, h),
-    }
-}
-
-/// Whether a kind is one of the four the Agent Canvas draws.
-const fn is_node(kind: &ItemKind) -> bool {
-    matches!(
-        kind,
-        ItemKind::Agent { .. }
-            | ItemKind::AgentNote { .. }
-            | ItemKind::FileTree { .. }
-            | ItemKind::Browser { .. }
-    )
-}
-
-/// The weight an agent connector is drawn at, in **device** pixels.
-///
-/// Screen-constant, which is a change of category from an ordinary connector and is the point:
-/// an agent link is not ink somebody drew on the board, it is a statement about what two nodes
-/// may do to each other. Drawing it at a constant screen weight puts it in the same family as
-/// the selection ring, a frame's hairline and the alignment guides — and it is what makes the
-/// **dash cadence** screen-constant too, because `vellum_connect` derives the pattern from the
-/// thickness. A world-unit cadence is a solid smear at 4% and three dashes across the window at
-/// 8×, which is the failure `push_grid` and `push_dashed` both already record.
-const AGENT_LINK_WIDTH: f64 = 1.6;
-
-/// The most dashes one agent link is allowed to cost.
-///
-/// The same backstop `GUIDE_MAX_DASHES` is, arrived at by the same arithmetic: a connector
-/// between two agents at opposite ends of a board is mostly off screen at a working zoom, and
-/// `vellum_connect` dashes the whole routed path because it has no viewport to clip against.
-/// Past the cap the link draws **solid** rather than at a coarser cadence — it is still the
-/// link's colour and still legible as an agent link, and a rhythm stretched until it fits is a
-/// rhythm that no longer says anything.
-const AGENT_LINK_MAX_DASHES: f64 = 512.0;
-
-/// The dot that travels a link while a message is passing along it, in device pixels.
-const PULSE_DIAMETER: f64 = 7.0;
-
-/// How the two kinds of agent link are told apart.
-///
-/// A **message** link is dashed and a **context** link is dotted — `vellum_connect`'s own
-/// vocabulary rather than a pattern invented here, and far enough apart to read at a glance,
-/// which is the requirement: *"reads this" and "talks to this" are not the same relationship
-/// and a board where they look alike is one you cannot follow*.
-///
-/// The colour splits them a second time. A message link wears the accent, because it is the
-/// live one — a pulse travels it. A context link is muted: it describes something standing
-/// rather than something happening.
-fn agent_link_look(
-    link: crate::agent::LinkKind,
-    theme: &Theme,
-) -> Option<(vellum_connect::LineStyle, Rgba)> {
-    match link {
-        crate::agent::LinkKind::Plain => None,
-        crate::agent::LinkKind::Message(_) => {
-            Some((vellum_connect::LineStyle::Dashed, theme.accent))
-        }
-        crate::agent::LinkKind::Context => {
-            Some((vellum_connect::LineStyle::Dotted, theme.text_muted))
-        }
-    }
-}
-
-/// The point a fraction `t` of the way along a polyline, by arc length.
-///
-/// `None` for a polyline with no points at all. A zero-length one answers its own only point,
-/// which is the degenerate connector: the pulse sits on it rather than being placed at an
-/// arbitrary end.
-fn point_along(line: &vellum_connect::Polyline, t: f64) -> Option<vellum_connect::Point> {
-    let total = line.length();
-    if total <= f64::EPSILON || line.points.len() < 2 {
-        return line.points.first().copied();
-    }
-    let target = t.clamp(0.0, 1.0) * total;
-    let mut travelled = 0.0;
-    for pair in line.points.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        let span = a.distance_to(b);
-        if span <= f64::EPSILON {
-            continue;
-        }
-        if travelled + span >= target {
-            let along = (target - travelled) / span;
-            return Some(vellum_connect::Point::new(
-                a.x + (b.x - a.x) * along,
-                a.y + (b.y - a.y) * along,
-            ));
-        }
-        travelled += span;
-    }
-    line.points.last().copied()
-}
-
-/// The message travelling a link right now.
-///
-/// # Why this is not the caret blink this application refuses to have
-///
-/// A blink needs a timer driving redraws while nothing is happening. This asks for repaints for
-/// the fraction of a second a message is actually in flight and then stops — the board
-/// library's `landed_background` rule (feedback 21), not the thing that rule is contrasted
-/// with. `AgentViews::any_in_flight` is the early-out that makes an idle board cost one
-/// boolean, and it is the **app's frame loop** that has to consult it: nothing in the painter
-/// can ask for the next frame, so a build that never calls it draws a pulse frozen at whatever
-/// progress the frame it appeared on happened to carry.
-fn push_link_pulse(
-    list: &mut DrawList,
-    ctx: &DrawContext<'_>,
-    line: &vellum_connect::Polyline,
-    pulse: vellum_agent::LinkPulse,
-    colour: Rgba,
-) {
-    let progress = f64::from(pulse.progress).clamp(0.0, 1.0);
-    // `forward` is start → end, which is the direction the path was built in — so a backward
-    // message is the same journey walked from the other end rather than a second code path.
-    let t = if pulse.forward { progress } else { 1.0 - progress };
-    let Some(at) = point_along(line, t) else { return };
-
-    let diameter = (PULSE_DIAMETER / ctx.camera.zoom()) as f32;
-    let origin = ctx.camera.to_camera_relative(WorldPoint::new(at.x, at.y));
-    // A short tail behind the dot, so a *still* frame says which way it is going — a
-    // `--screenshot` catches one instant and a dot alone at that instant is directionless. Two
-    // quads rather than a gradient: the mark is seven pixels across and a gradient at that size
-    // is one more pipeline for something nobody can resolve.
-    let tail = if pulse.forward { t - 0.06 } else { t + 0.06 };
-    if let Some(behind) = point_along(line, tail.clamp(0.0, 1.0)) {
-        let small = diameter * 0.55;
-        let back = ctx.camera.to_camera_relative(WorldPoint::new(behind.x, behind.y));
-        list.push_quad(
-            QuadInstance::solid(
-                [back[0] - small / 2.0, back[1] - small / 2.0],
-                [small, small],
-                colour.with_alpha(colour.a * 0.4),
-            )
-            .with_corner_radius(small / 2.0),
-        );
-    }
-    list.push_quad(
-        QuadInstance::solid(
-            [origin[0] - diameter / 2.0, origin[1] - diameter / 2.0],
-            [diameter, diameter],
-            colour,
-        )
-        .with_corner_radius(diameter / 2.0),
-    );
-}
-
 /// A card body: a rounded rectangle drawn through the SDF pipeline.
 ///
 /// Deliberately the analytic path rather than the quad one. It is the same shape
@@ -7094,40 +4178,6 @@ fn caret_is_visible(idle_for: f32) -> bool {
     (idle_for - CARET_SOLID_FOR) % CARET_BLINK_PERIOD < CARET_BLINK_PERIOD / 2.0
 }
 
-/// The prompt row's caret, as the same [`TextCursor`] the on-canvas caret uses.
-///
-/// Free rather than a method because it borrows nothing but the frame's context: the string is
-/// `AgentView::draft`, which is the buffer's own — `ActiveState::show_live_prompt` puts it
-/// there every frame precisely so the offsets and the characters they index arrive together.
-///
-/// `None` unless `slot` is the run the prompt was drawn into, which
-/// [`NodePaint::prompt_slot`] answered from the paint the painter just built. Deriving the
-/// slot here instead would be a second opinion about which run holds the prompt, which is the
-/// `kanban_runs` failure — a caret drawn on one row while the typing goes into another.
-fn prompt_cursor<'a>(
-    id: SceneId,
-    slot: u16,
-    prompt_slot: Option<u16>,
-    ctx: &DrawContext<'a>,
-) -> Option<TextCursor<'a>> {
-    if prompt_slot != Some(slot) {
-        return None;
-    }
-    // Bound out of the context first, so the borrow is the views' own `'a` and not a reborrow
-    // limited to this `&DrawContext` — the string has to outlive the call.
-    let views: &'a crate::agent_view::AgentViews = ctx.agents;
-    let view = views.get(id)?;
-    let caret = view.caret?;
-    Some(TextCursor {
-        scene: id,
-        slot,
-        idle_for: caret.idle_for,
-        cursor: caret.cursor,
-        anchor: caret.anchor,
-        text: view.draft.as_str(),
-    })
-}
-
 fn push_caret(
     list: &mut DrawList,
     ctx: &DrawContext<'_>,
@@ -7256,15 +4306,6 @@ fn push_placing(list: &mut DrawList, ctx: &DrawContext<'_>, board: u32) {
             list.push_quad(
                 QuadInstance::solid(origin, size, theme.sticky)
                     .with_corner_radius(STICKY_RADIUS),
-            );
-        }
-        // The same surface, radius and hairline the placed node draws with, so the preview
-        // and the item are one picture rather than two that happen to agree.
-        PlacingLook::Card => {
-            list.push_quad(
-                QuadInstance::solid(origin, size, theme.surface)
-                    .with_corner_radius(CARD_RADIUS)
-                    .with_border(theme.border, hairline),
             );
         }
         PlacingLook::Shape(shape) => {
@@ -7797,7 +4838,6 @@ mod tests {
     /// needs around it.
     pub(super) fn context<'a>(camera: &'a Camera, projection: &'a Projection) -> DrawContext<'a> {
         DrawContext {
-            agents: crate::agent_view::AgentViews::empty(),
             camera,
             projection,
             theme: Theme::LIGHT,
@@ -7805,8 +4845,6 @@ mod tests {
             hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
             marquee: None,
             placing: None,
             guides: &[],
@@ -7816,7 +4854,6 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territories: Vec::new(),
             minimap: None,
         }
     }
@@ -8124,7 +5161,7 @@ mod tests {
         let ctx = context(&camera, &projection);
 
         for (&id, projected) in projection.iter() {
-            for slot in 0..painter.slots_of(id, projected, projected.generation, &ctx) {
+            for slot in 0..painter.slots_of(id, projected, projected.generation) {
                 assert!(
                     painter.block(id, projected, slot, &ctx).is_none(),
                     "no text means no block, and no bar",
@@ -9069,7 +6106,7 @@ mod tests {
         let camera = camera_at(1.0);
         let ctx = context(&camera, &projection);
 
-        let slots = painter.slots_of(id, projected, ctx.projection.generation(), &ctx);
+        let slots = painter.slots_of(id, projected, ctx.projection.generation());
         let cells = crate::table::DEFAULT_ROWS * crate::table::DEFAULT_COLUMNS;
         assert_eq!(usize::from(slots), 2 + cells, "a 3x3 table needs 9 cell slots");
 
@@ -9081,7 +6118,7 @@ mod tests {
         )]);
         let (&sid, sprojected) = plain.iter().next().unwrap();
         let sctx = context(&camera, &plain);
-        assert_eq!(painter.slots_of(sid, sprojected, sctx.projection.generation(), &sctx), 2);
+        assert_eq!(painter.slots_of(sid, sprojected, sctx.projection.generation()), 2);
     }
 
     /// Cells with words produce blocks; empty cells produce none, so a freshly placed
@@ -9102,7 +6139,7 @@ mod tests {
         let camera = camera_at(1.0);
         let ctx = context(&camera, &projection);
 
-        let slots = painter.slots_of(id, projected, ctx.projection.generation(), &ctx);
+        let slots = painter.slots_of(id, projected, ctx.projection.generation());
         let drawn = (2..slots)
             .filter(|slot| painter.block(id, projected, *slot, &ctx).is_some())
             .count();
@@ -9125,7 +6162,7 @@ mod tests {
         let camera = camera_at(1.0);
         let ctx = context(&camera, &projection);
 
-        let slots = painter.slots_of(id, projected, ctx.projection.generation(), &ctx);
+        let slots = painter.slots_of(id, projected, ctx.projection.generation());
         assert_eq!(usize::from(slots), 2 + nodes, "a nine-node map needs nine node slots");
 
         let drawn = (2..slots)
@@ -9154,7 +6191,7 @@ mod tests {
         let ctx = context(&camera, &projection);
 
         // The branch itself stays visible; its two children do not.
-        let slots = painter.slots_of(id, projected, ctx.projection.generation(), &ctx);
+        let slots = painter.slots_of(id, projected, ctx.projection.generation());
         assert_eq!(usize::from(slots), 2 + 9 - (hidden - 1), "folding freed no slots");
     }
 
@@ -9201,7 +6238,6 @@ mod tests {
             WorldPoint::new(70.0, 60.0),
         ];
         let ctx = DrawContext {
-            agents: crate::agent_view::AgentViews::empty(),
             camera: &camera,
             projection: &projection,
             theme: Theme::LIGHT,
@@ -9209,8 +6245,6 @@ mod tests {
             hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
             marquee: None,
             placing: None,
             guides: &[],
@@ -9220,7 +6254,6 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territories: Vec::new(),
             minimap: None,
         };
         push_stroke(&mut list, &ctx, board);
@@ -9241,7 +6274,6 @@ mod tests {
 
         let points = [WorldPoint::new(10.0, 10.0)];
         let ctx = DrawContext {
-            agents: crate::agent_view::AgentViews::empty(),
             camera: &camera,
             projection: &projection,
             theme: Theme::LIGHT,
@@ -9249,8 +6281,6 @@ mod tests {
             hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
             marquee: None,
             placing: None,
             guides: &[],
@@ -9260,7 +6290,6 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territories: Vec::new(),
             minimap: None,
         };
         push_stroke(&mut list, &ctx, board);
@@ -9287,7 +6316,6 @@ mod tests {
             WorldPoint::new(far + 60.0, far + 50.0),
         ];
         let ctx = DrawContext {
-            agents: crate::agent_view::AgentViews::empty(),
             camera: &camera,
             projection: &projection,
             theme: Theme::LIGHT,
@@ -9295,8 +6323,6 @@ mod tests {
             hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
             marquee: None,
             placing: None,
             guides: &[],
@@ -9306,7 +6332,6 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territories: Vec::new(),
             minimap: None,
         };
         push_stroke(&mut list, &ctx, board);
@@ -9329,7 +6354,6 @@ mod tests {
         let screen = list.view(View::screen(camera.viewport()));
 
         let ctx = DrawContext {
-            agents: crate::agent_view::AgentViews::empty(),
             camera: &camera,
             projection: &projection,
             theme: Theme::LIGHT,
@@ -9337,8 +6361,6 @@ mod tests {
             hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
             marquee: Some((ScreenPoint::new(400.0, 300.0), ScreenPoint::new(100.0, 100.0))),
             placing: None,
             guides: &[],
@@ -9348,7 +6370,6 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territories: Vec::new(),
             minimap: None,
         };
         push_marquee(&mut list, &ctx, screen);
@@ -9378,7 +6399,6 @@ mod tests {
             let mut list = DrawList::new();
             let board = list.view(View::board(&camera));
             let ctx = DrawContext {
-                agents: crate::agent_view::AgentViews::empty(),
                 camera: &camera,
                 projection: &projection,
                 theme: Theme::LIGHT,
@@ -9386,8 +6406,6 @@ mod tests {
                 hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
                 marquee: None,
                 guides: &[],
                 placing: Some(Placing {
@@ -9400,7 +6418,6 @@ mod tests {
                 card_drop: None,
                 pattern: Pattern::Plain,
                 grid_color: None,
-                territories: Vec::new(),
                 minimap: None,
             };
             push_placing(&mut list, &ctx, board);
@@ -9484,7 +6501,6 @@ mod tests {
         push_marquee(
             &mut list,
             &DrawContext {
-                agents: crate::agent_view::AgentViews::empty(),
                 camera: &camera,
                 projection: &projection,
                 theme: Theme::LIGHT,
@@ -9492,8 +6508,6 @@ mod tests {
                 hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
                 marquee: None,
                 placing: None,
                 guides: &[],
@@ -9503,7 +6517,6 @@ mod tests {
                 card_drop: None,
                 pattern: Pattern::Plain,
                 grid_color: None,
-                territories: Vec::new(),
                 minimap: None,
             },
             screen,
@@ -9535,12 +6548,9 @@ mod tests {
             painter.push_selection(
                 &mut list,
                 &DrawContext {
-                    agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
                     camera: &camera,
                     projection: &projection,
                     theme: Theme::LIGHT,
@@ -9554,7 +6564,6 @@ mod tests {
                     card_drop: None,
                     pattern: Pattern::Plain,
                     grid_color: None,
-                    territories: Vec::new(),
                     minimap: None,
                 },
                 board,
@@ -9583,12 +6592,9 @@ mod tests {
             let mut list = DrawList::new();
             let board = list.view(View::board(&camera));
             let ctx = DrawContext {
-                agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
                 camera: &camera,
                 projection: &projection,
                 theme: Theme::LIGHT,
@@ -9602,7 +6608,6 @@ mod tests {
                 card_drop: None,
                 pattern: Pattern::Plain,
                 grid_color: None,
-                territories: Vec::new(),
                 minimap: None,
             };
             push_handles(&mut list, &ctx, board);
@@ -9641,12 +6646,9 @@ mod tests {
         let mut list = DrawList::new();
         let board = list.view(View::board(&camera));
         let ctx = DrawContext {
-            agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
             camera: &camera,
             projection: &projection,
             theme: Theme::LIGHT,
@@ -9660,7 +6662,6 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territories: Vec::new(),
             minimap: None,
         };
         push_handles(&mut list, &ctx, board);
@@ -9715,12 +6716,9 @@ mod tests {
             "the fixture is too small to read, so it would greek either way"
         );
         let ctx = DrawContext {
-            agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
             camera: &camera,
             projection: &projection,
             theme: Theme::LIGHT,
@@ -9734,7 +6732,6 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territories: Vec::new(),
             minimap: None,
         };
 
@@ -9778,12 +6775,9 @@ mod tests {
             text: "typing here",
         };
         let ctx = DrawContext {
-            agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
             camera: &camera,
             projection: &projection,
             theme: Theme::LIGHT,
@@ -9797,7 +6791,6 @@ mod tests {
             card_drop: None,
             pattern: Pattern::Plain,
             grid_color: None,
-            territories: Vec::new(),
             minimap: None,
         };
 
@@ -9821,12 +6814,9 @@ mod tests {
         painter.push_selection(
             &mut list,
             &DrawContext {
-                agents: crate::agent_view::AgentViews::empty(),
             hovered_badge: None,
             ports: None,
             connector_grips: None,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            default_display: DisplayMode::default(),
                 camera: &camera,
                 projection: &projection,
                 theme: Theme::LIGHT,
@@ -9840,7 +6830,6 @@ mod tests {
                 card_drop: None,
                 pattern: Pattern::Plain,
                 grid_color: None,
-                territories: Vec::new(),
                 minimap: None,
             },
             board,
@@ -10068,1100 +7057,18 @@ mod card_overflow_tests {
         }
     }
 
-    // ── The Agent Canvas ─────────────────────────────────────────────────────
-    //
-    // **What these tests cannot see, said once here rather than implied.** `DrawList` exposes
-    // no quad reader — feedback 32 records the same limitation for the selection ring — so
-    // nothing below asserts a *colour* or a *position on screen*. What they can assert is
-    // counts, layout agreement, ordering and purity, and where a colour genuinely matters the
-    // assertion is made against the palette the colour is taken from instead. The honest check
-    // of what an agent node looks like is a `--screenshot`.
-
-    use vellum_agent::transcript::{AgentRef, Choice, RequestId, TurnId, TurnOutcome};
-
-    fn agent_view(events: Vec<TranscriptEvent>) -> AgentView {
-        AgentView {
-            status: Status::Running,
-            detail: "ran 3 tools".into(),
-            subtitle: "Claude · subscription".into(),
-            mode: DisplayMode::Clean,
-            // Shared in the view, owned by the caller here — the tests are about what is
-            // drawn, not about who holds the events.
-            events: events.into_iter().map(std::sync::Arc::new).collect(),
-            truncated: false,
-            draft: String::new(),
-            caret: None,
-            voice: None,
-        }
-    }
-
-    fn said(text: &str) -> TranscriptEvent {
-        TranscriptEvent::Text { text: text.to_owned() }
-    }
-
-    fn node_layout() -> AgentLayout {
-        crate::agent::layout(crate::agent::DEFAULT_SIZE.0, crate::agent::DEFAULT_SIZE.1)
-    }
-
-    fn node_font() -> f64 {
-        node_font_size(crate::agent::DEFAULT_SIZE.0)
-    }
-
-    /// The two status colours this file spells out are the chrome's, to the byte.
-    ///
-    /// This is the join `inspect.rs`'s `THEME_BORDER` did not have and was burned by: a
-    /// constant hand-copied out of another crate goes stale where nothing on screen shows it.
-    /// `Theme::with_accent` already carries the same arrangement for the accent swatches, and
-    /// this is the same test for the same reason.
-    #[test]
-    fn the_status_colours_are_the_chromes_own_warning_and_danger() {
-        let chrome = vellum_ui::theme::Palette::LIGHT;
-        for (name, canvas, ui) in [
-            ("needs you", STATUS_NEEDS_YOU, chrome.warning),
-            ("failed", STATUS_FAILED, chrome.danger),
-        ] {
-            assert_eq!(
-                canvas.pack(),
-                [ui.r(), ui.g(), ui.b(), ui.a()],
-                "the `{name}` dot disagrees with the chrome's own token"
-            );
-        }
-    }
-
-    /// ⚠ **Typing into a prompt row drew nothing at all**, and every unit test passed
-    /// throughout: `type_prompt_key` wrote into its own buffer, the runtime's stored draft was
-    /// written only when the session *ended*, and `AgentView::draft` came from the stored one
-    /// — so the row said *"Ask this agent to do something"* for the whole of the typing. This
-    /// is the painter's half of the seam that closes it.
-    ///
-    /// Three things are asserted together because each is wrong on its own:
-    ///
-    /// - The run holds the buffer's string **exactly**. `NodePaint::text` ellipsises to what
-    ///   the box was measured for, which is right for a transcript and puts the caret at the
-    ///   wrong character in a field — `layout.caret` indexes the string it was given.
-    /// - It is pushed **even when empty**, so an empty prompt with a caret in it still has a
-    ///   block to be measured from. That is feedback 25, the caret that would not appear in an
-    ///   empty sticky, arriving in a fourth place.
-    /// - The **placeholder is suppressed**, or the caret sits inside a sentence the user is
-    ///   not typing.
-    #[test]
-    fn a_prompt_row_with_the_keyboard_draws_the_buffer_and_not_the_invitation() {
-        let laid = node_layout();
-        let font = node_font();
-        let caret = crate::agent_view::PromptCaret { cursor: 3, anchor: 3, idle_for: 0.0 };
-
-        // No caret: the stored draft, or the invitation when there is none.
-        let resting = agent_view(Vec::new());
-        let paint = agent_paint(&resting, &laid, font);
-        assert!(
-            paint.runs.iter().any(|run| run.text.contains("Ask this agent")),
-            "an untouched prompt row lost its invitation"
-        );
-        assert!(paint.prompt_slot().is_none(), "a row nobody is typing into claimed the caret");
-
-        // With the keyboard in it, and a string long enough that clipping would show.
-        let typed = "check the torque figures against the workshop manual and report back";
-        let live = AgentView {
-            draft: typed.to_owned(),
-            caret: Some(caret),
-            ..agent_view(Vec::new())
-        };
-        let paint = agent_paint(&live, &laid, font);
-        let slot = paint.prompt_slot().expect("the prompt row claimed no slot");
-        let index = usize::from(slot - CELL_SLOT_BASE);
-        let run = paint.run(index).expect("the prompt slot names no run");
-        assert_eq!(run.text, typed, "the shaped string is not the buffer's own");
-        assert!(
-            !paint.runs.iter().any(|run| run.text.contains("Ask this agent")),
-            "the invitation was drawn under the caret"
-        );
-
-        // Empty, with the caret in it. `NodePaint::text` refuses an empty string; the field
-        // path must not, or there is no block and nothing for the caret to measure against.
-        let blank = AgentView { draft: String::new(), caret: Some(caret), ..agent_view(Vec::new()) };
-        let paint = agent_paint(&blank, &laid, font);
-        let slot = paint.prompt_slot().expect("an empty prompt row with a caret claimed no slot");
-        let run = paint
-            .run(usize::from(slot - CELL_SLOT_BASE))
-            .expect("the caret has nothing to be drawn against");
-        assert!(run.text.is_empty());
-        assert!(
-            !paint.runs.iter().any(|run| run.text.contains("Ask this agent")),
-            "an empty row with the keyboard in it still offered the invitation"
-        );
-    }
-
-    /// Arriving in the prompt row changes what is drawn without changing a byte of text, so
-    /// the cache has to see it. Without this the row keeps the placeholder it was built with
-    /// and the caret is drawn over the word "Ask".
-    #[test]
-    fn the_node_cache_notices_the_keyboard_arriving_in_a_prompt_row() {
-        let kind = ItemKind::Agent { model: String::new(), label: StyledText::plain("Planner") };
-        let resting = agent_view(Vec::new());
-        let live = AgentView {
-            caret: Some(crate::agent_view::PromptCaret { cursor: 0, anchor: 0, idle_for: 0.0 }),
-            ..agent_view(Vec::new())
-        };
-        assert_ne!(
-            node_signature(&kind, Some(&resting)),
-            node_signature(&kind, Some(&live)),
-            "a node whose prompt row took the keyboard signed the same as one that had not"
-        );
-    }
-
-    /// The rows the press path resolves against are the rows that were **drawn**, which is not
-    /// the same list as the rows the tree holds: `visible_rows()` bounds them and one is held
-    /// back for the "n more" line. A press path that re-derived any of that would expand the
-    /// wrong directory — which is academic next to what it actually did, which was nothing at
-    /// all, because `filetree::row_at` had no caller.
-    #[test]
-    fn a_file_trees_drawn_rows_are_the_ones_a_press_resolves_against() {
-        use vellum_agent::filetree::{Entry, Row, View as TreeRows};
-
-        let entry = |name: &str, is_dir: bool| Entry {
-            name: name.to_owned(),
-            relative: name.to_owned(),
-            path: std::path::PathBuf::from("/tmp").join(name),
-            is_dir,
-            len: 0,
-            ignored: false,
-            is_symlink: false,
-        };
-        // Far more rows than fit, so the bound is exercised rather than assumed.
-        let rows: Vec<Row> = (0..200)
-            .map(|n| Row { entry: entry(&format!("item-{n}"), n % 2 == 0), depth: 0, expanded: false })
-            .collect();
-        let view = TreeRows { rows, truncated: false };
-
-        let laid = crate::filetree::layout(
-            crate::filetree::DEFAULT_SIZE.0,
-            crate::filetree::DEFAULT_SIZE.1,
-        );
-        let model = vellum_agent::FileTreeModel::default();
-        let paint =
-            tree_paint(&model, Some(&view), &laid, node_font_size(crate::filetree::DEFAULT_SIZE.0), 0);
-
-        assert!(!paint.tree_rows.is_empty(), "a drawn tree recorded no pressable rows");
-        assert!(
-            paint.tree_rows.len() < laid.visible_rows(),
-            "every visible row was drawn, leaving none for the \"n more\" line"
-        );
-        // Every recorded row answers at its own centre, and answers with itself.
-        for row in &paint.tree_rows {
-            let (cx, cy) = (row.rect.x + row.rect.width / 2.0, row.rect.y + row.rect.height / 2.0);
-            let (found, _) = paint.tree_row_at(cx, cy).expect("a drawn row was not pressable");
-            assert_eq!(found.relative, row.relative, "a press landed on the wrong row");
-        }
-        // A directory's triangle is inside its own row and is reported as the triangle; a file
-        // has none, and a press on a file's row must not claim to be on one.
-        let directory = paint.tree_rows.iter().find(|row| row.is_dir).expect("no directory drawn");
-        let twisty = directory.twisty.expect("a directory drew no disclosure triangle");
-        let (found, on_twisty) = paint
-            .tree_row_at(twisty.x + twisty.width / 2.0, twisty.y + twisty.height / 2.0)
-            .expect("a disclosure triangle was not pressable");
-        assert_eq!(found.relative, directory.relative);
-        assert!(on_twisty, "a press on the triangle did not report as one");
-
-        let file = paint.tree_rows.iter().find(|row| !row.is_dir).expect("no file drawn");
-        assert!(file.twisty.is_none(), "a file drew a disclosure triangle");
-        let (_, on_twisty) = paint
-            .tree_row_at(file.rect.x + 2.0, file.rect.y + file.rect.height / 2.0)
-            .expect("a file row was not pressable");
-        assert!(!on_twisty);
-
-        // Outside the list entirely — the header, and past the last drawn row.
-        assert!(paint.tree_row_at(laid.list.x + 1.0, laid.header.y + 1.0).is_none());
-        assert!(
-            paint
-                .tree_row_at(laid.list.x + 1.0, laid.list.y + laid.list.height + 10.0)
-                .is_none()
-        );
-    }
-
-    /// The four states have to be tellable apart under **every** accent Preferences offers,
-    /// and one of the three makes two of them the same colour: `Accent::Red` *is* the danger
-    /// coral. So the distinction is carried by the halo — the mark, not the palette — and this
-    /// asserts both halves: the colours part where they can, and the halo parts them where the
-    /// colour cannot.
-    #[test]
-    fn the_four_statuses_stay_distinguishable_under_every_accent() {
-        let states =
-            [Status::Idle, Status::Running, Status::WaitingForPermission, Status::Error];
-        for accent in vellum_ui::Accent::ALL {
-            let theme = Theme::LIGHT.with_accent(accent);
-            let colours: Vec<[u8; 4]> =
-                states.iter().map(|s| status_colour(*s, &theme).pack()).collect();
-            // Idle and needs-you are never the accent, so they always part from everything.
-            assert_ne!(colours[0], colours[1], "{accent:?}: idle and working are one colour");
-            assert_ne!(colours[0], colours[3], "{accent:?}: idle and failed are one colour");
-            assert_ne!(colours[2], colours[1], "{accent:?}: needs-you and working are one colour");
-            assert_ne!(colours[2], colours[3], "{accent:?}: needs-you and failed are one colour");
-        }
-        // …and the pair that *can* collide is parted by the halo instead. `needs_attention` is
-        // the single definition of "wants a person" and the halo is drawn from it.
-        assert!(!Status::Running.needs_attention());
-        assert!(Status::WaitingForPermission.needs_attention() && Status::Error.needs_attention());
-    }
-
-    /// The halo is one extra quad and nothing else, so a working node costs exactly what an
-    /// idle one does.
-    ///
-    /// A count rather than a colour, because `DrawList` has no quad reader — see the note at
-    /// the head of this section. A/B'd against the same call with `attention: false`.
-    #[test]
-    fn only_a_node_that_wants_a_person_draws_a_halo() {
-        let camera = camera_at(1.0);
-        let count = |attention: bool| {
-            let mut list = DrawList::new();
-            let board = list.view(vellum_render::View::board(&camera));
-            list.use_view(board);
-            push_status_dot(
-                &mut list,
-                ([0.0, 0.0], [10.0, 10.0]),
-                Theme::LIGHT.accent,
-                attention,
-                0.0,
-                1.0,
-            );
-            list.stats().quads
-        };
-        assert_eq!(count(false), 1, "an unblocked node drew more than its dot");
-        assert_eq!(count(true), 2, "a blocked node drew no halo");
-    }
-
-    /// The property a live transcript rests on: what just happened is what you can see.
-    ///
-    /// Laying entries out oldest-first and cutting the overflow is the obvious version and
-    /// would pass every "the node draws some text" assertion while losing the only line anyone
-    /// is watching. So this asserts the *newest* survived, the oldest did not, and that the cut
-    /// is stated on the node rather than left to look like the whole story.
-    #[test]
-    fn a_transcript_keeps_its_newest_entry_and_says_what_it_cut() {
-        let events: Vec<TranscriptEvent> =
-            (0..40).map(|n| said(&format!("entry number {n}"))).collect();
-        let paint = agent_paint(&agent_view(events), &node_layout(), node_font());
-        let drawn: Vec<&str> = paint.runs.iter().map(|run| run.text.as_str()).collect();
-
-        assert!(
-            drawn.iter().any(|text| text.contains("entry number 39")),
-            "the newest entry was not drawn: {drawn:?}"
-        );
-        assert!(
-            !drawn.iter().any(|text| text.contains("entry number 0")),
-            "a 400-unit node drew all forty entries"
-        );
-        assert!(
-            drawn.iter().any(|text| text.contains("some output is not shown")),
-            "the node cut its history and did not say so: {drawn:?}"
-        );
-    }
-
-    /// A short transcript is the whole story and must not claim otherwise. The elision line is
-    /// what a reader trusts; one that is always there says nothing.
-    #[test]
-    fn a_transcript_that_fits_claims_nothing_was_cut() {
-        let paint = agent_paint(&agent_view(vec![said("done")]), &node_layout(), node_font());
-        assert!(
-            !paint.runs.iter().any(|run| run.text.contains("some output")),
-            "a two-line transcript said it had been cut"
-        );
-        assert!(paint.runs.iter().any(|run| run.text.contains("done")));
-    }
-
-    /// Nothing a node draws may escape the node.
-    ///
-    /// A piece outside its own item is painted where nothing can be clicked and, on a frame,
-    /// over whatever is beside it — the badge-on-a-short-card failure (feedback 25) in a new
-    /// place. Every event kind is in the fixture on purpose: the plate arithmetic differs per
-    /// kind, and a check that only covered prose would have passed on the one that does not.
-    #[test]
-    fn no_piece_of_an_agent_node_escapes_its_own_box() {
-        let events = vec![
-            TranscriptEvent::TurnStarted { turn: TurnId(1), prompt: "go".into() },
-            TranscriptEvent::ToolCall {
-                id: vellum_agent::transcript::ToolCallId("t".into()),
-                name: "bash".into(),
-                input: "ls".into(),
-            },
-            said("a long answer that will certainly have to wrap more than once, twice even"),
-            TranscriptEvent::Message {
-                from: AgentRef::new("1@2", "Planner"),
-                text: "take this".into(),
-            },
-            TranscriptEvent::Error { message: "claude: command not found".into() },
-            TranscriptEvent::PermissionRequest {
-                id: RequestId("r".into()),
-                summary: "write to src/main.rs".into(),
-                detail: "the file is tracked".into(),
-            },
-            TranscriptEvent::Image { blob: "abc".into(), caption: Some("a chart".into()) },
-            TranscriptEvent::Options {
-                prompt: "which direction".into(),
-                choices: vec![
-                    Choice::new("a", "Cards").with_body("dense").with_image("h1"),
-                    Choice::new("b", "List").with_body("plain"),
-                    Choice::new("c", "Grid"),
-                ],
-                chosen: Some("b".into()),
-            },
-            TranscriptEvent::TurnEnded { turn: TurnId(1), outcome: TurnOutcome::Completed },
-        ];
-
-        for (w, h) in [
-            crate::agent::DEFAULT_SIZE,
-            (crate::agent::MIN_SIZE.0, crate::agent::MIN_SIZE.1),
-            (1400.0, 260.0),
-            (240.0, 1400.0),
-            (520.0, 200.0),
-        ] {
-            let laid = crate::agent::layout(w, h);
-            let paint = agent_paint(&agent_view(events.clone()), &laid, node_font_size(w));
-            let inside = |name: &str, rect: NodeRect| {
-                assert!(
-                    rect.x >= -0.001
-                        && rect.y >= -0.001
-                        && rect.x + rect.width <= w + 0.001
-                        && rect.y + rect.height <= h + 0.001,
-                    "a {name} escaped a {w}x{h} node: {rect:?}"
-                );
-            };
-            for run in &paint.runs {
-                inside("run", run.rect);
-            }
-            for plate in &paint.plates {
-                inside("plate", plate.rect);
-            }
-            for image in &paint.images {
-                inside("picture", image.rect);
-            }
-            for card in &paint.options {
-                inside("option card", card.rect);
-            }
-        }
-    }
-
-    /// An option card is pressable exactly where it is painted.
-    ///
-    /// The `row_rect`/`row_at` shape: the press path asks this same function, so the assertion
-    /// is that the two directions agree. Aiming at "the second card" instead would pass on a
-    /// build whose `option_at` answered for the wrong one, which is the only mistake that
-    /// matters here — the three cards differ by an id and nothing else on screen.
-    #[test]
-    fn an_option_card_is_pressable_where_it_was_painted() {
-        let events = vec![TranscriptEvent::Options {
-            prompt: "pick one".into(),
-            choices: vec![
-                Choice::new("first", "Cards"),
-                Choice::new("second", "List"),
-                Choice::new("third", "Grid"),
-            ],
-            chosen: None,
-        }];
-        let paint = agent_paint(&agent_view(events), &node_layout(), node_font());
-        assert_eq!(paint.options().len(), 3, "three choices did not make three cards");
-
-        for card in paint.options() {
-            let (cx, cy) = (
-                card.rect.x + card.rect.width / 2.0,
-                card.rect.y + card.rect.height / 2.0,
-            );
-            let hit = paint.option_at(cx, cy).expect("a card was not pressable at its centre");
-            assert_eq!(hit.choice, card.choice, "a press landed on the wrong card");
-            // The question the card answers travels with it, so a node holding two
-            // unanswered sets resolves the press to the one that was clicked.
-            assert_eq!(hit.prompt, card.prompt, "a card lost which question it belonged to");
-            assert!(!hit.prompt.is_empty(), "a card carried no question");
-        }
-        // The gap between two cards belongs to neither.
-        let (a, b) = (&paint.options()[0], &paint.options()[1]);
-        let between = (a.rect.x + a.rect.width + b.rect.x) / 2.0;
-        assert!(
-            paint.option_at(between, a.rect.y + 1.0).is_none(),
-            "the gutter between two cards answered as a card"
-        );
-        assert!(paint.option_at(-10.0, -10.0).is_none());
-    }
-
-    /// A chosen option is marked, and only the chosen one.
-    #[test]
-    fn the_option_the_user_picked_is_the_one_marked() {
-        let events = vec![TranscriptEvent::Options {
-            prompt: "pick one".into(),
-            choices: vec![Choice::new("a", "Cards"), Choice::new("b", "List")],
-            chosen: Some("b".into()),
-        }];
-        let paint = agent_paint(&agent_view(events), &node_layout(), node_font());
-        let marked: Vec<&str> = paint
-            .options()
-            .iter()
-            .filter(|card| card.chosen)
-            .map(|card| card.choice.as_str())
-            .collect();
-        assert_eq!(marked, ["b"], "the wrong card was marked, or more than one");
-        assert!(
-            paint.plates.iter().any(|plate| plate.tone == PlateTone::Chosen),
-            "the chosen card drew no ring"
-        );
-    }
-
-    /// **The bug a generation-keyed cache would have.**
-    ///
-    /// A transcript's words are not in the document, so nothing the projection knows about
-    /// moves when an agent speaks. A run therefore carries a stamp derived from its own
-    /// content: same words, same stamp — so a still node re-uses its layouts; new words, new
-    /// stamp — so the text cache re-shapes. Without this the node draws the previous sentence
-    /// forever, at the same slot, and every assertion about *counts* stays green.
-    #[test]
-    fn a_runs_stamp_follows_its_words_and_not_the_document() {
-        let laid = node_layout();
-        let font = node_font();
-        let first = agent_paint(&agent_view(vec![said("thinking about it")]), &laid, font);
-        let again = agent_paint(&agent_view(vec![said("thinking about it")]), &laid, font);
-        let changed = agent_paint(&agent_view(vec![said("thought about it")]), &laid, font);
-
-        let stamps = |paint: &NodePaint| -> Vec<u64> {
-            paint.runs.iter().map(|run| run.stamp).collect()
-        };
-        assert_eq!(stamps(&first), stamps(&again), "an unchanged transcript re-shaped");
-        assert_ne!(
-            stamps(&first),
-            stamps(&changed),
-            "a changed transcript kept the previous sentence's layout"
-        );
-    }
-
-    /// A node too small for its own header draws a badge, not a broken layout.
-    ///
-    /// `AgentLayout::hit` already refuses to offer a control at this size, and `agent_paint`
-    /// has to agree: a transcript laid out into rectangles nobody can read is quads nobody can
-    /// use, and a control drawn where `hit` answers `None` is a button that does not respond.
-    #[test]
-    fn a_compact_node_lays_out_a_badge_rather_than_a_transcript() {
-        let laid = crate::agent::layout(60.0, 40.0);
-        assert!(laid.too_small);
-        let paint = agent_paint(&agent_view(vec![said("hello"), said("world")]), &laid, 13.0);
-        assert!(paint.runs.is_empty(), "a compact node laid out a transcript");
-        assert!(paint.plates.is_empty() && paint.options.is_empty());
-    }
-
-    /// The estimate that decides how tall a run is must not be able to abort the process.
-    ///
-    /// Transcript text is the least controlled string in the application and
-    /// `[profile.release]` sets `panic = "abort"`, so `strip_site_affix`'s two aborts
-    /// (feedback 30) are the standing precedent: **characters, never bytes.** The CJK case is
-    /// also the one the advance estimate is *wrong* about, which is exactly why the clip
-    /// exists — so this asserts the clip holds as well as that nothing panics.
-    #[test]
-    fn a_run_survives_any_text_and_is_clipped_to_its_own_box() {
-        let cases = [
-            String::new(),
-            "   ".into(),
-            "夕".repeat(4_000),
-            "🙂".repeat(2_000),
-            "café".repeat(1_000),
-            format!("line one\nline two\n{}", "x".repeat(5_000)),
-        ];
-        for text in cases {
-            let mut paint = NodePaint::default();
-            paint.text(NodeRect::new(0.0, 0.0, 200.0, 40.0), &text, 13.0, Tone::Primary, Align::Left);
-            for run in &paint.runs {
-                // Two lines at 13 units in a 200-unit box is about 60 characters; the ellipsis
-                // is the sixty-first. A generous bound, because the assertion is that the clip
-                // *happened at all* — an unclipped 4,000-character run is the text that pours
-                // out through the bottom of the node.
-                assert!(
-                    run.text.chars().count() <= 128,
-                    "a run drew {} characters into a two-line box",
-                    run.text.chars().count()
-                );
-            }
-        }
-    }
-
-    /// A file tree draws what is on screen and never what exists.
-    ///
-    /// The sharpest case the whole canvas is built for: a `target/` directory holds forty
-    /// thousand entries. `TreeLayout::visible_rows` is the bound and this asserts the painter
-    /// honours it — and that the node *says* there is more, since a list that stops silently is
-    /// one the reader believes is complete.
-    #[test]
-    fn a_file_tree_draws_only_the_rows_that_fit_and_counts_the_rest() {
-        use vellum_agent::filetree::{Entry, Row};
-        let rows: Vec<Row> = (0..4_000)
-            .map(|n| Row {
-                entry: Entry {
-                    name: format!("file-{n}.rs"),
-                    relative: format!("src/file-{n}.rs"),
-                    path: std::path::PathBuf::from(format!("/p/src/file-{n}.rs")),
-                    is_dir: n % 10 == 0,
-                    len: 12,
-                    ignored: false,
-                    is_symlink: false,
-                },
-                depth: usize::from(n % 10 != 0),
-                expanded: n % 10 == 0,
-            })
-            .collect();
-        let view = TreeView { rows, truncated: true };
-        let laid = crate::filetree::layout(
-            crate::filetree::DEFAULT_SIZE.0,
-            crate::filetree::DEFAULT_SIZE.1,
-        );
-        let paint = tree_paint(
-            &vellum_agent::FileTreeModel::default(),
-            Some(&view),
-            &laid,
-            node_font_size(crate::filetree::DEFAULT_SIZE.0),
-            0,
-        );
-
-        let fits = laid.visible_rows();
-        assert!(fits > 0 && fits < 100, "a 420-unit tree claimed {fits} rows");
-        // One run for the header, one per drawn row, one for the count.
-        assert!(
-            paint.runs() <= fits + 1,
-            "a 4,000-row tree shaped {} runs into {fits} rows",
-            paint.runs()
-        );
-        assert!(
-            paint.runs.iter().any(|run| run.text.contains("more")),
-            "a truncated tree did not say so"
-        );
-    }
-
-    /// ⚠ **Everything below the fold used to be unreachable.** The list drew the first
-    /// `visible_rows()` and stopped, with no gesture to reach the rest — so a `src` directory
-    /// with forty files showed the first dozen and named the remainder in a line the user
-    /// could do nothing with.
-    ///
-    /// Two properties, and each rules out a build the other would pass: a scrolled list must
-    /// **start at a different row**, and the press path must resolve a click on a scrolled row
-    /// to *that* row — which it does by construction here, because both read the rectangles
-    /// this function records.
-    #[test]
-    fn a_scrolled_tree_shows_later_rows_and_presses_resolve_to_them() {
-        use vellum_agent::filetree::{Entry, Row};
-        let rows: Vec<Row> = (0..100)
-            .map(|n| Row {
-                entry: Entry {
-                    name: format!("file-{n}.rs"),
-                    relative: format!("file-{n}.rs"),
-                    path: std::path::PathBuf::from(format!("/p/file-{n}.rs")),
-                    is_dir: false,
-                    len: 12,
-                    ignored: false,
-                    is_symlink: false,
-                },
-                depth: 0,
-                expanded: false,
-            })
-            .collect();
-        let view = TreeView { rows, truncated: false };
-        let laid = crate::filetree::layout(
-            crate::filetree::DEFAULT_SIZE.0,
-            crate::filetree::DEFAULT_SIZE.1,
-        );
-        let font = node_font_size(crate::filetree::DEFAULT_SIZE.0);
-        let model = vellum_agent::FileTreeModel::default();
-
-        let top = tree_paint(&model, Some(&view), &laid, font, 0);
-        let scrolled = tree_paint(&model, Some(&view), &laid, font, 20);
-
-        let first = |paint: &NodePaint| paint.tree_rows()[0].relative.clone();
-        assert_eq!(first(&top), "file-0.rs");
-        assert_eq!(first(&scrolled), "file-20.rs", "the list did not move");
-        assert_eq!(
-            top.tree_rows().len(),
-            scrolled.tree_rows().len(),
-            "scrolling changed how many rows fit"
-        );
-
-        // A press at the first row's centre resolves to the row now drawn there — the whole
-        // point of the press path reading painted rectangles rather than re-deriving an index.
-        let row = &scrolled.tree_rows()[0];
-        let (cx, cy) = (
-            row.rect.x + row.rect.width / 2.0,
-            row.rect.y + row.rect.height / 2.0,
-        );
-        let (hit, _) = scrolled.tree_row_at(cx, cy).expect("the first drawn row is pressable");
-        assert_eq!(hit.relative, "file-20.rs");
-
-        // Past the end, the offset is clamped rather than emptying the list: a stale offset
-        // after directories close must degrade to the last screenful.
-        let past = tree_paint(&model, Some(&view), &laid, font, 10_000);
-        assert!(!past.tree_rows().is_empty(), "an over-scrolled tree drew nothing");
-    }
-
-    /// A tree with nothing read yet says so rather than drawing an empty well.
-    #[test]
-    fn a_tree_with_no_rows_explains_itself() {
-        let laid = crate::filetree::layout(
-            crate::filetree::DEFAULT_SIZE.0,
-            crate::filetree::DEFAULT_SIZE.1,
-        );
-        let paint = tree_paint(&vellum_agent::FileTreeModel::default(), None, &laid, 13.0, 0);
-        assert!(
-            paint.runs.iter().any(|run| run.text.contains("not been read")),
-            "an unread tree drew an empty box"
-        );
-    }
-
-    /// A note with no body says which of the two states it is in — the remedies differ.
-    #[test]
-    fn a_note_with_no_body_names_the_state_it_is_in() {
-        let laid = crate::note::layout(crate::note::DEFAULT_SIZE.0, crate::note::DEFAULT_SIZE.1);
-        let font = node_font_size(crate::note::DEFAULT_SIZE.0);
-
-        let unnamed = note_paint(&vellum_agent::NoteModel::default(), None, &laid, font);
-        assert!(unnamed.runs.iter().any(|run| run.text.contains("no file yet")));
-
-        let named = vellum_agent::NoteModel { path: ".velm/notes/plan.md".into(), ..Default::default() };
-        let unread = note_paint(&named, None, &laid, font);
-        assert!(unread.runs.iter().any(|run| run.text.contains("not been read")));
-        // The footer still names the file and its scope, whether or not the body arrived.
-        assert!(unread.runs.iter().any(|run| run.text.contains("plan.md")));
-        assert!(unread.runs.iter().any(|run| run.text.contains("Shared")));
-
-        let read = note_paint(&named, Some("# Plan\n\nShip the thing."), &laid, font);
-        assert!(read.runs.iter().any(|run| run.text.contains("Ship the thing")));
-    }
-
-    /// A browser node with no engine is a card that says why, never a dead rectangle — and the
-    /// two reasons are different because the remedies are.
-    #[test]
-    fn a_browser_node_with_no_engine_says_which_switch_is_off() {
-        let laid =
-            crate::browser::layout(crate::browser::DEFAULT_SIZE.0, crate::browser::DEFAULT_SIZE.1);
-        let font = node_font_size(crate::browser::DEFAULT_SIZE.0);
-        let model = vellum_agent::BrowserModel {
-            url: "https://example.com/spec".into(),
-            title: "The spec".into(),
-            live: false,
-        };
-        let reason = crate::browser::placeholder_reason(&model, false).map(str::to_owned);
-        let paint = browser_paint(&model, reason, &laid, font);
-        assert!(paint.runs.iter().any(|run| run.text.contains("The spec")), "no page name");
-        assert!(
-            paint.runs.iter().any(|run| run.text.contains("Preferences")),
-            "a dormant browser node drew no explanation"
-        );
-        assert!(paint.runs.iter().any(|run| run.text.contains("example.com")), "no address");
-    }
-
-    /// The two kinds of agent link have to be tellable apart, and an ordinary connector must
-    /// keep drawing exactly as it did — which is what makes this layer free on a board that
-    /// does not use it.
-    #[test]
-    fn the_two_agent_links_are_drawn_differently_and_a_plain_one_is_untouched() {
-        let theme = Theme::LIGHT;
-        assert!(agent_link_look(crate::agent::LinkKind::Plain, &theme).is_none());
-
-        let (message, message_ink) =
-            agent_link_look(crate::agent::LinkKind::Message(crate::agent::Direction::Both), &theme)
-                .expect("a message link is drawn differently");
-        let (context, context_ink) = agent_link_look(crate::agent::LinkKind::Context, &theme)
-            .expect("a context link is drawn differently");
-        assert_ne!(message, context, "the two agent links share a cadence");
-        assert_ne!(
-            message_ink.pack(),
-            context_ink.pack(),
-            "the two agent links share a colour as well as a cadence"
-        );
-    }
-
-    /// **The dash cadence is in screen pixels, and this is the assertion that says so.**
-    ///
-    /// `vellum_connect` derives its pattern from the thickness, so setting the thickness in
-    /// device pixels is what makes the cadence screen-constant — the whole reason the link is
-    /// drawn that way rather than at the connector's own world thickness. A world-unit cadence
-    /// is a solid smear at a fitted 4% and three dashes across the window at 8×, which is the
-    /// failure `push_grid` records for the board's own dots.
-    ///
-    /// Measured as the pattern's **on-screen** period at two zooms three orders apart.
-    #[test]
-    fn an_agent_links_dash_cadence_is_the_same_size_on_screen_at_any_zoom() {
-        let period_on_screen = |zoom: f64| {
-            let thickness = AGENT_LINK_WIDTH / zoom;
-            let pattern = vellum_connect::LineStyle::Dashed
-                .dash_pattern(thickness)
-                .expect("a dashed line has a pattern");
-            (pattern.on + pattern.off) * zoom
-        };
-        let near = period_on_screen(8.0);
-        let far = period_on_screen(0.04);
-        assert!(
-            (near - far).abs() < 1e-6,
-            "the cadence is {near} device px at 8x and {far} at 4%"
-        );
-    }
-
-    /// Past the cap the cadence is dropped rather than stretched.
-    ///
-    /// A connector between two agents at opposite ends of a board is mostly off screen at a
-    /// working zoom and `vellum_connect` has no viewport to clip against, so an unbounded
-    /// cadence is `GUIDE_MAX_DASHES`'s hazard in a new place: a frame that emits a hundred
-    /// thousand triangles for a rhythm nobody can see.
-    #[test]
-    fn a_link_too_long_to_dash_is_drawn_solid_rather_than_stretched() {
-        let dashes = |length: f64, zoom: f64| {
-            let thickness = AGENT_LINK_WIDTH / zoom;
-            let pattern = vellum_connect::LineStyle::Dashed.dash_pattern(thickness).unwrap();
-            length / (pattern.on + pattern.off)
-        };
-        // An ordinary link at a working zoom is nowhere near the cap.
-        assert!(dashes(600.0, 1.0) < AGENT_LINK_MAX_DASHES);
-        // One across a whole board at 8x is well past it.
-        assert!(dashes(100_000.0, 8.0) > AGENT_LINK_MAX_DASHES);
-    }
-
-    /// A pulse travels the path, and it travels it the way the message went.
-    ///
-    /// `LinkPulse::forward` is start → end, which is the direction the routed path was built
-    /// in, so a backward message is the same journey walked from the other end. Getting this
-    /// wrong draws every reply moving the way the question went, which looks correct until two
-    /// agents answer each other.
-    #[test]
-    fn a_pulse_travels_the_path_in_the_direction_the_message_went() {
-        use vellum_connect::{Point, Polyline};
-        let line = Polyline::new([
-            Point::new(0.0, 0.0),
-            Point::new(100.0, 0.0),
-            Point::new(100.0, 100.0),
-        ]);
-        let at = |t: f64| point_along(&line, t).expect("a path with extent has points on it");
-
-        assert_eq!(at(0.0), Point::new(0.0, 0.0));
-        assert_eq!(at(1.0), Point::new(100.0, 100.0));
-        // Halfway by **arc length**, which on this path is the corner.
-        let middle = at(0.5);
-        assert!((middle.x - 100.0).abs() < 1e-6 && middle.y.abs() < 1e-6, "{middle:?}");
-
-        // The direction rule itself: the same progress maps to opposite ends.
-        let forward = |progress: f64| at(progress);
-        let backward = |progress: f64| at(1.0 - progress);
-        assert_eq!(forward(0.0), backward(1.0));
-        assert_ne!(forward(0.1), backward(0.1));
-
-        // Degenerate paths answer their own only point rather than an arbitrary end — a
-        // connector with both ends on one anchor is an ordinary thing to draw.
-        let dot = Polyline::new([Point::new(5.0, 5.0)]);
-        assert_eq!(point_along(&dot, 0.5), Some(Point::new(5.0, 5.0)));
-        assert_eq!(point_along(&Polyline::default(), 0.5), None);
-    }
-
-    /// The pulse is two quads and nothing more, and it draws nothing on an idle board.
-    ///
-    /// The second half is the promise `docs/07` §0 rule 2 makes: *"a board with no agent nodes
-    /// must be frame-for-frame the same cost as before this layer existed"*. A count is all a
-    /// `DrawList` can be asked, and it is the right question here — an animation that cost a
-    /// pass would show up as quads on a frame where nothing is happening.
-    #[test]
-    fn a_pulse_costs_two_quads_and_an_idle_board_costs_none() {
-        use vellum_connect::{Point, Polyline};
-        let camera = camera_at(1.0);
-        let projection = projection_with([]);
-        let ctx = context(&camera, &projection);
-        let line = Polyline::new([Point::new(0.0, 0.0), Point::new(200.0, 0.0)]);
-
-        let mut list = DrawList::new();
-        let board = list.view(vellum_render::View::board(&camera));
-        list.use_view(board);
-        push_link_pulse(
-            &mut list,
-            &ctx,
-            &line,
-            vellum_agent::LinkPulse { forward: true, progress: 0.5 },
-            Theme::LIGHT.accent,
-        );
-        assert_eq!(list.stats().quads, 2, "the pulse is a dot and its tail");
-
-        // Nothing in flight is nothing drawn, and it is a length check rather than a scan.
-        assert!(!ctx.agents.any_in_flight());
-        assert!(ctx.agents.is_empty());
-        assert!(ctx.agents.pulse(1).is_none());
-    }
-
-    /// A node's text size follows its width, so a node dragged out four times carries text
-    /// legible from where it was dragged to — and a node made *narrower* keeps its type rather
-    /// than shrinking it until nothing is readable at any zoom.
-    #[test]
-    fn a_nodes_type_grows_with_the_node_and_never_shrinks_below_the_body_size() {
-        assert!((node_font_size(NODE_REFERENCE_WIDTH) - NODE_FONT_SIZE).abs() < 1e-9);
-        assert!(node_font_size(NODE_REFERENCE_WIDTH * 2.0) > NODE_FONT_SIZE);
-        assert!((node_font_size(40.0) - NODE_FONT_SIZE).abs() < 1e-9, "a narrow node shrank its type");
-        // Bounded above, or a node dragged to ten thousand units sets its transcript in
-        // headlines and shapes one word per line.
-        assert!(node_font_size(1_000_000.0) <= NODE_FONT_SIZE * 6.0 + 1e-9);
-    }
-
-    /// The role's box and the subtitle's must not overlap: they are derived from the same
-    /// rectangle by two different functions — `node_title_box` and `agent_paint` — and two
-    /// derivations of one measurement is how a label ends up drawn over another.
-    #[test]
-    fn the_role_and_the_line_under_it_do_not_overlap() {
-        let font = node_font();
-        let laid = node_layout();
-        let (_, role_y, _, role_h) = node_title_box(
-            &ItemKind::Agent { model: String::new(), label: StyledText::plain("Reviewer") },
-            crate::agent::DEFAULT_SIZE,
-            font,
-        );
-        // The **detail** line, not the subtitle: this fixture's agent is working, and the
-        // header prefers what an agent is doing to what it runs on. Looking for the provider
-        // here would fail on that rule rather than on the geometry this test is about — which
-        // is the shape of test that gets "fixed" by weakening the thing it was written for.
-        let paint = agent_paint(&agent_view(vec![]), &laid, font);
-        let subtitle = paint
-            .runs
-            .iter()
-            .find(|run| run.text.contains("ran 3 tools"))
-            .expect("the header drew no line under the role");
-        assert!(
-            role_y + role_h <= subtitle.rect.y + 0.001,
-            "the role's box ends at {} and the subtitle starts at {}",
-            role_y + role_h,
-            subtitle.rect.y
-        );
-    }
-
-    /// A node with a session shows what it is *doing*; one without shows what it runs on.
-    ///
-    /// There is room for one line under the role and the live one is worth more, but a node the
-    /// runtime has not reached yet must not be blank — it knows its own configuration from its
-    /// token, and `agent::subtitle` is the single derivation the inspector reads too.
-    #[test]
-    fn the_header_prefers_what_the_agent_is_doing_to_what_it_runs_on() {
-        let laid = node_layout();
-        let font = node_font();
-
-        let busy = agent_paint(&agent_view(vec![]), &laid, font);
-        assert!(busy.runs.iter().any(|run| run.text.contains("ran 3 tools")));
-
-        let fresh = AgentView { detail: String::new(), ..agent_view(vec![]) };
-        let quiet = agent_paint(&fresh, &laid, font);
-        assert!(
-            quiet.runs.iter().any(|run| run.text.contains("subscription")),
-            "a node with nothing in flight drew no provider line"
-        );
-    }
-
-    /// The prompt row is drawn whether or not anything has been typed into it, and the draft is
-    /// what is shown when there is one — `AgentView::draft` is held by the runtime precisely so
-    /// a half-written instruction survives clicking away, and a row that did not draw it would
-    /// make that promise invisible.
-    #[test]
-    fn the_prompt_row_shows_the_draft_and_invites_one_when_there_is_none() {
-        let laid = node_layout();
-        let font = node_font();
-
-        let empty = agent_paint(&agent_view(vec![]), &laid, font);
-        assert!(empty.runs.iter().any(|run| run.text.contains("Ask this agent")));
-
-        let typed = AgentView { draft: "refactor the parser".into(), ..agent_view(vec![]) };
-        let started = agent_paint(&typed, &laid, font);
-        assert!(started.runs.iter().any(|run| run.text.contains("refactor the parser")));
-        assert!(
-            !started.runs.iter().any(|run| run.text.contains("Ask this agent")),
-            "the invitation was drawn over the draft"
-        );
-    }
-
-    /// A message from another agent is attributed, and it is attributed the right way round.
-    ///
-    /// `docs/07` §6's whole point is that a wired-up board is followable. A message drawn like
-    /// the agent's own words makes two nodes read as one conversation with no author, and a
-    /// *sent* message drawn like a received one reverses who said what.
-    #[test]
-    fn inter_agent_messages_say_who_and_which_way() {
-        let events = vec![
-            TranscriptEvent::Message {
-                from: AgentRef::new("1@2", "Planner"),
-                text: "take this".into(),
-            },
-            TranscriptEvent::MessageSent {
-                to: AgentRef::new("3@4", "Builder"),
-                text: "done".into(),
-            },
-        ];
-        let paint = agent_paint(&agent_view(events), &node_layout(), node_font());
-        let texts: Vec<&str> = paint.runs.iter().map(|run| run.text.as_str()).collect();
-        assert!(texts.iter().any(|text| text.contains("from Planner")), "{texts:?}");
-        assert!(texts.iter().any(|text| text.contains("to Builder")), "{texts:?}");
-        // And both are railed rather than run in with the agent's own prose.
-        assert!(
-            paint.plates.iter().filter(|plate| plate.tone == PlateTone::Rail).count() >= 2,
-            "a message from another agent was drawn as the agent's own words"
-        );
-    }
-
-    /// A failure and a question each get their own wash, and they are different washes: one
-    /// reports something that happened and the other is blocking the agent until a person acts.
-    #[test]
-    fn a_failure_and_a_question_are_not_drawn_the_same_way() {
-        let events = vec![
-            TranscriptEvent::Error { message: "claude: command not found".into() },
-            TranscriptEvent::PermissionRequest {
-                id: RequestId("r1".into()),
-                summary: "write to src/main.rs".into(),
-                detail: String::new(),
-            },
-        ];
-        let paint = agent_paint(&agent_view(events), &node_layout(), node_font());
-        assert!(paint.plates.iter().any(|plate| plate.tone == PlateTone::Failed));
-        assert!(paint.plates.iter().any(|plate| plate.tone == PlateTone::NeedsYou));
-        assert!(
-            paint.runs.iter().any(|run| run.tone == Tone::Failed),
-            "the error was drawn in the ordinary ink"
-        );
-        assert!(
-            paint.runs.iter().any(|run| run.text.contains("Waiting for your answer")),
-            "a blocked agent did not say it was waiting"
-        );
-        let chips = paint.permissions();
-        assert_eq!(chips.len(), 1);
-        assert_eq!(chips[0].request, "r1");
-        assert!(!chips[0].allow.is_empty() && !chips[0].deny.is_empty());
-        assert!(chips[0].allow.x + chips[0].allow.width <= chips[0].deny.x + 0.001);
-    }
-
-    /// **A permission chip is drawn where it is pressed, and it is drawn at all.**
-    ///
-    /// The row shipped measured and unpainted: the rectangles went into `PermissionChips`, the
-    /// press path answered them, and nothing put a plate or a word in the band they reserved.
-    /// So the body of a blocked node carried a blank strip that allowed on its left half and
-    /// denied on its right — and because the arm returns `true`, a click there could not even
-    /// select the node.
-    ///
-    /// Both halves are asserted, because either alone passes on a build with the defect facing
-    /// the other way: the words prove something was painted, and comparing the plates against
-    /// the *press* rectangles proves it was painted where the click lands. Aiming at "two more
-    /// plates exist" would pass on chips drawn a hundred units below the button.
-    #[test]
-    fn a_permission_asks_with_two_buttons_drawn_where_the_press_path_reads_them() {
-        let events = vec![TranscriptEvent::PermissionRequest {
-            id: RequestId("r1".into()),
-            summary: "write to src/main.rs".into(),
-            detail: String::new(),
-        }];
-        let paint = agent_paint(&agent_view(events), &node_layout(), node_font());
-        let chips = paint.permissions().first().expect("no permission row was measured").clone();
-
-        let (allow, deny) = (chips.allow, chips.deny);
-        let word_in = |text: &str, x: f64, y: f64, width: f64, height: f64| {
-            paint.runs.iter().any(|run| {
-                run.text == text
-                    && run.rect.x >= x - 0.001
-                    && run.rect.x + run.rect.width <= x + width + 0.001
-                    && run.rect.y >= y - 0.001
-                    && run.rect.y + run.rect.height <= y + height + 0.001
-            })
-        };
-        assert!(
-            word_in("Allow", allow.x, allow.y, allow.width, allow.height),
-            "the allow chip drew no word inside itself"
-        );
-        assert!(
-            word_in("Deny", deny.x, deny.y, deny.width, deny.height),
-            "the deny chip drew no word inside itself"
-        );
-
-        // And a plate under each, at exactly the rectangle the press path answers.
-        let plate_at = |x: f64, y: f64, width: f64, height: f64| {
-            paint.plates.iter().any(|plate| {
-                (plate.rect.x - x).abs() < 0.001
-                    && (plate.rect.y - y).abs() < 0.001
-                    && (plate.rect.width - width).abs() < 0.001
-                    && (plate.rect.height - height).abs() < 0.001
-            })
-        };
-        assert!(
-            plate_at(allow.x, allow.y, allow.width, allow.height),
-            "the allow chip is a hot zone with nothing drawn on it"
-        );
-        assert!(
-            plate_at(deny.x, deny.y, deny.width, deny.height),
-            "the deny chip is a hot zone with nothing drawn on it"
-        );
-
-        // The question's own wash is **under** both, or a 10% tint lands over the buttons:
-        // `push_node_plate` walks the list in order.
-        let wash = paint
-            .plates
-            .iter()
-            .position(|plate| plate.tone == PlateTone::NeedsYou)
-            .expect("the question lost its wash");
-        // Matched on the whole rectangle, not on `x` alone: the prompt row's own well shares a
-        // left edge with the body, and finding *that* would make this assertion about a
-        // different plate entirely.
-        let first_chip = paint
-            .plates
-            .iter()
-            .position(|plate| {
-                (plate.rect.x - allow.x).abs() < 0.001
-                    && (plate.rect.y - allow.y).abs() < 0.001
-                    && (plate.rect.width - allow.width).abs() < 0.001
-                    && (plate.rect.height - allow.height).abs() < 0.001
-            })
-            .expect("the allow chip has no plate");
-        assert!(wash < first_chip, "the question's wash was drawn over its own buttons");
-    }
-
-    /// Scaffolding is muted and the answer is not, which is the whole difference between Raw
-    /// mode and a wall of text. **The painter does not decide what is shown** — that is
-    /// `TranscriptEvent::visible_in_clean_mode`, applied one layer up — so this asserts only
-    /// how the events it is *given* are drawn.
-    #[test]
-    fn scaffolding_is_muted_and_the_answer_is_not() {
-        let events = vec![
-            TranscriptEvent::ToolCall {
-                id: vellum_agent::transcript::ToolCallId("t".into()),
-                name: "bash".into(),
-                input: "ls -la".into(),
-            },
-            said("here is what I found"),
-        ];
-        let paint = agent_paint(&agent_view(events), &node_layout(), node_font());
-        let tool = paint
-            .runs
-            .iter()
-            .find(|run| run.text.contains("ran bash"))
-            .expect("a tool call drew nothing");
-        let answer = paint
-            .runs
-            .iter()
-            .find(|run| run.text.contains("here is what I found"))
-            .expect("the answer drew nothing");
-        assert_eq!(tool.tone, Tone::Muted);
-        assert_eq!(answer.tone, Tone::Primary);
-        assert!(tool.font_size < answer.font_size, "scaffolding was set at the body size");
-    }
-
-    /// A picture goes in the blob store and is drawn from its hash, exactly as a pasted
-    /// screenshot is — so the residency budget and the deduplication come for free and nothing
-    /// new is cached. The band is reserved whether or not the texture is resident yet, which is
-    /// what stops an image arriving mid-session reflowing the words out from under the reader —
-    /// the rule `card_layout` records for a favicon.
-    #[test]
-    fn a_transcript_picture_reserves_its_band_by_hash() {
-        let events = vec![TranscriptEvent::Image {
-            blob: "b3-deadbeef".into(),
-            caption: Some("the failing test".into()),
-        }];
-        let paint = agent_paint(&agent_view(events), &node_layout(), node_font());
-        assert_eq!(paint.images.len(), 1);
-        assert_eq!(paint.images[0].blob, "b3-deadbeef");
-        assert!(paint.images[0].rect.height > 0.0);
-        assert!(paint.runs.iter().any(|run| run.text.contains("the failing test")));
-    }
-
-    /// An agent's role and a note's title take the same caret exception a sticky does.
+    /// The two labelled residue kinds take the same caret exception a sticky does.
     ///
     /// **This is feedback 25's lesson as a test rather than as a comment.** The exception —
     /// an empty slot holding the cursor must still produce a block, or the caret has no origin
     /// to be drawn against — was taught to `table_cell_block` and `kanban_run_block` and *not*
     /// to the three plain kinds, and the symptom was a caret that only appeared after the
-    /// first keystroke. These two are new call sites for the same rule, and a screenshot of a
-    /// working sticky says nothing about either of them.
+    /// first keystroke.
+    ///
+    /// It is pinned here rather than deleted with the rest of that layer because these two
+    /// kinds are still in `vellum_doc::ItemKind` — see the residue arm in [`Painter::block`]
+    /// — so a board that carries one still gets a caret, and the exception is still the
+    /// thing that makes it visible.
     #[test]
     fn an_empty_role_or_title_holding_the_caret_still_gets_a_block() {
         for kind in [
@@ -11169,10 +7076,9 @@ mod card_overflow_tests {
             ItemKind::AgentNote { model: String::new(), title: StyledText::default() },
         ] {
             let tag = kind.tag();
-            let projection = projection_with([NewItem::new(
-                kind,
-                Placement::new(0.0, 0.0, crate::agent::DEFAULT_SIZE.0, crate::agent::DEFAULT_SIZE.1),
-            )]);
+            // A literal box, because the constant that used to size these is archived with
+            // the layer that produced them. Any box big enough to shape a word in will do.
+            let projection = projection_with([NewItem::new(kind, Placement::new(0.0, 0.0, 520.0, 360.0))]);
             let (&id, projected) = projection.iter().next().unwrap();
             let camera = camera_at(1.0);
             let mut painter = painter();
@@ -11198,36 +7104,5 @@ mod card_overflow_tests {
                 "the caret in an empty {tag} has nothing to be drawn against",
             );
         }
-    }
-
-    /// `agent_paint` is pure: the same view and the same box give the same answer, every time.
-    ///
-    /// It has to be, because the **press path calls it too** — `kanban_runs`' rule — and a
-    /// layout that depended on anything but its arguments would put a click somewhere the paint
-    /// was not on whichever of the two calls happened to disagree.
-    #[test]
-    fn laying_out_a_node_depends_on_nothing_but_its_arguments() {
-        let events = vec![
-            said("one"),
-            TranscriptEvent::Options {
-                prompt: "which".into(),
-                choices: vec![Choice::new("a", "A"), Choice::new("b", "B")],
-                chosen: None,
-            },
-        ];
-        let view = agent_view(events);
-        let laid = node_layout();
-        let font = node_font();
-        let first = agent_paint(&view, &laid, font);
-        let second = agent_paint(&view, &laid, font);
-
-        let boxes = |paint: &NodePaint| -> Vec<(String, NodeRect)> {
-            paint.runs.iter().map(|run| (run.text.clone(), run.rect)).collect()
-        };
-        assert_eq!(boxes(&first), boxes(&second));
-        let cards = |paint: &NodePaint| -> Vec<NodeRect> {
-            paint.options().iter().map(|card| card.rect).collect()
-        };
-        assert_eq!(cards(&first), cards(&second));
     }
 }

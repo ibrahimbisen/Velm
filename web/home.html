@@ -1,0 +1,838 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- ⚠ No `user-scalable=no`. `index.html` suppresses browser zoom because the board handles
+     its own pinch and a page zoom on top of it fights the camera. This page is a document:
+     pinching it to read is the browser doing its job, exactly as on `boards.html`. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Velm — an infinite canvas</title>
+<meta name="description" content="Velm is an infinite-canvas board app written in Rust. Native on macOS, and in a browser through a server you run yourself.">
+<meta name="color-scheme" content="light">
+<!-- The Viewport mark, from `assets/logo/mark.svg` — the same four brackets, the same two
+     colours, inlined as a data URI so this page fetches nothing. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48' fill='none'%3E%3Cpath d='M8 20V8h12' stroke='%2300A38C' stroke-width='2.5' stroke-linecap='square'/%3E%3Cpath d='M28 8h12v12M40 28v12H28M20 40H8V28' stroke='%231A1D1F' stroke-width='2.5' stroke-linecap='square'/%3E%3C/svg%3E">
+
+<!--
+  ══════════════════════════════════════════════════════════════════════════════════════
+  THE HOME PAGE — what this file is for, and the two rules it is written under
+  ══════════════════════════════════════════════════════════════════════════════════════
+
+  `velmd` serves this at `/`. It is the first thing anybody sees, including somebody who has
+  never heard of Velm and is following a link a friend sent them. So it does two jobs and
+  stops: **say what Velm is**, and **offer a way in**.
+
+  ── rule one: every claim here is checkable ───────────────────────────────────────────
+  Not one number below was recalled. Each is quoted from a file in this repository that
+  records how it was measured, and each is labelled with the machine it was measured on,
+  because a frame time with no machine beside it is decoration. The sources, once:
+
+      README.md                    the desktop figures, and how they were taken
+      docs/08-web.md §8            the browser figures, re-run 2026-08-22
+      docs/08-web.md §9            what the browser client does and does not do
+      crates/vellum-web/src/download.rs   why a picture exports as a placeholder
+      crates/velmd/src/paste.rs    why a pasted Miro board arrives with no pixels
+
+  ⚠ **A board's name is never written here**, and neither is anybody's. This file is tracked
+  in a public repository; the boards it is about are somebody's private work. "A 1,306-item
+  board" says everything the number needs to say.
+
+  ── rule two: never describe a gesture the user cannot perform ────────────────────────
+  This repository's signature defect is code that compiles, passes its tests and has no
+  caller — and its worst public form is a string instructing a gesture that does not exist
+  (CLAUDE.md feedback 36). Everything in *What you can do here* was checked against
+  `docs/08-web.md` §9, which is itself a ledger that was re-run rather than remembered. The
+  limits section exists so nothing here has to be softened to stay true.
+
+  ── the shape of the page ─────────────────────────────────────────────────────────────
+      header      the mark, and the way in, so a returning reader never scrolls
+      hero        one sentence, the two doors, and the status line the script sharpens
+      #measured   the figures, each labelled with the machine it was taken on
+      #what       what this tab can do
+      #mac        what the desktop app is for, and where to get it
+      #limits     the three things a browser cannot do, said plainly rather than buried
+      #accounts   what an account is, what it is *not*, and what happens to a password
+      footer      licence, source, and the trademark line the README carries
+
+  ── the one moving part ───────────────────────────────────────────────────────────────
+  Everything above is static HTML and works with the script blocked. The script only ever
+  *sharpens* what was already served — the two doors (`#way-in`, `#way-in-top`), the status
+  line (`#status`) and the footer's version (`#server-version`) — and the safety property
+  that makes that legal is written at `askWhoAmI()`: every signed-out state's door is
+  `/signin`, which serves the sign-in form or the first-run setup form itself, so the branch
+  cannot strand anybody and a failed request costs nothing but a less specific label.
+  ══════════════════════════════════════════════════════════════════════════════════════
+-->
+
+<style>
+  /* ════════════════════════════════════════════════════════════════════════════════════
+     The palette is `crates/vellum-ui/src/theme.rs`'s, under theme.rs's own role names —
+     the same port `boards.html` makes, and deliberately the same spellings, so the two
+     pages a person sees back to back are one interface.
+
+     ⚠ **Light only, and the missing `prefers-color-scheme` block is the point.**
+     `ThemePreference::resolve` answers `Light` whatever it is asked — *"i want only light
+     mode"* — so a page that flipped to dark would not match the board it opens. The dark
+     tokens exist in `theme.rs`, are tested, and are unreachable there too. Adding a dark
+     block here would make this the only surface in the product that has one.
+
+     ⚠ **This design draws its structure with a hairline where other designs use a shadow**,
+     and the light ramp's steps are 8/255 apart (CLAUDE.md feedback 22): the gaps *are* the
+     structure. So there is no `box-shadow` anywhere below, and no radius past 6 —
+     `radius::LARGE`. A landing page is where a house style gets quietly abandoned for
+     gradients and drop shadows, and this one is meant to look like the app it is about.
+     ════════════════════════════════════════════════════════════════════════════════════ */
+  :root {
+    --surface: #FCFDFE;        /* BONE   — a panel, a card, the header */
+    --page: #F7F9FA;           /* MILK   — the ground behind panels */
+    --canvas: #F2F2F2;         /* PAPER  — the board's own colour. Only the hero wears it */
+    --raised: #EBEEF0;         /* PEARL  — a well, a table's head */
+    --line: #E5EAED;           /* FROST  — every hairline on this page */
+    --ink: #1A1D1F;            /* INK */
+
+    /* ⚠ **Two muted greys, and the split is measured rather than stylistic.**
+       The brief for this page named `#7A8186` as *muted*. It is not a `theme.rs` token —
+       `theme.rs` calls `#5C656B` `INK_MUTED` — it is the fallback `boards.js` carries for
+       its own `--faint`. Measured against this page's ground `#F7F9FA`:
+
+           #5C656B   5.6:1   passes AA at any size
+           #7A8186   3.7:1   fails AA for body text, passes the large-text rule (≥24px)
+
+       So secondary prose, which is most of the words below, takes `INK_MUTED`; `#7A8186`
+       is kept under its right name and used only where WCAG's large-text rule applies or
+       where nothing is being read — a separator, a rule, a caption over 24px. Shipping a
+       3.7:1 paragraph to honour a hex would be a legibility bug chosen on purpose. */
+    --muted: #5C656B;          /* INK_MUTED — every paragraph on the page, fine print included */
+    --faint: #7A8186;          /* non-text marks only — today, the footer's separator dots */
+
+    --hover: #DCEBEF;          /* `Palette::hover` */
+    --pressed: #D0E6EC;        /* `Palette::pressed` */
+
+    --accent: #00A38C;         /* SIGNAL_TEAL — the one accent, chosen by the user */
+    /* Charcoal on the teal is 5.3:1; white on it is 3.2:1 and fails AA. README says so and
+       `Palette::on_accent` derives it rather than fixing it, because on the cobalt accent
+       those two numbers swap. */
+    --on-accent: #1A1D1F;
+    --accent-soft: #CAEBE7;    /* mix(BONE, teal, 20) */
+    --on-accent-soft: #0C675B; /* mix(teal, INK, 45) — 6.4:1 on the page, so accented *text*
+                                  is this and never the teal, which is only 3.1:1 */
+
+    /* ⚠ **The focus ring is the accent, not `--info`.** The chrome's ring is MONITOR_CYAN
+       `#6FD6E6`, which `boards.html` uses to match the Mac exactly. That page has a Mac
+       counterpart to be compared against and this one does not — and the cyan measures
+       **1.6:1** against this ground, which is not a ring anybody can see. The teal is
+       3.1:1, over WCAG's 3:1 floor for a non-text indicator. Matching a screenshot is a
+       real reason; there is no screenshot of this page. */
+    --focus: #00A38C;
+
+    --r-small: 4px;            /* radius::SMALL  — a button, a row */
+    --r-medium: 5px;           /* radius::MEDIUM — a card */
+    --r-large: 6px;            /* radius::LARGE  — the largest radius in the product */
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+    /* ⚠ The type scale is this page's own, and that is a deviation worth naming.
+       `boards.html` transcribes `theme.rs`'s 11/12/13/15/20 because it reproduces the Mac
+       board library and a point of difference shows up in a screenshot diff. This page
+       reproduces nothing — it is a document, read at arm's length, often on a phone — so it
+       is set at document sizes. The *face* is still the platform's own UI face, for
+       `theme.rs`'s reason: the app is meant to read as native rather than branded. */
+    --t-body: 16px;
+    --t-lede: 19px;
+    --t-small: 13.5px;
+    --t-label: 12px;
+  }
+
+  * { box-sizing: border-box; }
+
+  /* `boards.html` carries this rule and records why: an author `display` beats the user
+     agent's `[hidden] { display: none }`, so anything declared `display: flex` is visible
+     while carrying the attribute. Nothing on this page is script-hidden today — it is here
+     because the first thing anybody adds to a landing page is a banner that starts hidden. */
+  [hidden] { display: none !important; }
+
+  html {
+    /* An anchor jump lands under the sticky header without this. */
+    scroll-padding-top: 76px;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: var(--t-body)/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+  }
+
+  /* One column, one measure. 68ch is about 78 characters at this face and size, which is
+     the top of the range prose stays scannable at. */
+  .wrap {
+    max-width: 68ch;
+    margin: 0 auto;
+    padding-left: max(20px, env(safe-area-inset-left));
+    padding-right: max(20px, env(safe-area-inset-right));
+  }
+
+  /* A keyboard reader should not have to tab through the header to reach the page. Visible
+     only when focused, which is the whole idiom. */
+  .skip {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    padding: 10px 14px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-small);
+    color: var(--ink);
+  }
+  .skip:focus { left: 8px; top: 8px; z-index: 10; }
+
+  /* ── The header ────────────────────────────────────────────────────────────────────
+     Sticky, so the way in is never more than a glance away on a long page. A hairline
+     under it and no shadow, which is this design's whole structural vocabulary. */
+  header.top {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+    padding-top: max(0px, env(safe-area-inset-top));
+  }
+  .top .wrap {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-height: 56px;
+  }
+
+  /* The lockup from `assets/logo/README.md`: mark, a gap of one bracket arm, then `velm` —
+     always lowercase, tracking −0.045em, in the platform's interface face. */
+  .lockup {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    color: var(--ink);
+    text-decoration: none;
+    font-size: var(--t-lede);
+    letter-spacing: -0.045em;
+  }
+  .lockup svg { flex: none; width: 22px; height: 22px; }
+  .lockup:focus-visible { outline: 2px solid var(--focus); outline-offset: 4px; border-radius: 2px; }
+  .top .spacer { margin-left: auto; }
+
+  /* ── Buttons ──────────────────────────────────────────────────────────────────────── */
+  .btn {
+    appearance: none;
+    -webkit-appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 40px;
+    padding: 0 16px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-small);
+    background: var(--surface);
+    color: var(--ink);
+    font: inherit;
+    font-size: var(--t-small);
+    text-decoration: none;
+    white-space: nowrap;
+    cursor: pointer;
+    /* `docs/05` §3: motion is functional and fast — 120–160ms, ease-out. There is no other
+       animation on this page, and the reduced-motion block at the bottom removes this one. */
+    transition: background-color 130ms ease-out, border-color 130ms ease-out;
+    -webkit-tap-highlight-color: transparent;   /* iOS paints its own grey flash otherwise */
+    touch-action: manipulation;                 /* drops the 300ms double-tap-to-zoom wait */
+  }
+  /* ⚠ Guarded, because :hover latches on a touchscreen — a tapped button keeps the wash
+     until something else is tapped, so the page shows a control as pointed-at that nothing
+     is pointing at. Every other file in `web/` carries this guard for the same reason. */
+  @media (hover: hover) { .btn:hover { background: var(--hover); } }
+  .btn:active { background: var(--pressed); }
+  .btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+  .btn-accent { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  @media (hover: hover) { .btn-accent:hover { background: var(--accent); border-color: var(--accent); filter: brightness(1.06); } }
+  .btn-accent:active { background: var(--accent); filter: brightness(0.94); }
+
+  /* Apple's own 44 under a finger, and nowhere else. */
+  @media (pointer: coarse) { .btn { min-height: 44px; } }
+
+  /* ── The hero ──────────────────────────────────────────────────────────────────────
+     It sits on the **board's own colour** with the board's own dot grid, inside four corner
+     brackets with the top-left one accented. That is not decoration borrowed from
+     somewhere: `assets/logo/README.md` says the mark is the same shape as the canvas
+     selection indicator, *"the point, not a coincidence"* — so the page's opening statement
+     is drawn selected, on the board, in the app's own two colours.
+
+     The dot alpha here is chosen to read on a document at this size. It is **not** the
+     app's number: on the canvas the grid is pure black (`vellum-project/src/theme.rs:101`)
+     at whatever alpha the user's own grid setting carries, which is a preference and not a
+     constant this page could quote. */
+  .hero {
+    position: relative;
+    margin: 28px 0 0;
+    padding: 44px 34px 38px;
+    background-color: var(--canvas);
+    background-image: radial-gradient(circle at 1px 1px, rgba(0, 0, 0, 0.07) 1px, transparent 0);
+    background-size: 20px 20px;
+    border-radius: var(--r-large);
+  }
+  /* Four brackets, 2px, square-ended — `mark.svg` is stroke 2.5 on a 48 grid with
+     `stroke-linecap="square"`, and a CSS border is square by construction. The arm is 22px,
+     and the hero's padding clears it, which is the mark's own clear-space rule (one bracket
+     arm on every side) applied to a box instead of to a logo. */
+  .hero .bracket {
+    position: absolute;
+    width: 22px;
+    height: 22px;
+    border: 2px solid var(--ink);
+  }
+  /* ⚠ Only the top-left bracket is recoloured, and the other three stay `ink`. Recolouring
+     more of them would not be a variant of the mark, it would be a different mark — the
+     accented corner is what gives it a reading order instead of four-fold symmetry. */
+  .hero .bracket.tl { top: 12px; left: 12px; border-right: 0; border-bottom: 0; border-color: var(--accent); }
+  .hero .bracket.tr { top: 12px; right: 12px; border-left: 0; border-bottom: 0; }
+  .hero .bracket.br { bottom: 12px; right: 12px; border-left: 0; border-top: 0; }
+  .hero .bracket.bl { bottom: 12px; left: 12px; border-right: 0; border-top: 0; }
+
+  h1 {
+    margin: 0;
+    font-size: clamp(28px, 6vw, 40px);
+    line-height: 1.18;
+    letter-spacing: -0.022em;
+    font-weight: 600;
+  }
+  .lede {
+    margin: 16px 0 0;
+    max-width: 54ch;
+    font-size: var(--t-lede);
+    line-height: 1.5;
+    color: var(--muted);
+  }
+  .cta { display: flex; flex-wrap: wrap; gap: 10px; margin: 26px 0 0; }
+
+  /* The line the script sharpens. It is empty in the served HTML and stays empty unless
+     there is something true to put in it — a landing page that reports the state of its own
+     background requests is noise, and CLAUDE.md feedback 47 records what a diagnostic that
+     cries wolf costs: somebody who sees a red word on a page that is about to work stops
+     believing the indicator.
+
+     ⚠ The height is **reserved whether or not there is anything to say.** Collapsing it
+     while empty saves 22 points of nothing and buys a layout shift on exactly the two
+     answers that matter — the hero would grow under the reader's hand at the moment the
+     script decides they are signed in, or that this server has no accounts yet. */
+  .status {
+    margin: 14px 0 0;
+    min-height: 1.6em;
+    font-size: var(--t-small);
+    color: var(--muted);
+  }
+
+  /* ── Sections ─────────────────────────────────────────────────────────────────────── */
+  section { margin: 44px 0 0; }
+  h2 {
+    margin: 0 0 6px;
+    font-size: 21px;
+    line-height: 1.3;
+    letter-spacing: -0.012em;
+    font-weight: 600;
+  }
+  h2 + .sub { margin: 0 0 18px; color: var(--muted); font-size: var(--t-small); }
+  h3 {
+    margin: 0 0 4px;
+    font-size: var(--t-body);
+    font-weight: 600;
+  }
+  p { margin: 0 0 14px; }
+  p.note { color: var(--muted); font-size: var(--t-small); }
+  /* A note that follows a block rather than introducing one — a table's footnote, a
+     section's afterword. Its own class rather than an inline `style`, so the two places
+     that want it cannot drift apart. */
+  p.after { margin: 14px 0 0; }
+  a { color: var(--on-accent-soft); text-underline-offset: 2px; }
+  /* ⚠ Styled, because the browser default for `<code>` on macOS is Courier — which would
+     make `.rtb`, the one piece of jargon on the page, the only thing on it set in a face
+     nobody chose. The same monospace stack every figure uses, at 0.92em so it does not
+     out-size the sentence it sits in. */
+  code { font: 0.92em var(--mono); }
+  a:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 2px; }
+
+  /* A caption over a block of numbers. Uppercased and letterspaced in the stylesheet, as
+     `section_label` does on the Mac, so the markup carries a title-case string. */
+  .caption {
+    margin: 0 0 8px;
+    font-size: var(--t-label);
+    letter-spacing: 0.7px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* ── The numbers ──────────────────────────────────────────────────────────────────
+     A table, because these are rows of measurements and a table is what a measurement
+     lives in. The figure column is monospace and tabular for the same reason every count
+     in the app is: digits that do not line up read as approximate. */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-medium);
+    padding: 18px;
+  }
+  .card + .card { margin-top: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: var(--t-small); }
+  th, td { text-align: left; padding: 9px 0; vertical-align: baseline; }
+  tr + tr th, tr + tr td { border-top: 1px solid var(--line); }
+  th { font-weight: 400; color: var(--muted); padding-right: 16px; }
+  td.figure {
+    width: 1%;
+    white-space: nowrap;
+    text-align: right;
+    font: 500 var(--t-small)/1.5 var(--mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+  /* ⚠ On a narrow phone the figure column has nowhere to go and `nowrap` pushes the whole
+     document sideways. It is allowed to wrap there instead — at the space before the `·`,
+     which is where a reader would break it anyway.
+
+     The obvious alternative is `display: block` on the cells to stack them, and it is
+     rejected: a `display` other than the table values strips a table of its role in more
+     than one browser's accessibility tree, so `scope="row"` stops joining the label to its
+     number for exactly the reader who most needs the join. Losing four characters of
+     alignment is cheaper than losing the relationship. */
+  @media (max-width: 30rem) {
+    th { padding-right: 10px; }
+    td.figure { white-space: normal; }
+  }
+
+  /* ── A list of plain statements ───────────────────────────────────────────────────── */
+  ul.plain { list-style: none; margin: 0; padding: 0; }
+  ul.plain li { margin: 0 0 16px; }
+  ul.plain li:last-child { margin-bottom: 0; }
+  ul.plain p { margin: 0; color: var(--muted); font-size: var(--t-small); }
+
+  /* The limits list. A rule down the left rather than a warning colour: nothing here has
+     gone wrong, these are things the medium cannot do, and colouring them like a fault
+     would be the page arguing with itself. */
+  ul.limits li {
+    border-left: 2px solid var(--line);
+    padding-left: 14px;
+  }
+
+  /* ── Footer ──────────────────────────────────────────────────────────────────────── */
+  footer {
+    margin: 56px 0 0;
+    border-top: 1px solid var(--line);
+    background: var(--surface);
+  }
+  footer .wrap { padding-top: 22px; }
+  footer p { font-size: var(--t-small); color: var(--muted); }
+  /* ⚠ The trademark line is `--muted` like every other paragraph, and **not** `--faint`.
+     It is the smallest type on the page and the most likely to be read by somebody who
+     needs to, which is the exact combination that makes a 3.7:1 grey indefensible. Fine
+     print is not a licence to be hard to read; it is the reason not to be. */
+  footer .fine { color: var(--muted); }
+  footer .last { padding-bottom: max(28px, env(safe-area-inset-bottom)); }
+  .dot { color: var(--faint); padding: 0 6px; }
+
+  /* ⚠ Required, and it is nearly free here: the only motion on this page is the 130ms
+     hover on a button. A page with no animation still needs this block, because the next
+     thing somebody adds is one. */
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  }
+</style>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap">
+    <a class="lockup" href="/">
+      <!-- Inline rather than a mask, because two colours is the whole idea of the mark. -->
+      <svg viewBox="0 0 48 48" fill="none" aria-hidden="true" focusable="false">
+        <path d="M8 20V8h12" stroke="#00A38C" stroke-width="2.5" stroke-linecap="square"/>
+        <path d="M28 8h12v12M40 28v12H28M20 40H8V28" stroke="#1A1D1F" stroke-width="2.5" stroke-linecap="square"/>
+      </svg>
+      velm
+    </a>
+    <span class="spacer"></span>
+    <!-- ⚠ The header's door and the hero's door are the same element twice, and the script
+         updates **both**. Two doors that disagree about whether you are signed in is worse
+         than one door, so `#way-in` and `#way-in-top` are set from the same answer. -->
+    <a class="btn btn-accent" id="way-in-top" href="/signin">Sign in</a>
+  </div>
+</header>
+
+<main id="main" class="wrap">
+
+  <div class="hero">
+    <span class="bracket tl"></span>
+    <span class="bracket tr"></span>
+    <span class="bracket br"></span>
+    <span class="bracket bl"></span>
+
+    <h1>An infinite canvas that stays fast.</h1>
+    <p class="lede">
+      Velm is a whiteboard app written in Rust. It draws the canvas straight on the GPU and
+      draws only what is actually on screen — so a board with a hundred thousand things on
+      it costs the same per frame as a board with two hundred. This server puts your boards
+      in a browser, on whatever machine you happen to be sitting at.
+    </p>
+
+    <p class="cta">
+      <!-- The served label is `Sign in` and the served destination is `/signin`, which is
+           the correct answer in every state except one: already signed in. So with the
+           script blocked, or the request lost, the page is still a working front door. -->
+      <a class="btn btn-accent" id="way-in" href="/signin">Sign in</a>
+      <a class="btn" href="#what">What you can do here</a>
+    </p>
+    <p class="status" id="status" aria-live="polite"></p>
+  </div>
+
+  <section id="measured">
+    <h2>Measured, not claimed</h2>
+    <p class="sub">
+      Every figure below was measured on the machine named beside it, and is reproducible
+      from this repository. None of them is a benchmark somebody remembered.
+    </p>
+
+    <div class="card">
+      <p class="caption">On a Mac — 8-core, 8&nbsp;GB Apple Silicon, August 2026</p>
+      <table>
+        <tbody>
+          <tr>
+            <th scope="row">Installed, and how many processes it runs</th>
+            <td class="figure">18.5 MB · 1</td>
+          </tr>
+          <tr>
+            <th scope="row">Memory with a 596-item board open, every item on screen</th>
+            <td class="figure">104 MB</td>
+          </tr>
+          <tr>
+            <th scope="row">Frame time, all 596 of those items drawn</th>
+            <td class="figure">9.96 ms · 100 fps</td>
+          </tr>
+          <tr>
+            <th scope="row">Frame time on a 100,000-item board, 233 items on screen</th>
+            <td class="figure">9.96 ms · 100 fps</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="note after">
+        100&nbsp;fps is that display's refresh rate. It means no dropped frames, not a
+        ceiling. The comparison that started the project, on the same machine: Miro installs
+        296&nbsp;MB, runs fourteen processes, and holds 357&nbsp;MB with a board open.
+      </p>
+    </div>
+
+    <div class="card">
+      <p class="caption">In a browser — Brave on an M2, a 1,306-item board</p>
+      <table>
+        <tbody>
+          <tr>
+            <th scope="row">Cold start, to a drawn frame</th>
+            <td class="figure">155 ms</td>
+          </tr>
+          <tr>
+            <th scope="row">Steady-state frame time on a fitted board</th>
+            <td class="figure">9.4 ms</td>
+          </tr>
+          <tr>
+            <th scope="row">The client itself — WebAssembly, and what crosses the wire</th>
+            <td class="figure">4.6 MB · 681 KB</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="note after">
+        The board was served from a copy, not from the originals. Opening one is slower than
+        the steady state and that is where the work is: every visible block of text is shaped
+        and every auto-fitted sticky note is measured on the first few frames.
+      </p>
+    </div>
+  </section>
+
+  <section id="what">
+    <h2>What you can do here</h2>
+    <p class="sub">In this tab, on this server, without installing anything.</p>
+    <ul class="plain">
+      <li>
+        <h3>Open a board and move around it</h3>
+        <p>
+          Pan and zoom with a mouse or a trackpad, pinch and drag on a touchscreen. The
+          board is drawn on the GPU through WebGPU, the same renderer the Mac app uses.
+        </p>
+      </li>
+      <li>
+        <h3>Edit it</h3>
+        <p>
+          Select, move, resize, restyle, delete, and type on the canvas. There is no Save
+          button and no timer: every edit is pushed as it happens, and the board of record
+          is this server's, so the tab holds a working copy and never the only copy.
+        </p>
+      </li>
+      <li>
+        <h3>Work on a Mac and a tablet at once</h3>
+        <p>
+          Changes made in the desktop app appear in an open tab without a reload, and the
+          other way round. Boards merge rather than overwrite.
+        </p>
+      </li>
+      <li>
+        <h3>Search a board, and take one out</h3>
+        <p>
+          Find a word anywhere on the board you have open, and download that board as SVG
+          or as CSV.
+        </p>
+      </li>
+      <li>
+        <h3>Bring a Miro board across</h3>
+        <p>
+          Select a board in Miro, copy it, and paste it into the import box on your boards
+          page. It arrives as a new board here — stickies, text, frames, connectors, link
+          cards and your pen drawings, which no Miro API exposes at all.
+        </p>
+      </li>
+    </ul>
+  </section>
+
+  <section id="mac">
+    <h2>And there is a Mac app</h2>
+    <p>
+      The desktop app is where Velm started and where it is fastest. It keeps its boards in
+      a folder on your own machine: no account, no sync service, nothing sent anywhere. It
+      is what reads a Miro <code>.rtb</code> backup, exports PNG and PDF, and carries a
+      native menu bar.
+    </p>
+    <p class="note">
+      macOS&nbsp;11 or later, Apple Silicon. Every release is signed with an Apple Developer
+      ID and notarized by Apple, so there is nothing to allow in System Settings. Intel Macs
+      and Windows can be built from source; neither has a published binary and neither is
+      tested.
+    </p>
+    <p class="cta">
+      <a class="btn" href="https://github.com/ibrahimbisen/Velm/releases">Download for macOS</a>
+      <a class="btn" href="https://github.com/ibrahimbisen/Velm">Source on GitHub</a>
+    </p>
+  </section>
+
+  <section id="limits">
+    <h2>What a browser cannot do</h2>
+    <!-- ⚠ Three items, and all three are genuinely about the *medium*. An earlier draft had
+         a fourth — "nobody else is on the board with you" — and it did not belong: Velm has
+         no collaboration on the Mac either, so listing it as something a browser cannot do
+         made this section say something untrue about the desktop in order to be honest about
+         the tab. It moved to *About signing in*, where somebody is already thinking about
+         other people, which is the only place the question actually arises. -->
+    <p class="sub">
+      Three things this tab cannot do, said here rather than found out later.
+    </p>
+    <ul class="plain limits">
+      <li>
+        <h3>Pictures export as placeholders</h3>
+        <p>
+          An SVG downloaded here carries every item's geometry, style and words, but each
+          picture comes out as an empty rectangle: the browser decodes an image straight to
+          the graphics driver, so there are no bytes left for an exporter to write. The
+          count comes back with the file, so you are told how many. CSV is unaffected. PNG
+          and PDF are desktop only.
+        </p>
+      </li>
+      <li>
+        <h3>A <code>.rtb</code> backup cannot be attached here</h3>
+        <p>
+          Miro's clipboard carries <em>references</em> to pictures rather than pictures, so a
+          board pasted into this page arrives complete except for the image pixels, and says
+          how many are missing. The full-resolution images live in a <code>.rtb</code>
+          archive, which the Mac app reads.
+        </p>
+      </li>
+      <li>
+        <h3>Nothing here runs a program on your machine</h3>
+        <p>
+          A browser tab has no subprocesses. Anything that would drive another program on
+          your computer belongs to the desktop app, and that is structural rather than
+          unfinished.
+        </p>
+      </li>
+    </ul>
+  </section>
+
+  <section id="accounts">
+    <h2>About signing in</h2>
+    <p>
+      Everybody who uses this server has their own account. Every board has one owner, and
+      you see the boards you own plus any that have been shared with you. The first account
+      made on a server owns the server, and can create the others.
+    </p>
+    <p>
+      An account decides who can <em>open</em> a board, not who is drawing on it at the same
+      moment. There are no live cursors, no presence and no comments anywhere in Velm — on
+      the Mac either. It is a single-player tool by choice.
+    </p>
+    <p class="note">
+      Passwords are never stored. What is kept is an Argon2id hash, which is a deliberately
+      slow one-way function — the stored value carries its own cost parameters, so the cost
+      can be raised later without resetting anybody's password.
+    </p>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>
+      <a href="https://github.com/ibrahimbisen/Velm">Velm on GitHub</a>
+      <span class="dot" aria-hidden="true">·</span>
+      MIT or Apache-2.0, at your option
+      <span class="dot" aria-hidden="true">·</span>
+      <!-- Sharpened to `Served by velmd 1.2.0` when the ungated health route answers, and
+           left exactly as served when it does not. -->
+      <span id="server-version">Served by velmd</span>
+    </p>
+  </div>
+  <div class="wrap last">
+    <p class="fine">
+      Velm is not affiliated with Miro. “Miro” is a trademark of its owner and is used here
+      only to describe compatibility.
+    </p>
+  </div>
+</footer>
+
+<script>
+  // ════════════════════════════════════════════════════════════════════════════════════
+  // The only script on the page, and it may only ever *sharpen* what is already served.
+  //
+  // Two requests, both bounded, both silent when they fail:
+  //
+  //   GET /api/v1/whoami    which of the three doors to name
+  //   GET /api/v1/health    the server's own version, for the footer
+  //
+  // ⚠ **Every await on a browser is bounded.** `docs/08-web.md` §6 records three separate
+  // hangs in the WebGPU probe from missing exactly this — `mapAsync`, `toBlob` and
+  // `createImageBitmap`, each an await on a callback that never came — and the page sat on
+  // "Running…" for ever, which on a tablet is indistinguishable from the blank screen the
+  // probe exists to detect. Patching two of the three left the third to hang next.
+  // ════════════════════════════════════════════════════════════════════════════════════
+  (function () {
+    'use strict';
+
+    // Six seconds, and the number matters less than it looks. Nothing is announced when
+    // this expires: the page keeps the door it was served with, which already works. So the
+    // timeout only decides how long a label may still sharpen, and the cost of it being
+    // wrong is a slightly less specific word on a button.
+    var TIMEOUT_MS = 6000;
+
+    var wayIn = document.getElementById('way-in');
+    var wayInTop = document.getElementById('way-in-top');
+    var status = document.getElementById('status');
+    var version = document.getElementById('server-version');
+
+    /**
+     * One bounded GET, answering the parsed JSON body and the status, or null.
+     *
+     * `credentials: 'same-origin'` is the default for a same-origin fetch and is written
+     * out because this request is *only* meaningful with the session cookie attached —
+     * leaving it implicit invites somebody to add `credentials: 'omit'` while tidying and
+     * make every visitor look signed out.
+     */
+    async function ask(path) {
+      var controller = new AbortController();
+      var timer = window.setTimeout(function () { controller.abort(); }, TIMEOUT_MS);
+      try {
+        var response = await fetch(path, {
+          method: 'GET',
+          credentials: 'same-origin',
+          headers: { accept: 'application/json' },
+          signal: controller.signal
+        });
+        var body = null;
+        // ⚠ A body that is not JSON is not an error here. A 401 from a proxy, a plain-text
+        // refusal, an empty body — all of them are simply "no answer to the question this
+        // page asked", and `null` says that without a `catch` at the call site.
+        try { body = await response.json(); } catch (ignored) { body = null; }
+        return { status: response.status, body: body };
+      } catch (error) {
+        return null;
+      } finally {
+        window.clearTimeout(timer);
+      }
+    }
+
+    /** Set both doors at once. Two doors that disagree is worse than one door. */
+    function door(label, href) {
+      [wayIn, wayInTop].forEach(function (link) {
+        if (!link) return;
+        link.textContent = label;
+        link.setAttribute('href', href);
+      });
+    }
+
+    function say(text) {
+      // ⚠ `textContent`, never `innerHTML`. A username is a string somebody typed into a
+      // form on a server this page does not own, and it lands in the DOM here.
+      if (status) status.textContent = text;
+    }
+
+    /**
+     * Which door to name.
+     *
+     * ⚠ **The safety property, and the reason this may run at all.** Both signed-out
+     * answers point at `/signin`, which serves the sign-in form *or* the first-run setup
+     * form depending on what the server knows — so the branch below is cosmetic. A lost
+     * request, a slow network, a blocked script and a wrong guess all land the reader in
+     * exactly the same place; only the wording is less specific. Nothing about this can
+     * strand anybody, which is what makes a background fetch acceptable on a door.
+     *
+     * The three answers this reads, and they are a contract with `crates/velmd`:
+     *
+     *   200 `{"username": "…", "admin": bool}`   signed in
+     *   200 or 401 with `{"setup": true}`        this server has no accounts yet
+     *   anything else                            leave the served door alone
+     *
+     * `setup` is read on either status deliberately. Whether "no accounts exist" is an
+     * authorised answer or an unauthorised one is a question about the server's own
+     * modelling, and a page that only accepted one spelling would silently show the wrong
+     * door the day that changed.
+     */
+    async function askWhoAmI() {
+      var answer = await ask('/api/v1/whoami');
+      if (!answer) return;
+
+      var body = answer.body;
+      var setup = !!(body && body.setup === true);
+
+      if (setup) {
+        door('Set up this server', '/signin');
+        say('This server has no accounts yet. The first one you make owns it, and every board already on it.');
+        return;
+      }
+
+      if (answer.status === 200 && body && typeof body.username === 'string' && body.username !== '') {
+        door('Open your boards', '/boards.html');
+        say('Signed in as ' + body.username + '.');
+      }
+      // Every other answer — 401, 403, 404, a proxy's error page — keeps `Sign in`, which
+      // is the right door for all of them.
+    }
+
+    /**
+     * The server's own version, in the footer.
+     *
+     * `/api/v1/health` is the one route deliberately outside the token, so that a person
+     * setting this up can tell *the server is not running* from *my token is wrong*
+     * without a second tool. Naming the version here is the same courtesy at the other end:
+     * on a self-hosted server, "which build is this?" is otherwise a shell away.
+     */
+    async function askHealth() {
+      if (!version) return;
+      var answer = await ask('/api/v1/health');
+      if (!answer || answer.status !== 200 || !answer.body) return;
+      var name = answer.body.velmd;
+      if (typeof name === 'string' && name !== '') {
+        version.textContent = 'Served by velmd ' + name;
+      }
+    }
+
+    // Not awaited together and not chained: they are unrelated, neither blocks the page,
+    // and a rejection in one must not be able to skip the other.
+    askWhoAmI();
+    askHealth();
+  })();
+</script>

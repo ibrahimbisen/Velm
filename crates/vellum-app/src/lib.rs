@@ -35,18 +35,12 @@
 //! `docs/01-architecture.md` §3 rests the whole performance argument on.
 
 pub mod actions;
-pub mod agent;
-pub mod agent_runtime;
-pub mod agent_view;
 pub mod app;
 pub mod appearance;
 pub mod assets;
 pub mod bench;
-pub mod browser;
-pub mod browser_engine;
 pub mod capture;
 pub mod chart;
-pub mod filetree;
 pub mod chrome_pass;
 pub mod compose;
 pub mod decode;
@@ -63,7 +57,6 @@ pub mod links;
 pub mod menubar;
 pub mod mesh;
 pub mod mindmap;
-pub mod note;
 pub mod options;
 pub mod sync;
 pub mod session;
@@ -79,7 +72,6 @@ pub use vellum_project::{connector, edit, handle, project, theme};
 
 pub mod text;
 pub mod time;
-pub mod voice;
 pub mod words;
 
 pub use app::Vellum;

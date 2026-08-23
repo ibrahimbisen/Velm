@@ -15,10 +15,6 @@ use crate::selection::{Border, FontWeight, VerticalAlign};
 use crate::theme::{Theme, ThemePreference};
 use crate::tool::{CustomShapeId, EraserMode, PenPreset, ShapeColors, ShapeGroup, Tool};
 use std::path::PathBuf;
-use vellum_agent::{
-    AgentRules, DisplayMode, Layer, NoteScope, Provider, ProviderChoice, RoleKind, Schedule,
-    Territory,
-};
 use vellum_connect::{AnchorSide, Arrowhead, LineStyle, RoutingMode};
 use vellum_doc::{Align, Color, Pattern};
 
@@ -54,12 +50,6 @@ pub enum UiEvent {
     /// changes nothing already on the board — which is why it is its own event and not a
     /// `StyleEdit::Fill` with no selection.
     StickyColorChosen(vellum_doc::Color),
-    /// Which of the three roles the agent tool will place next.
-    ///
-    /// A *tool* setting, exactly as [`UiEvent::StickyColorChosen`] is: it names what the next
-    /// agent node will be and changes nothing already on the board. Converting an existing
-    /// node's role is a different verb and arrives as a style-style edit from the inspector.
-    AgentRoleChosen(vellum_agent::RoleKind),
     /// One of the user's own SVG shapes was chosen. Carries the id the app gave it in
     /// [`Chrome::set_custom_shapes`](crate::Chrome::set_custom_shapes), because the
     /// chrome never parses an SVG and has nothing else to identify it by.
@@ -182,218 +172,6 @@ pub enum UiEvent {
     /// chrome: a selection ring is drawn by `vellum-render`, not by egui, so
     /// `vellum_app::theme::Theme` carries the same accent and has to be told.
     AccentChanged(crate::theme::Accent),
-    /// One agent-family node's configuration was changed. See [`AgentEdit`].
-    ///
-    /// Its own variant rather than more [`StyleEdit`] arms because it is not styling: it
-    /// writes the node's own token, and the app has to re-encode a
-    /// [`vellum_agent::AgentModel`] rather than touch `vellum_doc::Style`.
-    ///
-    /// **It mutates the document, so the app must close an open text session first** —
-    /// exactly as it does for [`Self::Style`] and [`Self::Transform`]. `CLAUDE.md`'s
-    /// feedback 30 records why: `apply_style` and `apply_transform` each open their own
-    /// undo group, a group opened while the caret's is live fails, and that failure breaks
-    /// every later grouped operation for the rest of the session.
-    Agent(AgentEdit),
-    /// The app-wide default display mode for **new** agent nodes — feature 2's second half.
-    ///
-    /// A preference, so it follows [`Self::AccentChanged`]'s contract: the app persists it,
-    /// and every node that never chose a mode of its own moves with it. Nodes that named
-    /// one do not, which is the whole reason `AgentModel::display` is an `Option`.
-    DefaultDisplayModeChanged(DisplayMode),
-    /// Which provider a node that has not chosen one runs on — feature 16's *Inherit*.
-    DefaultProviderChanged(Provider),
-    /// Preferences ▸ Voice: which transcriber a spoken prompt goes to — feature 12's second
-    /// half. App-wide, because it names *this machine's* transcriber; whether a given node
-    /// listens at all is per node, on `AgentModel::voice`.
-    SpeechPreferenceChanged(vellum_agent::voice::Preference),
-    /// *Choose a model file…* was picked in Preferences ▸ Voice.
-    ///
-    /// The chrome opens no file dialog — this crate touches no files and knows nothing about
-    /// `rfd`, exactly as it knows nothing about `credentials.json`. It asks; the app picks and
-    /// stores. Same division as [`Self::ProviderSignIn`].
-    ChooseSpeechModel,
-    /// Preferences ▸ Agents ▸ Chat theme: what a node with no choice of its own draws in.
-    DefaultChatThemeChanged(vellum_agent::ChatTheme),
-    /// *Sign in* was chosen for a provider in Preferences ▸ Providers.
-    ///
-    /// The chrome does not read or write a credential — it cannot; this crate touches no
-    /// files. It asks, the app raises a [`Dialog::SignIn`](crate::Dialog::SignIn), and the
-    /// answer comes back as [`DialogEvent::SignedIn`] for the app to write to
-    /// `<data-dir>/credentials.json` at mode `0600` and nowhere else
-    /// (`docs/07-agent-canvas.md` §8a).
-    ProviderSignIn(Provider),
-    /// *Forget this key* was chosen. The app removes the stored credential; nothing here
-    /// ever held it.
-    ProviderForget(Provider),
-    /// Show a file to the user — a note's `.md`, an agent's working directory.
-    ///
-    /// A separate verb from [`Self::OpenLink`] because one hands a path to the file manager
-    /// and the other hands a URL to a browser, and because this one is only ever given a
-    /// path the app itself put into the model.
-    RevealPath(PathBuf),
-}
-
-/// A change to one agent-family node's configuration.
-///
-/// One variant per control, exactly as [`StyleEdit`] is one per control and for the same
-/// reason: a partial struct would make "the user chose a provider" and "the user chose a
-/// provider and cleared the working directory" the same value, and each of those is one
-/// undo step.
-///
-/// **Single-selection**, all of it. The properties that fold across a selection —
-/// running, role kind, display mode, provider — are the four on
-/// [`PanelModel`](crate::PanelModel); the rest describe one node. A schedule, a rule
-/// cascade and a list of attached files have no shared value, and writing one into forty
-/// nodes loses forty configurations in a single gesture.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AgentEdit {
-    /// The free-text role label — feature 5. It is also the node's `text()`, so it is
-    /// searchable and editable through the paths that already exist.
-    Role(String),
-    /// Worker, orchestrator or meta. Converting a node rather than placing one, which is
-    /// why this is not [`UiEvent::AgentRoleChosen`] — that one names what the *tool* will
-    /// place next and changes nothing already on the board.
-    Kind(RoleKind),
-    /// `None` inherits the board's default. Not the same as naming the same provider.
-    Provider(Option<ProviderChoice>),
-    /// `None` inherits the app-wide default.
-    Display(Option<DisplayMode>),
-    /// How this one transcript is dressed. `None` inherits the app-wide default, exactly as
-    /// [`Self::Display`] does — *"i should be able to set individual chats with individual
-    /// themes"*.
-    ChatTheme(Option<vellum_agent::ChatTheme>),
-    /// How see-through this node's paper is, 0–255. The **paper**, not the words: see
-    /// `vellum_agent::AgentModel::chat_opacity`.
-    ChatOpacity(u8),
-    /// A picture behind this node's transcript, by blob hash. `None` clears it.
-    ///
-    /// A hash rather than a path, because the app has already read the file and put its
-    /// bytes in the content-addressed store — the chrome never touches the filesystem, and a
-    /// path here would be a second way for a board to depend on one machine.
-    ChatBackground(Option<String>),
-    /// `None` is the board's project root.
-    WorkingDir(Option<String>),
-    /// Whether this node gets a git worktree of its own.
-    ///
-    /// **Turning it off is not a removal.** An agent's worktree is never force-removed
-    /// with uncommitted work in it (`docs/07-agent-canvas.md` §9), so the app is expected
-    /// to confirm — and to be able to refuse — rather than treat this as a plain write.
-    Worktree(bool),
-    /// An orchestrator's cap on simultaneous sub-agents. Never unbounded: there is no
-    /// value of this that means "as many as it likes".
-    SpawnCap(u32),
-    /// An orchestrator's region, in world units. `None` clears it.
-    Territory(Option<Territory>),
-    /// The node's own rule layer, whole.
-    ///
-    /// The **whole** value, for the reason [`UiEvent::BackgroundChanged`] carries a whole
-    /// background: the editor writes one value and cannot end up with front matter from one
-    /// event and a body from another.
-    ///
-    /// Note: `AgentRules::overrides` is a *cache of what resolution decided*. The app writes it
-    /// back from `ResolvedRules::override_names()` after applying; nothing in the chrome
-    /// authors it, because a hand-written provenance list is exactly the second source of
-    /// truth `docs/07-agent-canvas.md` §7 exists to avoid.
-    Rules(AgentRules),
-    /// `None` removes the schedule. The agent then runs only when asked, which is every
-    /// agent until the user says otherwise.
-    Schedule(Option<Schedule>),
-    AcceptsMessages(bool),
-    Voice(bool),
-    /// Attach a file as context, through the app's **own** file picker.
-    ///
-    /// No payload, and that is the whole design: this crate opens no dialogs and reads no
-    /// files, so all it can say is *the user asked for the picker on the selected node*.
-    /// The path, what kind of thing it turns out to be and how much of it could be read are
-    /// all `vellum_agent::ingest`'s answers, and the app is the only side that can ask.
-    ///
-    /// The other way in is a **file dropped on the node**, which never reaches this crate at
-    /// all — a drop is a window event. Two gestures, one code path behind them.
-    AttachContext,
-    /// Attach a **web page or a YouTube link** as context, through the app's own small prompt.
-    ///
-    /// Payload-free for the same reason as [`Self::AttachContext`], and a separate verb rather
-    /// than a mode of it because the two need different chrome: a file needs a picker and a
-    /// link needs a text field, and no picker on any platform will accept a URL. Both end at
-    /// the same `ingest` call, which decides from the string itself whether it is looking at a
-    /// path, a page or a video.
-    AttachLink,
-    /// Write the `.md` file a note has never had, under the stem the user accepted.
-    ///
-    /// A **stem**, not a path: the directory a note belongs in is decided by its scope
-    /// (`NoteStore::dir_for`), and a panel that composed a path would be a second answer to
-    /// where notes live — one that would be wrong for every private note.
-    ///
-    /// Its own verb rather than a `NotePath(String)` write, because *create* and *move* are
-    /// different consequences and only one of them is offered: a note whose file exists shows
-    /// its path as a readout with a reveal beside it, and nothing in the panel renames it.
-    CreateNoteFile(String),
-    /// A note's scope — shared with every agent on the board, or private to one.
-    NoteScope(NoteScope),
-    /// The directory a file tree shows, relative to the project root. Empty is the root
-    /// itself, which is what an unset tree already means.
-    TreeRoot(String),
-    /// Which agent a file tree is scoped to, as an **item id** string — feature 7's hard
-    /// requirement that a tree belongs to an agent rather than to the board.
-    ///
-    /// An id rather than a label, because two agents may be called *Reviewer* and the tree
-    /// has to name one of them. The panel offers labels and emits the id behind the one
-    /// picked, exactly as a private note's owner does. `None` is a tree the user placed for
-    /// themselves.
-    TreeOwner(Option<String>),
-    /// Detach the context source at this index of [`AgentSummary::context`] — an index,
-    /// because that list is the one the panel just drew, from the one selected node.
-    ///
-    /// [`AgentSummary::context`]: crate::AgentSummary::context
-    DropContext(usize),
-    /// Whether a file tree shows what git ignores.
-    ShowIgnored(bool),
-    /// A browser node's address.
-    BrowserUrl(String),
-    /// Whether *this page* may run an engine. Additional to the app-wide permission, never
-    /// a substitute for it.
-    BrowserLive(bool),
-}
-
-/// An API key on its way from the sign-in field to the app.
-///
-/// **Nothing ever prints it.** The repository is public, `docs/07-agent-canvas.md` §8a puts
-/// credentials in one file and nowhere else, and [`UiEvent`] derives `Debug` — so a bare
-/// `String` here would format into every log line, panic message and failing-test dump that
-/// touched the event. The manual `Debug` below is what makes that impossible rather than
-/// merely discouraged, and [`Self::expose`] is named so that a call site which logs it
-/// reads as a mistake.
-#[derive(Clone, PartialEq, Eq, Default)]
-pub struct SecretKey(String);
-
-impl std::fmt::Debug for SecretKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_empty() { "SecretKey(empty)" } else { "SecretKey(«redacted»)" })
-    }
-}
-
-impl SecretKey {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Whether anything worth storing was typed.
-    pub fn is_empty(&self) -> bool {
-        self.0.trim().is_empty()
-    }
-
-    /// The characters, for the one caller that has to write them to disk.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-
-    /// The buffer the sign-in field types into.
-    ///
-    /// A masked `TextEdit` needs a `&mut String`, and this is the only way to get one — so
-    /// the field cannot be bound to anything the redaction does not cover.
-    pub fn buffer_mut(&mut self) -> &mut String {
-        &mut self.0
-    }
 }
 
 impl UiEvent {
@@ -543,39 +321,12 @@ pub enum DialogEvent {
     Confirmed(DialogId),
     Cancelled(DialogId),
     Renamed(DialogId, String),
-    /// A schedule editor was saved. `None` means *remove the schedule*.
-    ///
-    /// The payload rides the [`DialogId`] rather than arriving as a separate
-    /// [`UiEvent::Agent`] beside a bare `Confirmed`, because the id is how the app already
-    /// knows *which node* it asked about — it recorded the question against that id when it
-    /// raised the dialog. Two events would make the correlation the app's problem twice.
-    ScheduleSet(DialogId, Option<Schedule>),
-    /// A rules editor was saved, carrying the node's whole own layer.
-    RulesSet(DialogId, AgentRules),
-    /// An *Edit* button on one of the two **inherited** rule layers was pressed.
-    ///
-    /// Not an answer to the editor that raised it — nothing was saved and nothing was
-    /// cancelled — but it does close it, because what the app does next is open an editor on
-    /// that layer, and two rules editors stacked over each other is a modal the user cannot
-    /// tell apart from the one underneath. The reopened editor carries the same
-    /// [`crate::Dialog::rules`] shape, so the layer's file is edited by the control that
-    /// already knows how to write the four structured settings into front matter.
-    EditRuleLayer(DialogId, Layer),
-    /// A provider sign-in was completed. The key has **never** been printed and is not
-    /// printable — see [`SecretKey`].
-    SignedIn(DialogId, SecretKey),
 }
 
 impl DialogEvent {
     pub const fn id(&self) -> DialogId {
         match self {
-            Self::Confirmed(id)
-            | Self::Cancelled(id)
-            | Self::Renamed(id, _)
-            | Self::ScheduleSet(id, _)
-            | Self::RulesSet(id, _)
-            | Self::EditRuleLayer(id, _)
-            | Self::SignedIn(id, _) => *id,
+            Self::Confirmed(id) | Self::Cancelled(id) | Self::Renamed(id, _) => *id,
         }
     }
 }
@@ -601,10 +352,6 @@ impl EventSink {
 
     pub fn style(&mut self, edit: StyleEdit) {
         self.push(UiEvent::Style(edit));
-    }
-
-    pub fn agent(&mut self, edit: AgentEdit) {
-        self.push(UiEvent::Agent(edit));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -650,36 +397,9 @@ mod tests {
             DialogEvent::Confirmed(id),
             DialogEvent::Cancelled(id),
             DialogEvent::Renamed(id, "Engine bay".to_owned()),
-            DialogEvent::ScheduleSet(id, None),
-            DialogEvent::RulesSet(id, AgentRules::default()),
-            DialogEvent::SignedIn(id, SecretKey::new("sk-not-a-real-key")),
         ] {
             assert_eq!(event.id(), id);
         }
-    }
-
-    /// The repository is public and [`UiEvent`] derives `Debug`, so a key that formats is a
-    /// key that ends up in a log line, a panic message or a failing test's dump.
-    ///
-    /// This asserts the **absence** of the characters rather than the presence of the
-    /// placeholder, because that is the property that matters: a future `Debug` that
-    /// printed a prefix "for debugging" would still satisfy a check for the word
-    /// *redacted*.
-    #[test]
-    fn an_api_key_never_formats_itself() {
-        let key = SecretKey::new("sk-ant-secret-value");
-        let printed = format!("{key:?}");
-        assert!(!printed.contains("secret-value"), "{printed}");
-        assert!(!printed.contains("sk-ant"), "{printed}");
-
-        // …and inside an event, which is the form that actually reaches a log.
-        let event = UiEvent::Dialog(DialogEvent::SignedIn(DialogId(1), key.clone()));
-        let printed = format!("{event:?}");
-        assert!(!printed.contains("secret-value"), "{printed}");
-
-        assert_eq!(key.expose(), "sk-ant-secret-value", "the app still has to be able to store it");
-        assert!(SecretKey::new("   ").is_empty(), "whitespace is not a key");
-        assert_eq!(format!("{:?}", SecretKey::default()), "SecretKey(empty)");
     }
 
     #[test]

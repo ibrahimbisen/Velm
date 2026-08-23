@@ -106,41 +106,11 @@ pub struct ChromeState<'a> {
     /// the app holds the camera that converts them. `None` — nothing selected, or a
     /// selection scrolled off screen — draws no bar, which is correct either way.
     pub selection_rect: Option<Rect>,
-    /// The display mode a **new** agent node inherits — feature 2's second half. The app
-    /// owns it and persists it, exactly as it does the accent.
-    pub default_display: vellum_agent::DisplayMode,
-    /// The provider a node that has not chosen one runs on — feature 16's *Inherit*. Supplied
-    /// and persisted by the app exactly as `default_display` is.
-    pub default_provider: vellum_agent::Provider,
-    /// The chat theme a node with no look of its own draws in. Supplied and persisted by the
-    /// app exactly as `default_display` is, and for the same reason: it lives in the library
-    /// sidecar, which this crate must not know about.
-    pub default_chat_theme: vellum_agent::ChatTheme,
-    /// Whether browser nodes may run a real engine at all — feature 13. Off by default.
-    pub browser_nodes: bool,
-    /// Whether coding agents on this board get their own worktrees — feature 4. Off by
-    /// default, and **per project**: the open board is the project, so this travels with the
-    /// board rather than with the application.
-    pub worktrees: bool,
-    /// Which providers this machine can reach and how each is paid for. Never a key —
-    /// see [`ProviderStatus`](crate::ProviderStatus).
-    pub providers: &'a [crate::menu::ProviderStatus],
-    /// How a spoken prompt is transcribed — feature 12's app-wide half.
+    /// Whether a text session on the **canvas** owns the keyboard — the on-canvas caret.
     ///
-    /// Four flattened facts rather than the `Speech` struct itself, because `MenuHeader` is
-    /// `Copy` and because these are the only parts the menu draws. `local_transcriber` is a
-    /// *status* like `providers`: the chrome cannot probe a `PATH`, and *Automatic* is the
-    /// default, so without it the commonest configuration could not be explained.
-    pub speech: vellum_agent::voice::Preference,
-    pub local_transcriber: Option<&'a str>,
-    pub speech_model: Option<&'a str>,
-    pub speech_hosted: bool,
-    /// Whether a text session on the **canvas** owns the keyboard: the on-canvas caret, a
-    /// note's body, or an agent's prompt row.
-    ///
-    /// None of the three is an egui widget, so `Context::egui_wants_keyboard_input` — the
-    /// only thing this crate could otherwise ask — is false throughout all of them. The app
-    /// is the only party that knows, which is why this is supplied rather than derived.
+    /// It is not an egui widget, so `Context::egui_wants_keyboard_input` — the only thing this
+    /// crate could otherwise ask — is false throughout it. The app is the only party that
+    /// knows, which is why this is supplied rather than derived.
     ///
     /// **What it cost while it did not exist.** Every keystroke reaches egui through
     /// `Shell::on_window_event` *before* the app's own sessions claim it, so the shortcut
@@ -158,7 +128,6 @@ impl Default for ChromeState<'_> {
         Self {
             screen: Screen::Library,
             board: BoardState::default(),
-            default_provider: vellum_agent::Provider::default(),
             tool: Tool::Select,
             selection: &[],
             view: ViewState::default(),
@@ -172,15 +141,6 @@ impl Default for ChromeState<'_> {
             snap_to_grid: false,
             grid: crate::event::GridSettings::default(),
             selection_rect: None,
-            default_display: vellum_agent::DisplayMode::Clean,
-            default_chat_theme: vellum_agent::ChatTheme::Velm,
-            browser_nodes: false,
-            worktrees: false,
-            providers: &[],
-            speech: vellum_agent::voice::Preference::default(),
-            local_transcriber: None,
-            speech_model: None,
-            speech_hosted: false,
             text_session: false,
         }
     }
@@ -191,33 +151,7 @@ impl ChromeState<'_> {
     /// the app cannot get them subtly out of step with the selection it passed.
     pub fn command_context(&self) -> CommandContext {
         let locked = self.selection.iter().filter(|i| i.locked).count();
-        // Counted from the summaries rather than from the facets, for the reason
-        // `crate::selection` records at every other property: a selection can hold one agent
-        // and four stickies, and the agent verbs still apply to the one.
-        let agents = self.selection.iter().filter_map(|i| i.agent.as_ref());
-        let running = agents.clone().filter(|a| a.running).count();
-        // Whether the one selected agent owns a region. Read from the role rather than from
-        // whether a territory happens to be set: a manager whose region the user cleared still
-        // owns one conceptually, and the sweep is how they draw the next.
-        let manager_selected =
-            agents.clone().next().is_some_and(|a| a.role_kind.may_spawn());
-        let agents_selected = agents.count();
         CommandContext {
-            agents_selected,
-            manager_selected: manager_selected && agents_selected == 1,
-            // *Has* a worktree, not *should have* one: `WorktreeState::At` is the state that
-            // names a directory, and there is nothing to remove without one.
-            git_available: crate::command::git_available(),
-            worktree_selected: agents_selected == 1
-                && self.selection.iter().filter_map(|item| item.agent.as_ref()).any(|agent| {
-                    matches!(
-                        agent.worktree,
-                        crate::selection::WorktreeState::At(_)
-                            | crate::selection::WorktreeState::Orphaned(_)
-                    )
-                }),
-            any_agent_running: running > 0,
-            all_agents_running: agents_selected > 0 && running == agents_selected,
             board_open: self.screen == Screen::Board,
             board_saved: self.board.path.is_some(),
             board_starred: self.board.starred,
@@ -635,15 +569,6 @@ impl Chrome {
         self.toolbar.shape
     }
 
-    /// Which of the three agent roles the agent tool will place.
-    pub const fn agent_role(&self) -> vellum_agent::RoleKind {
-        self.toolbar.agent_role
-    }
-
-    pub const fn set_agent_role(&mut self, role: vellum_agent::RoleKind) {
-        self.toolbar.agent_role = role;
-    }
-
     /// The pen tool's current settings.
     pub const fn pen(&self) -> PenPreset {
         self.toolbar.pen
@@ -739,17 +664,6 @@ impl Chrome {
             starred: state.board.starred,
             translucent: palette.translucent,
             properties_panel: self.properties_open,
-            // The **resolved** mode, not the stored one. A node that inherits a raw default
-            // is showing raw, and a tick derived from `AgentModel::display` would report it
-            // as clean — the tick has to agree with what is on the node, not with what is
-            // written on it.
-            agent_raw: {
-                let mut agents = state.selection.iter().filter_map(|i| i.agent.as_ref()).peekable();
-                agents.peek().is_some()
-                    && agents.all(|a| a.effective_display() == vellum_agent::DisplayMode::Raw)
-            },
-            browser_nodes: state.browser_nodes,
-            worktrees: state.worktrees,
         };
 
         self.shortcuts(ctx, state, &cmd_ctx, &mut events);
@@ -804,11 +718,6 @@ impl Chrome {
                 link_previews: state.link_previews,
                 align_objects: state.align_objects,
                 snap_to_grid: state.snap_to_grid,
-                default_display: state.default_display,
-                default_chat_theme: state.default_chat_theme,
-                browser_nodes: state.browser_nodes,
-                worktrees: state.worktrees,
-                providers: state.providers,
             };
             crate::library::show(
                 ui,
@@ -829,7 +738,6 @@ impl Chrome {
         // Read by the menu bar and by the context menu, which is drawn after the canvas
         // rectangle is known — hence out here rather than inside the board's arm.
         let header = crate::menu::MenuHeader {
-            default_provider: state.default_provider,
             title: state.board.title,
             path: state.board.path,
             dirty: state.board.dirty,
@@ -840,20 +748,6 @@ impl Chrome {
             spaces: &self.library.spaces,
             glass_opacity: self.glass_opacity(),
             accent: self.accent,
-            default_display: state.default_display,
-            default_chat_theme: state.default_chat_theme,
-            // The selected node's own look, for the ticks and the two controls a preset
-            // cannot carry. Read off the panel model rather than tracked separately: it is
-            // already the one flattened answer to "what is selected", and a second copy
-            // would be a tick that disagrees with the node.
-            node_theme: model.agent.as_ref().and_then(|a| a.chat_theme),
-            node_opacity: model.agent.as_ref().map_or(255, |a| a.chat_opacity),
-            node_has_background: model.agent.as_ref().is_some_and(|a| a.has_chat_background),
-            providers: state.providers,
-            speech: state.speech,
-            local_transcriber: state.local_transcriber,
-            speech_model: state.speech_model,
-            speech_hosted: state.speech_hosted,
             flags,
         };
 

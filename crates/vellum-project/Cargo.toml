@@ -39,7 +39,6 @@ serde_json.workspace = true
 # `theme` converts the chrome's accent choice and an agent's chat colourway into canvas
 # colours, so it genuinely needs both vocabularies. Neither drags anything native in: both
 # crates compile for wasm32, which is exactly what the feature split was for.
-vellum-agent.workspace = true
 vellum-connect.workspace = true
 vellum-doc.workspace = true
 vellum-render.workspace = true

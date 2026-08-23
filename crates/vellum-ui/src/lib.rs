@@ -110,8 +110,6 @@
 //!   [`Chrome::active_tab`] back; the strip owns the order and the selection. Four new
 //!   [`UiEvent`]s go with it: `SelectTab`, `CloseTab`, `ReorderTabs`, `NewBoardTab`.
 
-pub mod agent_dialogs;
-pub mod agent_panel;
 pub mod chrome;
 pub mod color;
 pub mod command;
@@ -134,10 +132,6 @@ pub mod tool;
 pub mod toolbar;
 pub mod widgets;
 
-pub use agent_dialogs::{
-    RuleFilePath, RuleFiles, RulesForm, compose as compose_rules, schedule_problem,
-};
-pub use agent_panel::{AgentPanelState, AgentRow};
 pub use chrome::{BoardState, Chrome, ChromeOutput, ChromeState, Screen, ViewState};
 pub use color::{ColorPicker, Hsv, SWATCHES, from_egui, parse_hex, to_egui};
 pub use command::{Availability, Command, CommandContext, Entry, Menu, Submenu, format_shortcut};
@@ -146,8 +140,8 @@ pub use context_bar::{ContextBarState, Control};
 pub use context_menu::{ContextMenu, ContextTarget, Row as ContextRow};
 pub use dialog::{Dialog, DialogStack, ReferenceSection, Step, Toast, ToastKind};
 pub use event::{
-    AgentEdit, DialogEvent, DialogId, EventSink, FindEvent, GridSettings, LibraryEvent, SecretKey,
-    StyleEdit, TransformEdit, UiEvent,
+    DialogEvent, DialogId, EventSink, FindEvent, GridSettings, LibraryEvent, StyleEdit,
+    TransformEdit, UiEvent,
 };
 pub use find::FindBar;
 pub use icon::Icon;
@@ -155,12 +149,11 @@ pub use library::{
     BoardCard, IMPORT_STEPS, LayoutMode as LibraryLayout, Scope as LibraryScope, SettingsTab,
     Space, Thumbnail,
 };
-pub use menu::{MenuFlags, MenuHeader, ProviderStatus};
+pub use menu::{MenuFlags, MenuHeader};
 pub use properties::ColorTarget;
 pub use selection::{
-    AgentLink, AgentSummary, Border, Bounds, BrowserSummary, ConnectorSummary, Field,
-    FileTreeSummary, FontWeight, ItemFacet, LinkSummary, NoteSummary, PanelModel, SelectionItem,
-    TextSummary, VerticalAlign, WorktreeState,
+    Border, Bounds, ConnectorSummary, Field, FontWeight, ItemFacet, LinkSummary, PanelModel,
+    SelectionItem, TextSummary, VerticalAlign,
 };
 pub use status::{ZOOM_STEPS, zoom_label};
 pub use tabs::{BoardTab, TabKey, TabStrip};
@@ -175,14 +168,6 @@ pub use tool::{
 // Re-exported so the app can spell the types the chrome hands it without having to
 // name a dependency it may not otherwise carry.
 pub use egui;
-// The Agent Canvas configuration types. `AgentSummary`, `Dialog::Schedule` and
-// `AgentEdit` all carry these, and a public field whose type the caller cannot name is a
-// field they cannot build — the same reason `CardMode` is re-exported below.
-pub use vellum_agent;
-pub use vellum_agent::{
-    AgentRules, Completion, DisplayMode, Layer, NoteScope, Permissions, Provider, ProviderChoice,
-    Recurrence, ResolvedRules, RoleKind, RuleFile, Schedule, Territory, Transport, Trigger,
-};
 pub use vellum_connect::{AnchorSide, Arrowhead, LineStyle, RoutingMode};
 // `CardMode` is here because `LinkSummary` carries one: a public struct whose field type
 // the caller cannot name is one they cannot build.

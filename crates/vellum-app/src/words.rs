@@ -46,27 +46,23 @@ pub fn of(kind: &ItemKind) -> Vec<String> {
         ItemKind::Chart { spec } => crate::chart::words(&crate::chart::decode(spec)),
         ItemKind::MindMap { model } => crate::mindmap::words(&crate::mindmap::decode(model)),
         ItemKind::Kanban { board } => crate::kanban::words(&crate::kanban::decode(board)),
-        // An agent's role and a note's title already came through `ItemKind::text` above.
-        // These two are the fields a *user typed* that happen to live inside a token: the
-        // page a browser node points at, and the directory a file tree is rooted in.
+        // ⚠ `ItemKind::{Agent, AgentNote, FileTree, Browser}` land here and index nothing,
+        // and that is deliberate rather than an oversight.
         //
-        // The line this follows is the one `ItemKind::text` already draws — words the user
-        // wrote are searchable, and metadata scraped from somebody else's page is not. So a
-        // browser's **title**, which the page supplied, is deliberately absent while its
-        // **url**, which the user typed, is present.
-        ItemKind::Browser { model } => {
-            let page = crate::browser::decode(model);
-            if page.url.trim().is_empty() { Vec::new() } else { vec![page.url] }
-        }
-        ItemKind::FileTree { model } => {
-            let tree = crate::filetree::decode(model);
-            if tree.root.trim().is_empty() { Vec::new() } else { vec![tree.root] }
-        }
-        // A note's *file content* is deliberately not searched. It is on disk and can be
-        // megabytes; the find bar runs this once per keystroke over every item on the
-        // board, and reading every note's file to answer a keystroke is the kind of cost
-        // this whole application exists not to pay. Searching note contents is a job for
-        // the index in `vellum-search`, not for a substring scan.
+        // **The two that carry the user's own words are already handled above.** An agent's
+        // role and a note's title are ordinary `StyledText` on the item — they live *beside*
+        // the opaque token, the way a shape's label lives beside its form — so `ItemKind::text`
+        // answers `Some` for both and they returned through the plain path at the top of this
+        // function. A board that holds them is still searchable by them, which is the point:
+        // this build no longer offers a way to *make* one of these items, and a board that
+        // already has one must not quietly stop answering for words the user typed into it.
+        //
+        // The other two keep their text *inside* the token — a browser node's address, a file
+        // tree's root directory — and nothing in this crate parses those tokens any more, so
+        // there is no honest way to report their contents. Answering with nothing is the right
+        // failure: a search that silently missed them would be indistinguishable from a search
+        // that found them empty, and inventing a decoder here to read a format nothing else in
+        // the application understands would be a second source of truth for it.
         _ => Vec::new(),
     }
 }
@@ -136,6 +132,36 @@ mod tests {
         assert!(contains(&chart, "q3"), "a category");
         assert!(contains(&chart, "target"), "a series name");
         assert!(!contains(&chart, "19"), "a value is not a word anybody searches by");
+    }
+
+    /// A board that already holds one of the four token-backed kinds is still searchable
+    /// by the words the *user* typed into it.
+    ///
+    /// RULE ZERO's line, at this layer: the document still understands these kinds, so a
+    /// board saved when they could be created must keep behaving like a board. The role and
+    /// the title survive because they were never inside the token — they are ordinary
+    /// `StyledText` beside it, so they come back through `ItemKind::text` and this module
+    /// never has to parse anything. A build that answered `Vec::new()` for all four would
+    /// make a find on such a board silently miss items that are plainly on screen.
+    #[test]
+    fn a_board_that_still_holds_a_token_backed_kind_keeps_its_own_words() {
+        let agent = ItemKind::Agent {
+            model: "{}".to_owned(),
+            label: StyledText::plain("Cooling Reviewer"),
+        };
+        assert_eq!(of(&agent), vec!["Cooling Reviewer".to_owned()]);
+        assert!(contains(&agent, "reviewer"));
+
+        let note =
+            ItemKind::AgentNote { model: "{}".to_owned(), title: StyledText::plain("Plan") };
+        assert!(contains(&note, "plan"), "{:?}", of(&note));
+
+        // These two keep their text inside the token and nothing here decodes one, so they
+        // index nothing. Asserted rather than left implicit: it is a real gap on a board
+        // that has them, and a silent `_ => Vec::new()` is exactly the kind of arm somebody
+        // later mistakes for an oversight and "fixes" with a second token parser.
+        assert!(of(&ItemKind::Browser { model: "{}".to_owned() }).is_empty());
+        assert!(of(&ItemKind::FileTree { model: "{}".to_owned() }).is_empty());
     }
 
     /// A folded branch is hidden, not deleted. Answering "not on this board" for a word

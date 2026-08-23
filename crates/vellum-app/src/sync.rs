@@ -117,10 +117,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A deadline for the whole exchange.
 ///
-/// Unlike `vellum-agent`'s HTTP transport — which deliberately has *no* global timeout,
-/// because a streamed answer to a hard question runs for minutes and a clock would look like
-/// the model giving up — a sync is one bounded request and one bounded response. There is
-/// nothing here that legitimately takes longer, so a deadline is the right shape.
+/// A global deadline is the right shape **here specifically**, and the reason is worth stating
+/// because it does not generalise to every HTTP call in an application: a sync is one bounded
+/// request and one bounded response, so there is nothing that legitimately takes longer and a
+/// clock can only ever be catching a fault. Put the same deadline over a long-lived *streamed*
+/// exchange and it does the opposite — it cuts off an answer that was arriving correctly, and
+/// reports the timeout as though the far end had gone quiet.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The most a reply may be, in bytes.
@@ -145,10 +147,12 @@ const BACKOFF_CAP: Duration = Duration::from_secs(60);
 
 /// What came back from one round trip.
 ///
-/// `Debug` is written by hand rather than derived, and the reason is the same one that made
-/// four derived `Debug`s over agent credentials a review finding: these fields are *board
-/// content*. A derived `Debug` would put a user's document into any log line that ever
-/// formatted a reply, and the useful thing to log is the size, which is what this prints.
+/// `Debug` is written by hand rather than derived, because these fields are *board content*.
+/// A derived `Debug` would put a user's document into any log line that ever formatted a
+/// reply, and the useful thing to log is the size, which is what this prints. It is a shape
+/// an adversarial review of this repository has caught before, on a struct whose own doc
+/// comment promised it was never printed: the promise is not the mechanism, the hand-written
+/// `Debug` is.
 pub enum SyncReply {
     /// The server accepted the delta and answered.
     Synced {
@@ -598,8 +602,8 @@ fn post(http: &ureq::Agent, endpoint: &str, token: &str, body: Vec<u8>) -> SyncR
 /// last case is the steady state of a working sync rather than an edge: once the two sides
 /// agree, every round trip answers with a version vector and nothing else. A build that
 /// reported it as an error would put a warning in front of the user for the whole time
-/// everything was fine, which `vellum-agent`'s own review found twice in the other direction
-/// — a failure reported as a success.
+/// everything was fine — and the mirror of it, a failure quietly reported as a success, is a
+/// defect an adversarial review of this repository has found more than once.
 fn parse_reply(status: u16, body: &[u8]) -> SyncReply {
     if !(200..300).contains(&status) {
         // Truncated by **characters**, never by bytes: velmd's own error bodies are ASCII, but
@@ -854,8 +858,8 @@ mod tests {
     }
 
     /// A `Debug` of a reply prints sizes, never board content. Derived, it would put the
-    /// user's document into any log line that formatted one — the shape a review already
-    /// found over agent credentials.
+    /// user's document into any log line that formatted one — the shape a review of this
+    /// repository has already found once, on a struct that only promised it in prose.
     #[test]
     fn a_reply_does_not_print_the_board() {
         let reply = SyncReply::Synced {

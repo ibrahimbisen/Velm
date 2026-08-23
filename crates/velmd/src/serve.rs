@@ -61,7 +61,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::{library_api, manage, paste, sync};
+use crate::{accounts, library_api, manage, paste, sync};
 use vellum_store::{BlobStore, BoardDb, Hash, list_boards};
 
 /// How many connections are served at once.
@@ -107,6 +107,13 @@ pub(crate) struct Server {
     /// has already been burned by once in the desktop app (`session.rs`: two `Editor`s over
     /// one file is two autosave threads). Serialising costs nothing at this scale.
     pub(crate) boards: Mutex<()>,
+    /// Who may sign in, who is signed in, and which boards each of them may see.
+    ///
+    /// ⚠ **Additional to `config.token`, never a replacement for it.** The bearer token is what
+    /// the desktop app's sync sends and what the wasm client fetches its board with, and
+    /// neither has a cookie jar — so requiring a session would break sync on the user's Mac
+    /// silently, which is the one way this change could cost them work.
+    pub(crate) accounts: Mutex<crate::accounts::Accounts>,
 }
 
 pub fn run(config: Config) -> anyhow::Result<()> {
@@ -149,7 +156,8 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     println!("It does open boards with SQLite, which writes a -wal sidecar: point --data at");
     println!("a copy, never at the directory the desktop app is using.");
 
-    let server = Arc::new(Server { config, boards: Mutex::new(()) });
+    let accounts = Mutex::new(crate::accounts::Accounts::open(&config.data));
+    let server = Arc::new(Server { config, boards: Mutex::new(()), accounts });
     let live = Arc::new(AtomicUsize::new(0));
 
     for stream in listener.incoming() {
@@ -213,7 +221,7 @@ fn refuse_live_data(paths: &[&Path]) -> anyhow::Result<()> {
 /// The three headers every proxy in common use sets — `X-Forwarded-For` and `X-Real-IP` by
 /// convention, `Forwarded` by RFC 7239. Presence is the whole test: the *value* is attacker
 /// -influenced and is never read, so there is nothing here to spoof into a bypass.
-fn proxied(headers: &std::collections::BTreeMap<String, String>) -> bool {
+pub(crate) fn proxied(headers: &std::collections::BTreeMap<String, String>) -> bool {
     const FORWARDING: [&str; 3] = ["x-forwarded-for", "x-real-ip", "forwarded"];
     // `read_head` lower-cases every name as it parses, so these compare directly — but
     // `eq_ignore_ascii_case` anyway, because a guard that depends on an upstream detail is
@@ -384,13 +392,23 @@ fn serve_one(server: &Server, stream: TcpStream) {
             /// Capitalised, and that is not a style preference: `tests/rule_zero.rs` greps
             /// this crate for a bare `rename(` and would fire on the lowercase spelling.
             Rename(&'a str),
+            SignIn,
+            CreateAccount,
         }
+        // ⚠ Signing out is a **DELETE**, and it is answered before the POST block below,
+        // because a session that could only be ended by a POST would be one a browser's own
+        // navigation could be tricked into ending. `SameSite=Strict` is what actually stops
+        // that; the method is the part a reader checks first.
         let post = if let Some(id) = sync::board_id(path) {
             Some(Post::Sync(id))
         } else if paste::is_import(path) {
             Some(Post::Import)
         } else if manage::is_create(path) {
             Some(Post::Create)
+        } else if accounts::is_session(path) {
+            Some(Post::SignIn)
+        } else if accounts::is_accounts(path) {
+            Some(Post::CreateAccount)
         } else {
             manage::rename_target(path).map(Post::Rename)
         };
@@ -410,6 +428,9 @@ fn serve_one(server: &Server, stream: TcpStream) {
         // large"*, and an operator who reads that after a failed **create** goes looking in
         // the wrong file.
         let length = match match post {
+            // A username and a password are smaller than a board's name and much smaller
+            // than a board; its own cap, so the refusal names the route the person was using.
+            Post::SignIn | Post::CreateAccount => accounts::content_length(&headers),
             Post::Create | Post::Rename(_) => manage::content_length(&headers),
             Post::Sync(_) | Post::Import => sync::content_length(&headers),
         } {
@@ -452,6 +473,8 @@ fn serve_one(server: &Server, stream: TcpStream) {
             Post::Import => paste::handle(server, query, &body, &stream),
             Post::Create => manage::create(server, &body, &stream),
             Post::Rename(id) => manage::rename_board(server, &percent_decode(id), &body, &stream),
+            Post::SignIn => accounts::sign_in(server, &headers, &body, &stream),
+            Post::CreateAccount => accounts::create_account(server, &headers, &body, &stream),
         };
         if let Err(error) = answered {
             eprintln!("velmd: {}: {error:#}", printable(path));
@@ -460,7 +483,7 @@ fn serve_one(server: &Server, stream: TcpStream) {
         return;
     }
 
-    let result = route(server, path, query, &stream);
+    let result = route(server, path, query, &headers, &stream);
     if let Err(error) = result {
         eprintln!("velmd: {}: {error:#}", printable(path));
         let _ = respond(&stream, 500, "text/plain", b"something went wrong\n", origin.as_deref());
@@ -476,7 +499,16 @@ fn needs_token(path: &str) -> bool {
     path.starts_with("/api/v1/")
 }
 
-fn route(server: &Server, path: &str, query: &str, stream: &TcpStream) -> anyhow::Result<()> {
+/// ⚠ `headers` is threaded in for the account routes alone: `whoami` and the account list
+/// answer from the **session cookie**, which is a header, and neither has a body to carry it.
+/// Every other arm ignores it.
+fn route(
+    server: &Server,
+    path: &str,
+    query: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    stream: &TcpStream,
+) -> anyhow::Result<()> {
     let origin = server.config.app_origin.as_deref();
     match path {
         // The render proof. The wasm client posts here with what it measured, so a board can
@@ -495,6 +527,12 @@ fn route(server: &Server, path: &str, query: &str, stream: &TcpStream) -> anyhow
         // beside it — which boards are starred and which folder each is in. A second route
         // rather than four more keys on the one above, so a client written against the older
         // shape keeps working byte for byte. See `library_api`'s header.
+        // Accounts. ⚠ These three sit **outside** the bearer gate by
+        // `accounts::is_exempt_from_the_bearer_gate` — a person who has not signed in yet has
+        // no token and no cookie, so a sign-in route behind the gate could never be reached
+        // and the server could never be set up at all.
+        accounts::PATH_WHOAMI => accounts::whoami(server, headers, stream),
+        accounts::PATH_ACCOUNTS => accounts::list_accounts(server, headers, stream),
         library_api::PATH => library_api::handle(server, stream),
         "/api/v1/boards" => {
             let body = {
@@ -652,7 +690,7 @@ fn under(root: &Path, relative: &str) -> Option<PathBuf> {
 /// A naive `==` on a `String` returns at the first differing byte, which is enough to
 /// recover a secret one character at a time over a network. The length is folded in as a
 /// difference rather than as an early return for the same reason.
-fn same_secret(a: &str, b: &str) -> bool {
+pub(crate) fn same_secret(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     // ⚠ The length is compared **first and honestly**. This used to fold it in as
     // `(a.len() ^ b.len()) as u8`, and the cast discarded every bit above the low byte — so
@@ -761,12 +799,42 @@ thread_local! {
     static HEAD_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// [`respond`], plus response headers of the caller's own.
+///
+/// ⚠ **One writer, not two.** `Set-Cookie` is the only thing that needs this, and a second
+/// response function for it would be a second copy of the status table, the CORS headers and
+/// the framing — three things that would then drift apart silently. `respond` delegates here
+/// with an empty slice, so every response in this program goes down one path.
+///
+/// Each entry is a whole header line without its terminator: `"Set-Cookie: velm_session=…"`.
+pub(crate) fn respond_with(
+    stream: &TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    origin: Option<&str>,
+    extra: &[String],
+) -> anyhow::Result<()> {
+    respond_inner(stream, status, content_type, body, origin, extra)
+}
+
 pub(crate) fn respond(
+    stream: &TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    origin: Option<&str>,
+) -> anyhow::Result<()> {
+    respond_inner(stream, status, content_type, body, origin, &[])
+}
+
+fn respond_inner(
     mut stream: &TcpStream,
     status: u16,
     content_type: &str,
     body: &[u8],
     origin: Option<&str>,
+    extra: &[String],
 ) -> anyhow::Result<()> {
     let reason = match status {
         200 => "OK",
@@ -803,6 +871,13 @@ pub(crate) fn respond(
              Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
              Vary: Origin\r\n"
         ));
+    }
+    // ⚠ After the CORS block and before the blank line, so a caller's header cannot displace
+    // one of ours and cannot land in the body. Each entry is a whole line without its
+    // terminator; `Set-Cookie` is the only thing that uses this today.
+    for line in extra {
+        head.push_str(line);
+        head.push_str("\r\n");
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes())?;

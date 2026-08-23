@@ -45,20 +45,10 @@ use vellum_shapes::Shape;
 /// Was fourteen buttons in five groups, which is a column tall enough to reach both
 /// edges of a laptop screen and long enough that finding the sticky note took a moment.
 /// *"i just dont use those enough"*: eight everyday tools stay, six fold.
-const GROUPS: [&[Tool]; 4] = [
+const GROUPS: [&[Tool]; 3] = [
     &[Tool::Select, Tool::Hand],
     &[Tool::Sticky, Tool::Text, Tool::Shape, Tool::Frame],
     &[Tool::Pen, Tool::Eraser],
-    // The Agent Canvas gets its own group rather than joining the content tools: it puts a
-    // *running process* on the board, which is a different kind of act from placing a note,
-    // and the separator is what says so without a label.
-    //
-    // It is on the palette at all because `every_tool_is_on_the_palette_or_behind_more_exactly_once`
-    // caught it not being: it was in `Tool::ALL` and in neither this list nor `OCCASIONAL`,
-    // so the headline tool of the whole layer was reachable only by its `A` shortcut. That
-    // is the "written, tested and unreachable" failure this repo keeps paying for, and the
-    // test found it before a person did.
-    &[Tool::Agent],
 ];
 
 /// The palette's own memory: which flyout is open and what each picker last chose.
@@ -69,13 +59,6 @@ pub struct ToolbarState {
     pub sticky: Option<vellum_doc::Color>,
     /// The shape a click on the shape tool will place, shown on the tool button.
     pub shape: Shape,
-    /// Which of the three agent roles the agent tool will place.
-    ///
-    /// On the toolbar rather than decided after placement, for the reason the sticky's
-    /// colour is: an orchestrator and a worker are configured differently from the moment
-    /// they exist — an orchestrator wants a territory drawn and a cap set — so placing one
-    /// and converting it afterwards is a step every single time.
-    pub agent_role: vellum_agent::RoleKind,
     pub pen: PenPreset,
     /// What the eraser takes. Miro puts this in the eraser's own flyout, and so does this.
     pub eraser: EraserMode,
@@ -94,7 +77,6 @@ impl Default for ToolbarState {
             open_flyout: None,
             sticky: None,
             shape: Shape::Rectangle,
-            agent_role: vellum_agent::RoleKind::Worker,
             pen: PenPreset::default(),
             eraser: EraserMode::default(),
             search: String::new(),
@@ -432,7 +414,6 @@ fn flyout_window(
                 Flyout::Shape => shape_picker(ui, palette, state, custom, events),
                 Flyout::Pen => pen_picker(ui, palette, state, events),
                 Flyout::Eraser => eraser_picker(ui, palette, state, events),
-                Flyout::Agent => agent_picker(ui, palette, state, events),
                 Flyout::More => more_picker(ui, palette, state, active, events),
             });
             paint_glass_edge(
@@ -974,58 +955,6 @@ fn eraser_picker(ui: &mut Ui, palette: Palette, state: &mut ToolbarState, events
     });
 }
 
-/// Which of the three roles the agent tool places: a worker, an orchestrator, or the meta
-/// agent.
-///
-/// A flyout rather than a conversion after the fact, for the sticky picker's reason: the
-/// three are configured differently from the moment they exist — an orchestrator is born
-/// owning a region of the board and a spawn cap — so placing a worker and converting it is an
-/// extra step every single time.
-///
-/// Each row carries a line saying what the role *is*. Three nouns alone would not do it:
-/// "Orchestrator" and "Meta agent" are the same word to somebody who has not used either,
-/// which is the same argument that put a drawn swatch beside each accent colour rather than
-/// its name.
-fn agent_picker(ui: &mut Ui, palette: Palette, state: &mut ToolbarState, events: &mut EventSink) {
-    use vellum_agent::RoleKind;
-
-    ui.set_max_width(space::of(56));
-    section_header(ui, palette, "Agent");
-
-    let roles: Vec<Segment<RoleKind>> =
-        RoleKind::ALL.iter().map(|role| Segment::text(*role, role.label())).collect();
-    if let Some(role) = segmented(ui, palette, &Field::Uniform(state.agent_role), &roles) {
-        state.agent_role = role;
-        events.push(UiEvent::AgentRoleChosen(role));
-        // Choosing arms the tool, exactly as choosing a sticky colour does: a picker that
-        // set a setting and left the pointer on Select would need a second click to do the
-        // thing the first click plainly meant.
-        events.push(UiEvent::ToolChanged(Tool::Agent));
-    }
-
-    ui.add_space(space::UNIT);
-    ui.label(
-        egui::RichText::new(agent_role_hint(state.agent_role)).size(11.0).color(palette.muted),
-    );
-}
-
-/// One line saying what a role does, for the picker.
-///
-/// Written for somebody who has not used one: what it is *for*, and — for the two that carry
-/// a power the others do not — what that power is, because a limit the user cannot see is one
-/// they cannot reason about.
-const fn agent_role_hint(role: vellum_agent::RoleKind) -> &'static str {
-    match role {
-        vellum_agent::RoleKind::Worker => "Does the work: writes, researches, answers.",
-        vellum_agent::RoleKind::Orchestrator => {
-            "Manages other agents. Owns a region of the board and a cap on how many it may run."
-        }
-        vellum_agent::RoleKind::Meta => {
-            "Talks to you about the board. The only role that may edit other agents' settings."
-        }
-    }
-}
-
 /// A width swatch drawn as a dot of that width, clamped so the widest still fits.
 fn width_tile(ui: &mut Ui, palette: Palette, width: f32, selected: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(space::of(8) - 2.0), Sense::click());
@@ -1314,30 +1243,25 @@ mod tests {
         assert!(listed.is_empty());
     }
 
-    /// The folded six are the user's list, in the user's order — **still the first six, and
-    /// still in that order**, with the Agent Canvas's three added after them.
+    /// The folded six are the user's list, in the user's order, and nothing else.
     ///
     /// Pinned because it is a *preference*, not a derivation — nothing about a chart makes
     /// it occasional, and the next reader has no way to tell this list was chosen rather
     /// than computed. *"put table charts kanabn and mindmap image and the connector into a
     /// smaller menu in this bar i just dont use those enough"*.
     ///
-    /// The assertion is written as a **prefix** check rather than a whole-array one so that
-    /// the user's six keep their identity as the user's six. Rewriting it to compare all
-    /// nine would have quietly turned a recorded preference into a list anybody may edit,
-    /// which is exactly the distinction the original test existed to preserve.
+    /// The assertion compares the **whole** array. It was a prefix check while a later
+    /// round had appended three tools of its own after the user's six, and the prefix form
+    /// was what kept those three from being read as part of the recorded preference. With
+    /// them gone the list is the preference again, so a whole-array check is the stronger
+    /// statement: anything appended here now fails, which is what a recorded preference
+    /// should do.
     #[test]
-    fn more_holds_exactly_the_six_the_user_named_then_the_agent_canvas_three() {
-        let (theirs, ours) = Tool::OCCASIONAL.split_at(6);
+    fn more_holds_exactly_the_six_the_user_named() {
         assert_eq!(
-            theirs,
+            Tool::OCCASIONAL,
             [Tool::Table, Tool::Chart, Tool::Kanban, Tool::MindMap, Tool::Image, Tool::Connector]
         );
-        // A note, a file tree and a browser are things you place occasionally *around* the
-        // agents. The agent tool itself is deliberately not here: a headline feature folded
-        // behind a More button is one nobody discovers.
-        assert_eq!(ours, [Tool::Note, Tool::FileTree, Tool::Browser]);
-        assert!(!Tool::Agent.is_occasional(), "the agent tool was folded behind More");
         for tool in Tool::OCCASIONAL {
             assert!(tool.is_occasional(), "{tool:?}");
         }

@@ -20,13 +20,6 @@ use std::collections::VecDeque;
 
 /// A question that blocks the board until it is answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "the Rules variant carries a whole resolved cascade and its two file paths, and \
-              the Schedule variant a schedule plus its hand-off targets. Boxing either would \
-              put an allocation behind every dialog in the application to save bytes on a \
-              value of which exactly one exists at a time — a modal is singular by definition"
-)]
 pub enum Dialog {
     Confirm {
         id: DialogId,
@@ -94,63 +87,6 @@ pub enum Dialog {
         steps: Vec<Step>,
         /// The affirmative button — "Continue". Same rule as everywhere else: a button
         /// labelled with what happens next, never "OK".
-        confirm: String,
-    },
-    /// When one agent runs by itself, and what it does afterwards — feature 10.
-    ///
-    /// Its own variant for the reason [`Self::Reference`] and [`Self::Steps`] are theirs: a
-    /// recurrence with three shapes and a hand-off picker built from the board's connectors
-    /// is a thing a renderer does, and `Dialog` cannot hold a closure.
-    ///
-    /// The two fields the chrome cannot supply for itself are here because it cannot: which
-    /// agents are reachable, and what the user's clock offset is. `vellum-agent` holds no
-    /// timezone database on purpose, and this crate reads no clock and no board.
-    Schedule {
-        id: DialogId,
-        title: String,
-        schedule: crate::Schedule,
-        /// The agents this one is connected to. The hand-off picker offers **only** these,
-        /// which is what makes an unreachable target unreachable by construction rather
-        /// than by validation — see `crate::agent_dialogs::schedule_problem` for the case
-        /// validation is still needed for.
-        targets: Vec<crate::AgentLink>,
-        /// The user's offset from UTC, in seconds. Seconds rather than hours because a
-        /// half-hour timezone and a 6:30 PM schedule are then the same arithmetic.
-        utc_offset: i32,
-        confirm: String,
-    },
-    /// One agent's own rule layer, over the cascade it sits in — feature 11.
-    ///
-    /// Carries the [`ResolvedRules`](vellum_agent::ResolvedRules) so the editor can show
-    /// *inherited* against *set here* from the record resolution produced, rather than by
-    /// comparing the three layers itself.
-    Rules {
-        id: DialogId,
-        title: String,
-        form: crate::agent_dialogs::RulesForm,
-        resolved: vellum_agent::ResolvedRules,
-        /// Where the two layers this editor **cannot** write live on disk.
-        ///
-        /// Supplied by the app because only the app knows its data directory and which
-        /// folder the board is in. Without it the editor names the layers a value came from
-        /// and can say nothing about how to change them, which is the state feature 11
-        /// shipped in: two of its three layers were reachable only by reading the source.
-        files: crate::agent_dialogs::RuleFiles,
-        confirm: String,
-    },
-    /// A provider credential — features 16 and 17.
-    ///
-    /// **The key is never seeded and never shown.** `has_key` is the whole of what this
-    /// crate is told about an existing credential (`docs/07-agent-canvas.md` §8a), so there
-    /// is no state in which a stored key is on screen; signing in replaces it. The typed
-    /// value is a [`SecretKey`](crate::SecretKey), whose `Debug` refuses to print it — which
-    /// matters because `Dialog` derives `Debug`.
-    SignIn {
-        id: DialogId,
-        provider: vellum_agent::Provider,
-        /// Whether one is already stored. Never *which*.
-        has_key: bool,
-        key: crate::event::SecretKey,
         confirm: String,
     },
 }
@@ -233,10 +169,7 @@ impl Dialog {
     pub fn with_confirm(mut self, label: impl Into<String>) -> Self {
         if let Self::Rename { confirm, .. }
         | Self::Confirm { confirm, .. }
-        | Self::Steps { confirm, .. }
-        | Self::Schedule { confirm, .. }
-        | Self::Rules { confirm, .. }
-        | Self::SignIn { confirm, .. } = &mut self
+        | Self::Steps { confirm, .. } = &mut self
         {
             *confirm = label.into();
         }
@@ -278,71 +211,12 @@ impl Dialog {
         }
     }
 
-    /// A schedule editor for one agent — see [`Dialog::Schedule`].
-    pub fn schedule(
-        id: DialogId,
-        title: impl Into<String>,
-        schedule: crate::Schedule,
-        targets: Vec<crate::AgentLink>,
-        utc_offset: i32,
-    ) -> Self {
-        Self::Schedule {
-            id,
-            title: title.into(),
-            schedule,
-            targets,
-            utc_offset,
-            confirm: "Save".to_owned(),
-        }
-    }
-
-    /// A rules editor for one agent — see [`Dialog::Rules`].
-    ///
-    /// Takes the node's own layer and the resolution it participated in. The form is derived
-    /// here so the caller never has to know that the four structured settings live in the
-    /// front matter of one string.
-    ///
-    /// `files` names the global and project layers on disk — a required argument rather than
-    /// a builder step, deliberately. It is the only way the two inherited layers become
-    /// findable at all, and a caller that could forget it would leave the cascade's top two
-    /// thirds invisible exactly as they were.
-    pub fn rules(
-        id: DialogId,
-        title: impl Into<String>,
-        rules: &vellum_agent::AgentRules,
-        resolved: vellum_agent::ResolvedRules,
-        files: crate::agent_dialogs::RuleFiles,
-    ) -> Self {
-        Self::Rules {
-            id,
-            title: title.into(),
-            form: crate::agent_dialogs::RulesForm::from_rules(rules),
-            resolved,
-            files,
-            confirm: "Save".to_owned(),
-        }
-    }
-
-    /// A provider sign-in — see [`Dialog::SignIn`]. The key starts empty, always.
-    pub fn sign_in(id: DialogId, provider: vellum_agent::Provider, has_key: bool) -> Self {
-        Self::SignIn {
-            id,
-            provider,
-            has_key,
-            key: crate::event::SecretKey::default(),
-            confirm: if has_key { "Replace".to_owned() } else { "Sign in".to_owned() },
-        }
-    }
-
     pub const fn id(&self) -> DialogId {
         match self {
             Self::Confirm { id, .. }
             | Self::Rename { id, .. }
             | Self::Reference { id, .. }
-            | Self::Steps { id, .. }
-            | Self::Schedule { id, .. }
-            | Self::Rules { id, .. }
-            | Self::SignIn { id, .. } => *id,
+            | Self::Steps { id, .. } => *id,
         }
     }
 }
@@ -472,15 +346,6 @@ impl DialogStack {
         let Some(dialog) = self.pending.front_mut() else { return };
         let id = dialog.id();
         let mut outcome = None;
-        // A file the dialog asked to be shown. Collected out of the modal's closure rather
-        // than pushed from inside it, because `events` is borrowed for the whole of
-        // `show_dialog` and the closure already holds `dialog` mutably. Revealing a file is
-        // not an answer to the dialog — the editor stays open — so it cannot ride `outcome`.
-        let mut reveal: Option<std::path::PathBuf> = None;
-        // An *Edit* pressed on one of the inherited rule layers. Collected out of the closure
-        // for the same borrow reason as `reveal` — but unlike a reveal, this **does** answer
-        // the dialog, because the app replaces this editor with one on that layer.
-        let mut edit_layer: Option<vellum_agent::Layer> = None;
 
         // Opaque, always: a modal exists to stop everything else, and one you can see
         // through undermines its own job. `dialog_frame` cannot be made glass even
@@ -498,9 +363,6 @@ impl DialogStack {
                     // reaches 140 makes the eye travel back across the whole modal to find
                     // the next number.
                     Dialog::Steps { .. } => space::of(118),
-                    // A form, not a question: a label column, a control and — in the rules
-                    // editor — a provenance caption hard right, on the same line.
-                    Dialog::Schedule { .. } | Dialog::Rules { .. } => space::of(125),
                     _ => space::of(95),
                 });
                 match dialog {
@@ -651,89 +513,6 @@ impl DialogStack {
                             });
                         });
                     }
-                    // The three agent forms. Each draws its own body in
-                    // `crate::agent_dialogs` and answers what the user pressed; the mapping
-                    // from that answer to a `DialogEvent` is here, so the payload rides the
-                    // id the app asked with.
-                    Dialog::Schedule { title, schedule, targets, utc_offset, confirm, .. } => {
-                        ui.label(screen_title(title.as_str()).color(palette.text));
-                        ui.add_space(space::of(3));
-                        egui::ScrollArea::vertical().max_height(space::of(150)).show(ui, |ui| {
-                            match crate::agent_dialogs::schedule_editor(
-                                ui,
-                                palette,
-                                schedule,
-                                targets.as_slice(),
-                                *utc_offset,
-                                confirm.as_str(),
-                            ) {
-                                Some(crate::agent_dialogs::Answer::Save) => {
-                                    outcome =
-                                        Some(DialogEvent::ScheduleSet(id, Some(schedule.clone())));
-                                }
-                                // `None`, not a disabled schedule: the two are different
-                                // states and only one of them keeps the prompt.
-                                Some(crate::agent_dialogs::Answer::Clear) => {
-                                    outcome = Some(DialogEvent::ScheduleSet(id, None));
-                                }
-                                Some(crate::agent_dialogs::Answer::Cancel) => {
-                                    outcome = Some(DialogEvent::Cancelled(id));
-                                }
-                                None => {}
-                            }
-                        });
-                    }
-                    Dialog::Rules { title, form, resolved, files, confirm, .. } => {
-                        ui.label(screen_title(title.as_str()).color(palette.text));
-                        ui.add_space(space::of(3));
-                        egui::ScrollArea::vertical().max_height(space::of(150)).show(ui, |ui| {
-                            match crate::agent_dialogs::rules_editor(
-                                ui,
-                                palette,
-                                form,
-                                resolved,
-                                files,
-                                &mut reveal,
-                                &mut edit_layer,
-                                confirm.as_str(),
-                            ) {
-                                Some(crate::agent_dialogs::Answer::Save) => {
-                                    outcome = Some(DialogEvent::RulesSet(
-                                        id,
-                                        form.clone().into_rules(),
-                                    ));
-                                }
-                                Some(
-                                    crate::agent_dialogs::Answer::Cancel
-                                    | crate::agent_dialogs::Answer::Clear,
-                                ) => {
-                                    outcome = Some(DialogEvent::Cancelled(id));
-                                }
-                                None => {}
-                            }
-                        });
-                    }
-                    Dialog::SignIn { provider, has_key, key, confirm, .. } => {
-                        match crate::agent_dialogs::sign_in(
-                            ui,
-                            palette,
-                            *provider,
-                            *has_key,
-                            key,
-                            confirm.as_str(),
-                        ) {
-                            Some(crate::agent_dialogs::Answer::Save) => {
-                                outcome = Some(DialogEvent::SignedIn(id, key.clone()));
-                            }
-                            Some(
-                                crate::agent_dialogs::Answer::Cancel
-                                | crate::agent_dialogs::Answer::Clear,
-                            ) => {
-                                outcome = Some(DialogEvent::Cancelled(id));
-                            }
-                            None => {}
-                        }
-                    }
                 }
             });
 
@@ -741,22 +520,6 @@ impl DialogStack {
         // never nothing, which would leave a dialog that cannot be dismissed.
         if outcome.is_none() && modal.should_close() {
             outcome = Some(DialogEvent::Cancelled(id));
-        }
-
-        // Before the outcome, so a *Show* pressed on the same frame something closed the
-        // dialog still reaches the app. Nothing here can produce both, and depending on that
-        // is how the one case that does arrive later gets dropped.
-        if let Some(path) = reveal {
-            events.push(UiEvent::RevealPath(path));
-        }
-
-        // Only when nothing else answered. The two cannot both happen in one frame — a click
-        // lands on one button — and preferring the real answer means that if they ever could,
-        // a *Save* is never discarded in favour of reopening the editor somewhere else.
-        if outcome.is_none()
-            && let Some(layer) = edit_layer
-        {
-            outcome = Some(DialogEvent::EditRuleLayer(id, layer));
         }
 
         if let Some(outcome) = outcome {
@@ -1034,55 +797,10 @@ mod tests {
             }
             Dialog::Rename { .. }
             | Dialog::Reference { .. }
-            | Dialog::Steps { .. }
-            | Dialog::Schedule { .. }
-            | Dialog::Rules { .. }
-            | Dialog::SignIn { .. } => {
+            | Dialog::Steps { .. } => {
                 panic!("wrong variant")
             }
         }
-    }
-
-    /// A sign-in dialog never carries a key in, so there is no state in which a stored
-    /// credential is on screen. `has_key` is the whole of what this crate is told.
-    #[test]
-    fn a_sign_in_starts_empty_even_when_a_key_is_already_stored() {
-        let dialog = Dialog::sign_in(DialogId(11), vellum_agent::Provider::Kimi, true);
-        let Dialog::SignIn { key, has_key, confirm, .. } = &dialog else { panic!("wrong variant") };
-        assert!(has_key);
-        assert!(key.is_empty(), "an existing key must never be seeded into the field");
-        assert_eq!(confirm, "Replace", "the button says what pressing it does to the old one");
-
-        let fresh = Dialog::sign_in(DialogId(12), vellum_agent::Provider::Kimi, false);
-        let Dialog::SignIn { confirm, .. } = &fresh else { panic!("wrong variant") };
-        assert_eq!(confirm, "Sign in");
-
-        // And the whole dialog is `Debug`, which is exactly why the key type is not.
-        let mut typed = Dialog::sign_in(DialogId(13), vellum_agent::Provider::Kimi, false);
-        if let Dialog::SignIn { key, .. } = &mut typed {
-            key.buffer_mut().push_str("sk-should-never-print");
-        }
-        assert!(!format!("{typed:?}").contains("should-never-print"), "{typed:?}");
-    }
-
-    /// The schedule editor is seeded with what the node has and with the two facts the
-    /// chrome cannot know: who is reachable, and what the user's clock offset is.
-    #[test]
-    fn a_schedule_dialog_carries_the_facts_the_chrome_cannot_work_out() {
-        let targets = vec![crate::AgentLink { id: "2@1".into(), label: "Builder".into() }];
-        let dialog = Dialog::schedule(
-            DialogId(14),
-            "Schedule",
-            vellum_agent::Schedule::default(),
-            targets.clone(),
-            3 * 3600,
-        );
-        let Dialog::Schedule { targets: carried, utc_offset, confirm, .. } = &dialog else {
-            panic!("wrong variant")
-        };
-        assert_eq!(carried, &targets, "the hand-off picker offers only these");
-        assert_eq!(*utc_offset, 10_800, "seconds, so a half-hour timezone is expressible");
-        assert_eq!(confirm, "Save");
     }
 
     /// The instructions in front of Import from Miro. Two things are asserted rather than

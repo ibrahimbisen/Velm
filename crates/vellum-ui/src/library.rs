@@ -156,57 +156,38 @@ pub enum Scope {
 
 /// Which page of the settings you are on.
 ///
-/// *"make different tabs in that settings page for the purpose of different tabs — one for
-/// application settings, one for ai playground settings."*
+/// # One page today, and the type stays anyway
 ///
-/// # Why tabs rather than one long page
+/// The strip is **not drawn while there is a single page** — a tab bar with one tab is a
+/// control that cannot do anything, which is worse than no control because it invites the
+/// click that proves it. [`settings`] skips it on `ALL.len() == 1` and keeps the subtitle,
+/// which is the half that was carrying information.
 ///
-/// The page had four bands and was already taller than the window, and the bands answer to
-/// different people at different moments: how the application *looks* is set once, and what
-/// the agents do is tuned while working. A scroll makes those one thing you have to travel
-/// through; a tab makes each of them a place you go.
-///
-/// The split is by **who is asking**, not by subsystem. [`Self::General`] is everything that
-/// is true of Velm whatever board you have open; [`Self::Agents`] is the whole AI layer,
-/// matching the *Agents* band the menus already use; [`Self::Providers`] is separate from it
-/// because it is about this **machine** — which binaries are installed, which keys are held —
-/// rather than about how agents behave.
+/// The type survives the strip because it is what makes a second page cheap: it is `pub`,
+/// `vellum_app::shell` resolves `--show settings:<tab>` through [`Self::label`], and a page
+/// reached by a click and nothing else is unphotographable without that. Collapsing it to
+/// nothing would mean rebuilding the strip, the diagnostic and the app's plumbing together
+/// the next time the settings outgrow one screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsTab {
     /// Appearance and board behaviour: the application's own settings.
     #[default]
     General,
-    /// The Agent Canvas: output, themes, worktrees, browser nodes.
-    Agents,
-    /// Which models this machine can reach, and how each is paid for.
-    Providers,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 3] = [Self::General, Self::Agents, Self::Providers];
+    pub const ALL: [Self; 1] = [Self::General];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::General => "General",
-            // The same word the menus use for this band, from one constant, so the layer is
-            // not called two things in two places.
-            Self::Agents => crate::command::AGENT_SECTION,
-            Self::Providers => "Providers",
         }
     }
 
-    /// One line under the tab strip saying what this page is for.
+    /// One line at the head of the page saying what it is for.
     pub const fn subtitle(self) -> &'static str {
         match self {
             Self::General => "How Velm looks, and how a board behaves as you work on it.",
-            Self::Agents => {
-                "The AI layer: what a new agent shows, how a transcript is dressed, and the \
-                 two switches that cost memory and disk."
-            }
-            Self::Providers => {
-                "Which models this machine can reach. No key is ever shown here, and one is \
-                 never written into a board."
-            }
         }
     }
 }
@@ -542,7 +523,7 @@ pub(crate) fn show(
     state: &mut LibraryState,
     boards: &[BoardCard],
     now: SystemTime,
-    settings_view: &SettingsView<'_>,
+    settings_view: &SettingsView,
     events: &mut EventSink,
 ) {
     sidebar(ui, palette, state, boards, events);
@@ -2224,11 +2205,6 @@ mod tests {
                 link_previews: true,
                 align_objects: true,
                 snap_to_grid: false,
-                default_display: vellum_agent::DisplayMode::Clean,
-                default_chat_theme: vellum_agent::ChatTheme::Velm,
-                browser_nodes: false,
-                worktrees: false,
-                providers: &[],
             };
             show(ui, Palette::LIGHT, state, boards, now, &settings, &mut events);
         });
@@ -2262,10 +2238,9 @@ mod tests {
 
     /// Every tab of the settings page draws, and none of them emits anything untouched.
     ///
-    /// Per tab rather than once: each is a different set of live controls — a slider and
-    /// painted swatches on General, two choice rows on Agents, a list built from the
-    /// machine's own `PATH` on Providers — and a control that fired on its own would rewrite
-    /// a preference every frame the page was up.
+    /// Written over `SettingsTab::ALL` rather than over the one page there is, so a second
+    /// page is covered the day it is added: each page is its own set of live controls, and a
+    /// control that fired on its own would rewrite a preference every frame the page was up.
     #[test]
     fn every_settings_tab_draws_and_emits_nothing_untouched() {
         for tab in SettingsTab::ALL {
@@ -2382,11 +2357,11 @@ mod tests {
 ///
 /// `MenuHeader` borrows `Chrome::library.spaces`, and the library panel needs
 /// `&mut Chrome::library` — the two cannot overlap, which is exactly what the comment above
-/// `library::show`'s call site already records. Every field here is `Copy` or borrows
-/// `ChromeState` instead, so the settings page can be drawn inside the library's own borrow
-/// without cloning the spaces into a header sixty times a second to get around it.
+/// `library::show`'s call site already records. Every field here is `Copy`, so the settings
+/// page can be drawn inside the library's own borrow without cloning the spaces into a header
+/// sixty times a second to get around it.
 #[derive(Debug, Clone, Copy)]
-pub struct SettingsView<'a> {
+pub struct SettingsView {
     pub accent: crate::theme::Accent,
     /// How see-through the floating chrome is, 0–255.
     pub glass_opacity: u8,
@@ -2396,11 +2371,6 @@ pub struct SettingsView<'a> {
     pub link_previews: bool,
     pub align_objects: bool,
     pub snap_to_grid: bool,
-    pub default_display: vellum_agent::DisplayMode,
-    pub default_chat_theme: vellum_agent::ChatTheme,
-    pub browser_nodes: bool,
-    pub worktrees: bool,
-    pub providers: &'a [crate::menu::ProviderStatus],
 }
 
 /// The settings page: every preference in the application, on one screen.
@@ -2417,27 +2387,34 @@ pub struct SettingsView<'a> {
 ///
 /// Each switch carries the sentence its menu row carries as a tooltip, drawn **under** the
 /// control rather than behind a hover. A page you are reading has room for the reason; a
-/// menu row does not, which is why the menu keeps the hover. Two of these switches cost
-/// memory or disk in ways the switch cannot show, and `docs/07-agent-canvas.md` §0's third
-/// rule asks for a legible explanation rather than a bare toggle.
+/// menu row does not, which is why the menu keeps the hover. A switch whose cost is invisible
+/// from the switch is the version of that failure nobody notices, because the control works
+/// perfectly and the consequence arrives an hour later.
 fn settings(
     ui: &mut Ui,
     palette: Palette,
     tab: &mut SettingsTab,
-    view: &SettingsView<'_>,
+    view: &SettingsView,
     events: &mut EventSink,
 ) {
     // The strip, then one line saying what this page is for. Above the scroll area, so it
     // stays put while a long page moves under it — a tab strip that scrolls away is one you
     // have to go back up to use.
-    ui.horizontal(|ui| {
-        for page in SettingsTab::ALL {
-            if ui.selectable_label(*tab == page, page.label()).clicked() {
-                *tab = page;
+    //
+    // **Skipped entirely while there is one page.** A strip with a single tab is a control
+    // whose only possible outcome is the state you are already in; drawing it costs a row and
+    // invites the click that proves it does nothing. The subtitle below is what was carrying
+    // the information, so it stays either way.
+    if SettingsTab::ALL.len() > 1 {
+        ui.horizontal(|ui| {
+            for page in SettingsTab::ALL {
+                if ui.selectable_label(*tab == page, page.label()).clicked() {
+                    *tab = page;
+                }
             }
-        }
-    });
-    ui.add_space(space::UNIT);
+        });
+        ui.add_space(space::UNIT);
+    }
     ui.label(
         egui::RichText::new(tab.subtitle())
             .color(palette.muted)
@@ -2450,12 +2427,6 @@ fn settings(
         ui.set_max_width(space::of(140));
         match tab {
             SettingsTab::General => general_settings(ui, palette, view, events),
-            SettingsTab::Agents => agent_settings(ui, palette, view, events),
-            SettingsTab::Providers => {
-                section(ui, palette, "Providers");
-                crate::menu::provider_rows(ui, palette, view.providers, events);
-                ui.add_space(space::of(8));
-            }
         }
     });
 }
@@ -2464,7 +2435,7 @@ fn settings(
 fn general_settings(
     ui: &mut Ui,
     palette: Palette,
-    view: &SettingsView<'_>,
+    view: &SettingsView,
     events: &mut EventSink,
 ) {
     {
@@ -2562,101 +2533,6 @@ fn general_settings(
         );
 
         ui.add_space(space::of(8));
-    }
-}
-
-/// The Agent Canvas's own settings — the AI playground.
-fn agent_settings(
-    ui: &mut Ui,
-    palette: Palette,
-    view: &SettingsView<'_>,
-    events: &mut EventSink,
-) {
-    {
-        section(ui, palette, "Every agent");
-        setting(
-            ui,
-            palette,
-            "Agent output",
-            "What a new agent node shows by default. A node you have switched by hand \
-             keeps its own setting and ignores this.",
-            |ui| {
-                choices(
-                    ui,
-                    &vellum_agent::DisplayMode::ALL,
-                    view.default_display,
-                    vellum_agent::DisplayMode::label,
-                    vellum_agent::DisplayMode::note,
-                    |mode| events.push(UiEvent::DefaultDisplayModeChanged(mode)),
-                );
-            },
-        );
-        setting(
-            ui,
-            palette,
-            "Chat theme",
-            "How every agent transcript is dressed, unless a node has been given a look of \
-             its own. Set one node's theme by right-clicking it.",
-            |ui| {
-                choices(
-                    ui,
-                    &vellum_agent::ChatTheme::ALL,
-                    view.default_chat_theme,
-                    vellum_agent::ChatTheme::label,
-                    vellum_agent::ChatTheme::note,
-                    |theme| events.push(UiEvent::DefaultChatThemeChanged(theme)),
-                );
-            },
-        );
-        section(ui, palette, "What they may use");
-        switch(
-            ui,
-            palette,
-            "Worktree isolation",
-            crate::command::Command::ToggleWorktrees.note().unwrap_or_default(),
-            view.worktrees,
-            |_| events.command(crate::command::Command::ToggleWorktrees),
-        );
-        switch(
-            ui,
-            palette,
-            "Browser nodes",
-            crate::command::Command::ToggleBrowserNodes.note().unwrap_or_default(),
-            view.browser_nodes,
-            |_| events.command(crate::command::Command::ToggleBrowserNodes),
-        );
-
-        ui.add_space(space::of(8));
-    }
-}
-
-/// A row of mutually exclusive choices, in **reading order**.
-///
-/// **The reversal is the whole point of this existing, and it is not cosmetic.** [`setting`] puts its control in a
-/// `Layout::right_to_left` so the control hangs off the right edge whatever its width — and
-/// that layout also reverses the order things are *added* in. A plain loop over
-/// `ChatTheme::ALL` therefore drew *Kimi · ChatGPT · Claude · Velm*, and `DisplayMode::ALL`
-/// drew *Raw · Clean*: every list on the page backwards, silently, while every test about
-/// which rows exist still passed. Found in a screenshot, not by a test.
-///
-/// Reversed here, once, rather than at each of the three call sites — a `.rev()` somebody
-/// has to remember is the same trap by a shorter route.
-fn choices<T: Copy + PartialEq>(
-    ui: &mut Ui,
-    items: &[T],
-    current: T,
-    label: impl Fn(T) -> &'static str,
-    note: impl Fn(T) -> &'static str,
-    mut chosen: impl FnMut(T),
-) {
-    for item in items.iter().rev() {
-        if ui
-            .selectable_label(*item == current, label(*item))
-            .on_hover_text(note(*item))
-            .clicked()
-        {
-            chosen(*item);
-        }
     }
 }
 

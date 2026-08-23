@@ -65,7 +65,6 @@ vellum-ui.workspace = true
 # `crate::agent`, `crate::note`, `crate::filetree` and `crate::browser` supply the
 # token encoding and the measurement it deliberately does not do — the same split
 # `vellum-flow` and `vellum-mindmap` already have.
-vellum-agent = { workspace = true, features = ["native"] }
 # Chart geometry: scales, nice-number ticks, marks, legends. `crate::chart`
 # supplies the shaping and the tessellation it does not do.
 vellum-chart.workspace = true
@@ -122,7 +121,7 @@ wry = { version = "0.56", optional = true }
 # With it off, `browser_engine::NoEngine` answers with a named, actionable message and the
 # node still places, persists, draws its address and opens the page in the user's own
 # browser. Nothing is inert.
-browser = ["dep:wry"]
+
 
 # Push-to-talk on an agent node — feature 14. **Off by default**, and the only thing this
 # line does is *forward*: the capability, the reasoning and the refusal all live in
@@ -139,7 +138,9 @@ browser = ["dep:wry"]
 # it is pressed on: the control is drawn, disabled, and names the feature. Nothing is
 # inert, and nothing is silently missing — an absent control would leave the user with no
 # way to discover that the feature exists.
-voice = ["vellum-agent/voice"]
+# ⚠ The Agent Canvas is archived — see `archive/`. `voice` and `browser` were its features
+# and forward to a crate that is no longer a workspace member, so they are gone with it. The
+# flags stay documented in `archive/vellum-agent` for whoever brings the layer back.
 
 [dev-dependencies]
 tempfile.workspace = true

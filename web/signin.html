@@ -1,0 +1,429 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- ⚠ No `user-scalable=no`. This is a document with two text fields in it; a person who
+     pinches to read a hint is the browser doing its job. `index.html` suppresses zoom because
+     the board handles its own pinch — that reasoning does not reach here. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="same-origin">
+<!-- ⚠ `noindex` on a sign-in page, not because it is secret — it holds nothing — but because a
+     search result pointing at somebody's own server's front door is an invitation to knock. -->
+<meta name="robots" content="noindex, nofollow">
+<title>Velm — sign in</title>
+
+<!--
+  ══════════════════════════════════════════════════════════════════════════════════════
+  ONE PAGE, TWO STATES — and the contract with `signin.js`
+  ══════════════════════════════════════════════════════════════════════════════════════
+
+  A server with no accounts on it needs **setting up**, not signing in. Both are this file,
+  and deliberately not two URLs: a separate `/setup` is one more address to route, one more
+  thing to leave reachable after the first account exists, and one more page to keep in step
+  with this one's palette. The state is decided on load by a single `GET /api/v1/whoami`:
+
+      200                     already signed in     → `location.replace` to the boards
+      401 `{"setup": true}`   no accounts yet       → the SETUP form below
+      401 `{"setup": false}`  accounts exist        → the SIGN IN form below
+      401, unreadable body    an older velmd        → the SIGN IN form (see `readSetupFlag`)
+      no answer at all        server down / offline → a message, and neither form
+
+  ── ⚠ this page only ever signs into the server that served it ────────────────────────
+  There is no *Server address* field here, unlike `boards.html`, and that is structural rather
+  than an omission. A session is a **cookie**, `SameSite=Strict`, and velmd's CORS response
+  carries no `Access-Control-Allow-Credentials` — so a cross-origin sign-in cannot set a
+  cookie, and could not send one afterwards if it had. Every request this page makes is a
+  root-relative path. A remote server is signed into by opening *that server's own* copy of
+  this page, which is exactly what `boards.js` already does for a remote board.
+
+  ── ⚠ the existing `VELMD_TOKEN` passphrase is untouched ──────────────────────────────
+  Accounts are an **additional** way to be authorised, never a replacement. The Mac app's sync
+  sends `Authorization: Bearer` and has nowhere to keep a cookie; `boards.js` sends the same
+  header; `index.html` and the wasm client carry `?token=` because a `<script type="module">`
+  and `WebAssembly.instantiateStreaming` fetch their own URLs and cannot be handed a header.
+  A person holding the passphrase never has to come here at all. This page is the *other* door.
+
+  ── the markup contract ───────────────────────────────────────────────────────────────
+  `signin.js`'s `mount()` looks every id below up in its own `IDS` table and **throws** when
+  one is missing, which is loud on purpose: a renamed id would otherwise make one control
+  silently do nothing, and that is this repository's signature defect.
+
+      #velm-sub                 the one live line — "Checking…", "Not connected.", …
+      #velm-message             a failure, shown as a title and a paragraph
+        #velm-message-title       what happened
+        #velm-message-detail      what to do about it — a different action per cause
+      #velm-signin              form; POSTs `/api/v1/session`
+        #velm-signin-user #velm-signin-pass #velm-signin-go
+      #velm-setup               form; POSTs `/api/v1/accounts`, then signs in
+        #velm-setup-user #velm-setup-pass #velm-setup-pass2 #velm-setup-go
+      #velm-lifetime            the sentence naming how long a session lasts
+
+  ── ⚠ why two forms rather than one whose labels change ───────────────────────────────
+  A password manager reads `autocomplete` to decide whether it is looking at a sign-in or a
+  new account. One form mutating `current-password` into `new-password` at runtime is how a
+  manager comes to offer a saved password into a *create* field, or to save the wrong one.
+  Two forms, each with its attributes fixed in the markup, cannot do that — and only one of
+  them is ever in the document's flow, because the other carries `hidden`.
+
+  ── ⚠ both forms are `method="post"` and neither has an `action` ──────────────────────
+  A `<form>` with no method **GETs**, and a GET submit puts every field in the address bar —
+  so a build where `signin.js` fails to load would write the password into the URL, into
+  history, and into every access log between here and the server. `method="post"` makes the
+  no-JS fallback a POST to this page's own path, which `serve.rs` answers **405** (verified:
+  its dispatch accepts `GET`/`HEAD`/`POST`, and its POST arm names four `/api/v1/` routes and
+  405s everything else). A refusal is the right outcome; a password in a URL is not.
+  ══════════════════════════════════════════════════════════════════════════════════════
+-->
+
+<style>
+  /* ════════════════════════════════════════════════════════════════════════════════════
+     The palette is `crates/vellum-ui/src/theme.rs`'s, under theme.rs's own role names, and
+     it is the same subset `boards.html` carries. Duplicated rather than imported: this page
+     is one screen with no script of its own until `signin.js` arrives, and a stylesheet
+     `<link>` is a second request standing between a person and the only field on the page.
+     ⚠ Whoever unifies the palette across `boards.html`, `index.html` and `chrome.js` should
+     take this file with them — it is the third copy, and it is named here so it is not the
+     one that gets missed.
+
+     ⚠ **Light only, and there is no `prefers-color-scheme` block below on purpose.**
+     `ThemePreference::resolve` answers `Light` whatever it is asked — *"i want only light
+     mode"* — so a page that flipped to dark would not match the library it opens.
+
+     ⚠ **Structure is drawn with a hairline, never a shadow**, and the light ramp's steps are
+     8/255 apart (feedback 22): the gaps *are* the structure.
+     ════════════════════════════════════════════════════════════════════════════════════ */
+  :root {
+    --backdrop: #F7F9FA;        /* MILK   — the page behind the card */
+    --surface: #FCFDFE;         /* BONE   — the card itself */
+    --field: #E5EAED;           /* FROST  — `Palette::well` */
+    --hover: #DCEBEF;
+    --pressed: #D0E6EC;
+    --border: #E5EAED;          /* FROST  — every hairline on this page */
+    --text: #1A1D1F;            /* INK */
+    --muted: #5C656B;           /* INK_MUTED */
+    --faint: #8B959B;           /* INK_FAINT */
+    --accent: #00A38C;          /* SIGNAL_TEAL */
+    --on-accent: #1A1D1F;       /* charcoal on the teal is 5.3:1; white is 3.2:1 and fails AA */
+    --info: #6FD6E6;            /* MONITOR_CYAN — focus, and only focus */
+    --info-soft: #E8F8FB;
+    --danger: #E65B58;          /* XR_RED — destruction, and nothing else */
+    --danger-soft: #FBEAEA;
+
+    --unit: 4px;
+    --pad: 8px;
+    --r-small: 4px;             /* radius::SMALL  — a field, a button */
+    --r-medium: 5px;            /* radius::MEDIUM — a card, a message */
+
+    --t-label: 11px;            /* LABEL */
+    --t-numeric: 12px;          /* NUMERIC */
+    --t-body: 13px;             /* BODY */
+    --t-screen: 20px;           /* SCREEN_TITLE */
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  /* ⚠ **The one rule this page cannot work without**, and it is copied from `boards.html`
+     with its reasoning intact because a fresh file is exactly where it gets forgotten.
+     `signin.js` drives every visibility decision through `el.X.hidden`, and an author
+     `display` beats the user agent's `[hidden] { display: none }` — so a `.btn` declared
+     `display: inline-flex` is **visible** while carrying the attribute. Every `display`
+     added below is another way in. `!important` because the whole point is that no later
+     rule can win. */
+  [hidden] { display: none !important; }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background: var(--backdrop);
+    color: var(--text);
+    font: var(--t-body)/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  /* One column, centred, and `dvh` so the card is not pushed under an iOS toolbar when the
+     software keyboard is up. `justify-content: center` with `padding` rather than a margin,
+     so a card taller than the viewport scrolls instead of being clipped at the top. */
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    min-height: 100dvh;
+    padding: 24px max(16px, env(safe-area-inset-left)) max(24px, env(safe-area-inset-bottom));
+  }
+
+  main { width: 100%; max-width: 380px; }
+
+  /* ── The wordmark ───────────────────────────────────────────────────────────────────
+     `mark.rs`'s own grid: four corner brackets on 48 units, inset 8, 12-unit arms at 2.5
+     stroke. The top-left corner is the accented one, always — it is what gives the mark a
+     reading direction, so it is not a parameter. Inline rather than a CSS mask, because it
+     is the one place on the page two colours are the point. */
+  .velm-wordmark {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--pad);
+    margin: 0 0 20px;
+    font-size: 15px;                                /* PANEL_TITLE */
+    color: var(--text);
+  }
+  .velm-wordmark svg { flex: none; width: 22px; height: 22px; }
+
+  .card {
+    border: 1px solid var(--border);
+    border-radius: var(--r-medium);
+    background: var(--surface);
+    padding: 20px;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: var(--t-screen);
+    /* ⚠ **Regular, and it is not an omission.** The Mac library is set end to end in one
+       weight — `strong` in egui 0.35 is a *colour* flag that never touches the font, and
+       nothing installs a bold face. 600 here is the difference a screenshot comparison finds
+       first. See `boards.html`'s `h1` for the full reasoning. */
+    font-weight: 400;
+    letter-spacing: -0.01em;
+  }
+  /* aria-live: on a tablet this line is the only thing that says a request is in flight. */
+  .sub { margin: var(--unit) 0 0; color: var(--muted); }
+
+  /* ── A message ──────────────────────────────────────────────────────────────────────
+     One object twice: a line naming what happened, and a paragraph naming what to do about
+     it. The paragraph is the load-bearing half — four causes reach this box and each one
+     needs a *different* next action, so a single "something went wrong" would be four
+     failures wearing one coat. `signin.js`'s `describeFailure` decides which.
+
+     Two tones. `.is-bad` for a refusal or a fault, `--info-soft` for a condition that has
+     not stopped anything. Colour is never the only signal: the title says which it is. */
+  .message {
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--info);
+    border-radius: var(--r-medium);
+    background: var(--info-soft);
+    padding: 12px;
+    margin: 16px 0 0;
+  }
+  .message.is-bad { border-left-color: var(--danger); background: var(--danger-soft); }
+  .message strong { display: block; font-weight: 600; margin-bottom: var(--unit); }
+  .message p { margin: 0; color: var(--muted); }
+
+  /* ── The forms ──────────────────────────────────────────────────────────────────────── */
+  form { margin: 16px 0 0; }
+  label.field {
+    display: block;
+    font-size: var(--t-body);
+    margin: 12px 0 var(--unit);
+  }
+  form > label.field:first-child { margin-top: 0; }
+
+  input[type="text"],
+  input[type="password"] {
+    display: block;
+    width: 100%;
+    /* 44 is Apple's own target, and a field is the one control on this page. */
+    min-height: 44px;
+    padding: 0 var(--pad);
+    border: 1px solid var(--border);
+    border-radius: var(--r-small);
+    background: var(--surface);
+    color: inherit;
+    /* ⚠ **16px, not 13px, and these are two declarations rather than the `font:` shorthand
+       for a reason worth writing down.** `inherit` is a legal value for `font` as a *whole*
+       — `font: inherit` — and is **not** a legal component of it: `font: 16px/1.4 inherit`
+       is a parse error, and CSS drops the entire declaration silently, so the field ends up
+       at the user agent's 13.33px monospace-ish default and every hint below is a lie. Two
+       longhands cannot have that failure.
+       And 16 rather than the Mac's 13 because iOS zooms the whole page in when a field
+       smaller than 16px takes focus, and does **not** zoom back out — which reads as the
+       layout breaking at the exact moment somebody is typing a password. */
+    font-family: inherit;
+    font-size: 16px;
+    line-height: 1.4;
+  }
+  input:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: -1px;
+    border-color: var(--info);
+  }
+  /* A field the browser refused (too short, empty) — but only once it has been interacted
+     with, so an untouched empty form is not painted red before anybody has typed anything. */
+  input:user-invalid { border-color: var(--danger); }
+
+  .hint { margin: var(--unit) 0 0; color: var(--muted); font-size: var(--t-numeric); }
+  .hint code { font: var(--t-numeric)/1 var(--mono); }
+  /* Reserved by `min-height` rather than shown and hidden: a per-field error that appears
+     from nowhere shifts every control below it downward under the thumb that is reaching
+     for one. */
+  .field-error {
+    margin: var(--unit) 0 0;
+    min-height: 1.4em;
+    color: var(--danger);
+    font-size: var(--t-numeric);
+  }
+
+  .btn {
+    appearance: none;
+    -webkit-appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    min-height: 44px;
+    margin-top: 16px;
+    padding: 0 12px;
+    border: 1px solid var(--accent);
+    border-radius: var(--r-small);
+    background: var(--accent);
+    color: var(--on-accent);
+    font: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+    /* §3: motion is functional and fast, 120-160ms, ease-out. */
+    transition: background-color 120ms ease-out, opacity 120ms ease-out;
+    -webkit-tap-highlight-color: transparent;       /* iOS paints its own grey flash otherwise */
+    touch-action: manipulation;                     /* drops the 300ms double-tap-to-zoom wait */
+  }
+  @media (hover: hover) { .btn:hover:not(:disabled) { filter: brightness(1.06); } }
+  .btn:active:not(:disabled) { filter: brightness(0.96); }
+  .btn:focus-visible { outline: 2px solid var(--info); outline-offset: 2px; }
+  /* Disabled while a request is in flight, and while a 429's wait is running. `cursor` and
+     the wash together, because opacity alone on a filled teal button still reads as pressable. */
+  .btn:disabled { opacity: 0.55; cursor: default; }
+  .btn-quiet {
+    background: var(--surface);
+    border-color: var(--border);
+    color: inherit;
+  }
+  @media (hover: hover) { .btn-quiet:hover:not(:disabled) { background: var(--hover); filter: none; } }
+  .btn-quiet:active:not(:disabled) { background: var(--pressed); filter: none; }
+
+  .note {
+    margin: 16px 0 0;
+    color: var(--faint);
+    font-size: var(--t-label);
+    text-align: center;
+  }
+  .note a { color: var(--muted); }
+</style>
+
+<main>
+  <p class="velm-wordmark">
+    <svg viewBox="0 0 48 48" fill="none" stroke-width="2.5" stroke-linecap="square"
+         aria-hidden="true" focusable="false">
+      <path d="M8 20V8h12" stroke="var(--accent)"/>
+      <path d="M40 20V8h-12M40 28v12h-12M8 28v12h12" stroke="var(--text)"/>
+    </svg>
+    velm
+  </p>
+
+  <div class="card">
+    <!-- ⚠ The heading and the live line both start on the *checking* state rather than on
+         either form. Naming a state before it has been decided is how a first-run server
+         comes to show "Sign in" for a moment and then replace it — a flicker that reads as
+         the page having changed its mind about who you are. -->
+    <h1 id="velm-title">Velm</h1>
+    <p class="sub" id="velm-sub" aria-live="polite">Checking…</p>
+
+    <div class="message" id="velm-message" role="alert" hidden>
+      <strong id="velm-message-title"></strong>
+      <p id="velm-message-detail"></p>
+    </div>
+
+    <!-- ══ SIGN IN ══════════════════════════════════════════════════════════════════════
+         `novalidate` is deliberate: the browser's own bubble says "Please fill out this
+         field" in a corner of the viewport a phone often scrolls away from, and it cannot
+         say the one thing this form needs to say (that the two passwords differ). Every
+         constraint is still declared on the elements — `required`, `minlength` — so a
+         no-JS build keeps them; `signin.js` reads them itself and writes into the
+         `.field-error` line under the field. -->
+    <form id="velm-signin" method="post" novalidate hidden>
+      <label class="field" for="velm-signin-user">Username</label>
+      <!-- ⚠ `autocapitalize="none"` is not decoration. iOS capitalises the first letter of a
+           text field by default, so `ada` is submitted as `Ada` — and the failure is invisible
+           to the person typing, because the capital is what they are looking at. `autocorrect`
+           and `spellcheck` for the neighbouring reason: a username is not a word. -->
+      <input id="velm-signin-user" name="username" type="text" required
+             autocomplete="username" inputmode="text" enterkeyhint="next"
+             autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
+      <p class="field-error" id="velm-signin-user-error"></p>
+
+      <label class="field" for="velm-signin-pass">Password</label>
+      <!-- ⚠ `current-password`, and **never** `autocomplete="off"` on a password field.
+           Managers ignore `off` on passwords anyway (they were told to, because sites used it
+           to fight them), so all it achieves is to stop the honest ones filling it — which
+           pushes people towards a password they can type from memory. -->
+      <input id="velm-signin-pass" name="password" type="password" required
+             autocomplete="current-password" enterkeyhint="go" maxlength="128">
+      <p class="field-error" id="velm-signin-pass-error"></p>
+
+      <button class="btn" id="velm-signin-go" type="submit">Sign in</button>
+      <p class="hint" id="velm-lifetime"></p>
+    </form>
+
+    <!-- ══ FIRST RUN ════════════════════════════════════════════════════════════════════
+         The sentence about owning the server is in the markup rather than written by the
+         script, because it is the one thing on this page that is true before any request has
+         been made and it must not depend on a fetch to be read. -->
+    <form id="velm-setup" method="post" novalidate hidden>
+      <p class="hint" id="velm-setup-note">
+        This server has no accounts yet. The first one <strong>owns it</strong> — it can see
+        every board already here, and it is the only account that can add or remove others.
+      </p>
+
+      <label class="field" for="velm-setup-user">Choose a username</label>
+      <input id="velm-setup-user" name="username" type="text" required
+             autocomplete="username" inputmode="text" enterkeyhint="next"
+             autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
+      <p class="field-error" id="velm-setup-user-error"></p>
+
+      <label class="field" for="velm-setup-pass">Choose a password</label>
+      <!-- ⚠ `new-password` on both, which is what makes a manager offer to *generate* one and
+           then offer the same generated value into the confirm field instead of treating the
+           second box as a different secret. `minlength` is the floor `signin.js` also checks;
+           `maxlength` is advisory only — see the hint, and the server enforces its own. -->
+      <input id="velm-setup-pass" name="password" type="password" required minlength="12"
+             autocomplete="new-password" enterkeyhint="next" maxlength="128">
+      <!-- ⚠ The error line sits directly under its own field and the hint below that. The
+           other way round reads as though the rule applies to whatever comes next, and on a
+           form with three fields that is a person fixing the wrong box. -->
+      <p class="field-error" id="velm-setup-pass-error"></p>
+      <p class="hint">
+        At least 12 characters. There are no rules about capitals or symbols — length is the
+        only thing that makes a password hard to guess, and every other rule just produces
+        <code>Password1!</code>.
+      </p>
+
+      <label class="field" for="velm-setup-pass2">And again</label>
+      <input id="velm-setup-pass2" name="password_confirm" type="password" required minlength="12"
+             autocomplete="new-password" enterkeyhint="go" maxlength="128">
+      <p class="field-error" id="velm-setup-pass2-error"></p>
+
+      <button class="btn" id="velm-setup-go" type="submit">Create this account</button>
+      <p class="hint">
+        There is no way to reset this password — nothing here can send you an email. Keep it
+        somewhere you will still have it.
+      </p>
+    </form>
+
+    <!-- Shown only when nothing answered, because that is the one failure where the useful
+         thing to do is ask again rather than type again. Every other cause leaves a form on
+         screen and the button is the retry. -->
+    <button class="btn btn-quiet" id="velm-retry" type="button" hidden>Try again</button>
+  </div>
+
+  <p class="note">
+    Your boards live on your own server. Nothing on this page is sent anywhere else.
+  </p>
+</main>
+
+<script type="module">
+  // Nothing runs on import: `signin.js` is a module of pure helpers plus one `mount`, which
+  // is what lets a `node --input-type=module` harness drive the redirect validator, the
+  // setup-flag reader and the failure classifier without a browser — the three pieces most
+  // able to be wrong while looking right.
+  import { mount } from './signin.js';
+  mount();
+</script>

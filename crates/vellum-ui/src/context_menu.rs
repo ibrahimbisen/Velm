@@ -59,9 +59,6 @@ pub enum Row {
     Command(Command),
     Separator,
     Sub(Submenu),
-    /// A band's name — [`crate::command::Entry::Heading`]'s twin, drawn by the same
-    /// function so a section is spelled the same on the right button and in the menu bar.
-    Heading(&'static str),
     /// A link card's three display forms, as a nested list. Not a [`Submenu`] because
     /// it emits a [`StyleEdit`] rather than a command, and because it is drawn from
     /// the selection's current mode so it can tick the one in force.
@@ -72,11 +69,6 @@ pub enum Row {
     /// Copy the one selected card's address to the pasteboard. Carries no URL, for the
     /// same reason [`Row::OpenPage`] does not.
     CopyLink,
-    /// Show the one selected note's `.md` file. Not a [`Command`] for the same reason
-    /// [`Row::OpenPage`] is not: it acts on a value only the model holds.
-    RevealNote,
-    /// Open the one selected browser node's page in the user's own browser.
-    BrowserOpen,
 }
 
 /// Which rows a target gets.
@@ -92,46 +84,6 @@ pub fn rows(target: ContextTarget, model: &PanelModel, cmd_ctx: &CommandContext)
             out.push(Row::Command(Command::Cut));
             out.push(Row::Command(Command::Duplicate));
             out.push(Row::Command(Command::Delete));
-
-            // The Agent Canvas band. Every row here is an ordinary command, and all of them
-            // are also in Edit ▸ Agent — which is not tidiness but the rule
-            // `every_command_offered_here_is_also_in_the_menu_bar` enforces: a verb that
-            // exists only on the right button is a verb a user who does not right-click
-            // never finds, and the shortcut sheet is generated from the menu tree.
-            //
-            // **Named, and complete.** It used to be four rows sitting between two
-            // separators, indistinguishable from the clipboard band above them and missing
-            // two of Edit ▸ Agent's verbs — reported as *"i want all of the settings that are
-            // associated to the ai / terminal mode to have its own section"* and *"more
-            // options here"*, of the `⋮` popup. Both halves are the same fix: say what the
-            // band is, and put the whole of it in.
-            if model.has_agent() {
-                out.push(Row::Separator);
-                out.push(Row::Heading(crate::command::AGENT_SECTION));
-                // One row, naming what pressing it will do — the same rule the lock row
-                // follows. Both are still in Edit ▸ Agent for the mixed case, where
-                // neither label is the whole truth.
-                out.push(Row::Command(if cmd_ctx.any_agent_running {
-                    Command::StopAgent
-                } else {
-                    Command::RunAgent
-                }));
-                out.push(Row::Command(Command::ToggleAgentRaw));
-                out.push(Row::Command(Command::EditAgentRules));
-                out.push(Row::Command(Command::EditAgentSchedule));
-                // The two that were only ever in the menu bar. `SetTerritory` in particular
-                // is the one verb on this list you reach *while looking at the node you want
-                // to draw a region for*, which is the gesture the right button is for.
-                out.push(Row::Command(Command::SetTerritory));
-            }
-            if model.has_note() && model.note_path().is_some() {
-                out.push(Row::Separator);
-                out.push(Row::RevealNote);
-            }
-            if model.has_browser() && model.browser_url().is_some() {
-                out.push(Row::Separator);
-                out.push(Row::BrowserOpen);
-            }
 
             // A card's own rows, in its own band. Only when something selected is one:
             // `card_mode` is `Absent` for every other kind, which is the same test the
@@ -318,7 +270,6 @@ fn draw(
             crate::menu::menu_item(ui, palette, command, cmd_ctx, header, events);
         }
         Row::Sub(sub) => crate::menu::submenu(ui, palette, sub, cmd_ctx, header, events),
-        Row::Heading(title) => crate::menu::section_heading(ui, palette, title),
         Row::CardMode => card_mode(ui, palette, model, events),
         Row::OpenPage => {
             let Some(url) = model.link_url.clone() else { return };
@@ -333,22 +284,6 @@ fn draw(
                 crate::menu::row_button("Copy link").min_size(egui::vec2(crate::menu::row_width(ui), 0.0));
             if ui.add(row).on_hover_text(url.clone()).clicked() {
                 events.push(UiEvent::CopyLink(url));
-            }
-        }
-        Row::RevealNote => {
-            let Some(path) = model.note_path().map(str::to_owned) else { return };
-            let row = crate::menu::row_button("Show the file")
-                .min_size(egui::vec2(crate::menu::row_width(ui), 0.0));
-            if ui.add(row).on_hover_text(path.clone()).clicked() {
-                events.push(UiEvent::RevealPath(path.into()));
-            }
-        }
-        Row::BrowserOpen => {
-            let Some(url) = model.browser_url().map(str::to_owned) else { return };
-            let row = crate::menu::row_button("Open in my browser")
-                .min_size(egui::vec2(crate::menu::row_width(ui), 0.0));
-            if ui.add(row).on_hover_text(url.clone()).clicked() {
-                events.push(UiEvent::OpenLink(url));
             }
         }
     }
@@ -440,58 +375,13 @@ mod tests {
         }
     }
 
-    fn agent(n: i32, running: bool) -> SelectionItem {
-        let own = vellum_agent::AgentRules::default();
-        SelectionItem {
-            agent: Some(crate::AgentSummary {
-                chat_theme: None,
-                chat_opacity: 255,
-                has_chat_background: false,
-                role: "Reviewer".to_owned(),
-                role_kind: vellum_agent::RoleKind::Worker,
-                provider: None,
-                inherited_provider: vellum_agent::ProviderChoice::new(
-                    vellum_agent::Provider::Claude,
-                ),
-                display: None,
-                inherited_display: vellum_agent::DisplayMode::Clean,
-                working_dir: None,
-                project_dir: None,
-                worktree: crate::WorktreeState::Off,
-                schedule: None,
-                territory: None,
-                spawn_cap: 0,
-                context: Vec::new(),
-                running,
-                rules: vellum_agent::rules::resolve(
-                    &vellum_agent::RuleFile::default(),
-                    &vellum_agent::RuleFile::default(),
-                    &own,
-                    "Reviewer",
-                ),
-                own_rules: own,
-                connected: Vec::new(),
-                accepts_messages: true,
-                voice: false,
-                voice_available: false,
-            }),
-            ..SelectionItem::new(id(n), ItemFacet::Agent, Placement::new(0.0, 0.0, 400.0, 300.0))
-        }
-    }
-
     fn ctx_for(selection: &[SelectionItem]) -> CommandContext {
         let locked = selection.iter().filter(|i| i.locked).count();
-        let agents = selection.iter().filter_map(|i| i.agent.as_ref());
-        let running = agents.clone().filter(|a| a.running).count();
-        let agents_selected = agents.count();
         CommandContext {
             board_open: true,
             selected: selection.len(),
             any_locked: locked > 0,
             all_locked: locked > 0 && locked == selection.len(),
-            agents_selected,
-            any_agent_running: running > 0,
-            all_agents_running: agents_selected > 0 && running == agents_selected,
             ..CommandContext::default()
         }
     }
@@ -595,56 +485,19 @@ mod tests {
         }
     }
 
-    /// An agent's right-click rows, and the one that names the direction it will move.
-    ///
-    /// The band appears because the selection *has* agent properties — a sticky must never
-    /// be offered *Run*, which is the failure a kind-match introduces the first time
-    /// somebody adds a node kind and forgets an arm.
-    #[test]
-    fn an_agent_gets_the_agent_verbs_and_a_sticky_does_not() {
-        let idle = [agent(1, false)];
-        let model = PanelModel::derive(&idle);
-        let offered = commands(&rows(ContextTarget::Selection, &model, &ctx_for(&idle)));
-        assert!(offered.contains(&Command::RunAgent));
-        assert!(!offered.contains(&Command::StopAgent), "it is not running");
-        assert!(offered.contains(&Command::ToggleAgentRaw));
-        assert!(offered.contains(&Command::EditAgentRules));
-        assert!(offered.contains(&Command::EditAgentSchedule));
-
-        let live = [agent(1, true)];
-        let model = PanelModel::derive(&live);
-        let offered = commands(&rows(ContextTarget::Selection, &model, &ctx_for(&live)));
-        assert!(offered.contains(&Command::StopAgent));
-        assert!(!offered.contains(&Command::RunAgent), "one row, naming what it will do");
-
-        let plain = [sticky(1)];
-        let model = PanelModel::derive(&plain);
-        let offered = commands(&rows(ContextTarget::Selection, &model, &ctx_for(&plain)));
-        for agentish in [
-            Command::RunAgent,
-            Command::StopAgent,
-            Command::ToggleAgentRaw,
-            Command::EditAgentRules,
-            Command::EditAgentSchedule,
-        ] {
-            assert!(!offered.contains(&agentish), "{agentish:?} was offered on a sticky");
-        }
-    }
-
     /// See [`is_in_the_menu_bar`].
     #[test]
     fn every_command_offered_here_is_also_in_the_menu_bar() {
         let selection = [card(1, Some("https://example.com"))];
         let model = PanelModel::derive(&selection);
-        // Both agent states, because the running one offers a *different* command and a
-        // fixture with only the idle one would leave `StopAgent` unchecked.
-        let idle = [agent(2, false)];
-        let live = [agent(3, true)];
+        // A **locked** selection as well as an unlocked one: the lock row offers a
+        // *different* command in each state, so a fixture with only one of them leaves
+        // `Unlock` unchecked.
+        let locked = [SelectionItem { locked: true, ..sticky(2) }];
         let both = [
             rows(ContextTarget::Selection, &model, &ctx_for(&selection)),
             rows(ContextTarget::Canvas, &PanelModel::empty(), &ctx_for(&[])),
-            rows(ContextTarget::Selection, &PanelModel::derive(&idle), &ctx_for(&idle)),
-            rows(ContextTarget::Selection, &PanelModel::derive(&live), &ctx_for(&live)),
+            rows(ContextTarget::Selection, &PanelModel::derive(&locked), &ctx_for(&locked)),
         ];
         for command in both.iter().flatten().filter_map(|r| match r {
             Row::Command(c) => Some(*c),

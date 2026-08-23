@@ -109,57 +109,40 @@ struct Filing {
     /// to enable and disable it"*. A feature nobody can find is off for everyone, and this
     /// one announces itself the first time an edge lights up.
     align_objects: Option<bool>,
-    /// The Agent Canvas layer's four application-wide settings.
+    /// ⚠ **The Agent Canvas's six settings — archived, still parsed, deliberately unread.**
     ///
-    /// In the sidecar rather than on a board, for the reason feedback 31 settled for the
-    /// grid: these are how *you* work, not what a board is. An agent's output style, whether
-    /// a browser engine may run at all, and whether coding agents get their own checkout are
-    /// all answers you give once — and putting any of them on the board would mean the answer
-    /// changing when you switched tabs.
+    /// The layer moved to `archive/` at the user's word: *"i just want it to be archived for
+    /// now … i just dont want it to be part of the app"*. Nothing in the application reads
+    /// any of these now, and no control anywhere writes one.
     ///
-    /// Every one is `Option` and every one resolves to a **conservative** default when unset,
-    /// so a `library.json` written before this layer existed reads exactly as it did: no
-    /// browser engine, no worktrees, clean output.
+    /// **They stay in this struct, and that is the sharpest edge in the whole archiving.**
+    /// This user's `library.json` already holds all six keys. Deleting the fields would not
+    /// fail the parse — `serde` reads a field with no home as *absent*, which is harmless on
+    /// its own. It is [`Library::persist`] that does the damage, because it writes the whole
+    /// struct back: the next star, rename or delete rewrites the sidecar **without** these
+    /// keys and the user's answers are gone, with nothing to notice it by, since the boards
+    /// themselves would be untouched. That is the reasoning `spaces` records above and what
+    /// was done for `grid` when feedback 31 removed *View ▸ Grid*. See RULE ZERO in
+    /// `CLAUDE.md`: archiving the *feature* must not archive what is already on disk.
     ///
-    /// `default_display` is a **string**, not the enum, for the reason `theme` and `accent`
-    /// already are: an enum serialised by variant order turns one value into another the day
-    /// somebody inserts a third in the middle. An unknown string degrades to the default
-    /// rather than failing the whole file to parse.
+    /// So they are read, carried, and written back unchanged. A later Agent Canvas picks the
+    /// user's answers up where they were left rather than asking all six again.
+    ///
+    /// `speech` is a raw [`serde_json::Value`] because its type lived in the archived crate.
+    /// A `Value` carries **every** key and value on disk back out again, including ones a
+    /// future version adds, where any stand-in struct would silently discard the half it did
+    /// not model on the very next `persist`. (`serde_json`'s default `Value::Object` is a
+    /// `BTreeMap`, so the keys inside `speech` come back alphabetised rather than in their
+    /// original order. Nothing is lost, and no reader of this file cares about order.)
+    ///
+    /// No `#[expect(dead_code)]`, for `grid`'s reason: serde's derive both reads and writes
+    /// every one of them, so they are not dead — only unread by the application.
     agent_display: Option<String>,
-    /// Which provider a node that has not chosen one runs on — feature 16's *Inherit*.
-    ///
-    /// ⚠ **The inspector has always offered "Inherit the board's default" and there was no
-    /// default to inherit**: the value was `ProviderChoice::new(Provider::default())`, a
-    /// compile-time constant, so every inheriting node followed Claude and the control's own
-    /// promise — *"a node that inherits follows when the board's default moves"* — described
-    /// something that could not move. A string for the reason `agent_display` above is one.
     agent_provider: Option<String>,
-    /// The chat theme a node with no choice of its own draws in. A **string**, for
-    /// `agent_display`'s reason above, and unset means Velm's own palette — so a
-    /// `library.json` written before chat themes existed reads exactly as it did.
     agent_chat_theme: Option<String>,
-    /// Whether browser nodes may instantiate an engine at all. Off unless asked: an engine is
-    /// 60–150MB idle and `docs/01-architecture.md` §1 rules a webview out of the canvas.
     browser_nodes: Option<bool>,
-    /// Whether a coding agent gets its own git worktree. Off unless asked: it is a second
-    /// checkout of the repository per agent, which is disk the user did not agree to spend.
     worktrees: Option<bool>,
-    /// How a spoken prompt is turned into words — feature 12's second half.
-    ///
-    /// App-wide rather than per node, because it names *this machine's* transcriber (which
-    /// whisper binary, which model file, or which API) and none of that is a property of one
-    /// agent. Whether a given node listens at all **is** per node, and stays on
-    /// `AgentModel::voice`.
-    ///
-    /// ⚠ **Carries no API key**, by construction — [`vellum_agent::voice::Speech`]'s own doc
-    /// says so and it is why this can live in a sidecar that is written in plain text. A
-    /// hosted transcription resolves its key from `credentials.json` when the request is
-    /// built, which is `docs/07` §8a's rule that a key lives in exactly one file.
-    ///
-    /// `None` is *never configured*, which is a different state from configured-and-default:
-    /// unset falls back to `Speech::default()`, whose `Preference::Auto` prefers a local
-    /// transcriber when one is installed and refuses by name when neither is.
-    speech: Option<vellum_agent::voice::Speech>,
+    speech: Option<serde_json::Value>,
     /// Miro's **Snap to grid**: whether a move, a resize or a placement lands on the
     /// board's own grid.
     ///
@@ -382,150 +365,6 @@ impl Library {
     pub fn set_align_objects(&mut self, on: bool) {
         self.filing.align_objects = Some(on);
         self.persist();
-    }
-
-    /// The mode a new agent node shows its output in — feature 2's second half, the global
-    /// default that every node inheriting follows.
-    ///
-    /// **Clean** unless the user has said otherwise: raw output is every tool call, every
-    /// shell command and every reasoning step, which is the right thing to *ask for* and the
-    /// wrong thing to be given.
-    pub fn default_display_mode(&self) -> vellum_agent::DisplayMode {
-        self.filing
-            .agent_display
-            .as_deref()
-            .and_then(|tag| {
-                vellum_agent::DisplayMode::ALL.into_iter().find(|mode| mode.tag() == tag)
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn set_default_display_mode(&mut self, mode: vellum_agent::DisplayMode) {
-        self.filing.agent_display = Some(mode.tag().to_owned());
-        self.persist();
-    }
-
-    /// The provider an agent node that has not chosen one runs on.
-    ///
-    /// Velm's own default unless the user has said otherwise, so no existing board changes
-    /// where it runs because this setting appeared. An unrecognised tag degrades to that
-    /// default rather than failing the sidecar to parse.
-    pub fn default_provider(&self) -> vellum_agent::Provider {
-        self.filing
-            .agent_provider
-            .as_deref()
-            .and_then(|tag| {
-                vellum_agent::Provider::ALL.into_iter().find(|provider| provider.tag() == tag)
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn set_default_provider(&mut self, provider: vellum_agent::Provider) {
-        self.filing.agent_provider = Some(provider.tag().to_owned());
-        self.persist();
-    }
-
-    /// The chat theme new agent nodes, and every node still inheriting, draw in.
-    ///
-    /// **Velm's own** unless the user has said otherwise, so nothing about an existing board
-    /// changes appearance because this feature landed.
-    pub fn default_chat_theme(&self) -> vellum_agent::ChatTheme {
-        self.filing
-            .agent_chat_theme
-            .as_deref()
-            .map(vellum_agent::ChatTheme::from_tag)
-            .unwrap_or_default()
-    }
-
-    pub fn set_default_chat_theme(&mut self, theme: vellum_agent::ChatTheme) {
-        self.filing.agent_chat_theme = Some(theme.tag().to_owned());
-        self.persist();
-    }
-
-    /// Whether a browser node may run a real engine. **Off** unless turned on.
-    pub fn browser_nodes(&self) -> bool {
-        self.filing.browser_nodes.unwrap_or(false)
-    }
-
-    pub fn set_browser_nodes(&mut self, on: bool) {
-        self.filing.browser_nodes = Some(on);
-        self.persist();
-    }
-
-    /// Whether coding agents get their own git worktree. **Off** unless turned on.
-    pub fn worktrees(&self) -> bool {
-        self.filing.worktrees.unwrap_or(false)
-    }
-
-    pub fn set_worktrees(&mut self, on: bool) {
-        self.filing.worktrees = Some(on);
-        self.persist();
-    }
-
-    /// How a spoken prompt is transcribed. Defaults to *prefer a local transcriber*.
-    pub fn speech(&self) -> vellum_agent::voice::Speech {
-        self.filing.speech.clone().unwrap_or_default()
-    }
-
-    pub fn set_speech(&mut self, speech: vellum_agent::voice::Speech) {
-        self.filing.speech = Some(speech);
-        self.persist();
-    }
-
-    /// What each provider looks like from here: installed, credentialled, and one line
-    /// saying what was found.
-    ///
-    /// **Probed, not assumed.** `Provider::supports_subscription` says a CLI *exists to
-    /// delegate to*, which is a statement about the world and not about this machine — so a
-    /// missing binary has to degrade to a row that names it rather than to a provider that
-    /// silently never answers.
-    ///
-    /// **No key ever leaves this function.** `has_key` is a boolean and `detail` is built
-    /// from the command's own name; neither can carry credential material, which is enforced
-    /// by there being nowhere in `ProviderStatus` to put it.
-    pub fn provider_status(&self) -> Vec<vellum_ui::ProviderStatus> {
-        vellum_agent::Provider::ALL
-            .into_iter()
-            .map(|provider| {
-                let command = provider.default_command();
-                // `probe_command` answers `Result`, and a missing binary is not an error
-                // here — it is the row's whole content. Flattened to `Option` deliberately.
-                let found = command
-                    .map(vellum_agent::transport::probe_command)
-                    .and_then(Result::ok);
-                let available = match provider {
-                    // A local model is reachable when its endpoint is, which needs a request
-                    // — too expensive to answer once per frame. Reported as available and
-                    // allowed to fail loudly at the first turn, which is the honest order.
-                    vellum_agent::Provider::Local | vellum_agent::Provider::Custom => true,
-                    _ if command.is_some() => found.is_some(),
-                    _ => self.has_credential(provider),
-                };
-                let detail = match (command, &found) {
-                    (Some(name), Some(path)) => format!("{name} at {}", path.display()),
-                    (Some(name), None) => format!("{name} is not installed"),
-                    (None, _) if provider.needs_api_key() => "needs an API key".to_owned(),
-                    (None, _) => "your own endpoint".to_owned(),
-                };
-                vellum_ui::ProviderStatus {
-                    provider,
-                    available,
-                    has_key: self.has_credential(provider),
-                    detail,
-                }
-            })
-            .collect()
-    }
-
-    /// Whether a credential is stored for a provider. **Never which.**
-    ///
-    /// The credentials file sits beside the boards directory rather than inside it — it is
-    /// the *application's*, not a board's, and a file under `boards/` is one a board-shaped
-    /// rescan has to learn to ignore. `docs/07-agent-canvas.md` §8a names the location.
-    fn has_credential(&self, provider: vellum_agent::Provider) -> bool {
-        let data_dir = self.root.parent().unwrap_or(&self.root);
-        vellum_agent::transport::http::Credentials::load(data_dir)
-            .is_ok_and(|creds| creds.has_key(provider))
     }
 
     /// Whether a move lands on the board's grid. **Off** unless the user has turned it on.
@@ -1248,6 +1087,59 @@ mod tests {
         assert_eq!(library.cards().len(), 1);
         assert!(library.spaces().is_empty());
         assert_eq!(library.theme_preference(), ThemePreference::System);
+    }
+
+    /// ⚠ **The archived Agent Canvas's six settings must survive an ordinary rewrite.**
+    ///
+    /// RULE ZERO applied to a preference file rather than to a board. The layer moved to
+    /// `archive/` and nothing reads these keys any more — but this user's `library.json`
+    /// already holds all six, and [`Library::persist`] writes the **whole** struct back on
+    /// every star, rename, delete and theme change. Drop the fields from `Filing` and the
+    /// first ordinary action erases the user's answers, silently, with every board intact so
+    /// nothing looks wrong until somebody goes looking. They are kept unread precisely so
+    /// that cannot happen; this is the assertion that says so.
+    ///
+    /// `speech` is checked *inside* rather than by key, because it is the one field whose
+    /// type lived in the archived crate: a stand-in that modelled none of its contents would
+    /// keep the key and write back an empty object, which passes a key-only check.
+    ///
+    /// A/B: delete the six fields and this fails on the first assertion.
+    #[test]
+    fn the_archived_agent_settings_survive_a_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("boards");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("library.json"),
+            br#"{
+                "agent_display": "raw",
+                "agent_provider": "codex",
+                "agent_chat_theme": "terminal",
+                "browser_nodes": true,
+                "worktrees": true,
+                "speech": { "preference": "Local", "model_file": "/models/base.bin" }
+            }"#,
+        )
+        .unwrap();
+
+        // Any ordinary action rewrites the sidecar; a star is the cheapest one to reach.
+        let mut library = Library::open(&root);
+        let path = library.create("Engine bay").unwrap();
+        library.set_starred(&path, true);
+
+        let bytes = std::fs::read(root.join("library.json")).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(written["agent_display"].as_str(), Some("raw"));
+        assert_eq!(written["agent_provider"].as_str(), Some("codex"));
+        assert_eq!(written["agent_chat_theme"].as_str(), Some("terminal"));
+        assert_eq!(written["browser_nodes"].as_bool(), Some(true));
+        assert_eq!(written["worktrees"].as_bool(), Some(true));
+        assert_eq!(
+            written["speech"]["model_file"].as_str(),
+            Some("/models/base.bin"),
+            "`speech` kept its key and lost what was inside it"
+        );
+        assert!(library.is_starred(&path), "the rewrite this test relies on did happen");
     }
 
     /// Filing that points at a board someone deleted from the Finder has to go, or a

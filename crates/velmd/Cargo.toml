@@ -22,6 +22,9 @@ path = "src/main.rs"
 # `vellum-link/net` for a link card's metadata, and a browser cannot fetch a third party's
 # page anyway — CORS refuses it. So the server does the import and the tab asks it to.
 vellum-import.workspace = true
+# Accounts: passwords are stored only as Argon2id hashes. See `accounts.rs` for why the
+# `PasswordHasher` trait rather than the raw KDF, and why the salt comes from the OS.
+argon2.workspace = true
 anyhow.workspace = true
 # The HTTP head parser, and nothing else -- no I/O, no runtime. Already in `Cargo.lock` by
 # way of `ureq`'s own `ureq-proto`, so `velmd serve` adds no new entry to the lock file.

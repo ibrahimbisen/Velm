@@ -15,6 +15,14 @@ keywords = ["canvas", "whiteboard", "miro", "wgpu", "graphics"]
 categories = ["graphics", "gui"]
 
 [workspace.dependencies]
+# Password hashing for `velmd`'s accounts. Argon2id, pure Rust — no C, so it does not repeat
+# `rusqlite`'s bundled-sqlite build and it crosses to any target the server runs on.
+#
+# ⚠ Through the `PasswordHasher` trait, never the raw KDF: the stored string carries its own
+# parameters, which is what lets the cost be raised later without invalidating every password
+# already set. A bare hash plus constants in the source cannot be re-tuned without locking
+# everybody out.
+argon2 = "0.5"
 anyhow = "1"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
@@ -155,7 +163,6 @@ cosmic-text = "0.14"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Local crates.
-vellum-agent = { path = "crates/vellum-agent", default-features = false }
 vellum-chart = { path = "crates/vellum-chart" }
 vellum-connect = { path = "crates/vellum-connect" }
 vellum-doc = { path = "crates/vellum-doc" }
