@@ -1,0 +1,1663 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- ⚠ No `user-scalable=no`. This page is a document: pinching it to read is the browser
+     doing its job. Only `index.html` suppresses zoom, because the board handles its own
+     pinch and a page zoom on top of it fights the camera. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Velm — bring your Miro boards across</title>
+<meta name="description" content="Velm is an infinite-canvas whiteboard written in Rust. One process and 18.5 MB instead of fourteen and 296. Paste a Miro board in — pen strokes and all. Free, open source, on a server you run yourself.">
+<meta name="color-scheme" content="light">
+<!-- The Viewport mark, from `assets/logo/mark.svg` — four corner brackets, one accented,
+     inlined as a data URI so this page fetches nothing at all. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48' fill='none'%3E%3Cpath d='M8 20V8h12' stroke='%2300A38C' stroke-width='2.5' stroke-linecap='square'/%3E%3Cpath d='M28 8h12v12M40 28v12H28M20 40H8V28' stroke='%231A1D1F' stroke-width='2.5' stroke-linecap='square'/%3E%3C/svg%3E">
+
+<!--
+  ══════════════════════════════════════════════════════════════════════════════════════
+  THE SWITCH PAGE — design plan, and the rules it is written under
+  ══════════════════════════════════════════════════════════════════════════════════════
+
+  `velmd` can serve this at `/`. It is written for one reader: somebody who already uses
+  Miro, is tired of it, and wants to know what leaving costs them.
+
+  ── THE ONE IDEA ──────────────────────────────────────────────────────────────────────
+
+      A switch page has to answer "what does this cost me?" before "why is it better?"
+
+  So the page is ordered against the instinct. The comparison comes early and is put in a
+  form the reader can check; then — before a single feature is sold — a column headed
+  **what you give up**, given exactly the same width, weight and type as the column beside
+  it. Generosity here is structural, not a turn of phrase: Miro's figures are set in the
+  same ink as Velm's, its bar is neutral rather than alarming, and there is not one ✗ on
+  the page. The argument is the measurement. If it needs a red cross it was not an
+  argument.
+
+  The hero carries the same idea in the other hand: it is a board **arriving**. Items land
+  one at a time and the last thing drawn is a pen stroke — which is the exact thing
+  Miro's own API cannot give back (§ *Moving a board*). The demo and the thesis are one
+  object.
+
+  ── PALETTE — every value from `crates/vellum-ui/src/theme.rs` ────────────────────────
+      BONE   #FCFDFE  panels, cards, the header
+      MILK   #F7F9FA  the ground behind them
+      PAPER  #F2F2F2  the board's own colour — the hero canvas wears it, nothing else
+      PEARL  #EBEEF0  a well
+      FROST  #E5EAED  every hairline
+      INK    #1A1D1F / INK_MUTED #5C656B  — see the note on the two greys below
+      SIGNAL_TEAL #00A38C, and #0C675B for accented *text*, which the teal cannot be
+
+  ── TYPE — no webfont, so the voice comes from scale, not from a typeface ─────────────
+  A CDN is forbidden here and a base64 face would be megabytes, so there is no display
+  font to choose. That is a constraint with a good answer: the app bundles Inter, whose
+  sibling on macOS is the system face, so `system-ui` reads as *the same product*. The
+  personality is then carried by three deliberate decisions instead:
+
+      · display  clamp(2.6rem … 5rem), weight 700, tracking -0.035em, leading 0.97
+      · body     17px/1.65, and never below 15px anywhere on the page
+      · utility  ui-monospace, in small caps-height with 0.12em tracking — used for the
+                 eyebrows, every figure, every ratio and the one shell command. This page
+                 argues from measurement, so numbers get their own voice and tabular
+                 figures, and the mono is that voice rather than decoration.
+
+  ── LAYOUT ────────────────────────────────────────────────────────────────────────────
+
+      ┌────────────────────────────────────────────────────────────┐
+      │ ⌐velm                                        [ way in ]    │  hairline
+      ├────────────────────────────────────────────────────────────┤
+      │ MOVING FROM MIRO          ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐      │
+      │ Bring your boards.        │  a board arriving       │      │  brackets = the mark
+      │ Leave the 296 MB.         │  (live <canvas>)        │      │  around a real
+      │ lede · [way in] [numbers] └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘      │  viewport
+      ├────────────────────────────────────────────────────────────┤
+      │ THE NUMBERS   Miro ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 296 MB                 │  bars carry the datum
+      │               Velm ▓ 18.5 MB              ·  16× smaller   │
+      ├────────────────────────────────────────────────────────────┤
+      │ WHAT COMES ACROSS        │  WHAT YOU GIVE UP               │  equal columns —
+      │ · · · ·                  │  · · · ·                        │  this is the page
+      ├────────────────────────────────────────────────────────────┤
+      │ 1 ─── 2 ─── 3   three steps, because it genuinely is three │
+      └────────────────────────────────────────────────────────────┘
+
+  ── SIGNATURE ────────────────────────────────────────────────────────────────────────
+  The mark's four brackets, enlarged into a real viewport around a live canvas. The mark
+  is called *Viewport*; on every other surface it is a 24px logo. Here it is the frame the
+  product is seen through, at the size it was drawn to be. That is the one thing this page
+  should be remembered by, and it is why there is no other flourish on it.
+
+  ── HOUSE RULES CARRIED FORWARD, NOT ABANDONED ───────────────────────────────────────
+  A landing page is where a house style quietly turns into gradients and drop shadows.
+  This one is allowed to be *bolder* — more scale, more air, more accent — and is not
+  allowed to be a different product:
+
+  · **Structure is drawn with a hairline, not a shadow.** The light ramp's steps are 8/255
+    apart and the gaps *are* the structure. No borders invented, no elevation faked.
+  · **Shadow only where something genuinely floats over the board**, and then exactly as
+    the app draws it — two passes, `(0,1) blur 3` at `alpha(INK, 26)` over `(0,2) blur 8`
+    at `alpha(INK, 12)`. `theme.rs:1201` for the offsets, `:618` for the two alphas. The
+    `Palette::ambient` doc says why two: *"two passes rather than one big blur is what
+    stops a floating panel reading as a 2003 drop-shadow filter."* On this page exactly one
+    thing floats — the hero's link card — so there is **no `box-shadow` in the stylesheet
+    at all**, and the two passes live in `card()` where they are drawn.
+  · **Radius 6 everywhere; 10 only on a floating surface**, which is `SELECTION_BAR_RADIUS`
+    — the one place the app itself goes past 6, for exactly this reason.
+
+  ── ⚠ LIGHT ONLY, AND THE MISSING DARK BLOCK IS DELIBERATE ───────────────────────────
+  `ThemePreference::resolve` answers `Light` whatever it is asked — the user's own
+  instruction, *"i want only light mode"*. The dark tokens exist in `theme.rs`, are
+  tested, and are unreachable there too. A `prefers-color-scheme: dark` block here would
+  make this the only surface in the entire product that has one, and it would not match
+  the board it opens.
+
+  ── ⚠ EVERY NUMBER IS QUOTED, NOT RECALLED ───────────────────────────────────────────
+      README.md §Why, lines 30-32        install size, memory, process count
+      README.md §Why, lines 38-39        Velm's own frame figures, and the machine
+      README.md lines 87-88              596 of 596 import, 532 losslessly
+      README.md lines 99-105, 137-141    what it deliberately does not do; platforms
+      docs/02-miro-formats.md §3         the API census — 310 of 577 content-free
+      docs/08-web.md §8                  the browser figures, re-run 2026-08-22
+      docs/08-web.md §9                  what the browser client does and does not do
+      web/boards.html                    the three import steps, worded as they ship
+
+  ⚠ **No board name and no person's name appears here**, and none ever may: this file is
+  tracked in a public repository and the boards it describes are somebody's private work.
+  "A 596-item board" says everything the number needs to say.
+
+  ⚠ **Never describe a gesture the reader cannot perform.** The three steps under *Moving a
+  board* are `boards.html`'s own, in its own order. Nothing deferred or archived is
+  described anywhere below as though it were a feature.
+
+  ── THE MOVING PARTS, AND WHAT HAPPENS WITHOUT THEM ──────────────────────────────────
+  Three, and all three degrade to the finished state rather than to nothing:
+
+    1. the hero canvas   → a `<canvas>` whose *fallback content* is an inline SVG of the
+                           settled board. Fallback content renders when scripting is off,
+                           not only when canvas is unsupported, so a no-JS reader gets the
+                           picture rather than a hole.
+    2. the comparison bars → full width in the stylesheet. The script only ever *subtracts*
+                           to animate them up from zero. A blocked script or a reduced-
+                           motion setting leaves the data drawn correctly, which is the
+                           only acceptable failure for a bar whose length is the datum.
+    3. `GET /api/v1/whoami` → sharpens the three doors, which are served pointing at
+                           `/signin` — the right answer in every state but one.
+  ══════════════════════════════════════════════════════════════════════════════════════
+-->
+
+<style>
+  /* ════════════════════════════════════════════════════════════════════════════════════
+     TOKENS — `crates/vellum-ui/src/theme.rs`, under theme.rs's own role names, so this
+     page and `boards.html` are one interface to somebody who sees them back to back.
+     ════════════════════════════════════════════════════════════════════════════════════ */
+  :root {
+    --surface: #FCFDFE;   /* BONE  */
+    --page: #F7F9FA;      /* MILK  */
+    --canvas: #F2F2F2;    /* PAPER — the board's own colour. Only the hero wears it. */
+    --raised: #EBEEF0;    /* PEARL */
+    --line: #E5EAED;      /* FROST — every hairline on the page */
+    --ink: #1A1D1F;       /* INK   */
+
+    /* ⚠ **Two greys, and the split is measured rather than stylistic.** The brief named
+       `#7A8186` as *muted*; `theme.rs` calls `#5C656B` `INK_MUTED`. Against this page's
+       ground `#F7F9FA`:
+
+           #5C656B   5.6:1   passes AA at any size
+           #7A8186   3.7:1   fails AA for body text; passes only the ≥24px large-text rule
+
+       So every paragraph — fine print included — takes `INK_MUTED`, and `#7A8186` keeps
+       its right name and is used only where nothing is being *read*: a separator dot, a
+       rule. Shipping a 3.7:1 paragraph to honour a hex is a legibility bug chosen on
+       purpose. */
+    --muted: #5C656B;     /* INK_MUTED */
+    --faint: #7A8186;     /* non-text marks only */
+
+    --accent: #00A38C;    /* SIGNAL_TEAL — the one accent, chosen by the user */
+    /* Charcoal on the teal is 5.3:1; white on it is 3.2:1 and fails AA. `Palette::on_accent`
+       derives this rather than fixing it, because on the cobalt accent the two swap. */
+    --on-accent: #1A1D1F;
+    --accent-soft: #CAEBE7;  /* mix(BONE, teal, 20) */
+    /* ⚠ Accented **text** is this and never `--accent`: the teal measures 3.1:1 on the
+       page and fails AA outright. This is 6.4:1. */
+    --accent-deep: #0C675B;
+
+    --hover: #DCEBEF;     /* Palette::hover   */
+    --pressed: #D0E6EC;   /* Palette::pressed */
+
+    /* ⚠ There is deliberately **no shadow token here**. The only thing on this page that
+       floats over the board is the hero's link card, and that card is drawn on the canvas
+       — so its two passes are in `card()`, in the one place they are used. A pair of
+       custom properties nothing referenced would be this repository's signature defect
+       written into its own landing page. */
+
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+    /* The type scale. Three sizes fluid, the rest fixed — a body size that grows with the
+       viewport is a body size that is wrong on one of them. */
+    --t-display: clamp(2.6rem, 7.2vw, 5rem);
+    --t-h2: clamp(1.7rem, 3.6vw, 2.6rem);
+    --t-h3: 1.0625rem;
+    --t-lede: clamp(1.0625rem, 1.5vw, 1.3125rem);
+    --t-body: 1.0625rem;
+    --t-small: 0.9375rem;
+    --t-mono: 0.75rem;
+
+    --wrap: 1120px;
+    --gut: clamp(20px, 5vw, 40px);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: 400 var(--t-body)/1.65 var(--sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* ── Type ─────────────────────────────────────────────────────────────────────────── */
+  h1, h2, h3 { margin: 0; font-weight: 700; }
+  h1 { font-size: var(--t-display); line-height: .97; letter-spacing: -.035em; }
+  h2 { font-size: var(--t-h2); line-height: 1.08; letter-spacing: -.025em; }
+  h3 { font-size: var(--t-h3); line-height: 1.4; letter-spacing: -.008em; }
+  p { margin: 0 0 1em; }
+  p:last-child { margin-bottom: 0; }
+
+  /* The utility voice. It is a *voice*, not a code style — eyebrows, ratios, figures. */
+  .mono {
+    font: 600 var(--t-mono)/1.4 var(--mono);
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    font-variant-numeric: tabular-nums;
+  }
+
+  code {
+    font: 500 .875em/1.5 var(--mono);
+    background: var(--raised);
+    border-radius: 4px;
+    padding: .12em .38em;
+  }
+
+  a { color: var(--accent-deep); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:hover { color: var(--ink); }
+
+  /* ⚠ A visible ring on everything focusable, and the accent rather than the chrome's
+     MONITOR_CYAN: the cyan measures 2.1:1 on this ground, which is not a ring somebody
+     tabbing can find. `boards.html` uses the cyan because it has a Mac counterpart to
+     match; this page has none. */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 3px;
+  }
+
+  .skip {
+    position: absolute; left: -9999px; top: 0;
+    background: var(--surface); color: var(--ink);
+    padding: 12px 18px; border: 1px solid var(--line); border-radius: 6px;
+    z-index: 20; font-size: var(--t-small);
+  }
+  .skip:focus { left: 12px; top: 12px; }
+
+  .wrap {
+    max-width: var(--wrap);
+    margin: 0 auto;
+    padding-left: var(--gut);
+    padding-right: var(--gut);
+  }
+
+  /* ── Buttons ──────────────────────────────────────────────────────────────────────── */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-height: 44px;                     /* a real touch target, phone included */
+    padding: 0 20px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--ink);
+    font: 500 var(--t-small)/1 var(--sans);
+    letter-spacing: -.006em;
+    text-decoration: none;
+    white-space: nowrap;
+    transition: background 130ms ease, border-color 130ms ease;
+  }
+  .btn:hover { background: var(--hover); border-color: var(--accent-soft); color: var(--ink); }
+  .btn:active { background: var(--pressed); }
+
+  .btn-accent {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--on-accent);
+    font-weight: 600;
+  }
+  .btn-accent:hover { background: var(--accent-deep); border-color: var(--accent-deep); color: #FFF; }
+  .btn-accent:active { background: var(--accent-deep); }
+
+  /* ── Header ───────────────────────────────────────────────────────────────────────── */
+  .top {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+  }
+  .top .wrap { display: flex; align-items: center; gap: 14px; height: 62px; }
+  .lockup {
+    display: inline-flex; align-items: center; gap: 9px;
+    color: var(--ink); text-decoration: none;
+    font: 700 1.0625rem/1 var(--sans); letter-spacing: -.02em;
+  }
+  .lockup svg { width: 22px; height: 22px; display: block; }
+  .spacer { flex: 1 1 auto; }
+  .top .btn { min-height: 38px; padding: 0 16px; }
+
+  /* ── Section rhythm ───────────────────────────────────────────────────────────────────
+     ⚠ One selector owns vertical space and nothing else sets a top or bottom margin on a
+     section. Two rules that both claim the gap between sections is how a stylesheet ends
+     up with a 177-point hole in it that nobody can find. */
+  .band { padding: clamp(56px, 9vw, 104px) 0; }
+  .band + .band { border-top: 1px solid var(--line); }
+  .band-surface { background: var(--surface); }
+
+  .eyebrow { color: var(--accent-deep); margin: 0 0 18px; }
+  .band > .wrap > h2 { max-width: 20ch; }
+  .sub {
+    margin: 16px 0 0;
+    max-width: 62ch;
+    color: var(--muted);
+    font-size: var(--t-lede);
+    line-height: 1.55;
+    letter-spacing: -.01em;
+  }
+  .note { color: var(--muted); font-size: var(--t-small); }
+
+  /* ══ HERO ═══════════════════════════════════════════════════════════════════════════ */
+  .hero { padding: clamp(44px, 7vw, 92px) 0 clamp(52px, 8vw, 96px); }
+  .hero .wrap {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.02fr);
+    gap: clamp(36px, 5vw, 68px);
+    align-items: center;
+  }
+  .hero h1 { max-width: 12ch; }
+  /* The second line of the headline. Not the teal — see `--accent-deep`. At display size
+     this is the only coloured word on the screen, which is the whole job. */
+  .hero h1 em { font-style: normal; color: var(--accent-deep); }
+  .hero .lede {
+    margin: 26px 0 0;
+    max-width: 46ch;
+    color: var(--muted);
+    font-size: var(--t-lede);
+    line-height: 1.55;
+    letter-spacing: -.01em;
+  }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin: 30px 0 0; }
+  .cta .btn { padding: 0 24px; }
+  /* Reserves its own line so the layout does not jump when the script sharpens it. */
+  .status {
+    margin: 18px 0 0;
+    min-height: 1.5em;
+    color: var(--accent-deep);
+    font-size: var(--t-small);
+    max-width: 44ch;
+  }
+
+  /* ── The signature: the mark's brackets, enlarged into a viewport ────────────────────
+     Four corner brackets, one accented, exactly as `assets/logo/mark.svg` draws them —
+     at the size the mark was designed for rather than at 22px in a header. */
+  .viewport { position: relative; padding: 20px; }
+  .viewport .corner {
+    position: absolute;
+    width: 30px; height: 30px;
+    border: 2.5px solid var(--ink);
+    pointer-events: none;
+  }
+  .viewport .tl { top: 0; left: 0; border-right: 0; border-bottom: 0; border-color: var(--accent); }
+  .viewport .tr { top: 0; right: 0; border-left: 0; border-bottom: 0; }
+  .viewport .br { bottom: 0; right: 0; border-left: 0; border-top: 0; }
+  .viewport .bl { bottom: 0; left: 0; border-right: 0; border-top: 0; }
+
+  /* The board itself. `--canvas` is PAPER, the board's own colour, and this is the only
+     element on the page allowed to wear it. */
+  .board {
+    position: relative;
+    background: var(--canvas);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .board canvas, .board svg.fallback {
+    display: block;
+    width: 100%;
+    height: auto;
+    aspect-ratio: 76 / 52;
+  }
+  .board-caption {
+    margin: 14px 0 0;
+    color: var(--muted);
+    font-size: var(--t-small);
+    text-align: center;
+  }
+
+  /* ══ THE NUMBERS ════════════════════════════════════════════════════════════════════ */
+  .rows { margin: 44px 0 0; }
+  .row { padding: 26px 0; border-top: 1px solid var(--line); }
+  .row:last-child { border-bottom: 1px solid var(--line); }
+  .row-head {
+    display: flex; flex-wrap: wrap; align-items: baseline;
+    gap: 6px 14px;
+    margin: 0 0 18px;
+  }
+  .row-head h3 { flex: 1 1 auto; }
+  /* The ratio chip. Accent-soft rather than accent: it is a summary of the two bars under
+     it, not a third datum, and it must not out-shout them. */
+  .ratio {
+    flex: 0 0 auto;
+    background: var(--accent-soft);
+    color: var(--accent-deep);
+    border-radius: 4px;
+    padding: 5px 9px;
+  }
+
+  /* A bar pair. ⚠ The reader is told the number in words *and* shown it as a length —
+     never length alone, because a bar with no figure beside it cannot be checked, and
+     this page's entire argument is that its figures can be. */
+  .pair { display: grid; gap: 10px; }
+  .bar-line {
+    display: grid;
+    grid-template-columns: 4.5rem minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 14px;
+  }
+  .bar-name { color: var(--muted); font-size: var(--t-small); }
+  .bar-track {
+    height: 14px;
+    background: var(--raised);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  /* ⚠ **Full width by default.** The script may only ever animate *up* to this from zero;
+     see the design note. A bar whose length is the datum must be correct with no script. */
+  .bar-fill {
+    display: block;
+    height: 100%;
+    width: var(--w);
+    border-radius: 3px;
+    background: var(--faint);
+  }
+  .is-velm .bar-fill { background: var(--accent); }
+  .bar-figure {
+    font: 600 var(--t-small)/1 var(--mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -.02em;
+    white-space: nowrap;
+  }
+  .is-velm .bar-figure { color: var(--accent-deep); }
+
+  /* Processes, drawn as processes. Fourteen dots against one is the shape of the fact,
+     and a bar would have said it less well. */
+  .dots { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; min-height: 14px; }
+  .dots i {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--faint);
+    display: block;
+  }
+  .is-velm .dots i { background: var(--accent); }
+
+  @media (max-width: 34rem) {
+    .bar-line { grid-template-columns: 3.4rem minmax(0, 1fr); gap: 8px 10px; }
+    .bar-figure { grid-column: 2; text-align: right; }
+  }
+
+  /* The measurement disclosure. A `<details>` because it is the *method*, and the method
+     has to be here for the numbers to mean anything — but it is not what a first reader
+     is looking for. */
+  details.method {
+    margin: 32px 0 0;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--surface);
+  }
+  details.method > summary {
+    cursor: pointer;
+    padding: 15px 18px;
+    font-size: var(--t-small);
+    font-weight: 500;
+    list-style: none;
+  }
+  details.method > summary::-webkit-details-marker { display: none; }
+  details.method > summary::after { content: " ↓"; color: var(--faint); }
+  details.method[open] > summary::after { content: " ↑"; }
+  .method-body { padding: 0 18px 18px; border-top: 1px solid var(--line); padding-top: 16px; }
+  .method-body p, .method-body li { color: var(--muted); font-size: var(--t-small); }
+  .method-body ul { margin: 0 0 1em; padding-left: 1.1em; }
+  .method-body li { margin: 0 0 .5em; }
+
+  /* Velm's own figures — a separate statement from the comparison, and deliberately not
+     inside it. There is no honest way to measure Miro's frame rate from outside it, so
+     these stand on their own. */
+  .own { margin: 34px 0 0; display: grid; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .own-cell { background: var(--surface); padding: 22px; }
+  .own-figure {
+    font: 700 1.5rem/1.1 var(--sans);
+    letter-spacing: -.03em;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent-deep);
+    display: block;
+  }
+  .own-cell p { margin: 8px 0 0; color: var(--muted); font-size: var(--t-small); }
+  @media (min-width: 48rem) { .own { grid-template-columns: 1fr 1fr; } }
+
+  /* ══ WHAT COMES ACROSS / WHAT YOU GIVE UP ═══════════════════════════════════════════
+     ⚠ The two columns are the same width, the same type and the same ink, and the second
+     is not styled as a warning. That is the page's one idea made visible: if the honest
+     column has to be dressed down to survive being read, it was not honest. */
+  .split { display: grid; gap: clamp(36px, 5vw, 56px); margin: 42px 0 0; }
+  @media (min-width: 54rem) { .split { grid-template-columns: 1fr 1fr; gap: 0; } }
+  .col { min-width: 0; }
+  @media (min-width: 54rem) {
+    .col + .col { border-left: 1px solid var(--line); padding-left: clamp(32px, 4vw, 52px); }
+    .col:first-child { padding-right: clamp(32px, 4vw, 52px); }
+  }
+  .col > h3 { font-size: 1.25rem; letter-spacing: -.02em; }
+  .col > .note { margin: 10px 0 0; }
+  .items { list-style: none; margin: 26px 0 0; padding: 0; }
+  .items li { margin: 0 0 22px; }
+  .items li:last-child { margin-bottom: 0; }
+  .items h4 { margin: 0 0 5px; font: 600 var(--t-body)/1.4 var(--sans); letter-spacing: -.01em; }
+  .items p { margin: 0; color: var(--muted); font-size: var(--t-small); }
+  /* A tick on the left of what carries across, a dash on the left of what does not.
+     Never a cross: a cross is an accusation and none of these is Miro's fault. */
+  .items li { padding-left: 26px; position: relative; }
+  .items li::before {
+    position: absolute; left: 0; top: .1em;
+    font: 600 var(--t-body)/1.4 var(--sans);
+  }
+  .col-yes .items li::before { content: "✓"; color: var(--accent); }
+  .col-no .items li::before { content: "—"; color: var(--faint); }
+
+  /* ══ MOVING A BOARD ═════════════════════════════════════════════════════════════════
+     Numbered, and the numbering is load-bearing: this genuinely is a sequence, and the
+     second step cannot be done before the first. */
+  .steps { list-style: none; counter-reset: s; margin: 42px 0 0; padding: 0; display: grid; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  @media (min-width: 54rem) { .steps { grid-template-columns: repeat(3, 1fr); } }
+  .steps li { counter-increment: s; background: var(--surface); padding: 26px 24px; }
+  .steps li::before {
+    content: counter(s);
+    display: flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent-deep);
+    font: 600 var(--t-mono)/1 var(--mono);
+    margin: 0 0 16px;
+  }
+  .steps h3 { margin: 0 0 6px; }
+  .steps p { margin: 0; color: var(--muted); font-size: var(--t-small); }
+  kbd {
+    font: 600 .8125rem/1 var(--mono);
+    background: var(--raised);
+    border: 1px solid var(--line);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    padding: 3px 6px;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+
+  /* The one pull-quote on the page, and it earns it: it is the single most surprising
+     checkable fact here. Accent rule down the left, no italics, no quotation marks. */
+  .pull {
+    margin: 42px 0 0;
+    border-left: 3px solid var(--accent);
+    padding: 4px 0 4px 24px;
+  }
+  .pull h3 { font-size: clamp(1.25rem, 2.4vw, 1.6rem); letter-spacing: -.022em; line-height: 1.25; max-width: 24ch; }
+  .pull p { margin: 14px 0 0; color: var(--muted); max-width: 62ch; }
+
+  /* ══ FEATURES ═══════════════════════════════════════════════════════════════════════ */
+  .grid { display: grid; gap: 1px; margin: 42px 0 0; background: var(--line); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  @media (min-width: 44rem) { .grid { grid-template-columns: 1fr 1fr; } }
+  @media (min-width: 68rem) { .grid { grid-template-columns: repeat(3, 1fr); } }
+  .cell { background: var(--surface); padding: 28px 24px; }
+  .cell h3 { margin: 0 0 8px; }
+  .cell p { margin: 0; color: var(--muted); font-size: var(--t-small); }
+  .cell .mono { display: block; color: var(--faint); margin: 0 0 14px; }
+
+  /* ══ FREE, AND YOURS ════════════════════════════════════════════════════════════════ */
+  .closer { text-align: center; }
+  .closer h2 { margin-inline: auto; max-width: 16ch; }
+  .closer .sub { margin-inline: auto; text-align: center; }
+  .closer .cta { justify-content: center; margin-top: 34px; }
+  .closer .note { margin: 22px 0 0; }
+
+  /* ── Two utilities, and they encode a relationship rather than a number ───────────────
+     Every standalone paragraph that qualifies the block above it is an `.aside`, and the
+     gap it takes is decided by *what it follows* — a figure grid, a pull quote, a list, or
+     another aside. Writing the gap at each call site is how a stylesheet ends up with four
+     spellings of the same distance and no way to change it once. */
+  .aside { margin-top: 34px; max-width: 68ch; }
+  .own + .aside { margin-top: 18px; }
+  .pull + .aside { margin-top: 30px; }
+  .aside + .aside { margin-top: 14px; }
+  .grid + .col { margin-top: 44px; }
+  .cell .own-figure + p { margin-top: 8px; }
+
+  /* ── Footer ───────────────────────────────────────────────────────────────────────── */
+  footer { background: var(--surface); border-top: 1px solid var(--line); padding: 30px 0 0; }
+  footer p { font-size: var(--t-small); color: var(--muted); }
+  /* ⚠ The trademark line is `--muted` like every other paragraph and **not** `--faint`.
+     It is the smallest type here and the most likely to be read by somebody who needs to,
+     which is exactly the pair that makes a 3.7:1 grey indefensible. */
+  footer .fine { margin: 16px 0 0; }
+  footer .last { padding-bottom: max(30px, env(safe-area-inset-bottom)); }
+  .dot { color: var(--faint); padding: 0 7px; }
+
+  /* ── Narrow ───────────────────────────────────────────────────────────────────────── */
+  @media (max-width: 60rem) {
+    .hero .wrap { grid-template-columns: minmax(0, 1fr); }
+    /* The board goes *under* the words on a phone — a hero picture above a headline is a
+       phone screen with no headline on it. */
+    .hero .viewport { order: 2; }
+  }
+
+  /* ⚠ Required, and it governs real motion here: the bars grow and the board draws itself.
+     Both have a correct finished state, so this turns them off rather than degrading them
+     — see `drawBoard()` and `growBars()`, which both check this themselves as well, since
+     a CSS override cannot stop a `requestAnimationFrame` loop. */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: .001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: .001ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+</style>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap">
+    <a class="lockup" href="/">
+      <!-- Inline rather than a mask: two colours is the whole idea of the mark. -->
+      <svg viewBox="0 0 48 48" fill="none" aria-hidden="true" focusable="false">
+        <path d="M8 20V8h12" stroke="#00A38C" stroke-width="2.5" stroke-linecap="square"/>
+        <path d="M28 8h12v12M40 28v12H28M20 40H8V28" stroke="#1A1D1F" stroke-width="2.5" stroke-linecap="square"/>
+      </svg>
+      velm
+    </a>
+    <span class="spacer"></span>
+    <!-- ⚠ Every door on this page carries `data-way-in` and they are all set from one
+         answer. Three doors that disagree about whether you are signed in is three times
+         worse than one door that is wrong. -->
+    <a class="btn btn-accent" data-way-in href="/signin">Sign in</a>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ══ HERO ═══════════════════════════════════════════════════════════════════════ -->
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <p class="mono eyebrow">Moving from Miro</p>
+        <h1>Bring your boards.<br><em>Leave the 296&nbsp;MB.</em></h1>
+        <p class="lede">
+          Velm is a whiteboard written in Rust. One process instead of fourteen, 18.5&nbsp;MB
+          instead of 296 — and it holds 100&nbsp;fps on a hundred-thousand-item board, because
+          it only ever draws what is actually on your screen. Copy a board out of Miro and
+          paste it in; the pen strokes come too.
+        </p>
+        <p class="cta">
+          <!-- Served as `Sign in` → `/signin`, which is the correct answer in every state
+               except one: already signed in. So with the script blocked, or the request
+               lost, this is still a working front door. -->
+          <a class="btn btn-accent" data-way-in href="/signin">Sign in</a>
+          <a class="btn" href="#numbers">See the numbers</a>
+        </p>
+        <p class="status" id="status" aria-live="polite"></p>
+      </div>
+
+      <!-- The signature: the mark's four brackets at the size they were drawn for, with a
+           real board inside them. -->
+      <div class="viewport">
+        <span class="corner tl" aria-hidden="true"></span>
+        <span class="corner tr" aria-hidden="true"></span>
+        <span class="corner br" aria-hidden="true"></span>
+        <span class="corner bl" aria-hidden="true"></span>
+        <div class="board">
+          <!-- ⚠ The content inside `<canvas>` is its **fallback**, and per the HTML spec it
+               is rendered whenever scripting is *disabled* — not only when canvas is
+               unsupported. So this SVG is the settled board, drawn once, and a reader with
+               no script gets the picture rather than a hole where the picture was. It is
+               the same geometry `drawBoard()` animates to, in the same coordinate space. -->
+          <canvas id="board" width="760" height="520" role="img"
+                  aria-label="An illustration of a Velm board: a frame holding sticky notes joined by connectors, a shape, a link card with an open-page badge, and a pen stroke.">
+            <svg class="fallback" viewBox="0 0 760 520" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+              <!-- Frames are pure white and behind everything — the app draws them in a
+                   negative z band so one number drives both paint order and hit-testing. -->
+              <rect x="32" y="56" width="424" height="352" fill="#FFFFFF" stroke="#E5EAED"/>
+              <rect x="64" y="100" width="120" height="110" rx="4" fill="#FFF3B0"/>
+              <rect x="80" y="122" width="80" height="7" rx="3.5" fill="#1A1D1F" opacity=".26"/>
+              <rect x="80" y="139" width="66" height="7" rx="3.5" fill="#1A1D1F" opacity=".26"/>
+              <rect x="80" y="156" width="74" height="7" rx="3.5" fill="#1A1D1F" opacity=".26"/>
+              <rect x="256" y="100" width="120" height="110" rx="4" fill="#CDEBFF"/>
+              <rect x="272" y="122" width="72" height="7" rx="3.5" fill="#1A1D1F" opacity=".26"/>
+              <rect x="272" y="139" width="84" height="7" rx="3.5" fill="#1A1D1F" opacity=".26"/>
+              <path d="M184 155H248" stroke="#1A1D1F" stroke-width="2" fill="none"/>
+              <path d="M256 155l-11-5.5v11z" fill="#1A1D1F"/>
+              <ellipse cx="124" cy="304" rx="60" ry="46" fill="#FFFFFF" stroke="#1A1D1F" stroke-width="2"/>
+              <rect x="256" y="258" width="120" height="92" rx="4" fill="#D6F5E3"/>
+              <rect x="272" y="280" width="76" height="7" rx="3.5" fill="#1A1D1F" opacity=".26"/>
+              <rect x="272" y="297" width="60" height="7" rx="3.5" fill="#1A1D1F" opacity=".26"/>
+              <path d="M316 210V250" stroke="#1A1D1F" stroke-width="2" fill="none"/>
+              <path d="M316 258l-5.5-11h11z" fill="#1A1D1F"/>
+              <!-- The link card floats over the board, so it is the one thing here with a
+                   shadow — and it is the app's own two-pass shadow, not a new one. -->
+              <rect x="500" y="90" width="200" height="186" rx="10" fill="#1A1D1F" opacity=".05"/>
+              <rect x="500" y="90" width="200" height="186" rx="10" fill="#FFFFFF" stroke="#E5EAED"/>
+              <path d="M510 90h180a10 10 0 0 1 10 10v76H500v-76a10 10 0 0 1 10-10z" fill="#CAEBE7"/>
+              <rect x="516" y="196" width="140" height="9" rx="4.5" fill="#1A1D1F" opacity=".82"/>
+              <rect x="516" y="216" width="112" height="8" rx="4" fill="#1A1D1F" opacity=".34"/>
+              <rect x="516" y="234" width="128" height="8" rx="4" fill="#1A1D1F" opacity=".34"/>
+              <rect x="660" y="102" width="26" height="26" rx="6" fill="#FCFDFE" stroke="#1A1D1F" stroke-opacity=".55"/>
+              <path d="M668 121l10-10M672.5 111H678v5.5" stroke="#1A1D1F" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+              <!-- The selection ring is one device pixel — `SELECTION_RING_WIDTH = 1.0`. -->
+              <rect x="495.5" y="85.5" width="209" height="195" rx="13" fill="none" stroke="#00A38C"/>
+              <rect x="500" y="316" width="150" height="9" rx="4.5" fill="#1A1D1F" opacity=".3"/>
+              <rect x="500" y="336" width="186" height="9" rx="4.5" fill="#1A1D1F" opacity=".3"/>
+              <rect x="500" y="356" width="120" height="9" rx="4.5" fill="#1A1D1F" opacity=".3"/>
+              <path d="M70 452c46-30 84 18 128 4s62-46 106-32 46 34 84 26"
+                    stroke="#1A1D1F" stroke-width="5" fill="none"
+                    stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </canvas>
+        </div>
+        <p class="board-caption">
+          An illustration — drawn on this page the way Velm draws a board. The figures below
+          are measured.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ THE NUMBERS ════════════════════════════════════════════════════════════════ -->
+  <section class="band band-surface" id="numbers">
+    <div class="wrap">
+      <p class="mono eyebrow">Measured, not claimed</p>
+      <h2>The numbers, side by side.</h2>
+      <p class="sub">
+        Both applications on one machine — an 8-core, 8&nbsp;GB Apple Silicon MacBook, August
+        2026. Miro is Electron, so a single process badly undercounts it: its memory figure is
+        the sum of all fourteen.
+      </p>
+
+      <div class="rows" id="bars">
+        <div class="row">
+          <div class="row-head">
+            <h3>Install size</h3>
+            <span class="mono ratio">16× smaller</span>
+          </div>
+          <div class="pair">
+            <div class="bar-line">
+              <span class="bar-name">Miro</span>
+              <span class="bar-track"><span class="bar-fill" style="--w:100%"></span></span>
+              <span class="bar-figure">296 MB</span>
+            </div>
+            <div class="bar-line is-velm">
+              <span class="bar-name">Velm</span>
+              <span class="bar-track"><span class="bar-fill" style="--w:6.25%"></span></span>
+              <span class="bar-figure">18.5 MB</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="row-head">
+            <h3>Memory, with a board open</h3>
+            <span class="mono ratio">3.4× less</span>
+          </div>
+          <div class="pair">
+            <div class="bar-line">
+              <span class="bar-name">Miro</span>
+              <span class="bar-track"><span class="bar-fill" style="--w:100%"></span></span>
+              <span class="bar-figure">357 MB</span>
+            </div>
+            <div class="bar-line is-velm">
+              <span class="bar-name">Velm</span>
+              <span class="bar-track"><span class="bar-fill" style="--w:29.1%"></span></span>
+              <span class="bar-figure">104 MB</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="row-head">
+            <h3>Processes it runs</h3>
+            <span class="mono ratio">14 → 1</span>
+          </div>
+          <!-- Drawn as processes rather than as a bar: fourteen things against one thing is
+               the shape of this fact, and a length would have said it less well. The dots
+               are decorative — the count is in the label and in the figure. -->
+          <div class="pair">
+            <div class="bar-line">
+              <span class="bar-name">Miro</span>
+              <span class="dots" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+              <span class="bar-figure">14 processes</span>
+            </div>
+            <div class="bar-line is-velm">
+              <span class="bar-name">Velm</span>
+              <span class="dots" aria-hidden="true"><i></i></span>
+              <span class="bar-figure">1 process</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <details class="method">
+        <summary>How these were measured</summary>
+        <div class="method-body">
+          <ul>
+            <li><strong>Install size</strong> — <code>du -sk</code> on Miro's application
+              bundle against the one this repository's build script produces. The same thing
+              you would download.</li>
+            <li><strong>Memory</strong> — <code>ps -o rss</code>, both sampled after the app
+              had settled with a real 596-widget board open and every item drawn. Velm is one
+              process, so that is the whole story; Miro's figure sums all fourteen of its.</li>
+            <li><strong>Frame rate</strong> — Velm's own HUD, averaged over a 45-second run.</li>
+          </ul>
+          <p>
+            Reproduce the frame figures yourself:
+            <code>./target/release/vellum-app --bench 100000 --hud --exit-after 25</code>
+          </p>
+        </div>
+      </details>
+
+      <div class="own">
+        <div class="own-cell">
+          <span class="own-figure">100 fps · 9.96 ms</span>
+          <p>A 596-item board with <strong>every item on screen</strong>, holding 104&nbsp;MB.</p>
+        </div>
+        <div class="own-cell">
+          <span class="own-figure">100 fps · 9.96 ms</span>
+          <p>A <strong>100,000-item</strong> board with 233 items on screen, holding 110&nbsp;MB.</p>
+        </div>
+      </div>
+      <p class="note aside">
+        100&nbsp;fps is that display's refresh rate. It means no dropped frames, not a ceiling.
+        And there is no frame-rate multiple over Miro anywhere on this page: there is no honest
+        way to measure Miro's from outside it, so Velm's are given on their own.
+      </p>
+    </div>
+  </section>
+
+  <!-- ══ WHAT COMES ACROSS / WHAT YOU GIVE UP ═══════════════════════════════════════
+       ⚠ The page's one idea, in its plainest form. Same width, same type, same ink, and
+       the right-hand column is not softened, collapsed behind a summary, or coloured like
+       a warning. A switch page that cannot afford to print this column is asking to be
+       taken on trust, which is the one thing it has not earned yet. -->
+  <section class="band" id="carries">
+    <div class="wrap">
+      <p class="mono eyebrow">Before anything else</p>
+      <h2>What comes across, and what you give up.</h2>
+      <p class="sub">
+        The honest half first. Velm does less than Miro does, on purpose and by accident, and
+        the list below is the accurate one — it is cheaper to read it now than to find it out
+        in a fortnight.
+      </p>
+
+      <div class="split">
+        <div class="col col-yes">
+          <h3>What comes across</h3>
+          <p class="note">
+            On the 596-widget board all of this was measured against, 596 of 596 widgets
+            import and 532 of them arrive losslessly.
+          </p>
+          <ul class="items">
+            <li>
+              <h4>Sticky notes, text, frames and connectors</h4>
+              <p>With their colours, their styling and their positions — including the
+                parent-relative coordinates Miro stores for 485 of those 596 widgets.</p>
+            </li>
+            <li>
+              <h4>Every pen stroke</h4>
+              <p>All 219 of them on that board, as real ink you can erase, move and redraw —
+                not as a flattened picture.</p>
+            </li>
+            <li>
+              <h4>Link cards, with their pictures</h4>
+              <p>The site, the title, the blurb and the preview image, in the same three card
+                sizes Miro draws them in.</p>
+            </li>
+            <li>
+              <h4>Images at full resolution</h4>
+              <p>Point the Mac app at a <code>.rtb</code> backup and it recovers the original
+                pixels rather than a thumbnail.</p>
+            </li>
+            <li>
+              <h4>The 64 that arrive degraded</h4>
+              <p>Mostly embeds. They arrive as a card carrying the title, the link and the
+                provider; the live frame inside them is not imported.</p>
+            </li>
+          </ul>
+        </div>
+
+        <div class="col col-no">
+          <h3>What you give up</h3>
+          <p class="note">
+            Some of this is unfinished and some of it was cut deliberately. Which is which is
+            said each time, because they are not the same promise.
+          </p>
+          <ul class="items">
+            <li>
+              <h4>Working on a board with other people, live</h4>
+              <p>No cursors, no presence, no comments, no voting — on the Mac either. Cut on
+                purpose: this is a single-player tool. It is the biggest
+                thing on this list, and the first one to check against how you actually work.</p>
+            </li>
+            <li>
+              <h4>Templates</h4>
+              <p>There is no gallery and no starter set. Unfinished rather than refused.</p>
+            </li>
+            <li>
+              <h4>Phone and tablet apps</h4>
+              <p>The browser client works on a tablet, with real pinch and pan. There is no
+                app in either store.</p>
+            </li>
+            <li>
+              <h4>Windows, and Intel Macs</h4>
+              <p>Apple Silicon is the supported platform. Velm has never been built or tested
+                on Windows; an Intel Mac builds from source, with no published binary.</p>
+            </li>
+            <li>
+              <h4>Embeds that play in the board</h4>
+              <p>A video link becomes a card with its poster and a ▶ that opens your browser.
+                A live embed needs a browser engine per card — 60 to 150&nbsp;MB idle, each —
+                and it could not zoom, be hidden by a frame, or export.</p>
+            </li>
+            <li>
+              <h4>PDF pages</h4>
+              <p>A PDF's bytes are stored and kept safe; nothing draws its pages yet.</p>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ MOVING A BOARD ═════════════════════════════════════════════════════════════ -->
+  <section class="band band-surface" id="move">
+    <div class="wrap">
+      <p class="mono eyebrow">Bringing them over</p>
+      <h2>Moving a board is three keystrokes.</h2>
+      <p class="sub">
+        There is nothing to export, no file to convert and no connector to authorise. These are
+        the steps as they appear on your boards page.
+      </p>
+
+      <!-- ⚠ Numbered because it genuinely is a sequence: step two cannot be done before step
+           one. And these are `boards.html`'s own steps in its own order — never describe a
+           gesture the reader cannot perform. -->
+      <ol class="steps">
+        <li>
+          <h3>Copy it in Miro</h3>
+          <p>Open the board and press <kbd>⌘A</kbd>, then <kbd>⌘C</kbd>.</p>
+        </li>
+        <li>
+          <h3>Paste it in Velm</h3>
+          <p>Click the box on your boards page and press <kbd>⌘V</kbd>. Nothing is sent
+            anywhere until you press the button.</p>
+        </li>
+        <li>
+          <h3>Name it</h3>
+          <p>Give it a name and press <em>Bring it across</em>. It arrives as a new board;
+            nothing you already have is touched.</p>
+        </li>
+      </ol>
+
+      <!-- The single most surprising checkable fact on the page, and the reason the
+           clipboard is the route. It is a limit of Miro's API rather than a fault of
+           Miro's, and it is written that way. -->
+      <div class="pull">
+        <h3>Miro's own API cannot give your pen strokes back.</h3>
+        <p>
+          On the board all of this was measured against, Miro's own REST API lists 577 items —
+          connectors come from a separate endpoint, which is why that total and the 596 above
+          differ — and <strong>310 of them, 54%, come back with no content at all</strong>: a
+          position, and <code>isSupported: false</code>. That is every one of its 219 pen
+          strokes and all 91 of its link cards, the two largest things on it, while the
+          response still counts them and looks complete. Miro's clipboard carries them in
+          full. That is why Velm reads the clipboard rather than the API.
+        </p>
+      </div>
+
+      <p class="note aside">
+        <strong>Pictures are the one exception.</strong> The clipboard carries references to
+        images rather than the pixels themselves, so a board pasted into a browser tab arrives
+        complete apart from those and tells you exactly how many are missing. The Mac app reads
+        the originals out of a <code>.rtb</code> backup, which a browser tab cannot open.
+      </p>
+    </div>
+  </section>
+
+  <!-- ══ WHAT YOU GET ═══════════════════════════════════════════════════════════════ -->
+  <section class="band" id="what">
+    <div class="wrap">
+      <p class="mono eyebrow">Once you are here</p>
+      <h2>What you get.</h2>
+
+      <div class="grid">
+        <div class="cell">
+          <span class="mono">The canvas</span>
+          <h3>Everything a board is made of</h3>
+          <p>41 shapes, connectors that stay attached to what they join, sticky notes, text,
+            images, frames, tables, kanban boards, mind maps and charts.</p>
+        </div>
+        <div class="cell">
+          <span class="mono">Drawing</span>
+          <h3>A pen that behaves like one</h3>
+          <p>Stroke smoothing, an eraser that rubs out strokes or whole objects, and undo that
+            groups a typed word into a single step rather than one per letter.</p>
+        </div>
+        <div class="cell">
+          <span class="mono">Placing things</span>
+          <h3>Snapping that suggests</h3>
+          <p>Alignment and equal-spacing guides that are loose rather than strict, and hold
+            <kbd>⌘</kbd> to suspend them mid-drag. Snap-to-grid is there too, switched off.</p>
+        </div>
+        <div class="cell">
+          <span class="mono">Anywhere</span>
+          <h3>Your Mac, and any browser</h3>
+          <p>The desktop app and this server draw the same board with the same renderer, and
+            an edit made in one appears in the other without a reload.</p>
+        </div>
+        <div class="cell">
+          <span class="mono">Organising</span>
+          <h3>A trash that keeps things</h3>
+          <p>Boards, folders, and the ones you star. Deleting a board puts it in
+            <em>Recently deleted</em>, where it stays until you say otherwise — nothing here
+            expires anything, ever.</p>
+        </div>
+        <div class="cell">
+          <span class="mono">Getting work out</span>
+          <h3>PNG, PDF, SVG and CSV</h3>
+          <p>From the Mac app. A browser tab exports SVG and CSV, and searches every word on
+            the board you have open — inside tables and cards included.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ IN A BROWSER, ON YOUR OWN SERVER ═══════════════════════════════════════════ -->
+  <section class="band band-surface" id="browser">
+    <div class="wrap">
+      <p class="mono eyebrow">The server you are looking at</p>
+      <h2>In a browser, on hardware you own.</h2>
+      <p class="sub">
+        The same renderer, compiled to WebAssembly and drawing through WebGPU. Measured in
+        Brave on an M2 against a 1,306-item board, served from a copy.
+      </p>
+
+      <div class="grid">
+        <div class="cell">
+          <span class="own-figure">155 ms</span>
+          <p>Cold start to a drawn frame, GPU handshake and board fetch
+            included.</p>
+        </div>
+        <div class="cell">
+          <span class="own-figure">9.4 ms</span>
+          <p>Steady-state frame time on a fitted board. Opening one is
+            slower, and that is where the work is.</p>
+        </div>
+        <div class="cell">
+          <span class="own-figure">681 KB</span>
+          <p>Over the wire on the first load — 4.6&nbsp;MB of
+            WebAssembly, compressed.</p>
+        </div>
+      </div>
+
+      <div class="col col-no">
+        <h3>What a tab cannot do</h3>
+        <p class="note">Said here rather than found out later.</p>
+        <ul class="items">
+          <li>
+            <h4>Pictures export as placeholders</h4>
+            <p>An SVG downloaded here carries every item's geometry, style and words, but each
+              picture comes out as an empty rectangle — the browser hands an image straight to
+              the graphics driver, so there are no bytes left for an exporter to write. You are
+              told how many. CSV is unaffected; PNG and PDF are desktop only.</p>
+          </li>
+          <li>
+            <h4>A <code>.rtb</code> backup cannot be attached here</h4>
+            <p>So a board pasted into a tab arrives without its image pixels, and says how many
+              are missing. The Mac app is what reads the archive.</p>
+          </li>
+          <li>
+            <h4>Nothing here runs a program on your machine</h4>
+            <p>A browser tab has no subprocesses. That is structural rather than unfinished.</p>
+          </li>
+        </ul>
+      </div>
+
+      <p class="note aside">
+        <strong>Free, and yours.</strong> MIT or Apache-2.0, at your option. There is no paid
+        tier, no seat count, no trial and no account with us — because there is no us. Your
+        boards are files in a folder, on your own machine or on a server you run. Nothing is
+        uploaded anywhere else, and the board of record is always the server's rather than the
+        tab's, so a browser that gets closed never holds the only copy.
+      </p>
+      <p class="note aside">
+        <strong>Two things that are honestly untested.</strong> The server has been run on
+        macOS only — nothing in it is platform-specific and it is meant for Linux, but "meant
+        for" is not "measured on". And nothing has yet been served over HTTPS from a real
+        domain; every figure above is from a loopback address.
+      </p>
+    </div>
+  </section>
+
+  <!-- ══ THE WAY IN ═════════════════════════════════════════════════════════════════ -->
+  <section class="band closer" id="start">
+    <div class="wrap">
+      <p class="mono eyebrow">One board is enough to tell</p>
+      <h2>Bring the first board across.</h2>
+      <p class="sub">
+        It takes about a minute, it does not touch the board in Miro, and you can stop after
+        one. Nothing here deletes anything you already have.
+      </p>
+      <p class="cta">
+        <a class="btn btn-accent" data-way-in href="/signin">Sign in</a>
+        <a class="btn" href="https://github.com/ibrahimbisen/Velm/releases">Download for macOS</a>
+      </p>
+      <p class="note">
+        macOS 11 or later, Apple Silicon. Every release is signed with an Apple Developer ID
+        and notarized by Apple, so there is nothing to allow in System Settings.
+      </p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>
+      <a href="https://github.com/ibrahimbisen/Velm">Velm on GitHub</a>
+      <span class="dot" aria-hidden="true">·</span>
+      MIT or Apache-2.0, at your option
+      <span class="dot" aria-hidden="true">·</span>
+      <!-- Sharpened to `Served by velmd 1.2.0` when the ungated health route answers, and
+           left exactly as served when it does not. -->
+      <span id="server-version">Served by velmd</span>
+    </p>
+  </div>
+  <div class="wrap last">
+    <p class="fine">
+      Velm is not affiliated with Miro. “Miro” is a trademark of its owner and is used here
+      only to describe compatibility. Every figure quoted for Miro was measured on one machine
+      in August 2026, against the version installed on it that day.
+    </p>
+  </div>
+</footer>
+
+<script>
+  // ════════════════════════════════════════════════════════════════════════════════════
+  // Three moving parts, and every one of them may only ever *sharpen* what was served.
+  //
+  //   drawBoard()   the hero board, arriving one item at a time
+  //   growBars()    the comparison bars, animated up from zero
+  //   askWhoAmI()   which of the three doors to name
+  //   askHealth()   the server's own version, for the footer
+  //
+  // ⚠ **Every await on a browser is bounded.** `docs/08-web.md` §6 records three separate
+  // hangs in the WebGPU probe from missing exactly this — `mapAsync`, `toBlob` and
+  // `createImageBitmap`, each an await on a callback that never came — and the page sat on
+  // "Running…" for ever, which on a tablet is indistinguishable from the blank screen the
+  // probe exists to detect. Patching two of the three left the third to hang next.
+  // ════════════════════════════════════════════════════════════════════════════════════
+  (function () {
+    'use strict';
+
+    var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    // 1. THE BOARD
+    //
+    // Logical space is 760 × 520 and the element's CSS pins that aspect ratio, so the
+    // whole drawing is written in one fixed coordinate system and scaled once at the
+    // transform. The alternative — laying out against the measured pixel width — makes
+    // every constant on the page a function of the viewport.
+    //
+    // ⚠ The geometry here is the same geometry as the inline SVG inside the `<canvas>`
+    // element. That SVG is the no-script fallback and it is the finished state of this
+    // animation; if one is edited the other has to move with it, which is why they sit
+    // in the same coordinate space and use the same numbers.
+    // ══════════════════════════════════════════════════════════════════════════════════
+    var W = 760, H = 520;
+    var canvas = document.getElementById('board');
+    var ctx = canvas && canvas.getContext ? canvas.getContext('2d') : null;
+
+    // Velm's own tokens for its own chrome; the sticky colours are a board's *content* —
+    // a colour somebody picked — so they are illustration values and named as such.
+    var INK = '#1A1D1F', LINE = '#E5EAED', ACCENT = '#00A38C', SOFT = '#CAEBE7';
+    var STICKY_A = '#FFF3B0', STICKY_B = '#CDEBFF', STICKY_C = '#D6F5E3';
+
+    // The order things arrive in, in seconds. A board is built roughly this way: the frame
+    // first, then what goes on it, then the lines between them, then the annotation.
+    var TL = {
+      frame: [0.00, 0.40], stickyA: [0.22, 0.34], stickyB: [0.36, 0.34],
+      link1: [0.56, 0.30], shape: [0.62, 0.34], stickyC: [0.74, 0.34],
+      link2: [0.92, 0.30], card: [1.02, 0.40], text: [1.28, 0.34],
+      pen: [1.46, 0.95], ring: [2.34, 0.30]
+    };
+    var END = 2.70;
+
+    function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+    function at(now, key) { var k = TL[key]; return clamp01((now - k[0]) / k[1]); }
+    function ease(t) { return 1 - Math.pow(1 - t, 3); }
+
+    /** A rounded rectangle path. `ctx.roundRect` is not old enough to rely on. */
+    function rr(x, y, w, h, r) {
+      r = Math.min(r, w / 2, h / 2);
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + w - r, y);
+      ctx.arcTo(x + w, y, x + w, y + r, r);
+      ctx.lineTo(x + w, y + h - r);
+      ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+      ctx.lineTo(x + r, y + h);
+      ctx.arcTo(x, y + h, x, y + h - r, r);
+      ctx.lineTo(x, y + r);
+      ctx.arcTo(x, y, x + r, y, r);
+      ctx.closePath();
+    }
+
+    /**
+     * An item landing: it fades up, rises a few units and settles from 96.5%.
+     * Scaled about its own centre, because scaling about the origin sends everything on
+     * the board sliding in from the top-left corner at once.
+     */
+    function land(p, cx, cy, paint) {
+      if (p <= 0) return;
+      var e = ease(p);
+      ctx.save();
+      ctx.globalAlpha = e;
+      ctx.translate(cx, cy + (1 - e) * 7);
+      ctx.scale(0.965 + 0.035 * e, 0.965 + 0.035 * e);
+      ctx.translate(-cx, -cy);
+      paint();
+      ctx.restore();
+    }
+
+    /** Greeked text — bars on the type's own rhythm, which is what the app draws when a
+        block is too small to shape. It is also how this illustration avoids inventing
+        words that would look like somebody's board. */
+    function greek(x, y, widths, alpha, h, gap) {
+      // ⚠ save/restore rather than multiply-then-divide. This composes with whatever alpha
+      // `land()` is part-way through fading in, and puts it back *exactly* — dividing it
+      // back out is a rounding error that accumulates over a hundred frames, and is
+      // catastrophic rather than merely wrong the day somebody passes alpha 0.
+      ctx.save();
+      ctx.fillStyle = INK;
+      ctx.globalAlpha = ctx.globalAlpha * alpha;
+      for (var i = 0; i < widths.length; i++) {
+        rr(x, y + i * gap, widths[i], h, h / 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function sticky(x, y, w, h, fill, widths) {
+      ctx.fillStyle = fill;
+      rr(x, y, w, h, 4);
+      ctx.fill();
+      greek(x + 16, y + 22, widths, 0.26, 7, 17);
+    }
+
+    /** A connector, drawn along its own length, with the arrowhead arriving at the end. */
+    function connector(p, x1, y1, x2, y2) {
+      if (p <= 0) return;
+      var e = ease(p);
+      var hx = x1 + (x2 - x1) * e, hy = y1 + (y2 - y1) * e;
+      ctx.save();
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = 2;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(hx, hy);
+      ctx.stroke();
+      if (e > 0.82) {
+        ctx.globalAlpha = (e - 0.82) / 0.18;
+        var a = Math.atan2(y2 - y1, x2 - x1);
+        ctx.translate(x2, y2);
+        ctx.rotate(a);
+        ctx.fillStyle = INK;
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(-11, -5.5);
+        ctx.lineTo(-11, 5.5);
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    // The pen stroke, as three cubic segments. Sampled rather than stroked as a path so it
+    // can be drawn *progressively* — which is the whole point of it being last.
+    var PEN = [
+      [70, 452, 116, 422, 154, 470, 198, 456],
+      [198, 456, 242, 442, 260, 410, 304, 424],
+      [304, 424, 348, 438, 350, 458, 388, 450]
+    ];
+    var PEN_PTS = (function () {
+      var pts = [], i, j, t, u, s;
+      for (i = 0; i < PEN.length; i++) {
+        s = PEN[i];
+        for (j = (i === 0 ? 0 : 1); j <= 24; j++) {
+          t = j / 24; u = 1 - t;
+          pts.push([
+            u * u * u * s[0] + 3 * u * u * t * s[2] + 3 * u * t * t * s[4] + t * t * t * s[6],
+            u * u * u * s[1] + 3 * u * u * t * s[3] + 3 * u * t * t * s[5] + t * t * t * s[7]
+          ]);
+        }
+      }
+      return pts;
+    })();
+
+    /** Ink, drawn the way a hand draws it: leading in, and tapered at both ends. */
+    function pen(p) {
+      if (p <= 0) return;
+      var n = PEN_PTS.length;
+      var upto = Math.max(1, Math.floor(ease(p) * (n - 1)));
+      ctx.save();
+      ctx.strokeStyle = INK;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (var i = 1; i <= upto; i++) {
+        var u = i / (n - 1);
+        ctx.lineWidth = 2.4 + 3.4 * Math.sin(Math.PI * u);
+        ctx.beginPath();
+        ctx.moveTo(PEN_PTS[i - 1][0], PEN_PTS[i - 1][1]);
+        ctx.lineTo(PEN_PTS[i][0], PEN_PTS[i][1]);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    /** The link card — the one thing here that floats over the board, so the one thing
+        with a shadow, and it is the app's own two-pass shadow rather than a new one. */
+    function card() {
+      var x = 500, y = 90, w = 200, h = 186;
+      ctx.save();
+      ctx.shadowColor = 'rgba(26,29,31,0.047)';
+      ctx.shadowBlur = 8; ctx.shadowOffsetY = 2;
+      ctx.fillStyle = '#FFFFFF'; rr(x, y, w, h, 10); ctx.fill();
+      ctx.shadowColor = 'rgba(26,29,31,0.102)';
+      ctx.shadowBlur = 3; ctx.shadowOffsetY = 1;
+      rr(x, y, w, h, 10); ctx.fill();
+      ctx.restore();
+
+      ctx.save();
+      ctx.fillStyle = '#FFFFFF'; rr(x, y, w, h, 10); ctx.fill();
+      ctx.strokeStyle = LINE; ctx.lineWidth = 1; rr(x, y, w, h, 10); ctx.stroke();
+
+      // The picture band, clipped to the card so its top corners keep the card's radius.
+      ctx.save();
+      rr(x, y, w, h, 10); ctx.clip();
+      ctx.fillStyle = SOFT;
+      ctx.fillRect(x, y, w, 86);
+      ctx.restore();
+
+      // Three voices: a bold title, then the blurb.
+      greek(x + 16, y + 106, [140], 0.82, 9, 20);
+      greek(x + 16, y + 126, [112, 128], 0.34, 8, 18);
+
+      // The ↗ badge — drawn as geometry, never as the character U+2197, which is outside
+      // every plain sans face and would render as tofu on a machine without a symbols font.
+      ctx.strokeStyle = 'rgba(26,29,31,0.55)';
+      ctx.lineWidth = 1;
+      ctx.fillStyle = '#FCFDFE';
+      rr(x + 160, y + 12, 26, 26, 6); ctx.fill(); ctx.stroke();
+      ctx.strokeStyle = INK; ctx.lineWidth = 1.6; ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x + 168, y + 31); ctx.lineTo(x + 178, y + 21);
+      ctx.moveTo(x + 172.5, y + 21); ctx.lineTo(x + 178, y + 21); ctx.lineTo(x + 178, y + 26.5);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    /** One frame of the board at time `now`. */
+    function paint(now) {
+      ctx.clearRect(0, 0, W, H);
+
+      // A frame is pure white and behind everything — the app puts it in a negative z band
+      // so one number drives both paint order and hit-testing.
+      land(at(now, 'frame'), 244, 232, function () {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(32, 56, 424, 352);
+        ctx.strokeStyle = LINE; ctx.lineWidth = 1;
+        ctx.strokeRect(32.5, 56.5, 423, 351);
+      });
+
+      land(at(now, 'stickyA'), 124, 155, function () {
+        sticky(64, 100, 120, 110, STICKY_A, [80, 66, 74]);
+      });
+      land(at(now, 'stickyB'), 316, 155, function () {
+        sticky(256, 100, 120, 110, STICKY_B, [72, 84]);
+      });
+
+      connector(at(now, 'link1'), 184, 155, 256, 155);
+
+      land(at(now, 'shape'), 124, 304, function () {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.beginPath();
+        ctx.ellipse(124, 304, 60, 46, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.stroke();
+      });
+      land(at(now, 'stickyC'), 316, 304, function () {
+        sticky(256, 258, 120, 92, STICKY_C, [76, 60]);
+      });
+
+      connector(at(now, 'link2'), 316, 210, 316, 258);
+
+      land(at(now, 'card'), 600, 183, card);
+
+      land(at(now, 'text'), 593, 340, function () {
+        greek(500, 316, [150, 186, 120], 0.30, 9, 20);
+      });
+
+      pen(at(now, 'pen'));
+
+      // The selection ring is one device pixel wide — `SELECTION_RING_WIDTH = 1.0`, which
+      // is its own constant in the app precisely so a ring can be thinner than a handle.
+      var r = at(now, 'ring');
+      if (r > 0) {
+        ctx.save();
+        ctx.globalAlpha = ease(r);
+        ctx.strokeStyle = ACCENT;
+        ctx.lineWidth = 1;
+        rr(495.5, 85.5, 209, 195, 13);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    /**
+     * Size the backing store to the device and scale the context once.
+     *
+     * ⚠ Capped at 2. A three-times-density phone would otherwise allocate 2.25× the pixels
+     * for a difference nobody can see on an illustration, and this is the hero — it is the
+     * first thing the device is asked to do.
+     */
+    function fit() {
+      var rect = canvas.getBoundingClientRect();
+      if (!rect.width) return false;
+      var dpr = Math.min(window.devicePixelRatio || 1, 2);
+      var w = Math.round(rect.width * dpr);
+      var h = Math.round(rect.width * (H / W) * dpr);
+      if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+      ctx.setTransform(w / W, 0, 0, w / W, 0, 0);
+      return true;
+    }
+
+    var shown = END;   // what is currently on screen, so a resize can redraw the same thing
+
+    function drawBoard() {
+      if (!ctx) return;
+      if (!fit()) return;
+
+      // ⚠ Reduced motion gets the *finished* board rather than nothing. There is a correct
+      // final state here, so honouring the setting means skipping to it — an empty box
+      // would be a worse answer to "please do not animate" than a still picture.
+      if (reduce) { shown = END; paint(END); return; }
+
+      var t0 = 0;
+      function step(ts) {
+        if (!t0) t0 = ts;
+        var now = (ts - t0) / 1000;
+        shown = now > END ? END : now;
+        paint(shown);
+        if (now < END) window.requestAnimationFrame(step);
+      }
+      window.requestAnimationFrame(step);
+    }
+
+    // A resize redraws whatever is currently shown — mid-animation or settled — rather than
+    // restarting it. Restarting on an orientation change would replay the whole sequence in
+    // front of somebody who is already reading the third section.
+    var resizeTimer = 0;
+    window.addEventListener('resize', function () {
+      if (!ctx) return;
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(function () { if (fit()) paint(shown); }, 120);
+    });
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    // 2. THE BARS
+    //
+    // ⚠ **The stylesheet serves them at full width and this may only ever subtract.** A
+    // bar's length *is* the datum, so a blocked script, a missing `IntersectionObserver`
+    // or a reduced-motion setting must leave the comparison drawn correctly — never at
+    // zero. Hence the shape below: a row is only zeroed once the observer has confirmed
+    // it is off screen, so nothing anybody is looking at is ever emptied, and a row that
+    // is already visible on load simply stays right.
+    // ══════════════════════════════════════════════════════════════════════════════════
+    function growBars() {
+      if (reduce || !('IntersectionObserver' in window)) return;
+      var rows = document.querySelectorAll('#bars .row');
+      if (!rows.length) return;
+
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          var row = entry.target;
+          var fills = row.querySelectorAll('.bar-fill');
+          if (entry.isIntersecting) {
+            if (row.getAttribute('data-zeroed') === '1') {
+              // Clearing the inline width hands the element back to the stylesheet's
+              // `width: var(--w)` — the served value, so the animation can only ever
+              // finish where the no-script page already was.
+              Array.prototype.forEach.call(fills, function (el, i) {
+                window.setTimeout(function () { el.style.width = ''; }, i * 90);
+              });
+            }
+            io.unobserve(row);
+          } else if (row.getAttribute('data-zeroed') !== '1') {
+            row.setAttribute('data-zeroed', '1');
+            Array.prototype.forEach.call(fills, function (el) {
+              el.style.transition = 'width 800ms cubic-bezier(.22,.61,.36,1)';
+              el.style.width = '0%';
+            });
+          }
+        });
+      }, { threshold: 0.3 });
+
+      Array.prototype.forEach.call(rows, function (row) { io.observe(row); });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    // 3. THE DOORS
+    // ══════════════════════════════════════════════════════════════════════════════════
+
+    // Six seconds, and the number matters less than it looks. Nothing is announced when it
+    // expires: the page keeps the door it was served with, which already works. So the
+    // timeout decides only how long a label may still sharpen, and the cost of it being
+    // wrong is a slightly less specific word on a button.
+    var TIMEOUT_MS = 6000;
+
+    var doors = document.querySelectorAll('[data-way-in]');
+    var status = document.getElementById('status');
+    var version = document.getElementById('server-version');
+
+    /**
+     * One bounded GET, answering the parsed JSON body and the status, or null.
+     *
+     * `credentials: 'same-origin'` is the default for a same-origin fetch and is written
+     * out because this request is *only* meaningful with the session cookie attached —
+     * leaving it implicit invites somebody to add `credentials: 'omit'` while tidying and
+     * make every visitor look signed out.
+     */
+    async function ask(path) {
+      var controller = new AbortController();
+      var timer = window.setTimeout(function () { controller.abort(); }, TIMEOUT_MS);
+      try {
+        var response = await fetch(path, {
+          method: 'GET',
+          credentials: 'same-origin',
+          headers: { accept: 'application/json' },
+          signal: controller.signal
+        });
+        var body = null;
+        // ⚠ A body that is not JSON is not an error here. A 401 from a proxy, a plain-text
+        // refusal, an empty body — all of them are simply "no answer to the question this
+        // page asked", and `null` says that without a `catch` at the call site.
+        try { body = await response.json(); } catch (ignored) { body = null; }
+        return { status: response.status, body: body };
+      } catch (error) {
+        return null;
+      } finally {
+        window.clearTimeout(timer);
+      }
+    }
+
+    /** Set every door at once. Doors that disagree are worse than one door that is vague. */
+    function door(label, href) {
+      Array.prototype.forEach.call(doors, function (link) {
+        link.textContent = label;
+        link.setAttribute('href', href);
+      });
+    }
+
+    function say(text) {
+      // ⚠ `textContent`, never `innerHTML`. A username is a string somebody typed into a
+      // form on a server this page does not own, and it lands in the DOM here.
+      if (status) status.textContent = text;
+    }
+
+    /**
+     * Which door to name.
+     *
+     * ⚠ **The safety property, and the reason this may run at all.** Both signed-out
+     * answers point at `/signin`, which serves the sign-in form *or* the first-run setup
+     * form depending on what the server knows — so the branch below is cosmetic. A lost
+     * request, a slow network, a blocked script and a wrong guess all land the reader in
+     * exactly the same place; only the wording is less specific. Nothing about this can
+     * strand anybody, which is what makes a background fetch acceptable on a door.
+     *
+     * The three answers this reads, and they are a contract with `crates/velmd`:
+     *
+     *   200 {"username": "…", "admin": bool}    signed in
+     *   200 or 401 with {"setup": true}         this server has no accounts yet
+     *   anything else                           leave the served door alone
+     *
+     * `setup` is read on either status deliberately. Whether "no accounts exist" is an
+     * authorised answer or an unauthorised one is a question about the server's own
+     * modelling, and a page that accepted only one spelling would silently show the wrong
+     * door the day that changed.
+     */
+    async function askWhoAmI() {
+      var answer = await ask('/api/v1/whoami');
+      if (!answer) return;
+
+      var body = answer.body;
+      var setup = !!(body && body.setup === true);
+
+      if (setup) {
+        door('Set up this server', '/signin');
+        say('This server has no accounts yet. The first one you make owns it, and every board already on it.');
+        return;
+      }
+
+      if (answer.status === 200 && body && typeof body.username === 'string' && body.username !== '') {
+        door('Open your boards', '/boards.html');
+        say('Signed in as ' + body.username + '.');
+      }
+      // Every other answer — 401, 403, 404, a proxy's error page — keeps `Sign in`, which
+      // is the right door for all of them.
+    }
+
+    /**
+     * The server's own version, in the footer.
+     *
+     * `/api/v1/health` is the one route deliberately outside the token, so somebody setting
+     * this up can tell *the server is not running* from *my token is wrong* without a second
+     * tool. Naming the version here is the same courtesy at the other end: on a self-hosted
+     * server, "which build is this?" is otherwise a shell away.
+     */
+    async function askHealth() {
+      if (!version) return;
+      var answer = await ask('/api/v1/health');
+      if (!answer || answer.status !== 200 || !answer.body) return;
+      var name = answer.body.velmd;
+      if (typeof name === 'string' && name !== '') {
+        version.textContent = 'Served by velmd ' + name;
+      }
+    }
+
+    drawBoard();
+    growBars();
+    // Not awaited together and not chained: they are unrelated, neither blocks the page,
+    // and a rejection in one must not be able to skip the other.
+    askWhoAmI();
+    askHealth();
+  })();
+</script>

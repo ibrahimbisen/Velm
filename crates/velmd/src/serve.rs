@@ -414,7 +414,25 @@ fn serve_one(server: &Server, stream: TcpStream) {
         Some(expected) if authorised(&headers, query, expected) => Some(accounts::Caller::Token),
         _ => accounts::identity(server, &headers).map(accounts::Caller::Account),
     };
-    if needs_token(path) && !accounts::is_exempt_from_the_bearer_gate(path) && gated && caller.is_none()
+    // ⚠ **The first-run carve-out, and it is conditioned rather than by path.** Founding the
+    // first account is the one write a server must accept from somebody who cannot yet
+    // authenticate — a fresh server with `$VELMD_TOKEN` set otherwise answers 401 to its own
+    // setup form, and the operator's only way in is `curl` with a header the page does not
+    // send. That is exactly what happened: both the flag and the gate were wrong, and either
+    // alone was fatal.
+    //
+    // It cannot outlive setup, and that is what makes it safe rather than a hole:
+    // `setup_is_open` is false the instant an account exists, `create_account` re-checks under
+    // the same lock that closes setup — which is where the race between two setup requests is
+    // actually settled — and it is `POST` alone, so the account *listing* stays admin-only.
+    let founding = method == "POST"
+        && accounts::is_accounts(path)
+        && accounts::setup_is_open(server);
+    if needs_token(path)
+        && !accounts::is_exempt_from_the_bearer_gate(path)
+        && !founding
+        && gated
+        && caller.is_none()
     {
         let _ = respond(&stream, 401, "text/plain", b"sign in, or send a bearer token\n", origin.as_deref());
         return;
@@ -528,7 +546,23 @@ fn serve_one(server: &Server, stream: TcpStream) {
             // The same decode the snapshot route needs, and it was the sibling check that
             // found it: a board reachable for reading and not for syncing would be a board
             // that loads and then silently never updates.
-            Post::Sync(id) => sync::handle(server, &percent_decode(id), &body, &stream),
+            Post::Sync(id) => {
+                // ⚠ **The one write route that had no ownership check, while every read route
+                // did.** `Post::Rename` three lines below already asked; this did not, and it
+                // is the worse omission of the two: `sync::handle` **merges into the board**,
+                // non-undoably, so a signed-in account that could not so much as list somebody
+                // else's board could still write into it by naming it directly.
+                //
+                // 404 rather than 403, and the same sentence the read routes use: a different
+                // answer here would tell a stranger the board exists, which is most of what
+                // they wanted to know.
+                let id = percent_decode(id);
+                if accounts::may_see(server, &id, caller.as_ref()) {
+                    sync::handle(server, &id, &body, &stream)
+                } else {
+                    respond(&stream, 404, "text/plain", b"no such board\n", origin.as_deref())
+                }
+            }
             Post::Import => paste::handle(server, query, &body, caller.as_ref(), &stream),
             Post::Create => manage::create(server, &body, caller.as_ref(), &stream),
             Post::Rename(id) => {

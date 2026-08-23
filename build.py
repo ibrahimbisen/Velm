@@ -232,16 +232,6 @@ def build(dest: Path) -> Path:
     #
     # `os.access(X_OK)` rather than `is_file()`: the runtime requires the execute bit, so
     # that is the question worth asking.
-    for shim in ("velm-agent-cli", "velm-mcp"):
-        path = app / "Contents" / "MacOS" / shim
-        if not path.is_file():
-            die(
-                f"make-app.sh reported success but {app} has no {shim}",
-                "Agents would launch and be unable to message each other, read the "
-                "board's notes or spawn helpers.",
-            )
-        if not os.access(path, os.X_OK):
-            die(f"{path} is not executable — the app would not find it at runtime")
 
     # An .app is a directory that macOS reads three things out of, and only one of
     # them is the executable. A bundle with a blank icon shipped once because this

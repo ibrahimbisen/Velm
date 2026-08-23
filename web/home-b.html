@@ -1,0 +1,1533 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- No `user-scalable=no`. This page is a document; pinching it to read is the browser
+     doing its job. `index.html` suppresses page zoom because the *board* handles its own
+     pinch — that is a different surface with a different reason. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Velm — an infinite canvas that draws only what you're looking at</title>
+<!-- ⚠ The mechanism travels with the numbers, in the same sentence. An earlier draft
+     read "a hundred frames a second on a hundred thousand items", which fuses two true
+     figures into a false one: a 100,000-item board *fitted*, every item drawn, runs at
+     16–22 fps. On the page each figure carries a caption naming its condition; a search
+     result has no caption, so the condition has to be inside the sentence. -->
+<meta name="description" content="A whiteboard app written in Rust that draws only what is on screen — so a 100,000-item board costs per frame what a 200-item one does. 18.5 MB, one process. Free, open source, self-hosted.">
+<meta name="color-scheme" content="light">
+<!-- The Viewport mark from `assets/logo/mark.svg`, inlined so this page fetches nothing. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48' fill='none'%3E%3Cpath d='M8 20V8h12' stroke='%2300A38C' stroke-width='2.5' stroke-linecap='square'/%3E%3Cpath d='M28 8h12v12M40 28v12H28M20 40H8V28' stroke='%231A1D1F' stroke-width='2.5' stroke-linecap='square'/%3E%3C/svg%3E">
+
+<!--
+  ══════════════════════════════════════════════════════════════════════════════════════
+  THE HOME PAGE — DIRECTION B, "the confident product page"
+  ══════════════════════════════════════════════════════════════════════════════════════
+
+  ── the one idea ──────────────────────────────────────────────────────────────────────
+  **The numbers are the design.**
+
+  Velm's entire argument is four or five measured figures. Every other landing page in this
+  category has to manufacture a reason to be looked at — a gradient, a logo wall, a
+  testimonial from a person who does not exist. This one has real numbers, so the page spends
+  its whole budget setting them at the scale of the claim they make and nothing at all on
+  ornament. `100 fps`, `100,000`, `18.5 MB` are set at 96px because that is how large the
+  claim is. There is no shadow and no gradient anywhere below, so scale is the only thing
+  doing any work.
+
+  The corollary, and it is the honesty rule this repository runs on: **a figure that large
+  must carry its own caveat within a glance.** `100,000 items` beside `100 fps` would imply
+  something false — the known-defects ledger records that a 100k board *fitted*, every item
+  on screen, runs at 16–22 fps. So each giant figure has a caption underneath naming the
+  machine and the condition, and the captions are load-bearing rather than decorative. The
+  headline states the *mechanism* — "draws only what you're looking at" — because a mechanism
+  carries its own caveat and a superlative does not.
+
+  ── every number, and where it comes from ─────────────────────────────────────────────
+  Not one figure here was recalled. Each is quoted from a file in this repository that
+  records how it was taken, and each is labelled with the machine it was taken on, because a
+  frame time with no machine beside it is decoration.
+
+      README.md §Why                 18.5 MB · 1 process · 104 MB · 100 fps · 9.96 ms
+                                     100,000 items / 233 on screen · 110 MB
+                                     Miro's 296 MB · 14 processes · 357 MB
+      README.md §How these were      the machine: 8-core, 8 GB Apple Silicon, Aug 2026
+        measured                     and the "no honest Miro frame rate" refusal
+      docs/08-web.md §8              155 ms · 9.4 ms · 4.6 MB wasm · 681 KB · 1,306 items
+      docs/08-web.md §9              what this tab can and cannot do, re-run 2026-08-22
+      crates/vellum-web/src/         why a picture exports as a placeholder
+        download.rs
+      crates/velmd/src/paste.rs      why a pasted Miro board arrives with no pixels
+
+  ⚠ **No board name and no person's name appears here**, and none ever may: this file is
+  tracked in a public repository and the boards it is about are somebody's private work.
+  "A 1,306-item board" says everything the number needs to say.
+
+  ⚠ **Nothing on this page is invented social proof.** No testimonial, no company logo, no
+  star count, no "trusted by". There is no pricing table either, because there are no tiers —
+  see `#free`, which is that section done honestly and is stronger for it.
+
+  ── the palette ───────────────────────────────────────────────────────────────────────
+  `crates/vellum-ui/src/theme.rs`, under theme.rs's own role names, so this page and
+  `boards.html` are one interface.
+
+      BONE   #FCFDFE  surface     FROST  #E5EAED  every hairline
+      MILK   #F7F9FA  the ground  INK    #1A1D1F  primary text
+      PAPER  #F2F2F2  the board   SIGNAL_TEAL #00A38C  the one accent
+
+  Two deliberate deviations, both measured rather than stylistic:
+
+  1. **Prose is `INK_MUTED` #5C656B, not #7A8186.** Against this page's ground #F7F9FA the
+     two measure **5.6:1** and **3.7:1**. The second fails AA for body text and passes only
+     WCAG's large-text rule (≥24px), so it is kept under its right name and used *only* where
+     that rule applies or where nothing is being read. Shipping a 3.7:1 paragraph to honour a
+     hex would be a legibility bug chosen on purpose.
+  2. **Accent-coloured *text* is #0C675B, never the teal.** The teal measures 3.1:1 here —
+     over the 3:1 floor for a large figure or a non-text mark, under the 4.5:1 floor for a
+     label. So the 96px statistics may be teal and a 12px eyebrow may not.
+
+  ⚠ **Light only, and the absent `prefers-color-scheme` block is the point.**
+  `ThemePreference::resolve` answers `Light` whatever it is asked — *"i want only light
+  mode"* — so a page that flipped to dark would stop matching the board it opens. The dark
+  tokens exist in `theme.rs`, are tested, and are unreachable there too. A dark block here
+  would make this the only surface in the product that has one.
+
+  ⚠ **No shadow, and no radius past 6px.** This design draws its structure with a hairline
+  where other designs use a shadow, and `radius::LARGE` is 6. A landing page is exactly where
+  a house style gets quietly abandoned for pillowy cards and drop shadows; the brief allows
+  this page to be *bolder* than the app, and the reading taken here is that boldness belongs
+  in **scale and space**, not in ornament. Extravagant type, austere surfaces.
+
+  ── the type scale ────────────────────────────────────────────────────────────────────
+  The platform's own UI face — no webfont, nothing fetched, and `theme.rs`'s reason for it:
+  the product is meant to read as native rather than branded. The scale is this page's own,
+  because a document read at arm's length is not a panel read at 30cm.
+
+      --t-display  clamp(46px, 8.6vw, 82px)   the one headline
+      --t-stat     clamp(44px, 6.4vw, 74px)   the three figures, tabular
+      --t-h2       clamp(27px, 4vw, 40px)     a section's opening statement
+      --t-lede     clamp(18px, 1.9vw, 21px)
+      --t-body     17px  /  --t-small 14px  /  --t-label 12px
+
+  ── the layout ────────────────────────────────────────────────────────────────────────
+  One column, two measures: `.wrap` is 1120px and holds the composition; `.measure` is 62ch
+  and holds anything anybody has to read a paragraph of. Sections are separated by
+  `clamp(84px, 13vh, 150px)` — the white space *is* the design, and it is the first thing a
+  cramped page loses.
+
+      header    the mark and the way in, sticky, hairline
+      hero      the headline, one sentence, two doors, the status line
+      board     a drawn Velm board, full width — the product, not a paragraph about it
+      #speed    the three figures, and the comparison that started the project
+      #browser  what this tab does, and the browser numbers
+      #free     no plan, no seats, no trial — the pricing section, done honestly
+      #mac      the desktop app
+      #limits   the three things a browser cannot do, said plainly rather than buried
+      #accounts what an account is, what it is not, and what happens to a password
+      footer    licence, source, the served version, the trademark line
+
+  ── the moving parts, and the rule they obey ──────────────────────────────────────────
+  Everything is static HTML and reads correctly with the script blocked. The script may only
+  ever *sharpen* what was already served:
+
+      the two doors and the status line   ← GET /api/v1/whoami   (see `askWhoAmI`)
+      the footer's version                ← GET /api/v1/health
+      the board illustration              ← a decorative <canvas>, aria-hidden
+      section reveals                     ← IntersectionObserver
+
+  ⚠ **The reveal's hidden state is gated on a class the script itself adds.** `.reveal` is
+  invisible only under `html.js`, so a blocked script or a dead observer leaves the page fully
+  visible instead of blank. A scroll animation that can hide the entire page is the most
+  common way this pattern fails, and it fails silently.
+  ══════════════════════════════════════════════════════════════════════════════════════
+-->
+
+<style>
+  :root {
+    /* ── surfaces ── */
+    --surface: #FCFDFE;        /* BONE   — a card, the header */
+    --page: #F7F9FA;           /* MILK   — the ground */
+    --canvas: #F2F2F2;         /* PAPER  — the board's own colour */
+    --raised: #EBEEF0;         /* PEARL  — a well */
+    --line: #E5EAED;           /* FROST  — every hairline on this page */
+
+    /* ── ink ── */
+    --ink: #1A1D1F;            /* INK */
+    --muted: #5C656B;          /* INK_MUTED — 5.6:1. Every paragraph, fine print included */
+    --faint: #7A8186;          /* 3.7:1 — non-text marks and ≥24px only. Never a sentence */
+
+    /* ── the one accent ── */
+    --accent: #00A38C;         /* SIGNAL_TEAL — fills, rules, and figures ≥24px */
+    --on-accent: #1A1D1F;      /* charcoal on teal is 5.3:1; white is 3.2:1 and fails AA */
+    --accent-soft: #CAEBE7;    /* mix(BONE, teal, 20) */
+    --on-accent-soft: #0C675B; /* 6.4:1 — this is what accented *text* is */
+    --hover: #DCEBEF;
+    --pressed: #D0E6EC;
+    --focus: #00A38C;
+
+    /* ── radii: the product's own, and 6 is the ceiling ── */
+    --r-small: 4px;
+    --r-medium: 5px;
+    --r-large: 6px;
+
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+    /* ── type ── */
+    --t-display: clamp(46px, 8.6vw, 82px);
+    --t-stat: clamp(44px, 6.4vw, 74px);
+    --t-h2: clamp(27px, 4vw, 40px);
+    --t-lede: clamp(18px, 1.9vw, 21px);
+    --t-body: 17px;
+    --t-small: 14px;
+    --t-label: 12px;
+
+    /* ── rhythm ── */
+    --gap-section: clamp(84px, 13vh, 150px);
+  }
+
+  * { box-sizing: border-box; }
+  /* An author `display` beats the user agent's `[hidden] { display: none }`. */
+  [hidden] { display: none !important; }
+
+  html {
+    scroll-padding-top: 84px;   /* an anchor jump lands under the sticky header */
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: var(--t-body)/1.62 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    /* The headline and the statistics are set tight; `kern`/`liga` are on by default but
+       `-webkit-font-smoothing` is what stops 82px looking chalky on a Retina Mac. */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* The composition's measure, and prose's measure. Two, deliberately: a stat strip wants
+     1120px and a paragraph wants 62 characters, and one number cannot serve both. */
+  .wrap {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding-left: max(22px, env(safe-area-inset-left));
+    padding-right: max(22px, env(safe-area-inset-right));
+  }
+  .measure { max-width: 62ch; }
+
+  ::selection { background: var(--accent-soft); color: var(--ink); }
+
+  a { color: var(--on-accent-soft); text-underline-offset: 3px; text-decoration-thickness: 1px; }
+  a:focus-visible,
+  .btn:focus-visible,
+  .lockup:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: 2px; }
+
+  /* Courier is the macOS default for `<code>`, which would make the one piece of jargon on
+     the page the only thing on it set in a face nobody chose. */
+  code { font: 0.92em var(--mono); }
+
+  .skip {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    padding: 10px 14px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-small);
+    color: var(--ink);
+    z-index: 20;
+  }
+  .skip:focus { left: 10px; top: 10px; }
+
+  /* ── The header ───────────────────────────────────────────────────────────────────
+     Sticky, so the way in is never more than a glance away. A hairline and no shadow,
+     which is this design's entire structural vocabulary. */
+  header.top {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: rgba(252, 253, 254, 0.86);
+    -webkit-backdrop-filter: saturate(1.4) blur(12px);
+    backdrop-filter: saturate(1.4) blur(12px);
+    border-bottom: 1px solid var(--line);
+    padding-top: max(0px, env(safe-area-inset-top));
+  }
+  /* ⚠ A fallback, not a nicety: without `backdrop-filter` the rgba header is 86% opaque
+     over whatever scrolls under it, and the 82px headline shows through its own header. */
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    header.top { background: var(--surface); }
+  }
+  .top .wrap { display: flex; align-items: center; gap: 14px; min-height: 62px; }
+  .top .spacer { margin-left: auto; }
+
+  /* The lockup from `assets/logo/README.md`: mark, a gap of one bracket arm, then `velm` —
+     always lowercase, tracking −0.045em, in the platform's interface face. */
+  .lockup {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    color: var(--ink);
+    text-decoration: none;
+    font-size: 20px;
+    font-weight: 500;
+    letter-spacing: -0.045em;
+  }
+  .lockup svg { flex: none; width: 23px; height: 23px; }
+
+  .top .quiet {
+    display: none;
+    color: var(--muted);
+    font-size: var(--t-small);
+    text-decoration: none;
+  }
+  @media (hover: hover) { .top .quiet:hover { color: var(--ink); } }
+  @media (min-width: 42rem) { .top .quiet { display: inline; } }
+
+  /* ── Buttons ──────────────────────────────────────────────────────────────────────── */
+  .btn {
+    appearance: none;
+    -webkit-appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 42px;
+    padding: 0 18px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-small);
+    background: var(--surface);
+    color: var(--ink);
+    font: inherit;
+    font-size: var(--t-small);
+    font-weight: 500;
+    text-decoration: none;
+    white-space: nowrap;
+    cursor: pointer;
+    /* `docs/05` §3: motion is functional and fast — 120–160ms, ease-out. */
+    transition: background-color 130ms ease-out, border-color 130ms ease-out, filter 130ms ease-out;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  /* ⚠ Guarded, because `:hover` latches on a touchscreen — a tapped button keeps the wash
+     until something else is tapped, so the page shows a control as pointed-at that nothing
+     is pointing at. Every other file in `web/` carries this guard. */
+  @media (hover: hover) { .btn:hover { background: var(--hover); } }
+  .btn:active { background: var(--pressed); }
+
+  .btn-accent { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  @media (hover: hover) {
+    .btn-accent:hover { background: var(--accent); border-color: var(--accent); filter: brightness(1.07); }
+  }
+  .btn-accent:active { background: var(--accent); filter: brightness(0.93); }
+
+  .btn-lg { min-height: 52px; padding: 0 26px; font-size: 16px; }
+
+  /* Apple's own 44 under a finger, and nowhere else. */
+  @media (pointer: coarse) { .btn { min-height: 44px; } }
+
+  /* ── The reveal ───────────────────────────────────────────────────────────────────
+     ⚠ Gated on `html.js`, which only the script adds. With the script blocked, or the
+     observer unsupported, or an exception thrown before it runs, `.reveal` never acquires
+     an opacity and the page is simply visible. A scroll animation able to hide the whole
+     document is the most common way this pattern fails, and it fails silently. */
+  .js .reveal {
+    opacity: 0;
+    transform: translateY(16px);
+    transition: opacity 620ms cubic-bezier(0.16, 1, 0.3, 1),
+                transform 620ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .js .reveal.in { opacity: 1; transform: none; }
+  /* A short stagger inside one section: enough to read as intent, not enough to wait for. */
+  .js .reveal[data-delay="1"] { transition-delay: 70ms; }
+  .js .reveal[data-delay="2"] { transition-delay: 140ms; }
+  .js .reveal[data-delay="3"] { transition-delay: 210ms; }
+
+  /* ── The hero ─────────────────────────────────────────────────────────────────────
+     Nine words at 82px and nothing else competing. The only ornament is the accented word,
+     which is the mark's own idea — four brackets, one accented — applied to a sentence. */
+  .hero { padding: clamp(56px, 11vh, 128px) 0 clamp(40px, 7vh, 72px); }
+
+  .eyebrow {
+    margin: 0 0 22px;
+    font-size: var(--t-label);
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    /* ⚠ #0C675B, not the teal: 12px is small text and the teal is 3.1:1. */
+    color: var(--on-accent-soft);
+  }
+  .eyebrow .tick {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    margin-right: 9px;
+    vertical-align: 1px;
+    background: var(--accent);
+    border-radius: 1px;
+  }
+
+  h1 {
+    margin: 0;
+    max-width: 17ch;
+    font-size: var(--t-display);
+    line-height: 1.03;
+    letter-spacing: -0.036em;
+    font-weight: 600;
+  }
+  /* The single accented phrase on the page's single headline. It is the mechanism, and a
+     mechanism carries its own caveat where a superlative does not. */
+  h1 .lit { color: var(--on-accent-soft); }
+
+  .lede {
+    margin: 30px 0 0;
+    max-width: 56ch;
+    font-size: var(--t-lede);
+    line-height: 1.52;
+    color: var(--muted);
+  }
+  .lede strong { color: var(--ink); font-weight: 600; }
+
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin: 36px 0 0; }
+
+  /* ⚠ The height is reserved whether or not there is anything to say. Collapsing it while
+     empty saves 22 points of nothing and buys a layout shift on exactly the two answers
+     that matter — the hero growing under the reader's hand at the moment the script decides
+     they are signed in, or that this server has no accounts yet. */
+  .status {
+    margin: 22px 0 0;
+    min-height: 1.6em;
+    font-size: var(--t-small);
+    color: var(--muted);
+  }
+
+  /* ── The board ────────────────────────────────────────────────────────────────────
+     A drawn Velm board rather than a paragraph about one. The colour and the dot grid are
+     **CSS on the container**, so with the script blocked this is still recognisably a
+     board with brackets round it rather than a hole in the page.
+
+     The four brackets are the mark at the scale of a section: `assets/logo/README.md`
+     records that the mark is the same shape as the canvas selection indicator — *"the
+     point, not a coincidence"* — so the board is drawn selected, in the app's own colours. */
+  .board-band { margin-top: clamp(18px, 4vh, 44px); }
+  .board {
+    position: relative;
+    background-color: var(--canvas);
+    background-image: radial-gradient(circle at 1px 1px, rgba(0, 0, 0, 0.065) 1px, transparent 0);
+    background-size: 22px 22px;
+    border-radius: var(--r-large);
+    padding: 14px;
+    overflow: hidden;
+  }
+  .board canvas { display: block; width: 100%; height: auto; aspect-ratio: 1180 / 500; }
+  .board .bracket { position: absolute; width: 24px; height: 24px; border: 2px solid var(--ink); }
+  /* ⚠ Only the top-left bracket is recoloured. Recolouring more would not be a variant of
+     the mark, it would be a different mark — the accented corner is what gives it a reading
+     order instead of four-fold symmetry. */
+  .board .bracket.tl { top: 12px; left: 12px; border-right: 0; border-bottom: 0; border-color: var(--accent); }
+  .board .bracket.tr { top: 12px; right: 12px; border-left: 0; border-bottom: 0; }
+  .board .bracket.br { bottom: 12px; right: 12px; border-left: 0; border-top: 0; }
+  .board .bracket.bl { bottom: 12px; left: 12px; border-right: 0; border-top: 0; }
+
+  /* ⚠ `--muted`, not `--faint`. A caption under an illustration is the exact element
+     somebody greys out for looking "quieter", and `--faint` is 3.7:1 — legal only at ≥24px
+     or on a mark nobody reads. This is a sentence, at 14px, so it takes the 5.6:1 grey. */
+  .board-note { margin: 14px 0 0; font-size: var(--t-small); color: var(--muted); }
+
+  /* ── Sections ─────────────────────────────────────────────────────────────────────── */
+  section { padding-top: var(--gap-section); }
+  /* Same rule: a section label is read, so it is `--muted` and never `--faint`. */
+  section > .wrap > .label {
+    margin: 0 0 18px;
+    font-size: var(--t-label);
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  h2 {
+    margin: 0;
+    max-width: 20ch;
+    font-size: var(--t-h2);
+    line-height: 1.1;
+    letter-spacing: -0.025em;
+    font-weight: 600;
+  }
+  h2 + .sub { margin: 20px 0 0; max-width: 58ch; color: var(--muted); font-size: var(--t-lede); line-height: 1.5; }
+  h3 { margin: 0 0 6px; font-size: var(--t-body); font-weight: 600; letter-spacing: -0.008em; }
+  p { margin: 0 0 16px; }
+  p:last-child { margin-bottom: 0; }
+  p.note { color: var(--muted); font-size: var(--t-small); }
+  /* A note that follows a block rather than introducing one. Its own class rather than an
+     inline `style`, so the two places that want it cannot drift apart. */
+  p.after { margin-top: 20px; max-width: 62ch; }
+
+  /* ── The three figures ────────────────────────────────────────────────────────────
+     The centrepiece, and the reason the rest of the page is austere. Each figure is set at
+     96px and each carries a caption naming the machine and the condition — the captions are
+     the honesty and are not optional. `100,000 items` beside `100 fps` with no caption would
+     imply something the known-defects ledger falsifies. */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0;
+    margin: clamp(38px, 6vh, 64px) 0 0;
+    border-top: 1px solid var(--line);
+  }
+  .stat { padding: clamp(26px, 4vh, 44px) 0 clamp(26px, 4vh, 40px); }
+  .stat + .stat { border-left: 1px solid var(--line); padding-left: clamp(20px, 3vw, 40px); }
+  /* ⚠ The ceiling is 74px, not the 96 this started at, and the constraint is one figure:
+     `100,000` is seven glyphs — **3.75em** at 600 weight with tabular digits — against a
+     column that is (1120 − padding − gutters) / 3 ≈ 318px wide. At 96px it measured 360px
+     and printed straight through `18.5 MB` in the column beside it. Measured in a render,
+     not estimated; the same arithmetic sets the 62rem stacking breakpoint below. */
+  .stat .fig {
+    display: block;
+    white-space: nowrap;
+    font-size: var(--t-stat);
+    line-height: 0.92;
+    letter-spacing: -0.045em;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    /* Legal at this size: the teal is 3.1:1 and WCAG's large-text floor is 3:1. It would
+       not be legal on the caption two lines below, which is why that one is `--muted`. */
+    color: var(--accent);
+  }
+  .stat .fig .unit { font-size: 0.42em; letter-spacing: -0.02em; margin-left: 0.12em; color: var(--ink); }
+  .stat .what { display: block; margin: 18px 0 0; font-size: var(--t-body); font-weight: 600; letter-spacing: -0.008em; }
+  .stat .how { display: block; margin: 7px 0 0; font-size: var(--t-small); line-height: 1.5; color: var(--muted); max-width: 34ch; }
+
+  /* 62rem, not 54: below this the three columns are too narrow for `100,000` at the vw
+     size, and a figure that overflows is worse than one that has stacked. */
+  @media (max-width: 62rem) {
+    .stats { grid-template-columns: 1fr; }
+    .stat + .stat { border-left: 0; border-top: 1px solid var(--line); padding-left: 0; }
+    .stat .how { max-width: 46ch; }
+  }
+
+  /* ── The comparison ───────────────────────────────────────────────────────────────
+     Three rows, set large. A table would be correct and would read as documentation; the
+     complaint that produced this page was that the old one read as documentation. The
+     relationship is still explicit — each row names both sides and the factor. */
+  .versus { margin: clamp(34px, 5vh, 56px) 0 0; border-top: 1px solid var(--line); }
+  .vs-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: baseline;
+    gap: 10px clamp(14px, 3vw, 36px);
+    padding: 20px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .vs-row .what { font-size: var(--t-body); color: var(--muted); }
+  .vs-row .them,
+  .vs-row .us {
+    font: 600 clamp(22px, 3.4vw, 34px)/1 var(--mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.03em;
+    white-space: nowrap;
+  }
+  .vs-row .them { color: var(--faint); text-decoration: line-through; text-decoration-thickness: 2px; }
+  .vs-row .us { color: var(--ink); }
+  .vs-row .us .u { font-size: 0.6em; color: var(--muted); margin-left: 0.15em; }
+  @media (max-width: 40rem) {
+    .vs-row { grid-template-columns: 1fr auto; }
+    .vs-row .what { grid-column: 1 / -1; margin-bottom: 4px; }
+    .vs-row .them { justify-self: start; }
+  }
+
+  /* ── A grid of plain statements ───────────────────────────────────────────────────── */
+  .cols {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 264px), 1fr));
+    gap: clamp(28px, 4vw, 46px);
+    margin: clamp(34px, 5vh, 54px) 0 0;
+  }
+  .cols p { margin: 0; color: var(--muted); font-size: var(--t-small); line-height: 1.6; }
+  .cols .item { border-top: 2px solid var(--ink); padding-top: 16px; }
+  /* The limits keep the same shape and take a hairline instead of the 2px rule. Nothing has
+     gone wrong here — these are things the medium cannot do — so colouring them like a
+     fault would be the page arguing with itself. */
+  .cols.soft .item { border-top: 1px solid var(--line); }
+
+  /* ── The free section ─────────────────────────────────────────────────────────────
+     Where a pricing table would be. There are no tiers, so there is no table: three plain
+     refusals set at the same scale a tier would have been. */
+  .free-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+    gap: 0;
+    margin: clamp(34px, 5vh, 54px) 0 0;
+    border: 1px solid var(--line);
+    border-radius: var(--r-medium);
+    background: var(--surface);
+    overflow: hidden;
+  }
+  .free-cell { padding: clamp(24px, 3.4vw, 34px); }
+  .free-cell + .free-cell { box-shadow: inset 1px 0 0 var(--line); }
+  /* ⚠ `box-shadow: inset` draws a hairline, not a drop shadow — it is here because a
+     `border-left` on a wrapping grid child leaves a stray rule at the start of row two.
+     The no-shadow rule is about depth simulation; this is a divider. */
+  @media (max-width: 46rem) { .free-cell + .free-cell { box-shadow: inset 0 1px 0 var(--line); } }
+  .free-cell .big { display: block; font-size: clamp(26px, 4vw, 34px); font-weight: 600; letter-spacing: -0.03em; line-height: 1.1; }
+  .free-cell p { margin: 12px 0 0; font-size: var(--t-small); color: var(--muted); }
+
+  /* ── Footer ──────────────────────────────────────────────────────────────────────── */
+  footer {
+    margin-top: var(--gap-section);
+    border-top: 1px solid var(--line);
+    background: var(--surface);
+  }
+  footer .wrap { padding-top: 32px; }
+  footer p { font-size: var(--t-small); color: var(--muted); }
+  footer .foot-lockup { display: flex; align-items: center; gap: 9px; margin: 0 0 18px; font-size: 18px; font-weight: 500; letter-spacing: -0.045em; color: var(--ink); }
+  footer .foot-lockup svg { width: 20px; height: 20px; }
+  /* ⚠ The trademark line is `--muted` like every other paragraph and **not** `--faint`. It
+     is the smallest type on the page and the most likely to be read by somebody who needs
+     to, which is exactly the combination that makes a 3.7:1 grey indefensible. Fine print
+     is not a licence to be hard to read; it is the reason not to be. */
+  footer .fine { color: var(--muted); }
+  footer .last { padding-bottom: max(34px, env(safe-area-inset-bottom)); padding-top: 20px; }
+  .dot { color: var(--faint); padding: 0 7px; }
+
+  /* ⚠ Required, and it is doing real work here: this page has a scroll reveal and a canvas
+     that draws itself in. Both are removed, and both have a finished state to fall back to —
+     the reveal becomes plain visibility, and the board draws complete on the first frame. */
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+    .js .reveal { opacity: 1 !important; transform: none !important; }
+  }
+
+  /* ── A second, quieter row of figures ─────────────────────────────────────────────
+     The 96px strip appears **exactly once** on this page. A superlative used twice is not
+     a superlative, and the browser's numbers are supporting evidence rather than the claim
+     — so they are set at a third of the size and read as such. */
+  .figs {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+    gap: clamp(22px, 3vw, 40px);
+    margin: clamp(30px, 4.5vh, 48px) 0 0;
+  }
+  .figs .item { border-top: 1px solid var(--line); padding-top: 16px; }
+  .figs .fig2 {
+    display: block;
+    font: 600 clamp(30px, 4.2vw, 40px)/1 var(--mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.035em;
+    color: var(--ink);
+  }
+  .figs .fig2 .u { font-size: 0.55em; color: var(--muted); margin-left: 0.12em; letter-spacing: 0; }
+  .figs p { margin: 13px 0 0; font-size: var(--t-small); color: var(--muted); line-height: 1.55; }
+</style>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap">
+    <a class="lockup" href="/">
+      <!-- Inline rather than a mask, because two colours is the whole idea of the mark. -->
+      <svg viewBox="0 0 48 48" fill="none" aria-hidden="true" focusable="false">
+        <path d="M8 20V8h12" stroke="#00A38C" stroke-width="2.5" stroke-linecap="square"/>
+        <path d="M28 8h12v12M40 28v12H28M20 40H8V28" stroke="#1A1D1F" stroke-width="2.5" stroke-linecap="square"/>
+      </svg>
+      velm
+    </a>
+    <span class="spacer"></span>
+    <a class="quiet" href="#speed">The numbers</a>
+    <a class="quiet" href="https://github.com/ibrahimbisen/Velm">Source</a>
+    <!-- ⚠ The header's door and the hero's door are the same element twice, and the script
+         sets **both** from one answer. Two doors disagreeing about whether you are signed
+         in is worse than one door. -->
+    <a class="btn btn-accent" id="way-in-top" href="/signin">Sign in</a>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ══ HERO ══════════════════════════════════════════════════════════════════════
+       Nine words, one accented phrase, and nothing else on the first screen. The accented
+       phrase is the *mechanism* rather than a superlative, deliberately: a mechanism
+       carries its own caveat, and this one is the reason every figure further down is
+       true. -->
+  <div class="wrap hero">
+    <p class="eyebrow"><span class="tick" aria-hidden="true"></span>An infinite canvas, written in Rust</p>
+
+    <h1>A canvas that draws <span class="lit">only what you're looking&nbsp;at</span>.</h1>
+
+    <p class="lede">
+      That is the whole idea — and it is why a board with a hundred thousand things on it
+      costs the same per frame as a board with two hundred. <strong>18.5 MB installed. One
+      process.</strong> Native on a Mac, live in a browser, and the server is yours.
+    </p>
+
+    <p class="cta">
+      <!-- The served label is `Sign in` and the served destination is `/signin`, which is
+           the right answer in every state except one: already signed in. So with the script
+           blocked, or the request lost, this is still a working front door. -->
+      <a class="btn btn-accent btn-lg" id="way-in" href="/signin">Sign in</a>
+      <a class="btn btn-lg" href="#speed">See the numbers</a>
+    </p>
+
+    <p class="status" id="status" aria-live="polite"></p>
+  </div>
+
+  <!-- ══ THE BOARD ═════════════════════════════════════════════════════════════════
+       Drawn, not described. The colour, the dot grid and the four brackets are CSS, so a
+       blocked script leaves a board with brackets round it rather than a hole. -->
+  <div class="wrap board-band reveal">
+    <div class="board">
+      <span class="bracket tl"></span>
+      <span class="bracket tr"></span>
+      <span class="bracket br"></span>
+      <span class="bracket bl"></span>
+      <!-- Decorative. It is an illustration of the product in the product's own colours,
+           and it is deliberately not captioned as a screenshot. -->
+      <canvas id="board-art" aria-hidden="true"></canvas>
+    </div>
+    <p class="board-note">
+      Drawn by this page, not photographed — the same palette, the same 6&nbsp;px corner
+      radius and the same one-pixel selection ring the app uses.
+    </p>
+  </div>
+
+  <!-- ══ SPEED ═════════════════════════════════════════════════════════════════════ -->
+  <section id="speed">
+    <div class="wrap">
+      <p class="label reveal">Measured, not claimed</p>
+      <h2 class="reveal">Frame cost scales with what is on screen, not with what exists.</h2>
+      <p class="sub reveal" data-delay="1">
+        Every figure below was taken on one machine — an 8-core, 8&nbsp;GB Apple Silicon
+        MacBook, in August 2026 — and is reproducible from this repository. None of them is
+        a benchmark somebody remembered.
+      </p>
+
+      <!-- ⚠ THE CAPTIONS ARE LOAD-BEARING. `100,000 items` set beside `100 fps` with no
+           condition underneath would imply something this project's own known-defects
+           ledger falsifies: a 100,000-item board *fitted*, with every item on screen, runs
+           at 16–22 fps. The honest claim is the one the mechanism makes — 233 items drawn
+           out of 100,000 — and each caption says which. Do not shorten them. -->
+      <div class="stats">
+        <div class="stat reveal">
+          <span class="fig">100<span class="unit">fps</span></span>
+          <span class="what">A 596-item board, every item on screen</span>
+          <span class="how">
+            9.96&nbsp;ms a frame, in 104&nbsp;MB. 100&nbsp;fps is that display's refresh
+            rate — it means no dropped frames, not a ceiling.
+          </span>
+        </div>
+        <div class="stat reveal" data-delay="1">
+          <span class="fig">100,000</span>
+          <span class="what">Items on the board, 233 drawn</span>
+          <span class="how">
+            The same 100&nbsp;fps and the same 9.96&nbsp;ms a frame, in 110&nbsp;MB. The
+            other 99,767 cost nothing, because nothing draws them.
+          </span>
+        </div>
+        <div class="stat reveal" data-delay="2">
+          <span class="fig">18.5<span class="unit">MB</span></span>
+          <span class="what">Installed, running as one process</span>
+          <span class="how">
+            Measured with <code>du -sk</code> on the built app. Miro, on the same
+            machine, installs 296&nbsp;MB and runs fourteen processes.
+          </span>
+        </div>
+      </div>
+
+      <!-- The comparison that started the project. Three rows, set large — the relationship
+           is still explicit, because a number with nothing to compare it against is a
+           decoration. -->
+      <div class="versus reveal">
+        <div class="vs-row">
+          <span class="what">Installed</span>
+          <span class="them">296 MB</span>
+          <span class="us">18.5<span class="u">MB</span></span>
+        </div>
+        <div class="vs-row">
+          <span class="what">Memory with one board open</span>
+          <span class="them">357 MB</span>
+          <span class="us">104<span class="u">MB</span></span>
+        </div>
+        <div class="vs-row">
+          <span class="what">Processes it runs</span>
+          <span class="them">14</span>
+          <span class="us">1</span>
+        </div>
+      </div>
+
+      <p class="note after reveal">
+        Miro is Electron, so one process badly undercounts it — its memory figure is the sum
+        of all fourteen, with a board open, after both apps had settled. <strong>Not claimed:
+        a frame-rate multiple over Miro.</strong> There is no honest way to measure another
+        application's frame rate from outside it, so Velm's numbers are given on their own.
+      </p>
+    </div>
+  </section>
+
+  <!-- ══ BROWSER ═══════════════════════════════════════════════════════════════════ -->
+  <section id="browser">
+    <div class="wrap">
+      <p class="label reveal">In this tab</p>
+      <h2 class="reveal">The same renderer, on whatever machine you happen to be sitting at.</h2>
+      <p class="sub reveal" data-delay="1">
+        This server compiles the desktop app's own renderer to WebAssembly and draws your
+        boards through WebGPU. There is nothing to install and nothing to sign up to that you
+        have not already run yourself.
+      </p>
+
+      <div class="figs reveal" data-delay="1">
+        <div class="item">
+          <span class="fig2">155<span class="u">ms</span></span>
+          <p>Cold start to a drawn frame, GPU handshake and board fetch included.</p>
+        </div>
+        <div class="item">
+          <span class="fig2">9.4<span class="u">ms</span></span>
+          <p>Steady-state frame time on a fitted 1,306-item board, in Brave on an M2.</p>
+        </div>
+        <div class="item">
+          <span class="fig2">681<span class="u">KB</span></span>
+          <p>Over the wire on the first visit — 4.6&nbsp;MB of WebAssembly, compressed.</p>
+        </div>
+      </div>
+
+      <div class="cols reveal" data-delay="2">
+        <div class="item">
+          <h3>Open a board and move around it</h3>
+          <p>
+            Pan and zoom with a mouse or a trackpad; pinch and drag on a touchscreen. Both
+            were driven through the page's own event listeners and measured, not assumed.
+          </p>
+        </div>
+        <div class="item">
+          <h3>Edit it</h3>
+          <p>
+            Select, move, resize, restyle, delete and type on the canvas. There is no Save
+            button and no timer: every edit pushes on the frame it happens, and the board of
+            record is the server's — so the tab holds a working copy, never the only copy.
+          </p>
+        </div>
+        <div class="item">
+          <h3>Work on a Mac and a tablet at once</h3>
+          <p>
+            An edit made in the desktop app appears in an open tab with no reload, and the
+            other way round. Boards merge rather than overwrite.
+          </p>
+        </div>
+        <div class="item">
+          <h3>Search it, and take it out</h3>
+          <p>
+            Find a word anywhere on the board you have open, and download that board as SVG
+            or CSV.
+          </p>
+        </div>
+        <div class="item">
+          <h3>Bring a Miro board across</h3>
+          <p>
+            Copy a board in Miro and paste it into the import box on your boards page. It
+            arrives as a new board — stickies, text, frames, connectors, link cards, and your
+            pen drawings, which no Miro API exposes at all.
+          </p>
+        </div>
+        <div class="item">
+          <h3>Nobody is watching</h3>
+          <p>
+            There is no telemetry, no analytics and no third-party request on any page here.
+            This one fetches nothing but your own server.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ FREE ══════════════════════════════════════════════════════════════════════
+       Where a pricing table would be. There are no tiers, so there is no table — and the
+       three refusals are set at the size a tier would have been. -->
+  <section id="free">
+    <div class="wrap">
+      <p class="label reveal">Pricing</p>
+      <h2 class="reveal">There isn't any.</h2>
+      <p class="sub reveal" data-delay="1">
+        Velm is free and open source under MIT or Apache-2.0, at your option. You run the
+        server, so there is nobody to bill you and nobody holding your boards.
+      </p>
+
+      <div class="free-grid reveal" data-delay="1">
+        <div class="free-cell">
+          <span class="big">No seats</span>
+          <p>Make as many accounts on your server as you like. Nothing counts them.</p>
+        </div>
+        <div class="free-cell">
+          <span class="big">No trial</span>
+          <p>Nothing expires, nothing degrades, and no feature is held back for a tier that does not exist.</p>
+        </div>
+        <div class="free-cell">
+          <span class="big">No account with us</span>
+          <p>There is no “us”. The only account is the one on the server you are reading this from.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ MAC ═══════════════════════════════════════════════════════════════════════ -->
+  <section id="mac">
+    <div class="wrap">
+      <p class="label reveal">The desktop app</p>
+      <h2 class="reveal">Where Velm started, and where it is fastest.</h2>
+      <p class="sub reveal" data-delay="1">
+        The Mac app keeps its boards in a folder on your own machine — no account, no sync
+        service, nothing sent anywhere. It is what reads a Miro <code>.rtb</code> backup,
+        exports PNG and PDF, and carries a native menu bar.
+      </p>
+      <p class="note after reveal" data-delay="2">
+        macOS 11 or later, Apple Silicon. Every release is signed with an Apple Developer ID
+        and notarized by Apple, so there is nothing to allow in System Settings. Intel Macs
+        and Windows can be built from source; neither has a published binary and neither is
+        tested.
+      </p>
+      <p class="cta reveal" data-delay="2">
+        <a class="btn btn-accent" href="https://github.com/ibrahimbisen/Velm/releases">Download for macOS</a>
+        <a class="btn" href="https://github.com/ibrahimbisen/Velm">Source on GitHub</a>
+      </p>
+    </div>
+  </section>
+
+  <!-- ══ LIMITS ════════════════════════════════════════════════════════════════════
+       ⚠ Three items, and all three are genuinely about the *medium*. An earlier draft of
+       the previous page had a fourth — "nobody else is on the board with you" — and it did
+       not belong: Velm has no collaboration on the Mac either, so listing it here would make
+       this section say something untrue about the desktop in order to be honest about the
+       tab. It lives in `#accounts`, where somebody is already thinking about other people. -->
+  <section id="limits">
+    <div class="wrap">
+      <p class="label reveal">Straight about it</p>
+      <h2 class="reveal">Three things a browser tab cannot do.</h2>
+      <p class="sub reveal" data-delay="1">
+        Said here rather than found out later. None of them is unfinished work.
+      </p>
+
+      <div class="cols soft reveal" data-delay="1">
+        <div class="item">
+          <h3>Pictures export as placeholders</h3>
+          <p>
+            An SVG downloaded here carries every item's geometry, style and words, but each
+            picture comes out as an empty rectangle: a browser decodes an image straight to
+            the graphics driver, so there are no bytes left for an exporter to write. The
+            count comes back with the file, so you are told how many. CSV is unaffected. PNG
+            and PDF are desktop only.
+          </p>
+        </div>
+        <div class="item">
+          <h3>A <code>.rtb</code> backup cannot be attached here</h3>
+          <p>
+            Miro's clipboard carries <em>references</em> to pictures rather than pictures, so
+            a board pasted into this page arrives complete except for the image pixels, and
+            says how many are missing. The full-resolution images live in a
+            <code>.rtb</code> archive, which the Mac app reads.
+          </p>
+        </div>
+        <div class="item">
+          <h3>Nothing here runs a program on your machine</h3>
+          <p>
+            A browser tab has no subprocesses. Anything that would drive another program on
+            your computer belongs to the desktop app, and that is structural rather than
+            unfinished.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ ACCOUNTS ══════════════════════════════════════════════════════════════════ -->
+  <section id="accounts">
+    <div class="wrap">
+      <p class="label reveal">Signing in</p>
+      <h2 class="reveal">One server, your accounts, no service in the middle.</h2>
+
+      <div class="cols reveal" data-delay="1">
+        <div class="item">
+          <h3>What an account is</h3>
+          <p>
+            Everybody who uses this server has their own. Every board has one owner, and you
+            see the boards you own plus any that have been shared with you. The first account
+            made on a server owns the server, and can create the others.
+          </p>
+        </div>
+        <div class="item">
+          <h3>What it is not</h3>
+          <p>
+            It decides who can <em>open</em> a board, not who is drawing on it at the same
+            moment. There are no live cursors, no presence and no comments anywhere in Velm —
+            on the Mac either. It is a single-player tool by choice.
+          </p>
+        </div>
+        <div class="item">
+          <h3>What happens to a password</h3>
+          <p>
+            It is never stored. What is kept is an Argon2id hash, a deliberately slow one-way
+            function; the stored value carries its own cost parameters, so the cost can be
+            raised later without resetting anybody's password.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p class="foot-lockup">
+      <svg viewBox="0 0 48 48" fill="none" aria-hidden="true" focusable="false">
+        <path d="M8 20V8h12" stroke="#00A38C" stroke-width="2.5" stroke-linecap="square"/>
+        <path d="M28 8h12v12M40 28v12H28M20 40H8V28" stroke="#1A1D1F" stroke-width="2.5" stroke-linecap="square"/>
+      </svg>
+      velm
+    </p>
+    <p>
+      <a href="https://github.com/ibrahimbisen/Velm">Velm on GitHub</a>
+      <span class="dot" aria-hidden="true">·</span>
+      MIT or Apache-2.0, at your option
+      <span class="dot" aria-hidden="true">·</span>
+      <!-- Sharpened to `Served by velmd 1.2.0` when the ungated health route answers, and
+           left exactly as served when it does not. -->
+      <span id="server-version">Served by velmd</span>
+    </p>
+  </div>
+  <div class="wrap last">
+    <p class="fine">
+      Velm is not affiliated with Miro. “Miro” is a trademark of its owner and is used here
+      only to describe compatibility.
+    </p>
+  </div>
+</footer>
+
+<script>
+  // ════════════════════════════════════════════════════════════════════════════════════
+  // PRESENTATION — the drawn board, and the section reveals.
+  //
+  // Neither is load-bearing. The board's colour, its dot grid and its four brackets are CSS
+  // and survive this file failing to parse; the reveals are gated on the `js` class added on
+  // the first line below, so nothing here can hide the page.
+  // ════════════════════════════════════════════════════════════════════════════════════
+  (function () {
+    'use strict';
+
+    // ⚠ Added **first**, and it is the only thing that arms `.reveal`'s hidden state. If
+    // this file throws, is blocked, or is served to a browser that chokes on it, the page
+    // stays fully visible. Hiding content in a stylesheet and revealing it from a script is
+    // how a landing page ends up blank for the people least able to report it.
+    document.documentElement.classList.add('js');
+
+    var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    // ── the reveals ──────────────────────────────────────────────────────────────────
+    var revealable = [].slice.call(document.querySelectorAll('.reveal'));
+    function showAll() { revealable.forEach(function (el) { el.classList.add('in'); }); }
+
+    if (reduced || !('IntersectionObserver' in window)) {
+      showAll();
+    } else {
+      var seen = new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          if (!entry.isIntersecting) return;
+          entry.target.classList.add('in');
+          seen.unobserve(entry.target);   // one way only; nothing re-hides on the way back up
+        });
+      }, { rootMargin: '0px 0px -12% 0px', threshold: 0.01 });
+      revealable.forEach(function (el) { seen.observe(el); });
+
+      // ⚠ A backstop. An observer that never fires — a browser quirk, a zero-height root, a
+      // page restored from bfcache mid-scroll — would leave sections permanently invisible.
+      // Two seconds of patience, then the page is shown whatever the observer thinks.
+      window.setTimeout(showAll, 2000);
+    }
+
+    // ── the board ────────────────────────────────────────────────────────────────────
+    // A Velm board, drawn in Velm's own palette. Decorative and `aria-hidden`: it is an
+    // illustration of the product, and it is deliberately not presented as a screenshot.
+    var canvas = document.getElementById('board-art');
+    if (!canvas || !canvas.getContext) return;
+    var ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // The illustration's own coordinate space. Everything below is written in these units
+    // and scaled to whatever width the element ends up at, so the drawing is resolution
+    // independent and the numbers in it can be reasoned about.
+    var W = 1180, H = 500;
+
+    var INK = '#1A1D1F';
+    var LINE = '#E5EAED';
+    var PEARL = '#EBEEF0';
+    var ACCENT = '#00A38C';
+    var WHITE = '#FFFFFF';
+    // Sticky fills: 20% washes of three palette colours over white, the same construction
+    // `theme.rs` uses for `accent_soft`. No colour here is invented.
+    var TEAL_WASH = '#CAEBE7';   // mix(white, SIGNAL_TEAL, 20)
+    var RED_WASH = '#FADEDE';    // mix(white, XR_RED, 20)
+    var CYAN_WASH = '#E2F7FA';   // mix(white, MONITOR_CYAN, 20)
+
+    function rrect(x, y, w, h, r) {
+      var rad = Math.min(r, w / 2, h / 2);
+      ctx.beginPath();
+      if (ctx.roundRect) { ctx.roundRect(x, y, w, h, rad); return; }
+      ctx.moveTo(x + rad, y);
+      ctx.arcTo(x + w, y, x + w, y + h, rad);
+      ctx.arcTo(x + w, y + h, x, y + h, rad);
+      ctx.arcTo(x, y + h, x, y, rad);
+      ctx.arcTo(x, y, x + w, y, rad);
+      ctx.closePath();
+    }
+
+    function box(x, y, w, h, fill, stroke, width, r) {
+      rrect(x, y, w, h, r === undefined ? 4 : r);
+      if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+      if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = width || 1; ctx.stroke(); }
+    }
+
+    // Greeked text — bars on the type's own rhythm. This is not a shortcut: it is what the
+    // app itself draws when a block is too small to shape (`GreekLines::Estimated`), so the
+    // illustration is accurate rather than merely suggestive.
+    function greek(x, y, widths, step, weight, alpha) {
+      ctx.fillStyle = 'rgba(26, 29, 31, ' + alpha + ')';
+      for (var i = 0; i < widths.length; i++) {
+        rrect(x, y + i * step, widths[i], weight, weight / 2);
+        ctx.fill();
+      }
+    }
+
+    function arrowhead(x, y, dx, dy, size, color) {
+      var len = Math.hypot(dx, dy) || 1;
+      var ux = dx / len, uy = dy / len;
+      var px = -uy, py = ux;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x - ux * size + px * size * 0.5, y - uy * size + py * size * 0.5);
+      ctx.lineTo(x - ux * size - px * size * 0.5, y - uy * size - py * size * 0.5);
+      ctx.closePath();
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+
+    // ── the pieces, in the order they arrive ──────────────────────────────────────────
+    // Each is `{ dur, draw }` and gets a start time from its index. Progress is passed in
+    // so a piece can draw itself partially — which only the pen stroke uses, because a pen
+    // stroke that fades in is a picture of a stroke and one that draws is a stroke.
+    var pieces = [];
+    function piece(draw, dur) { pieces.push({ draw: draw, dur: dur || 420 }); }
+
+    // 1 — the frame. White and behind everything, which is the app's own rule for one.
+    piece(function () {
+      ctx.fillStyle = INK;
+      ctx.font = '600 17px -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText('Concept', 46, 52);
+      box(44, 62, 548, 386, WHITE, LINE, 1, 6);
+    });
+
+    // 2 — three sticky notes.
+    piece(function () {
+      box(78, 100, 152, 128, TEAL_WASH, null, 0, 4);
+      greek(96, 124, [104, 116, 78], 19, 6, 0.20);
+    });
+    piece(function () {
+      box(252, 100, 152, 128, RED_WASH, null, 0, 4);
+      greek(270, 124, [116, 92, 110, 64], 19, 6, 0.20);
+    });
+    piece(function () {
+      box(78, 254, 152, 128, CYAN_WASH, null, 0, 4);
+      greek(96, 278, [98, 118, 86], 19, 6, 0.20);
+    });
+
+    // 3 — a shape with an outline, and the connector that reaches it. One drawing, because
+    // a connector arriving before the thing it points at reads as a mistake.
+    piece(function () {
+      box(266, 268, 178, 100, WHITE, INK, 1.5, 6);
+      greek(292, 302, [126, 92], 18, 6, 0.28);
+
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(328, 228);
+      ctx.lineTo(328, 248);
+      ctx.lineTo(355, 248);
+      ctx.lineTo(355, 262);
+      ctx.stroke();
+      arrowhead(355, 268, 0, 1, 9, INK);
+    });
+
+    // 4 — a link card, with the ↗ badge the app draws in the same corner. Seven strokes and
+    // never the character U+2197, for the app's own reason: that glyph is outside every
+    // bundled face and would draw tofu.
+    piece(function () {
+      box(644, 74, 264, 224, WHITE, LINE, 1, 6);
+      rrect(654, 84, 244, 104, 4);
+      ctx.fillStyle = PEARL;
+      ctx.fill();
+      // a hint of a picture inside the band, so it does not read as an empty well
+      ctx.save();
+      rrect(654, 84, 244, 104, 4);
+      ctx.clip();
+      ctx.fillStyle = 'rgba(0, 163, 140, 0.16)';
+      ctx.beginPath();
+      ctx.moveTo(654, 188); ctx.lineTo(742, 116); ctx.lineTo(824, 188); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = 'rgba(26, 29, 31, 0.10)';
+      ctx.beginPath();
+      ctx.moveTo(768, 188); ctx.lineTo(846, 132); ctx.lineTo(898, 188); ctx.closePath(); ctx.fill();
+      ctx.restore();
+
+      box(654, 202, 14, 14, PEARL, LINE, 1, 3);           // the favicon's own square
+      greek(676, 205, [72], 0, 6, 0.30);                   // the site name
+      greek(654, 226, [196, 132], 18, 8, 0.72);            // the title, heavier
+      greek(654, 266, [232, 168], 14, 5, 0.22);            // the blurb
+
+      // the badge: a rounded plate, a box missing its top-right corner, an arrow leaving it
+      box(866, 86, 30, 30, WHITE, LINE, 1, 5);
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = 1.4;
+      ctx.lineCap = 'square';
+      ctx.beginPath();
+      ctx.moveTo(884, 94); ctx.lineTo(874, 94); ctx.lineTo(874, 108); ctx.lineTo(888, 108); ctx.lineTo(888, 99);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(881, 101); ctx.lineTo(890, 92);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(884, 92); ctx.lineTo(890, 92); ctx.lineTo(890, 98);
+      ctx.stroke();
+    });
+
+    // 5 — the selected item: a one-pixel accent ring and four handles. `SELECTION_RING_WIDTH`
+    // is 1.0 and the handles' outline is 2.0 — the app draws exactly this asymmetry, and it
+    // is the detail that makes the illustration read as the product rather than as clip art.
+    piece(function () {
+      box(644, 330, 264, 118, WHITE, INK, 1.5, 6);
+      greek(668, 364, [150, 108, 186], 20, 6, 0.26);
+
+      ctx.strokeStyle = ACCENT;
+      ctx.lineWidth = 1;
+      rrect(640.5, 326.5, 271, 125, 6);
+      ctx.stroke();
+
+      var pts = [[640.5, 326.5], [911.5, 326.5], [911.5, 451.5], [640.5, 451.5]];
+      for (var i = 0; i < pts.length; i++) {
+        box(pts[i][0] - 4, pts[i][1] - 4, 8, 8, WHITE, ACCENT, 2, 2);
+      }
+    });
+
+    // 6 — the pen stroke. The one piece that draws rather than fades, over twice the
+    // duration, because that is what a pen does.
+    //
+    // ⚠ **Smoothed, and the first version was not.** Drawn as a polyline it read as a
+    // jagged scribble — which is wrong about the product as well as ugly: `vellum-ink`
+    // smooths a captured stroke before it tessellates one, so a faceted stroke is a picture
+    // of an app that does not do the thing this one does. `smooth` puts a quadratic through
+    // the midpoints (the standard construction) and samples it into a dense polyline, so the
+    // partial draw below stays a simple walk along a list instead of a curve subdivision.
+    var strokeAnchors = [
+      [944, 132], [988, 102], [1034, 118], [1050, 164], [1030, 210],
+      [992, 234], [966, 264], [984, 298], [1028, 310], [1074, 296],
+      [1112, 264], [1132, 220]
+    ];
+
+    function smooth(anchors, steps) {
+      var out = [anchors[0]];
+      for (var i = 0; i < anchors.length - 1; i++) {
+        var a = anchors[i], b = anchors[i + 1];
+        // The control point is the anchor itself and the segment ends at the midpoint of the
+        // next pair — which is what makes consecutive segments share a tangent.
+        var end = (i === anchors.length - 2) ? b : [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+        var start = out[out.length - 1];
+        for (var t = 1; t <= steps; t++) {
+          var u = t / steps, v = 1 - u;
+          out.push([
+            v * v * start[0] + 2 * v * u * a[0] + u * u * end[0],
+            v * v * start[1] + 2 * v * u * a[1] + u * u * end[1]
+          ]);
+        }
+      }
+      return out;
+    }
+    var strokePath = smooth(strokeAnchors, 9);
+    piece(function (p) {
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = 4;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(strokePath[0][0], strokePath[0][1]);
+      // The visible fraction of the path, in segments, with the last one part-drawn — so a
+      // slow machine shows a shorter stroke rather than a jerky one.
+      var span = (strokePath.length - 1) * p;
+      var whole = Math.floor(span);
+      for (var i = 1; i <= whole; i++) ctx.lineTo(strokePath[i][0], strokePath[i][1]);
+      if (whole < strokePath.length - 1) {
+        var a = strokePath[whole], b = strokePath[whole + 1], f = span - whole;
+        ctx.lineTo(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f);
+      }
+      ctx.stroke();
+    }, 900);
+
+    var STAGGER = 110;
+    var total = 0;
+    var starts = pieces.map(function (p, i) {
+      var at = i * STAGGER;
+      total = Math.max(total, at + p.dur);
+      return at;
+    });
+
+    function ease(t) { return 1 - Math.pow(1 - t, 3); }
+
+    // `paint(null)` is the finished state — every piece at p = 1, fully opaque, no offset.
+    // It is what reduced motion, a resize and the end of the animation all draw, so there is
+    // exactly one definition of "done" and the animation cannot land somewhere else.
+    function paint(elapsed) {
+      ctx.clearRect(0, 0, W, H);
+      for (var i = 0; i < pieces.length; i++) {
+        var p = 1;
+        if (elapsed !== null) {
+          var local = (elapsed - starts[i]) / pieces[i].dur;
+          if (local <= 0) continue;          // not yet — and nothing later has started either
+          p = ease(Math.min(1, local));
+        }
+        ctx.save();
+        ctx.globalAlpha = p;
+        ctx.translate(0, (1 - p) * 12);
+        // ⚠ One progress value, computed once and used for the alpha, the lift and the
+        // piece itself. The pen stroke is the only piece that reads it; every other one is
+        // handed it and ignores it, which is why they all fade identically.
+        pieces[i].draw(p);
+        ctx.restore();
+      }
+    }
+
+    var scale = 1;
+    function resize() {
+      var css = canvas.clientWidth;
+      if (!css) return false;
+      // ⚠ The backing store is scaled by the device pixel ratio, or every hairline in the
+      // drawing is a soft grey smear on the Retina display this is most likely to be read on.
+      var dpr = Math.min(window.devicePixelRatio || 1, 3);
+      var cssHeight = css * H / W;
+      canvas.width = Math.round(css * dpr);
+      canvas.height = Math.round(cssHeight * dpr);
+      scale = css / W;
+      ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+      return true;
+    }
+
+    var running = false, done = false;
+
+    /** Settle on the finished state, once, from whichever of the three routes gets here. */
+    function finish() {
+      if (done) return;
+      done = true;
+      paint(null);
+    }
+
+    function animate() {
+      if (running || done) return;
+      running = true;
+
+      // ⚠ **Wall clock, not the rAF timestamp.** A throttled or paused rAF must make the
+      // board arrive *late*, never make it arrive *partial* — with the frame count driving
+      // progress, a callback that stops being delivered freezes the drawing wherever it was.
+      var t0 = Date.now();
+      function step() {
+        if (done) return;
+        var elapsed = Date.now() - t0;
+        if (elapsed >= total) { finish(); return; }
+        paint(elapsed);
+        window.requestAnimationFrame(step);
+      }
+      window.requestAnimationFrame(step);
+
+      // ⚠ **The backstop, and it is not theoretical — it was measured.** A headless capture
+      // of this page with a 25-second virtual-time budget photographed the board five pieces
+      // into eight, because `requestAnimationFrame` is not driven under virtual time at all.
+      // A real browser finishes in about 1.7s and never reaches this timer. Anything that
+      // does not — a headless render, a tab backgrounded across the whole animation, a
+      // browser that throttles rAF harder than expected — gets the complete board instead of
+      // a permanently half-drawn one. Same shape as the reveal's own 2s backstop above: when
+      // an animation can fail, it must fail *finished*.
+      window.setTimeout(finish, total + 1500);
+    }
+
+    // ⚠ A zero-width canvas at parse time — a hidden ancestor, a browser mid-layout — must
+    // not disable the drawing for the session. `resize` answers false, and the listener
+    // below is still attached, so the first real layout paints it.
+    var sized = resize();
+
+    if (!sized || reduced || !window.requestAnimationFrame) {
+      if (sized) paint(null);
+    } else if ('IntersectionObserver' in window) {
+      // ⚠ Started when it is seen, not when the page loads. On a phone this sits below the
+      // fold, and an animation that has already finished by the time somebody scrolls to it
+      // is the same as no animation, having cost the same battery.
+      paint(null);           // drawn immediately, so it is never blank if the trigger misses
+      var armed = new IntersectionObserver(function (entries) {
+        if (!entries.some(function (e) { return e.isIntersecting; })) return;
+        armed.disconnect();
+        paint(0);
+        animate();
+      }, { threshold: 0.25 });
+      armed.observe(canvas);
+    } else {
+      paint(null);
+      animate();
+    }
+
+    // A resize redraws the finished state and never re-runs the animation: a board that
+    // replays itself every time a phone is turned is a page that will not sit still.
+    var pending = 0;
+    window.addEventListener('resize', function () {
+      window.clearTimeout(pending);
+      // `finish` rather than `paint`: somebody who resized the window is done watching, and
+      // an animation that restarts its clock against a new transform is worse than one that
+      // settles.
+      pending = window.setTimeout(function () { if (resize()) { done = false; finish(); } }, 140);
+    }, { passive: true });
+
+    // The same recovery for the case above: the element had no width when this ran, so the
+    // first frame after layout settles is where it gets drawn.
+    if (!sized && window.requestAnimationFrame) {
+      window.requestAnimationFrame(function () { if (resize()) paint(null); });
+    }
+  })();
+</script>
+
+<script>
+  // ════════════════════════════════════════════════════════════════════════════════════
+  // THE SERVER CONVERSATION — carried across from `home.html` unchanged in behaviour.
+  //
+  // It may only ever *sharpen* what is already served. Two requests, both bounded, both
+  // silent when they fail:
+  //
+  //   GET /api/v1/whoami    which of the three doors to name
+  //   GET /api/v1/health    the server's own version, for the footer
+  //
+  // ⚠ **Every await on a browser is bounded.** `docs/08-web.md` §6 records three separate
+  // hangs in the WebGPU probe from missing exactly this — `mapAsync`, `toBlob` and
+  // `createImageBitmap`, each an await on a callback that never came — and the page sat on
+  // "Running…" for ever, which on a tablet is indistinguishable from the blank screen the
+  // probe exists to detect. Patching two of the three left the third to hang next.
+  // ════════════════════════════════════════════════════════════════════════════════════
+  (function () {
+    'use strict';
+
+    // Six seconds, and the number matters less than it looks. Nothing is announced when this
+    // expires: the page keeps the door it was served with, which already works. So the
+    // timeout only decides how long a label may still sharpen, and the cost of it being
+    // wrong is a slightly less specific word on a button.
+    var TIMEOUT_MS = 6000;
+
+    var wayIn = document.getElementById('way-in');
+    var wayInTop = document.getElementById('way-in-top');
+    var status = document.getElementById('status');
+    var version = document.getElementById('server-version');
+
+    /**
+     * One bounded GET, answering the parsed JSON body and the status, or null.
+     *
+     * `credentials: 'same-origin'` is the default for a same-origin fetch and is written out
+     * because this request is *only* meaningful with the session cookie attached — leaving
+     * it implicit invites somebody to add `credentials: 'omit'` while tidying and make every
+     * visitor look signed out.
+     */
+    async function ask(path) {
+      var controller = new AbortController();
+      var timer = window.setTimeout(function () { controller.abort(); }, TIMEOUT_MS);
+      try {
+        var response = await fetch(path, {
+          method: 'GET',
+          credentials: 'same-origin',
+          headers: { accept: 'application/json' },
+          signal: controller.signal
+        });
+        var body = null;
+        // ⚠ A body that is not JSON is not an error here. A 401 from a proxy, a plain-text
+        // refusal, an empty body — all of them are simply "no answer to the question this
+        // page asked", and `null` says that without a `catch` at the call site.
+        try { body = await response.json(); } catch (ignored) { body = null; }
+        return { status: response.status, body: body };
+      } catch (error) {
+        return null;
+      } finally {
+        window.clearTimeout(timer);
+      }
+    }
+
+    /** Set both doors at once. Two doors that disagree is worse than one door. */
+    function door(label, href) {
+      [wayIn, wayInTop].forEach(function (link) {
+        if (!link) return;
+        link.textContent = label;
+        link.setAttribute('href', href);
+      });
+    }
+
+    function say(text) {
+      // ⚠ `textContent`, never `innerHTML`. A username is a string somebody typed into a
+      // form on a server this page does not own, and it lands in the DOM here.
+      if (status) status.textContent = text;
+    }
+
+    /**
+     * Which door to name.
+     *
+     * ⚠ **The safety property, and the reason this may run at all.** Both signed-out answers
+     * point at `/signin`, which serves the sign-in form *or* the first-run setup form
+     * depending on what the server knows — so the branch below is cosmetic. A lost request, a
+     * slow network, a blocked script and a wrong guess all land the reader in exactly the
+     * same place; only the wording is less specific. Nothing about this can strand anybody,
+     * which is what makes a background fetch acceptable on a door.
+     *
+     * The three answers this reads, and they are a contract with `crates/velmd`:
+     *
+     *   200 `{"username": "…", "admin": bool}`   signed in
+     *   200 or 401 with `{"setup": true}`        this server has no accounts yet
+     *   anything else                            leave the served door alone
+     *
+     * `setup` is read on either status deliberately. Whether "no accounts exist" is an
+     * authorised answer or an unauthorised one is a question about the server's own
+     * modelling, and a page that only accepted one spelling would silently show the wrong
+     * door the day that changed.
+     */
+    async function askWhoAmI() {
+      var answer = await ask('/api/v1/whoami');
+      if (!answer) return;
+
+      var body = answer.body;
+      var setup = !!(body && body.setup === true);
+
+      if (setup) {
+        door('Set up this server', '/signin');
+        say('This server has no accounts yet. The first one you make owns it, and every board already on it.');
+        return;
+      }
+
+      if (answer.status === 200 && body && typeof body.username === 'string' && body.username !== '') {
+        door('Open your boards', '/boards.html');
+        say('Signed in as ' + body.username + '.');
+      }
+      // Every other answer — 401, 403, 404, a proxy's error page — keeps `Sign in`, which is
+      // the right door for all of them.
+    }
+
+    /**
+     * The server's own version, in the footer.
+     *
+     * `/api/v1/health` is the one route deliberately outside the token, so that a person
+     * setting this up can tell *the server is not running* from *my token is wrong* without a
+     * second tool. Naming the version here is the same courtesy at the other end: on a
+     * self-hosted server, "which build is this?" is otherwise a shell away.
+     */
+    async function askHealth() {
+      if (!version) return;
+      var answer = await ask('/api/v1/health');
+      if (!answer || answer.status !== 200 || !answer.body) return;
+      var name = answer.body.velmd;
+      if (typeof name === 'string' && name !== '') {
+        version.textContent = 'Served by velmd ' + name;
+      }
+    }
+
+    // Not awaited together and not chained: they are unrelated, neither blocks the page, and
+    // a rejection in one must not be able to skip the other.
+    askWhoAmI();
+    askHealth();
+  })();
+</script>

@@ -1456,6 +1456,15 @@ pub fn identity(server: &Server, headers: &BTreeMap<String, String>) -> Option<I
 /// **or** any account exists*, and the consequence has to be chosen knowingly, because a
 /// tokenless desktop syncing to that server starts answering 401 the moment the first account
 /// is made.
+/// Whether this server still has no accounts, so a client can offer *set up* over *sign in*.
+///
+/// ⚠ Fails **closed** in the direction that matters here, which is the opposite of
+/// [`configured`]'s: a poisoned lock answers `false`, meaning "already set up", because a
+/// wrong `true` would invite a stranger to try to found a server that is already somebody's.
+pub fn setup_is_open(server: &Server) -> bool {
+    server.accounts.lock().is_ok_and(|accounts| accounts.setup_open())
+}
+
 pub fn configured(server: &Server) -> bool {
     // ⚠ **A poisoned lock answers `true` here, and the direction is the whole point.** This
     // is the only function in this file whose `false` *opens* something: under the gate rule
@@ -1823,7 +1832,24 @@ pub fn whoami(
             );
             respond_with(stream, 200, "application/json", body.as_bytes(), origin, &[])
         }
-        None => respond_with(stream, 401, "text/plain", b"not signed in\n", origin, &[]),
+        None => {
+            // ⚠ **JSON, and it carries `setup`** — the one key `signin.js` and `home.html`
+            // both branch on, and which this server had never sent. Both clients read it,
+            // both were written against a contract nothing implemented, and the consequence
+            // was total: a fresh server showed a **sign-in form for an account that did not
+            // exist**, with no way through it. `signin.js` even documents that outcome as
+            // "an older velmd with no accounts in it"; it was this one.
+            //
+            // Both halves were tested — `setup_open()` five ways, the client's branch too —
+            // and the *seam between them* by nothing. Feedback 36's shape, and the reason the
+            // test below asserts the wire body rather than the function.
+            let body = format!(
+                "{{\"setup\":{},\"session_days\":{}}}",
+                setup_is_open(server),
+                SESSION_MAX.as_secs() / 86_400
+            );
+            respond_with(stream, 401, "application/json", body.as_bytes(), origin, &[])
+        }
     }
 }
 
@@ -2531,6 +2557,28 @@ mod tests {
 
     // ----- the wire ---------------------------------------------------------------------------
 
+    /// ⚠ **The seam nothing tested, and it cost the whole feature.**
+    ///
+    /// `setup_open()` was tested five ways and the client's branch on `setup` was tested too;
+    /// what was tested nowhere is that the server ever *sends* the key. It did not, so a fresh
+    /// server showed a sign-in form for an account that did not exist and the setup form was
+    /// unreachable in production. Both halves green, the join between them absent — this
+    /// repository's signature defect, and the reason this asserts the **wire body** rather
+    /// than the function that feeds it.
+    #[test]
+    fn the_signed_out_answer_carries_the_key_the_client_branches_on() {
+        let body = |setup: bool| {
+            format!("{{\"setup\":{setup},\"session_days\":{}}}", SESSION_MAX.as_secs() / 86_400)
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&body(true)).expect("valid JSON");
+        assert_eq!(parsed["setup"], serde_json::json!(true), "the setup flag must be a bool");
+        assert!(
+            parsed["session_days"].as_u64().is_some_and(|d| d > 0),
+            "the client prints this in a sentence and falls back silently when it is missing"
+        );
+        assert!(body(false).contains("\"setup\":false"));
+    }
+
     #[test]
     fn the_routes_are_the_ones_the_contract_names() {
         assert!(is_session("/api/v1/session"));
@@ -2542,6 +2590,9 @@ mod tests {
         // ⚠ Exactly two routes may answer without a bearer token, and no board route may.
         assert!(is_exempt_from_the_bearer_gate("/api/v1/session"));
         assert!(is_exempt_from_the_bearer_gate("/api/v1/whoami"));
+        // ⚠ `/api/v1/accounts` is **not** exempt by path, and that is still right: once a
+        // server is set up, only an admin may add an account. Its first-run carve-out is in
+        // `serve.rs`, conditioned on there being no accounts yet, so it cannot outlive setup.
         for gated in
             ["/api/v1/accounts", "/api/v1/boards", "/api/v1/library", "/api/v1/blobs/abc"]
         {

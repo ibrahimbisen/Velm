@@ -107,14 +107,6 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 echo "signing with: $IDENTITY"
 
-# `velm-agent-cli` and `velm-mcp` sit beside the main executable because
-# `vellum_agent::transport::Shim` resolves them from `current_exe()`'s directory.
-# They are separate Mach-Os and each needs its own hardened-runtime signature.
-for shim in velm-agent-cli velm-mcp; do
-  echo "  signing $shim"
-  codesign --force --timestamp --options runtime \
-           --sign "$IDENTITY" "$APP/Contents/MacOS/$shim"
-done
 
 echo "  signing the bundle"
 codesign --force --timestamp --options runtime \

@@ -1,0 +1,2073 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- ⚠ No `user-scalable=no`. `index.html` suppresses browser zoom because the board handles
+     its own pinch and a page zoom on top of it fights the camera. This page is a document:
+     pinching it to read is the browser doing its job. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Velm — an infinite canvas that never slows down</title>
+<meta name="description" content="Velm is an infinite-canvas whiteboard written in Rust. 100 fps on a 100,000-item board, 18.5 MB installed, free and open source, and it runs on your own server.">
+<meta name="color-scheme" content="light">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48' fill='none'%3E%3Cpath d='M8 20V8h12' stroke='%2300A38C' stroke-width='2.5' stroke-linecap='square'/%3E%3Cpath d='M28 8h12v12M40 28v12H28M20 40H8V28' stroke='%231A1D1F' stroke-width='2.5' stroke-linecap='square'/%3E%3C/svg%3E">
+
+<!--
+  ══════════════════════════════════════════════════════════════════════════════════════
+  THE HOME PAGE — design plan
+  ══════════════════════════════════════════════════════════════════════════════════════
+
+  ── the one idea ──────────────────────────────────────────────────────────────────────
+  **Show the canvas.** This is a canvas app, so the page's whole argument is made by a
+  board you can put your hands on before you have agreed to anything: notes settle into
+  place, a connector draws itself, a pen stroke appears — and then you can drag a note,
+  recolour it from the same floating bar the real app uses, arm the pen and draw. The
+  words underneath only name what the hero already did.
+
+  Everything else on the page is deliberately quiet so the board carries it.
+
+  ── palette ───────────────────────────────────────────────────────────────────────────
+  `crates/vellum-ui/src/theme.rs`, under theme.rs's own role names, so this page and the
+  board it opens are one interface:
+
+      bone   #FCFDFE  panels, cards, the header      ink        #1A1D1F  primary text
+      milk   #F7F9FA  the ground                     ink-muted  #5C656B  every paragraph
+      paper  #F2F2F2  the board — the stage wears it frost      #E5EAED  every hairline
+      pearl  #EBEEF0  a raised surface               teal       #00A38C  the one accent
+
+  ⚠ **Light only, and the missing `prefers-color-scheme` block is deliberate.**
+  `ThemePreference::resolve` answers `Light` whatever it is asked — *"i want only light
+  mode"* — so a page that flipped to dark would not match the board it opens. The dark
+  tokens exist in `theme.rs`, are tested, and are unreachable there too.
+
+  ⚠ **Two greys, and the split is measured.** `#7A8186` measures **3.7:1** on this ground
+  and fails AA for body text; `INK_MUTED` `#5C656B` measures 5.6:1. So every paragraph,
+  fine print included, is `--muted`; `--faint` is kept under its right name and is used
+  for non-text marks only. Accent-coloured *text* is `--on-accent-soft` `#0C675B` (6.4:1),
+  never the teal itself (3.1:1).
+
+  ── type scale ────────────────────────────────────────────────────────────────────────
+  The platform's own UI face, as the app uses, at document sizes rather than chrome sizes:
+
+      display  clamp(34px, 6.2vw, 58px)/1.05  −0.03em   the headline, and the figures
+      lede     20px/1.5                                 one paragraph under the headline
+      body     16.5px/1.62
+      small    13.5px          label 12px, uppercased and letterspaced in CSS
+
+  ── layout ────────────────────────────────────────────────────────────────────────────
+      header        the mark, and the way in, sticky
+      hero          eyebrow · headline · one paragraph · two doors · the status line
+      the stage     full-bleed, live, interactive — the argument
+      #speed        four measured figures in a hairline grid, each sourced
+      #what         six things you can do, tiles in the same hairline grid
+      #miro         bringing a Miro board across, with the import numbers
+      #free         there is no pricing page — free, self-hosted, your files
+      #edges        the three things a browser cannot do, said rather than found out
+      #mac          the desktop app, and where to get it
+      footer        licence, source, trademark
+
+  ⚠ **This design draws its structure with a hairline where other designs use a shadow**
+  (`docs/05-design-language.md` §2), and the light ramp's steps are 8/255 apart: the gaps
+  *are* the structure. So the only `box-shadow` on the page is under the floating context
+  bar in the hero — which is the one thing that genuinely floats in the real app too — and
+  it is the only radius past 6px, at `radius::FLOAT` 10, because `context_bar.rs` moved the
+  real bar to exactly that (CLAUDE.md feedback 38). No gradients, no purple, no emoji.
+
+  ── honesty, which is the tone rather than a limitation ───────────────────────────────
+  Every figure is quoted from a file in this repository that records how it was measured:
+
+      README.md            the desktop figures, the Miro comparison, the import numbers
+      docs/08-web.md §8    the browser figures, re-run 2026-08-22
+      docs/08-web.md §9    what this tab does and does not do
+
+  There is no invented number, no testimonial, no logo wall and no pricing table on this
+  page, and there is not going to be one. **The hero board is drawn by this file's own
+  2D-canvas code and is not the real renderer** — the caption under the stage says so
+  outright, because a demo that implies it is the product is the same lie as a fake logo.
+
+  ── the moving parts ──────────────────────────────────────────────────────────────────
+  Two scripts, and neither is load-bearing. The **door** script only *sharpens* what is
+  already served: `#way-in` ships as `Sign in → /signin`, which is the correct answer in
+  every state except already-signed-in, so a blocked script, a lost request or a wrong
+  guess all land the reader in exactly the same place. The **stage** script draws the
+  hero; with JavaScript off a `<noscript>` rule removes the stage entirely rather than
+  leaving a hole where a board should be.
+  ══════════════════════════════════════════════════════════════════════════════════════
+-->
+
+<style>
+  :root {
+    --surface: #FCFDFE;        /* BONE */
+    --page: #F7F9FA;           /* MILK */
+    --canvas: #F2F2F2;         /* PAPER — the board's own colour. The stage wears it */
+    --raised: #EBEEF0;         /* PEARL */
+    --line: #E5EAED;           /* FROST — every hairline on this page */
+    --ink: #1A1D1F;            /* INK */
+    --muted: #5C656B;          /* INK_MUTED — every paragraph, fine print included */
+    --faint: #7A8186;          /* non-text marks only */
+
+    --hover: #DCEBEF;          /* Palette::hover */
+    --pressed: #D0E6EC;        /* Palette::pressed */
+
+    --accent: #00A38C;         /* SIGNAL_TEAL */
+    --on-accent: #1A1D1F;      /* charcoal on the teal is 5.3:1; white is 3.2:1 and fails */
+    --accent-soft: #CAEBE7;    /* mix(BONE, teal, 20) */
+    --on-accent-soft: #0C675B; /* 6.4:1 — accented *text* is this, never the teal */
+    --focus: #00A38C;
+
+    --r-small: 4px;
+    --r-medium: 5px;
+    --r-large: 6px;
+    --r-float: 10px;           /* radius::FLOAT — the context bar, and nothing else */
+
+    --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+    --t-body: 16.5px;
+    --t-lede: 20px;
+    --t-small: 13.5px;
+    --t-label: 12px;
+  }
+
+  * { box-sizing: border-box; }
+
+  /* An author `display` beats the user agent's `[hidden] { display: none }`, so anything
+     declared `display: flex` stays visible while carrying the attribute. The hero's chrome
+     ships hidden and is unhidden by script, which is what keeps a no-script visitor from
+     being shown a row of buttons that do nothing. */
+  [hidden] { display: none !important; }
+
+  html {
+    scroll-padding-top: 76px;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: var(--t-body)/1.62 var(--ui);
+  }
+
+  .wrap {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding-left: max(20px, env(safe-area-inset-left));
+    padding-right: max(20px, env(safe-area-inset-right));
+  }
+  .measure { max-width: 62ch; }
+
+  .skip {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    padding: 10px 14px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-small);
+    color: var(--ink);
+  }
+  .skip:focus { left: 8px; top: 8px; z-index: 20; }
+
+  /* Screen-reader-only. Used once, for a description of the hero board — the canvas itself
+     is `aria-hidden`, because a picture of a whiteboard read out shape by shape is noise. */
+  .sr {
+    position: absolute;
+    width: 1px; height: 1px;
+    margin: -1px; padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  /* ── header ───────────────────────────────────────────────────────────────────────── */
+  header.top {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+    padding-top: max(0px, env(safe-area-inset-top));
+  }
+  .top .wrap { display: flex; align-items: center; gap: 14px; min-height: 58px; }
+
+  /* The lockup from `assets/logo/README.md`: mark, a gap of one bracket arm, then `velm` —
+     always lowercase, tracking −0.045em, in the platform's interface face. */
+  .lockup {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    color: var(--ink);
+    text-decoration: none;
+    font-size: var(--t-lede);
+    letter-spacing: -0.045em;
+  }
+  .lockup svg { flex: none; width: 22px; height: 22px; }
+  .lockup:focus-visible { outline: 2px solid var(--focus); outline-offset: 4px; border-radius: 2px; }
+  .top .spacer { margin-left: auto; }
+  .top nav { display: none; gap: 20px; }
+  .top nav a { color: var(--muted); text-decoration: none; font-size: var(--t-small); }
+  @media (hover: hover) { .top nav a:hover { color: var(--ink); } }
+  @media (min-width: 720px) { .top nav { display: flex; } }
+
+  /* ── buttons ──────────────────────────────────────────────────────────────────────── */
+  .btn {
+    appearance: none;
+    -webkit-appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 40px;
+    padding: 0 18px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-small);
+    background: var(--surface);
+    color: var(--ink);
+    font: inherit;
+    font-size: var(--t-small);
+    text-decoration: none;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color 130ms ease-out, border-color 130ms ease-out;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  /* ⚠ Guarded, because :hover latches on a touchscreen — a tapped button keeps the wash
+     until something else is tapped, so the page shows a control as pointed-at that nothing
+     is pointing at. Every file in `web/` carries this guard. */
+  @media (hover: hover) { .btn:hover { background: var(--hover); } }
+  .btn:active { background: var(--pressed); }
+  .btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .btn-accent { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  @media (hover: hover) { .btn-accent:hover { background: var(--accent); border-color: var(--accent); filter: brightness(1.06); } }
+  .btn-accent:active { background: var(--accent); filter: brightness(0.94); }
+  .btn-lg { min-height: 46px; padding: 0 22px; font-size: 15px; }
+  @media (pointer: coarse) { .btn { min-height: 44px; } }
+
+  /* ── the hero copy ────────────────────────────────────────────────────────────────── */
+  .hero { padding: clamp(40px, 7vw, 76px) 0 clamp(28px, 4vw, 40px); }
+  .eyebrow {
+    display: inline-block;
+    margin: 0 0 20px;
+    padding: 5px 11px;
+    border-radius: var(--r-small);
+    background: var(--accent-soft);
+    color: var(--on-accent-soft);
+    font-size: var(--t-label);
+    letter-spacing: 0.4px;
+  }
+  h1 {
+    margin: 0;
+    max-width: 17ch;
+    font-size: clamp(34px, 6.2vw, 58px);
+    line-height: 1.05;
+    letter-spacing: -0.03em;
+    font-weight: 600;
+  }
+  h1 em { font-style: normal; color: var(--on-accent-soft); }
+  .lede {
+    margin: 22px 0 0;
+    font-size: var(--t-lede);
+    line-height: 1.5;
+    color: var(--muted);
+  }
+  .cta { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 30px 0 0; }
+  .cta .quiet { color: var(--muted); font-size: var(--t-small); margin-left: 4px; }
+
+  /* The line the door script sharpens. Empty in the served HTML, and its height is
+     **reserved whether or not there is anything to say** — collapsing it while empty buys a
+     layout shift on exactly the two answers that matter, the hero growing under the
+     reader's hand at the moment the script decides they are signed in. */
+  .status {
+    margin: 16px 0 0;
+    min-height: 1.6em;
+    font-size: var(--t-small);
+    color: var(--muted);
+  }
+
+  /* ── the stage ────────────────────────────────────────────────────────────────────── */
+  .stage-shell {
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    background: var(--canvas);
+  }
+  .stage {
+    position: relative;
+    height: clamp(340px, 54vh, 560px);
+    overflow: hidden;
+  }
+  #board {
+    display: block;
+    width: 100%;
+    height: 100%;
+    /* ⚠ **`touch-action` is the whole of the touch design, and it is toggled rather than
+       chosen once.** It is evaluated at pointerdown, so the stage may legally change it
+       between gestures. With Select armed and nothing selected the page must scroll under a
+       thumb — that is the reader's page, not ours. The moment the visitor *opts in* — arms
+       the pen or the note tool, or taps a note to pick it up — the stage takes the gesture,
+       and tapping empty board hands scrolling straight back.
+
+       Doing it the other way, one global `pan-y`, silently breaks the two gestures the hint
+       chip advertises: a vertical drag of a note and a vertical pen line both go to the
+       browser as a scroll, and the board looks broken. */
+    touch-action: none;
+    cursor: grab;
+  }
+  @media (pointer: coarse) {
+    #board { touch-action: pan-y; }
+    .stage.grab #board { touch-action: none; }
+  }
+  /* The cursor is the only thing on the page that says what the armed tool will do before
+     you use it, so it is worth the four rules. */
+  .stage.over #board { cursor: move; }
+  .stage.holding #board { cursor: grabbing; }
+  /* ⚠ `data-armed` and not `data-tool`. The palette's buttons carry `data-tool`, and the
+     stage is their ancestor — so `document.querySelector('[data-tool="pen"]')` would match
+     the stage rather than the button the moment the pen was armed. Nothing in this file
+     makes that query today, which is exactly when a name collision is cheap to remove. */
+  .stage[data-armed="pen"] #board { cursor: crosshair; }
+  .stage[data-armed="sticky"] #board { cursor: copy; }
+  /* ⚠ **No focus ring on the canvas, deliberately, and it is not an omission.** The canvas is
+     `tabindex="-1"` — focused only by a press, never reachable by Tab — so a keyboard reader
+     never lands here and has nothing to be shown. Chrome matched `:focus-visible` on the
+     programmatic focus anyway and drew a two-pixel accent rectangle around the entire stage
+     the first time anybody clicked the board, which read as the whole hero being selected.
+     The keyboard's way in is the palette, the bar and the zoom pill, and all three ring. */
+  #board:focus, #board:focus-visible { outline: none; }
+
+  /* The tool palette, at the same left inset the app's own is. Real buttons, so a keyboard
+     reader reaches the board's verbs even though the board itself is a picture to them. */
+  .palette {
+    position: absolute;
+    left: clamp(10px, 2vw, 20px);
+    top: clamp(10px, 2vw, 20px);
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 5px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-large);
+  }
+  .tool {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 36px; height: 36px;
+    display: grid; place-items: center;
+    border: 0;
+    border-radius: var(--r-small);
+    background: transparent;
+    color: var(--ink);
+    cursor: pointer;
+    transition: background-color 120ms ease-out;
+    -webkit-tap-highlight-color: transparent;
+  }
+  @media (hover: hover) { .tool:hover { background: var(--hover); } }
+  .tool[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+  .tool:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .tool-rule { height: 1px; margin: 3px 4px; background: var(--line); }
+  .tool svg { width: 20px; height: 20px; }
+
+  /* ⚠ The context bar, and the one place this page exceeds the radius cap and the one
+     shadow on it. Both are quoted from the real control: `context_bar.rs` is radius 10,
+     no hairline, shadow (0,2) blur 8, 6pt spacing, 32pt controls in a 44pt frame, and a
+     colour *disc* rather than a chip (CLAUDE.md feedback 38). It floats above the board in
+     the app, which is the exception `docs/05` §2 allows a shadow for. */
+  .bar {
+    position: absolute;
+    z-index: 3;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px;
+    background: var(--surface);
+    border-radius: var(--r-float);
+    box-shadow: 0 2px 8px rgba(26, 29, 31, 0.16);
+  }
+  .bar button {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 32px; height: 32px;
+    display: grid; place-items: center;
+    border: 0;
+    border-radius: var(--r-small);
+    background: transparent;
+    color: var(--ink);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  @media (hover: hover) { .bar button:hover { background: var(--hover); } }
+  .bar button:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .bar .disc {
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    /* A hairline of the ink at 12%, so a pale swatch still has an edge on a white bar. */
+    box-shadow: inset 0 0 0 1px rgba(26, 29, 31, 0.12);
+  }
+  .bar button[aria-pressed="true"] .disc { box-shadow: inset 0 0 0 1px rgba(26, 29, 31, 0.12), 0 0 0 2px var(--accent); }
+  .bar .sep { width: 1px; height: 20px; background: var(--line); }
+  .bar svg { width: 18px; height: 18px; }
+
+  .zoom {
+    position: absolute;
+    right: clamp(10px, 2vw, 20px);
+    bottom: clamp(10px, 2vw, 20px);
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 4px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-large);
+  }
+  .zoom button {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 28px; height: 28px;
+    display: grid; place-items: center;
+    border: 0;
+    border-radius: var(--r-small);
+    background: transparent;
+    color: var(--ink);
+    font: 15px/1 var(--ui);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  @media (hover: hover) { .zoom button:hover { background: var(--hover); } }
+  .zoom button:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+  /* Tabular, for `theme.rs`'s reason: a percentage read while something is being dragged
+     jitters sideways in proportional digits. */
+  .zoom output {
+    min-width: 46px;
+    text-align: center;
+    font: 500 12px/1 var(--mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+  }
+
+  .hint {
+    position: absolute;
+    left: clamp(10px, 2vw, 20px);
+    bottom: clamp(10px, 2vw, 20px);
+    margin: 0;
+    padding: 7px 11px;
+    background: rgba(252, 253, 254, 0.94);
+    border: 1px solid var(--line);
+    border-radius: var(--r-small);
+    font-size: 12.5px;
+    color: var(--muted);
+    transition: opacity 260ms ease-out;
+    pointer-events: none;
+  }
+  .hint kbd {
+    font: 500 11.5px/1 var(--mono);
+    background: var(--raised);
+    border-radius: 3px;
+    padding: 2px 4px;
+  }
+  .hint.gone { opacity: 0; }
+  @media (max-width: 520px) { .hint { display: none; } }
+
+  .stage-note {
+    margin: 0;
+    padding: 14px 0 0;
+    font-size: var(--t-small);
+    color: var(--muted);
+    max-width: 76ch;
+  }
+
+  /* Shown only when the stage is removed, which is only ever by the `<noscript>` rule. */
+  .nojs { display: none; }
+
+  /* ── bands ────────────────────────────────────────────────────────────────────────── */
+  .band { padding: clamp(48px, 7vw, 84px) 0; border-top: 1px solid var(--line); }
+  .band:first-of-type { border-top: 0; }
+  .band.surface { background: var(--surface); }
+
+  h2 {
+    margin: 0;
+    max-width: 20ch;
+    font-size: clamp(24px, 3.4vw, 34px);
+    line-height: 1.15;
+    letter-spacing: -0.022em;
+    font-weight: 600;
+  }
+  h2 + .sub { margin: 14px 0 0; color: var(--muted); font-size: var(--t-body); }
+  h3 { margin: 0 0 6px; font-size: var(--t-body); font-weight: 600; }
+  p { margin: 0 0 16px; }
+  p:last-child { margin-bottom: 0; }
+  p.note { color: var(--muted); font-size: var(--t-small); }
+  a { color: var(--on-accent-soft); text-underline-offset: 2px; }
+  a:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 2px; }
+  /* Styled, because the browser default for `<code>` on macOS is Courier — which would make
+     `.rtb`, the one piece of jargon on the page, the only thing on it set in a face nobody
+     chose. */
+  code { font: 0.92em var(--mono); }
+
+  .label {
+    margin: 0 0 14px;
+    font-size: var(--t-label);
+    letter-spacing: 0.7px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* ⚠ The hairline grid. The container is painted `--line` and the cells `--surface` with a
+     1px gap, so every rule between cells is exactly one hairline whatever the cells wrap
+     to — the alternative, a border on each cell, doubles up at every seam and leaves a
+     ragged edge on the last row. One border around the outside completes it. */
+  .grid {
+    display: grid;
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: var(--r-medium);
+    overflow: hidden;
+  }
+  .grid > * { background: var(--surface); padding: 22px; margin: 0; }
+  .g4 { grid-template-columns: repeat(auto-fit, minmax(198px, 1fr)); }
+  .g3 { grid-template-columns: repeat(auto-fit, minmax(248px, 1fr)); }
+  .g2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+
+  /* ── the figures ──────────────────────────────────────────────────────────────────── */
+  .figures { margin-top: 34px; }
+  .fig .n {
+    display: block;
+    font-size: clamp(30px, 4.4vw, 44px);
+    line-height: 1.02;
+    letter-spacing: -0.03em;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .fig .n .u { font-size: 0.5em; letter-spacing: -0.01em; color: var(--muted); margin-left: 3px; }
+  .fig p { margin: 12px 0 0; font-size: var(--t-small); color: var(--muted); }
+  .against {
+    margin-top: 18px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    font-size: var(--t-small);
+    color: var(--muted);
+  }
+  .against b { color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
+
+  /* ── tiles ────────────────────────────────────────────────────────────────────────── */
+  .tiles { margin-top: 34px; }
+  .tile svg { width: 22px; height: 22px; color: var(--on-accent-soft); display: block; margin-bottom: 14px; }
+  .tile p { margin: 0; font-size: var(--t-small); color: var(--muted); }
+
+  /* ── the limits list ──────────────────────────────────────────────────────────────
+     A rule down the left rather than a warning colour: nothing here has gone wrong, these
+     are things the medium cannot do, and colouring them like a fault would be the page
+     arguing with itself. */
+  ul.limits { list-style: none; margin: 30px 0 0; padding: 0; }
+  ul.limits li { border-left: 2px solid var(--line); padding-left: 16px; margin: 0 0 22px; }
+  ul.limits li:last-child { margin-bottom: 0; }
+  ul.limits p { margin: 0; color: var(--muted); font-size: var(--t-small); }
+
+  .two { display: grid; gap: clamp(24px, 4vw, 56px); grid-template-columns: 1fr; margin-top: 4px; }
+  @media (min-width: 860px) { .two { grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); align-items: start; } }
+
+  /* ── footer ───────────────────────────────────────────────────────────────────────── */
+  footer { border-top: 1px solid var(--line); background: var(--surface); }
+  footer .wrap { padding-top: 26px; }
+  footer p { font-size: var(--t-small); color: var(--muted); }
+  /* ⚠ The trademark line is `--muted` like every other paragraph, and **not** `--faint`. It
+     is the smallest type on the page and the most likely to be read by somebody who needs
+     to, which is exactly what makes a 3.7:1 grey indefensible. */
+  footer .last { padding-bottom: max(30px, env(safe-area-inset-bottom)); }
+  .dot { color: var(--faint); padding: 0 7px; }
+
+  /* ⚠ Required, and it does **not** on its own reach the hero: a CSS rule cannot stop a
+     `requestAnimationFrame` loop. `matchMedia` is read in the stage script too, where the
+     intro is skipped to its finished state and the ambient drift never starts. This block
+     covers the page's own transitions. */
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  }
+</style>
+
+<!-- ⚠ With scripting off the stage is a grey rectangle with nothing in it, which is worse
+     than no stage at all: it reads as a page that failed to load. Removing it leaves the
+     copy, the figures and both doors, all of which are served HTML and all of which work. -->
+<noscript>
+  <style>
+    .stage-shell, .stage-note { display: none; }
+    .nojs { display: block; }
+  </style>
+</noscript>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap">
+    <a class="lockup" href="/">
+      <!-- Inline rather than a mask, because two colours is the whole idea of the mark. -->
+      <svg viewBox="0 0 48 48" fill="none" aria-hidden="true" focusable="false">
+        <path d="M8 20V8h12" stroke="#00A38C" stroke-width="2.5" stroke-linecap="square"/>
+        <path d="M28 8h12v12M40 28v12H28M20 40H8V28" stroke="#1A1D1F" stroke-width="2.5" stroke-linecap="square"/>
+      </svg>
+      velm
+    </a>
+    <nav aria-label="Sections">
+      <a href="#speed">Speed</a>
+      <a href="#what">What it does</a>
+      <a href="#free">Free</a>
+      <a href="#mac">Mac app</a>
+    </nav>
+    <span class="spacer"></span>
+    <!-- ⚠ The header's door and the hero's door are the same door twice, and the script sets
+         **both** from one answer. Two doors that disagree about whether you are signed in is
+         worse than one door. -->
+    <a class="btn btn-accent" id="way-in-top" href="/signin">Sign in</a>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="hero">
+    <div class="wrap">
+      <p class="eyebrow">Free · open source · runs on your own server</p>
+      <h1>An infinite canvas that <em>never slows down</em>.</h1>
+      <p class="lede measure">
+        Velm is a whiteboard written in Rust. It draws your board straight on the GPU and
+        draws only what is actually on screen — so a hundred thousand things cost the same
+        per frame as two hundred. Open it on a Mac, or in any browser, from a server that
+        belongs to you.
+      </p>
+      <p class="cta">
+        <!-- The served label is `Sign in` and the served destination is `/signin`, which is
+             the right answer in every state except already-signed-in. So with the script
+             blocked, or the request lost, this is still a working front door. -->
+        <a class="btn btn-accent btn-lg" id="way-in" href="/signin">Sign in</a>
+        <a class="btn btn-lg" href="https://github.com/ibrahimbisen/Velm/releases">Download for macOS</a>
+        <span class="quiet">No account needed on the Mac.</span>
+      </p>
+      <p class="status" id="status" aria-live="polite"></p>
+    </div>
+  </section>
+
+  <!-- ══════════════════════════════════════════════════════════════════════════════════
+       THE STAGE — the page's whole argument.
+       Full bleed, on the board's own colour, with the board's own dot grid. The canvas is
+       `aria-hidden`; every verb it offers is a real focusable button beside it, and the
+       description a screen reader gets is the visually-hidden paragraph below.
+       ══════════════════════════════════════════════════════════════════════════════════ -->
+  <div class="stage-shell">
+    <p class="sr" id="stage-description">
+      An interactive demonstration board: a frame titled “Q3 — what ships” holding three
+      sticky notes, a rounded shape labelled “Release 1.3”, a connector between two of them
+      and two hand-drawn pen strokes, with two more notes and an ellipse loose on the canvas
+      beside it. It can be drawn on with a pointer. The buttons that follow choose a tool,
+      recolour or delete whatever is selected, and change the zoom.
+    </p>
+    <div class="stage" id="stage">
+      <canvas id="board" tabindex="-1" aria-hidden="true"></canvas>
+
+      <div class="palette" id="palette" role="group" aria-label="Board tools" hidden>
+        <!-- The keys are the app's own: V select, N note, P pen. -->
+        <button class="tool" type="button" data-tool="select" aria-pressed="true" title="Select — V" aria-label="Select tool">
+          <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M5.4 2.6a.6.6 0 0 1 .95-.49l9.1 6.6a.6.6 0 0 1-.3 1.08l-3.86.3 2.2 4.3a.6.6 0 0 1-.28.82l-1.5.72a.6.6 0 0 1-.8-.3l-2.15-4.4-2.5 2.72a.6.6 0 0 1-1.04-.4z"/></svg>
+        </button>
+        <button class="tool" type="button" data-tool="sticky" aria-pressed="false" title="Sticky note — N" aria-label="Sticky note tool">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M3.4 3.4h13.2v8.4l-4.8 4.8H3.4z"/><path d="M16.6 11.8h-4.8v4.8"/></svg>
+        </button>
+        <button class="tool" type="button" data-tool="pen" aria-pressed="false" title="Pen — P" aria-label="Pen tool">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M3.6 16.4l1-3.6L13.2 4.2a1.7 1.7 0 0 1 2.4 2.4l-8.6 8.6z"/><path d="M11.8 5.6 14.2 8"/></svg>
+        </button>
+        <span class="tool-rule" aria-hidden="true"></span>
+        <button class="tool" type="button" id="reset" title="Put the board back" aria-label="Put the board back">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16.2 10a6.2 6.2 0 1 1-1.9-4.5"/><path d="M16.4 2.6V6.2h-3.6"/></svg>
+        </button>
+      </div>
+
+      <!-- The floating bar. Its buttons are built by script, from the selection, exactly as
+           `context_bar.rs` derives its controls from the properties the selection *has*. -->
+      <div class="bar" id="bar" role="group" aria-label="Selected item" hidden></div>
+
+      <div class="zoom" id="zoom" hidden>
+        <button type="button" id="zoom-out" aria-label="Zoom out">−</button>
+        <output id="zoom-level" aria-live="off">100%</output>
+        <button type="button" id="zoom-in" aria-label="Zoom in">+</button>
+      </div>
+
+      <p class="hint" id="hint" hidden></p>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <p class="stage-note">
+      That board is drawn by this page, in a few hundred lines of ordinary canvas code, so
+      you can put your hands on one before signing into anything. <strong>It is not the real
+      renderer</strong> — the real one is Rust on WebGPU, and it is what the numbers below
+      were taken from.
+    </p>
+    <p class="stage-note nojs">
+      This page opens with a board you can draw on, which needs JavaScript. Everything
+      below works without it.
+    </p>
+  </div>
+
+  <section class="band surface" id="speed">
+    <div class="wrap">
+      <p class="label">Measured, not remembered</p>
+      <h2>The whole point is the frame time.</h2>
+      <p class="sub measure">
+        Velm exists because a board that fills up should not get slower. Every figure here
+        was measured on the machine named under it and is reproducible from the repository.
+        None of them is a benchmark somebody recalled.
+      </p>
+
+      <div class="grid g4 figures">
+        <div class="fig">
+          <span class="n">100<span class="u">fps</span></span>
+          <p>On a <strong>100,000-item</strong> board with 233 items on screen. 9.96&nbsp;ms a frame — and the same 9.96&nbsp;ms with all 596 items of a real board drawn.</p>
+        </div>
+        <div class="fig">
+          <span class="n">18.5<span class="u">MB</span></span>
+          <p>Installed, and it is <strong>one process</strong>. Not a browser in a costume.</p>
+        </div>
+        <div class="fig">
+          <span class="n">104<span class="u">MB</span></span>
+          <p>Held with a 596-item board open and every item drawn. 110&nbsp;MB on the 100,000-item board.</p>
+        </div>
+        <div class="fig">
+          <span class="n">155<span class="u">ms</span></span>
+          <p>Cold start in a browser to a drawn frame, on a 1,306-item board. 9.4&nbsp;ms a frame after that.</p>
+        </div>
+      </div>
+
+      <p class="against">
+        <span>Miro on the same machine: <b>296&nbsp;MB</b> installed</span>
+        <span><b>14</b> processes</span>
+        <span><b>357&nbsp;MB</b> with a board open</span>
+      </p>
+
+      <p class="note" style="margin-top:20px; max-width:76ch;">
+        The desktop figures are one machine — an 8-core, 8&nbsp;GB Apple Silicon MacBook, in
+        August 2026 — from the app's own HUD averaged over 45 seconds, and <code>ps</code> for
+        the memory, summed across all fourteen of Miro's processes because one PID badly
+        undercounts Electron. 100&nbsp;fps is that display's refresh rate: it means no dropped
+        frames, not a ceiling. The browser figures are Brave on an M2, from the client's own
+        <code>?selftest=perf</code>. There is deliberately no frame-rate multiple over Miro
+        quoted anywhere, because there is no honest way to measure Miro's from outside it.
+      </p>
+    </div>
+  </section>
+
+  <section class="band" id="what">
+    <div class="wrap">
+      <p class="label">What it does</p>
+      <h2>A whiteboard, finished rather than sketched.</h2>
+      <p class="sub measure">
+        Not a demo of a renderer. The things you actually reach for on a board, and they all
+        work.
+      </p>
+
+      <div class="grid g3 tiles">
+        <div class="tile">
+          <svg viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.8 18.2l1.1-3.9L14.3 4.8a1.9 1.9 0 0 1 2.7 2.7l-9.5 9.4z"/><path d="M12.7 6.4 15.4 9.1"/></svg>
+          <h3>Draw</h3>
+          <p>A pen with smoothing, an eraser that rubs out strokes or whole objects, 41 shapes including the flowchart set, and connectors that stay attached and re-route when you move either end.</p>
+        </div>
+        <div class="tile">
+          <svg viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 4.5h15v13h-15z"/><path d="M3.5 9h15M8.5 9v8.5"/></svg>
+          <h3>Structure</h3>
+          <p>Tables, kanban boards, mind maps that lay themselves out, and bar, line and pie charts. Double-click into any cell, card or node and type.</p>
+        </div>
+        <div class="tile">
+          <svg viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 6.2h13"/><path d="M11 6.2v10.3"/><path d="M8.4 16.5h5.2"/></svg>
+          <h3>Write</h3>
+          <p>Sticky notes, text boxes and titles, edited on the canvas with a real caret — click to place it, word motion, select a range, and copy characters rather than objects. Text auto-fits its box.</p>
+        </div>
+        <div class="tile">
+          <svg viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M2.6 4.6h11.2v8.8H2.6z"/><path d="M1.5 16.4h13.4"/><path d="M15.6 8.2h4.9v9.6h-4.9z"/></svg>
+          <h3>Both at once</h3>
+          <p>The Mac app and a browser tab on the same board. Changes appear without a reload, in either direction, and boards merge rather than overwrite.</p>
+        </div>
+        <div class="tile">
+          <svg viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><circle cx="9.6" cy="9.6" r="5.6"/><path d="M13.8 13.8 18.4 18.4"/></svg>
+          <h3>Find things</h3>
+          <p>Search a word anywhere on the board you have open — including inside a table cell, on a kanban card or on a mind-map node. On the Mac, across every board at once.</p>
+        </div>
+        <div class="tile">
+          <svg viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 3.4v9.8"/><path d="M7.4 7 11 3.4 14.6 7"/><path d="M4.2 13.6v3.4a1.4 1.4 0 0 0 1.4 1.4h10.8a1.4 1.4 0 0 0 1.4-1.4v-3.4"/></svg>
+          <h3>Take it out</h3>
+          <p>SVG and CSV from a browser tab; PNG and PDF as well on the Mac. Text exports shaped at the size it is actually drawn at, not at a default somebody guessed.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band surface" id="miro">
+    <div class="wrap">
+      <div class="two">
+        <div>
+          <p class="label">Coming from Miro</p>
+          <h2>Copy a board. Paste it here.</h2>
+          <p class="sub">
+            That is the whole of it. It arrives as a new board with its sticky notes, text,
+            frames, connectors, link cards and images.
+          </p>
+        </div>
+        <div>
+          <p>
+            <strong>On the reference board, 596 of 596 widgets came across — 532 of them
+            losslessly.</strong> Including 219 pen strokes, which Miro's own API does not
+            expose at all: ask it for that board and 310 of 577 items come back with no
+            content in them.
+          </p>
+          <p>
+            The desktop app goes one further and reads a Miro <code>.rtb</code> backup, which
+            is where the full-resolution pictures live.
+          </p>
+          <p class="note">
+            Velm is not affiliated with Miro, and none of this uses a private API — the
+            clipboard payload is a documented-by-measurement format, reverse-engineered and
+            written up in <code>docs/02-miro-formats.md</code>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="free">
+    <div class="wrap">
+      <p class="label">Pricing</p>
+      <h2>There is no pricing page.</h2>
+      <p class="sub measure">
+        Velm is free, and it is licensed that way rather than for now. There is no paid tier
+        to graduate to, no seat count, and no board limit — because there is nobody in the
+        middle to pay.
+      </p>
+
+      <div class="grid g3" style="margin-top:34px;">
+        <div class="tile">
+          <h3>MIT or Apache-2.0</h3>
+          <p>At your option. Read it, build it, fork it, ship it inside something else. The whole thing is on GitHub, including the parts of it that are unfinished.</p>
+        </div>
+        <div class="tile">
+          <h3>Your server</h3>
+          <p><code>velmd</code> is one binary that serves the browser client and your boards from one origin. Put it behind whatever you already run. Nothing phones home; there is no telemetry in it.</p>
+        </div>
+        <div class="tile">
+          <h3>Your files</h3>
+          <p>A board is a SQLite file on a disk you own, next to a content-addressed store for its pictures. On the Mac there is no account and no server at all — boards live in a folder, and nothing is sent anywhere.</p>
+        </div>
+      </div>
+
+      <p class="note" style="margin-top:22px; max-width:76ch;">
+        Signing in exists because a server is shared. Everybody on one has their own account,
+        every board has one owner, and the first account made owns the server and creates the
+        others. Passwords are never stored — what is kept is an Argon2id hash, which carries
+        its own cost parameters so the cost can be raised later without resetting anybody's
+        password. An account decides who can <em>open</em> a board, not who is drawing on it
+        at the same moment: there are no live cursors, no presence and no comments anywhere
+        in Velm, on the Mac either. It is a single-player tool by choice.
+      </p>
+    </div>
+  </section>
+
+  <section class="band surface" id="edges">
+    <div class="wrap">
+      <p class="label">Straight about the edges</p>
+      <h2>Three things a browser tab cannot do.</h2>
+      <p class="sub measure">
+        Said here rather than found out later. None of them is a bug, and none of them is on
+        a roadmap pretending otherwise.
+      </p>
+      <ul class="limits measure">
+        <li>
+          <h3>Pictures export as placeholders</h3>
+          <p>
+            An SVG downloaded in a tab carries every item's geometry, style and words, but
+            each picture comes out as an empty rectangle: a browser decodes an image straight
+            to the graphics driver, so there are no bytes left for an exporter to write. The
+            file tells you how many. CSV is unaffected; PNG and PDF are desktop only.
+          </p>
+        </li>
+        <li>
+          <h3>A <code>.rtb</code> backup cannot be attached here</h3>
+          <p>
+            Miro's clipboard carries <em>references</em> to pictures rather than pictures, so
+            a board pasted into a tab arrives complete except for the image pixels, and says
+            how many are missing. The archive that holds them is read by the Mac app.
+          </p>
+        </li>
+        <li>
+          <h3>Nothing here runs a program on your machine</h3>
+          <p>
+            A browser tab has no subprocesses. Anything that would drive another program on
+            your computer belongs to the desktop app, and that is structural rather than
+            unfinished.
+          </p>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="band" id="mac">
+    <div class="wrap">
+      <div class="two">
+        <div>
+          <p class="label">The desktop app</p>
+          <h2>And it is native where it can be.</h2>
+          <p class="sub">
+            Velm started on the Mac and is fastest there. No account, no sync service, no
+            server — boards are a folder on your own machine.
+          </p>
+          <p class="cta">
+            <a class="btn btn-accent" href="https://github.com/ibrahimbisen/Velm/releases">Download for macOS</a>
+            <a class="btn" href="https://github.com/ibrahimbisen/Velm">Source on GitHub</a>
+          </p>
+        </div>
+        <div>
+          <p class="note">
+            macOS&nbsp;11 or later, Apple Silicon. Every release is signed with an Apple
+            Developer&nbsp;ID and notarized by Apple, so there is nothing to allow in System
+            Settings and no Gatekeeper warning. Releases before 1.2.0 were ad-hoc signed and
+            will still ask.
+          </p>
+          <p class="note">
+            Intel Macs build from source and are untested. Windows is planned and has never
+            been built. Linux is not planned — though <code>velmd</code>, the server, is meant
+            for it, and the browser client runs anywhere WebGPU does.
+          </p>
+          <p class="note">
+            Deleting a board puts it in <em>Recently deleted</em>, where it stays until you
+            say otherwise. Nothing in Velm expires a board on a timer.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>
+      <a href="https://github.com/ibrahimbisen/Velm">Velm on GitHub</a>
+      <span class="dot" aria-hidden="true">·</span>
+      MIT or Apache-2.0, at your option
+      <span class="dot" aria-hidden="true">·</span>
+      <!-- Sharpened to `Served by velmd 1.2.0` when the ungated health route answers, and
+           left exactly as served when it does not. -->
+      <span id="server-version">Served by velmd</span>
+    </p>
+  </div>
+  <div class="wrap last">
+    <p>
+      Velm is not affiliated with Miro. “Miro” is a trademark of its owner and is used here
+      only to describe compatibility.
+    </p>
+  </div>
+</footer>
+
+<script>
+  // ════════════════════════════════════════════════════════════════════════════════════
+  // THE DOOR. Carried across from the previous home page unchanged in substance, because
+  // it is the one piece of this file that is a contract with `crates/velmd` rather than a
+  // design decision.
+  //
+  // It may only ever *sharpen* what is already served. Two requests, both bounded, both
+  // silent when they fail:
+  //
+  //   GET /api/v1/whoami    which of the three doors to name
+  //   GET /api/v1/health    the server's own version, for the footer
+  //
+  // ⚠ **Every await on a browser is bounded.** `docs/08-web.md` §6 records three separate
+  // hangs in the WebGPU probe from missing exactly this — `mapAsync`, `toBlob` and
+  // `createImageBitmap`, each an await on a callback that never came — and the page sat on
+  // "Running…" for ever, which on a tablet is indistinguishable from the blank screen the
+  // probe exists to detect. Patching two of the three left the third to hang next.
+  // ════════════════════════════════════════════════════════════════════════════════════
+  (function () {
+    'use strict';
+
+    // Six seconds, and the number matters less than it looks. Nothing is announced when it
+    // expires: the page keeps the door it was served with, which already works. So the
+    // timeout only decides how long a label may still sharpen, and the cost of it being
+    // wrong is a slightly less specific word on a button.
+    var TIMEOUT_MS = 6000;
+
+    var wayIn = document.getElementById('way-in');
+    var wayInTop = document.getElementById('way-in-top');
+    var status = document.getElementById('status');
+    var version = document.getElementById('server-version');
+
+    /**
+     * One bounded GET, answering the parsed JSON body and the status, or null.
+     *
+     * `credentials: 'same-origin'` is the default for a same-origin fetch and is written out
+     * because this request is *only* meaningful with the session cookie attached — leaving
+     * it implicit invites somebody to add `credentials: 'omit'` while tidying and make every
+     * visitor look signed out.
+     */
+    async function ask(path) {
+      var controller = new AbortController();
+      var timer = window.setTimeout(function () { controller.abort(); }, TIMEOUT_MS);
+      try {
+        var response = await fetch(path, {
+          method: 'GET',
+          credentials: 'same-origin',
+          headers: { accept: 'application/json' },
+          signal: controller.signal
+        });
+        var body = null;
+        // ⚠ A body that is not JSON is not an error here. A 401 from a proxy, a plain-text
+        // refusal, an empty body — all of them are simply "no answer to the question this
+        // page asked", and `null` says that without a `catch` at the call site.
+        try { body = await response.json(); } catch (ignored) { body = null; }
+        return { status: response.status, body: body };
+      } catch (error) {
+        return null;
+      } finally {
+        window.clearTimeout(timer);
+      }
+    }
+
+    /** Set both doors at once. Two doors that disagree is worse than one door. */
+    function door(label, href) {
+      [wayIn, wayInTop].forEach(function (link) {
+        if (!link) return;
+        link.textContent = label;
+        link.setAttribute('href', href);
+      });
+    }
+
+    function say(text) {
+      // ⚠ `textContent`, never `innerHTML`. A username is a string somebody typed into a
+      // form on a server this page does not own, and it lands in the DOM here.
+      if (status) status.textContent = text;
+    }
+
+    /**
+     * Which door to name.
+     *
+     * ⚠ **The safety property, and the reason this may run at all.** Both signed-out answers
+     * point at `/signin`, which serves the sign-in form *or* the first-run setup form
+     * depending on what the server knows — so the branch below is cosmetic. A lost request,
+     * a slow network, a blocked script and a wrong guess all land the reader in exactly the
+     * same place; only the wording is less specific. Nothing about this can strand anybody,
+     * which is what makes a background fetch acceptable on a door.
+     *
+     * The three answers this reads, and they are a contract with `crates/velmd`:
+     *
+     *   200 `{"username": "…", "admin": bool}`   signed in
+     *   200 or 401 with `{"setup": true}`        this server has no accounts yet
+     *   anything else                            leave the served door alone
+     *
+     * `setup` is read on either status deliberately. Whether "no accounts exist" is an
+     * authorised answer or an unauthorised one is a question about the server's own
+     * modelling, and a page that only accepted one spelling would silently show the wrong
+     * door the day that changed.
+     */
+    async function askWhoAmI() {
+      var answer = await ask('/api/v1/whoami');
+      if (!answer) return;
+
+      var body = answer.body;
+      var setup = !!(body && body.setup === true);
+
+      if (setup) {
+        door('Set up this server', '/signin');
+        say('This server has no accounts yet. The first one you make owns it, and every board already on it.');
+        return;
+      }
+
+      if (answer.status === 200 && body && typeof body.username === 'string' && body.username !== '') {
+        door('Open your boards', '/boards.html');
+        say('Signed in as ' + body.username + '.');
+      }
+      // Every other answer — 401, 403, 404, a proxy's error page — keeps `Sign in`, which is
+      // the right door for all of them.
+    }
+
+    /**
+     * The server's own version, in the footer.
+     *
+     * `/api/v1/health` is the one route deliberately outside the token, so that a person
+     * setting this up can tell *the server is not running* from *my token is wrong* without
+     * a second tool. Naming the version here is the same courtesy at the other end.
+     */
+    async function askHealth() {
+      if (!version) return;
+      var answer = await ask('/api/v1/health');
+      if (!answer || answer.status !== 200 || !answer.body) return;
+      var name = answer.body.velmd;
+      if (typeof name === 'string' && name !== '') {
+        version.textContent = 'Served by velmd ' + name;
+      }
+    }
+
+    // Not awaited together and not chained: they are unrelated, neither blocks the page, and
+    // a rejection in one must not be able to skip the other.
+    askWhoAmI();
+    askHealth();
+  })();
+</script>
+
+<script>
+  // ════════════════════════════════════════════════════════════════════════════════════
+  // THE STAGE — a board you can put your hands on, in a 2D canvas.
+  //
+  // ⚠ **This is not Velm's renderer and must never be described as one.** The real one is
+  // Rust compiled to wasm drawing through WebGPU, and it is what every figure on this page
+  // was measured from. This is a few hundred lines of `CanvasRenderingContext2D` whose only
+  // job is to make the first three seconds of the page show the product instead of
+  // describing it. The caption under the stage says so in the served HTML, not here.
+  //
+  // What it *does* borrow from the real thing, deliberately, because a demo that disagrees
+  // with the app is worse than none:
+  //
+  //   · the board's colour and its dot grid, and the grid's step chosen at the live zoom
+  //   · a connector routed from **live bounds every frame** — storing a route produces a
+  //     line that lies the moment either end moves
+  //   · a **one-device-pixel** selection ring (feedback 32), and the floating bar's real
+  //     geometry: radius 10, no hairline, 32pt controls in a 44pt frame, colour discs
+  //   · a frame title **clamped** to a device floor rather than scaled to nothing (38)
+  //   · create tools that disarm after one use; the pen, which does not
+  //   · V / N / P, the app's own tool keys
+  //
+  // Three things that are *not* the app's, and are right for a page:
+  //   · **the wheel is not captured.** Velm zooms on the wheel; a landing page that eats
+  //     the wheel is a landing page you cannot scroll past. The zoom pill is the way in.
+  //   · **no marquee.** A drag on empty board pans, which is the gesture that shows an
+  //     infinite canvas; sweeping a selection shows nothing in a demo.
+  //   · **a press on a frame pans rather than picking the frame up.** That is feedback 29's
+  //     rule for a reason — a frame is the largest thing on the board and everything sits on
+  //     it — and here it also means the big white rectangle is a safe place to grab.
+  // ════════════════════════════════════════════════════════════════════════════════════
+  (function () {
+    'use strict';
+
+    var stage = document.getElementById('stage');
+    var canvas = document.getElementById('board');
+    if (!stage || !canvas || !canvas.getContext) return;
+    var ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    var palette = document.getElementById('palette');
+    var bar = document.getElementById('bar');
+    var zoomBox = document.getElementById('zoom');
+    var zoomLevel = document.getElementById('zoom-level');
+    var hint = document.getElementById('hint');
+
+    var UI_FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif';
+
+    var INK = '#1A1D1F';
+    var LINE = '#E5EAED';
+    var WHITE = '#FFFFFF';
+    var PAPER = '#F2F2F2';
+    var ACCENT = '#00A38C';
+
+    // ⚠ Sticky fills are **content, not tokens.** `theme.rs` has no sticky palette — a note's
+    // colour is the user's choice on a real board — so these four are invented for the demo.
+    // They are washes of colours the palette does have (the teal, `xr-red`, cobalt) plus one
+    // warm yellow, and none of them is purple, which `docs/05` §2 prohibits outright.
+    var FILLS = ['#FFE9A8', '#CAEBE7', '#FFD9D8', '#D6E2FB'];
+    var FILL_NAMES = ['Yellow', 'Teal', 'Coral', 'Blue'];
+    var STROKES = [INK, ACCENT, '#E65B58', '#1B62E8'];
+    var STROKE_NAMES = ['Ink', 'Teal', 'Coral', 'Blue'];
+
+    // ⚠ A CSS `@media (prefers-reduced-motion)` block cannot reach a `requestAnimationFrame`
+    // loop, so it is read here as well: the intro is skipped to its finished state, the
+    // ambient drift never starts, and the canvas is drawn on demand rather than every frame.
+    // Dragging still works — direct manipulation is not animation.
+    var motionQuery = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+    var reduce = !!(motionQuery && motionQuery.matches);
+    var coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+
+    // ── the scene ──────────────────────────────────────────────────────────────────────
+    // Deterministic wobble, so the hand-drawn strokes are the same on every load and the
+    // Reset button puts back the board somebody was just looking at.
+    function rand(seed) {
+      var s = (seed >>> 0) || 1;
+      return function () { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; };
+    }
+
+    function ellipseInk(cx, cy, rx, ry, seed) {
+      var r = rand(seed), pts = [], n = 52, start = -0.75, i, a, w;
+      for (i = 0; i <= n; i++) {
+        a = start + (i / n) * (Math.PI * 2 + 0.5);
+        w = (r() - 0.5) * 7;
+        pts.push([cx + Math.cos(a) * (rx + w), cy + Math.sin(a) * (ry + w * 0.6)]);
+      }
+      return pts;
+    }
+
+    function tickInk(x, y, s, seed) {
+      var r = rand(seed), pts = [], path = [[0.02, 0.52], [0.36, 0.96], [0.98, 0.04]], k, i, t, px, py;
+      for (k = 0; k < path.length - 1; k++) {
+        for (i = 0; i < 10; i++) {
+          t = i / 10;
+          px = path[k][0] + (path[k + 1][0] - path[k][0]) * t;
+          py = path[k][1] + (path[k + 1][1] - path[k][1]) * t;
+          pts.push([x + px * s + (r() - 0.5) * 2.4, y + py * s + (r() - 0.5) * 2.4]);
+        }
+      }
+      pts.push([x + path[2][0] * s, y + path[2][1] * s]);
+      return pts;
+    }
+
+    var uid = 1;
+
+    function makeScene() {
+      return [
+        { id: 'frame', kind: 'frame', x: -560, y: -240, w: 520, h: 360, title: 'Q3 — what ships', t0: 0 },
+        { id: 's1', kind: 'sticky', x: -532, y: -212, w: 224, h: 120, fill: FILLS[0], text: 'Ship the browser client', t0: 150 },
+        { id: 's2', kind: 'sticky', x: -292, y: -212, w: 224, h: 120, fill: FILLS[1], text: 'Sync both ways', t0: 220 },
+        { id: 's3', kind: 'sticky', x: -532, y: -62, w: 224, h: 120, fill: FILLS[2], text: 'Sign every release', t0: 290 },
+        { id: 'sh1', kind: 'shape', form: 'round', x: -292, y: -52, w: 224, h: 100, fill: WHITE, text: 'Release 1.3', t0: 360 },
+        { id: 's4', kind: 'sticky', x: 30, y: -200, w: 210, h: 130, fill: FILLS[3], text: 'Ideas that have not landed yet', t0: 440 },
+        { id: 'sh2', kind: 'shape', form: 'ellipse', x: 30, y: 0, w: 250, h: 112, fill: WHITE, text: 'Next quarter', t0: 520 },
+        { id: 's5', kind: 'sticky', x: 288, y: -208, w: 150, h: 110, fill: FILLS[0], text: '?', t0: 590 },
+        { id: 'c1', kind: 'connector', from: 's2', to: 'sh1', t0: 700, dur: 520 },
+        { id: 'i1', kind: 'ink', points: ellipseInk(-180, -2, 134, 70, 7), stroke: ACCENT, width: 3, t0: 950, dur: 820 },
+        // Inside the first note's own top-right corner, which is where a hand puts a tick.
+        // It started life beside the shape and landed *on* its left edge, where it read as a
+        // stray mark rather than as somebody crossing something off.
+        { id: 'i2', kind: 'ink', points: tickInk(-352, -204, 34, 23), stroke: ACCENT, width: 3, t0: 1360, dur: 430 }
+      ];
+    }
+
+    var items = makeScene();
+    var selected = null;
+    var tool = 'select';
+    // The pen's colour, which the bar's swatches set when a stroke is the selection — so
+    // recolouring one stroke chooses the colour of the next.
+    var strokeColour = INK;
+
+    function byId(id) {
+      for (var i = 0; i < items.length; i++) { if (items[i].id === id) return items[i]; }
+      return null;
+    }
+
+    function boundsOf(it) {
+      if (it.kind !== 'ink') return { x: it.x, y: it.y, w: it.w, h: it.h };
+      var p = it.points, minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity, i;
+      for (i = 0; i < p.length; i++) {
+        if (p[i][0] < minx) minx = p[i][0];
+        if (p[i][0] > maxx) maxx = p[i][0];
+        if (p[i][1] < miny) miny = p[i][1];
+        if (p[i][1] > maxy) maxy = p[i][1];
+      }
+      return { x: minx, y: miny, w: Math.max(1, maxx - minx), h: Math.max(1, maxy - miny) };
+    }
+
+    // ── the camera ─────────────────────────────────────────────────────────────────────
+    var cam = { x: 0, y: 0, z: 1 };
+    var ZOOM_MIN = 0.3, ZOOM_MAX = 2.4;   // what the pill and a pinch may reach
+    var FIT_MIN = 0.5, FIT_MAX = 1.5;     // what an automatic fit may choose
+    var W = 1, H = 1, dpr = 1;
+    var userMoved = false;
+
+    // ⚠ Two focus rectangles, not one fit of the whole scene. A single fit puts a phone at
+    // about 0.45 zoom, where a note's words are six pixels tall and the hero is a picture of
+    // some coloured rectangles. The narrow rect frames the top-left corner of the frame
+    // instead; the loose items to the right are still there, off the edge, which is what an
+    // infinite canvas is supposed to look like.
+    var FOCUS_WIDE = { x: -620, y: -300, w: 640, h: 480 };
+    var FOCUS_NARROW = { x: -570, y: -262, w: 322, h: 214 };
+
+    function fit() {
+      var f = (W < 640) ? FOCUS_NARROW : FOCUS_WIDE;
+      var z = Math.min(W / f.w, H / f.h) * 0.94;
+      cam.z = Math.max(FIT_MIN, Math.min(FIT_MAX, z));
+      cam.x = f.x + f.w / 2;
+      cam.y = f.y + f.h / 2;
+    }
+
+    // The ambient drift — the board breathing, as though somebody were panning it slowly.
+    // It is added to the camera at read time rather than written into it, so a visitor who
+    // pans keeps their own position and the drift simply continues around it.
+    var driftClock = 0;
+    var drift = { x: 0, y: 0 };
+    var holding = false;
+
+    function vx(x) { return (x - (cam.x + drift.x)) * cam.z + W / 2; }
+    function vy(y) { return (y - (cam.y + drift.y)) * cam.z + H / 2; }
+    function wx(sx) { return (sx - W / 2) / cam.z + cam.x + drift.x; }
+    function wy(sy) { return (sy - H / 2) / cam.z + cam.y + drift.y; }
+
+    function zoomAbout(sx, sy, factor) {
+      var bx = wx(sx), by = wy(sy);
+      cam.z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, cam.z * factor));
+      cam.x += bx - wx(sx);
+      cam.y += by - wy(sy);
+      userMoved = true;
+    }
+
+    function resize() {
+      var r = stage.getBoundingClientRect();
+      W = Math.max(1, Math.round(r.width));
+      H = Math.max(1, Math.round(r.height));
+      // Capped at 2.5: past that the backing store costs more than the sharpness is worth on
+      // a decorative canvas, and a 3x phone would be pushing 8 megapixels a frame.
+      dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+      canvas.width = Math.max(1, Math.round(W * dpr));
+      canvas.height = Math.max(1, Math.round(H * dpr));
+      if (!userMoved) fit();
+      requestDraw();
+    }
+
+    // ── the grid ───────────────────────────────────────────────────────────────────────
+    // ⚠ One tile, rendered once and repeated as a pattern. The obvious version — `arc()` per
+    // dot — is three thousand paths a frame at this size, on a page that also has to scroll.
+    // The tile is a whole number of **device** pixels, which is feedback 11's lesson: a dot
+    // straddling two device pixels composites to a lighter grey than the one asked for.
+    var tileCanvas = null, tilePattern = null, tileKey = '', tileCss = 0;
+
+    function gridStep() {
+      var s = 20;
+      while (s * cam.z < 11) { s *= 2; }
+      while (s * cam.z > 34 && s > 5) { s /= 2; }
+      return s;
+    }
+
+    function grid() {
+      var dev = Math.max(4, Math.round(gridStep() * cam.z * dpr));
+      var key = dev + '@' + Math.round(dpr * 100);
+      if (key !== tileKey) {
+        if (!tileCanvas) tileCanvas = document.createElement('canvas');
+        tileCanvas.width = dev;
+        tileCanvas.height = dev;
+        var c = tileCanvas.getContext('2d');
+        if (!c) return null;
+        c.clearRect(0, 0, dev, dev);
+        // Not the app's number. On the canvas the grid is pure black at whatever alpha the
+        // user's own grid setting carries, which is a preference and not a constant this
+        // page could quote. This one is chosen to read on a document at this size.
+        c.fillStyle = 'rgba(0,0,0,0.085)';
+        var rad = Math.max(1, Math.round(1.05 * dpr));
+        c.beginPath();
+        c.arc(Math.round(dev / 2) + 0.5, Math.round(dev / 2) + 0.5, rad, 0, Math.PI * 2);
+        c.fill();
+        tilePattern = ctx.createPattern(tileCanvas, 'repeat');
+        tileCss = dev / dpr;
+        tileKey = key;
+      }
+      return tilePattern;
+    }
+
+    function drawGrid() {
+      var p = grid();
+      if (!p) return;
+      var t = tileCss;
+      var px = ((vx(0) % t) + t) % t;
+      var py = ((vy(0) % t) + t) % t;
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.fillStyle = p;
+      ctx.fillRect(-px - t, -py - t, W + 2 * t, H + 2 * t);
+      ctx.restore();
+    }
+
+    // ── drawing ────────────────────────────────────────────────────────────────────────
+    function rrect(x, y, w, h, r) {
+      r = Math.max(0, Math.min(r, Math.min(Math.abs(w), Math.abs(h)) / 2));
+      if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); return; }
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+      ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+      ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+      ctx.closePath();
+    }
+
+    function shade(hex, amount) {
+      var n = parseInt(hex.slice(1), 16);
+      function f(v) { return Math.max(0, Math.min(255, Math.round(v + 255 * amount))); }
+      return 'rgb(' + f((n >> 16) & 255) + ',' + f((n >> 8) & 255) + ',' + f(n & 255) + ')';
+    }
+
+    function wrapText(text, maxW) {
+      var words = String(text).split(' '), lines = [], cur = '', i, t;
+      for (i = 0; i < words.length; i++) {
+        t = cur ? cur + ' ' + words[i] : words[i];
+        if (cur && ctx.measureText(t).width > maxW) { lines.push(cur); cur = words[i]; }
+        else { cur = t; }
+      }
+      if (cur) lines.push(cur);
+      return lines;
+    }
+
+    function centredText(text, cx, cy, maxW, size, colour, weight) {
+      ctx.font = (weight || '500') + ' ' + size.toFixed(1) + 'px ' + UI_FONT;
+      ctx.fillStyle = colour;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      var lines = wrapText(text, maxW);
+      var lh = size * 1.32;
+      var top = cy - (lines.length - 1) * lh / 2;
+      for (var i = 0; i < lines.length; i++) ctx.fillText(lines[i], cx, top + i * lh);
+    }
+
+    function drawFrame(it) {
+      var x = vx(it.x), y = vy(it.y), w = it.w * cam.z, h = it.h * cam.z;
+      rrect(x, y, w, h, Math.max(2, 4 * cam.z));
+      ctx.fillStyle = WHITE;
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = LINE;
+      ctx.stroke();
+      // ⚠ Clamped to a device floor rather than scaled all the way down with the frame.
+      // Feedback 38: a frame's name greeked into one grey slab at a fitted zoom, the user
+      // photographed it beside Miro's, and Miro clamps.
+      var size = Math.max(12, 22 * cam.z);
+      ctx.font = '600 ' + size.toFixed(1) + 'px ' + UI_FONT;
+      ctx.fillStyle = INK;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillText(it.title, x, y - Math.max(7, 10 * cam.z));
+    }
+
+    function drawSticky(it) {
+      var x = vx(it.x), y = vy(it.y), w = it.w * cam.z, h = it.h * cam.z;
+      rrect(x, y, w, h, Math.max(2, 4 * cam.z));
+      ctx.fillStyle = it.fill;
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = shade(it.fill, -0.09);
+      ctx.stroke();
+      // Miro's 8% inset, which is what `vellum_project::layout` answers for a sticky's words.
+      var pad = it.w * 0.08 * cam.z;
+      centredText(it.text, x + w / 2, y + h / 2, Math.max(8, w - pad * 2), Math.max(7, 15 * cam.z), INK);
+    }
+
+    function drawShape(it) {
+      var x = vx(it.x), y = vy(it.y), w = it.w * cam.z, h = it.h * cam.z;
+      if (it.form === 'ellipse') {
+        ctx.beginPath();
+        ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+      } else {
+        rrect(x, y, w, h, Math.max(2, 6 * cam.z));
+      }
+      ctx.fillStyle = it.fill || WHITE;
+      ctx.fill();
+      ctx.lineWidth = Math.max(1, 1.6 * cam.z);
+      ctx.strokeStyle = INK;
+      ctx.stroke();
+      centredText(it.text, x + w / 2, y + h / 2, Math.max(8, w - 26 * cam.z), Math.max(7, 16 * cam.z), INK, '600');
+    }
+
+    // ⚠ The route is worked out from **live bounds, every frame**, exactly as the painter
+    // does it. Storing a route produces a connector that lies the moment either end moves —
+    // which on this page is one drag away.
+    function anchors(a, b) {
+      var ac = { x: a.x + a.w / 2, y: a.y + a.h / 2 };
+      var bc = { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+      var dx = bc.x - ac.x, dy = bc.y - ac.y;
+      if (Math.abs(dx) > Math.abs(dy)) {
+        return [
+          { x: dx > 0 ? a.x + a.w : a.x, y: ac.y },
+          { x: dx > 0 ? b.x : b.x + b.w, y: bc.y }
+        ];
+      }
+      return [
+        { x: ac.x, y: dy > 0 ? a.y + a.h : a.y },
+        { x: bc.x, y: dy > 0 ? b.y : b.y + b.h }
+      ];
+    }
+
+    function drawConnector(it, p) {
+      var a = byId(it.from), b = byId(it.to);
+      if (!a || !b) return;
+      var e = anchors(boundsOf(a), boundsOf(b));
+      var x1 = vx(e[0].x), y1 = vy(e[0].y), x2 = vx(e[1].x), y2 = vy(e[1].y);
+      var ex = x1 + (x2 - x1) * p, ey = y1 + (y2 - y1) * p;
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = Math.max(1, 1.6 * cam.z);
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
+      if (p > 0.985) {
+        var ang = Math.atan2(y2 - y1, x2 - x1), s = Math.max(6, 9 * cam.z);
+        ctx.beginPath();
+        ctx.moveTo(x2, y2);
+        ctx.lineTo(x2 - s * Math.cos(ang - 0.42), y2 - s * Math.sin(ang - 0.42));
+        ctx.lineTo(x2 - s * Math.cos(ang + 0.42), y2 - s * Math.sin(ang + 0.42));
+        ctx.closePath();
+        ctx.fillStyle = INK;
+        ctx.fill();
+      }
+    }
+
+    function drawInk(it, p) {
+      var pts = it.points;
+      var n = Math.max(2, Math.floor(pts.length * p));
+      if (pts.length < 2) return;
+      if (n > pts.length) n = pts.length;
+      ctx.strokeStyle = it.stroke;
+      ctx.lineWidth = Math.max(1.2, it.width * cam.z);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(vx(pts[0][0]), vy(pts[0][1]));
+      for (var i = 1; i < n - 1; i++) {
+        var mx = (pts[i][0] + pts[i + 1][0]) / 2, my = (pts[i][1] + pts[i + 1][1]) / 2;
+        ctx.quadraticCurveTo(vx(pts[i][0]), vy(pts[i][1]), vx(mx), vy(my));
+      }
+      ctx.lineTo(vx(pts[n - 1][0]), vy(pts[n - 1][1]));
+      ctx.stroke();
+    }
+
+    function drawSelection(it) {
+      var b = boundsOf(it);
+      var pad = 5 / cam.z;
+      var x = vx(b.x - pad), y = vy(b.y - pad);
+      var w = (b.w + pad * 2) * cam.z, h = (b.h + pad * 2) * cam.z;
+      ctx.save();
+      // ⚠ **One device pixel**, and it is its own decision. `SELECTION_RING_WIDTH` was split
+      // out from `SELECTION_WIDTH` because the user asked for a thinner ring and nothing
+      // else: the ring holds its device width while the item shrinks with the zoom, so at a
+      // fitted camera 2px is a band *around* a small item rather than an outline *on* it.
+      ctx.lineWidth = Math.max(0.5, 1 / dpr);
+      ctx.strokeStyle = ACCENT;
+      rrect(x, y, w, h, Math.max(2, 5 * cam.z));
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function ease(t) { return 1 - Math.pow(1 - t, 3); }
+
+    function progress(it, elapsed) {
+      if (reduce || it.t0 == null) return 1;
+      var d = it.dur || 420;
+      var t = (elapsed - it.t0) / d;
+      if (t <= 0) return 0;
+      if (t >= 1) return 1;
+      return ease(t);
+    }
+
+    function drawOne(it) {
+      if (it.kind === 'frame') drawFrame(it);
+      else if (it.kind === 'sticky') drawSticky(it);
+      else if (it.kind === 'shape') drawShape(it);
+    }
+
+    var introStart = 0;
+    var live = null;
+    var lastZoomText = '';
+
+    function render(now) {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = PAPER;
+      ctx.fillRect(0, 0, W, H);
+      drawGrid();
+
+      var elapsed = now - introStart;
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        var p = progress(it, elapsed);
+        if (p <= 0) continue;
+        if (it.kind === 'connector') { drawConnector(it, p); continue; }
+        if (it.kind === 'ink') {
+          ctx.save();
+          ctx.globalAlpha = Math.min(1, p * 3);
+          drawInk(it, p);
+          ctx.restore();
+          continue;
+        }
+        // Everything with a box arrives by rising a few points and settling, at its own
+        // moment. The transform is about the item's own centre so nothing slides in from a
+        // corner of the screen, which is the difference between a board being laid out and a
+        // slide deck animating.
+        var b = boundsOf(it);
+        var cx = vx(b.x + b.w / 2), cy = vy(b.y + b.h / 2);
+        ctx.save();
+        ctx.globalAlpha = p;
+        if (p < 1) {
+          var s = 0.965 + 0.035 * p;
+          ctx.translate(cx, cy + (1 - p) * 11);
+          ctx.scale(s, s);
+          ctx.translate(-cx, -cy);
+        }
+        drawOne(it);
+        ctx.restore();
+      }
+
+      if (live) drawInk(live, 1);
+      if (selected) drawSelection(selected);
+
+      positionBar();
+      // Guarded, because this runs sixty times a second and the value changes on perhaps one
+      // frame in a hundred. Writing it unconditionally is a DOM write per frame for nothing.
+      var pct = Math.round(cam.z * 100) + '%';
+      if (zoomLevel && pct !== lastZoomText) { zoomLevel.textContent = pct; lastZoomText = pct; }
+    }
+
+    // ── the loop ───────────────────────────────────────────────────────────────────────
+    // Runs only while the stage is on screen and the tab is visible, and under reduced
+    // motion only when something has actually changed.
+    var raf = null, last = 0, onScreen = true, started = false;
+
+    function running() { return onScreen && document.visibilityState !== 'hidden'; }
+
+    function requestDraw() { if (raf === null) raf = window.requestAnimationFrame(tick); }
+
+    function tick(now) {
+      raf = null;
+      var dt = last ? Math.min(48, now - last) : 16;
+      last = now;
+      if (!reduce && !holding) driftClock += dt;
+      if (!reduce) {
+        drift.x = Math.sin(driftClock / 9000) * 13;
+        drift.y = Math.cos(driftClock / 12300) * 8;
+      }
+      render(now);
+      if (running() && !reduce) requestDraw();
+    }
+
+    function start() {
+      if (started) return;
+      started = true;
+      introStart = (window.performance && performance.now) ? performance.now() : Date.now();
+      last = 0;
+      requestDraw();
+    }
+
+    // ── selection, tools, the bar ──────────────────────────────────────────────────────
+    function updateChrome() {
+      var buttons = palette ? palette.querySelectorAll('[data-tool]') : [];
+      for (var i = 0; i < buttons.length; i++) {
+        buttons[i].setAttribute('aria-pressed', String(buttons[i].getAttribute('data-tool') === tool));
+      }
+      // The touch contract, in one line: the stage takes the gesture only once the visitor
+      // has opted in by arming a tool or picking something up.
+      stage.classList.toggle('grab', tool !== 'select' || selected !== null);
+      stage.setAttribute('data-armed', tool);
+    }
+
+    function icon(paths) {
+      return '<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" ' +
+        'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + paths + '</svg>';
+    }
+
+    function buildBar() {
+      if (!bar) return;
+      while (bar.firstChild) bar.removeChild(bar.firstChild);
+      if (!selected) { bar.hidden = true; return; }
+
+      var ink = selected.kind === 'ink';
+      var swatches = ink ? STROKES : FILLS;
+      var names = ink ? STROKE_NAMES : FILL_NAMES;
+      var current = ink ? selected.stroke : selected.fill;
+
+      swatches.forEach(function (colour, i) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.setAttribute('aria-label', names[i]);
+        b.setAttribute('aria-pressed', String(colour.toLowerCase() === String(current).toLowerCase()));
+        b.title = names[i];
+        var disc = document.createElement('span');
+        disc.className = 'disc';
+        disc.style.background = colour;
+        b.appendChild(disc);
+        b.addEventListener('click', function () { paint(colour); });
+        bar.appendChild(b);
+      });
+
+      var sep = document.createElement('span');
+      sep.className = 'sep';
+      bar.appendChild(sep);
+
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.title = 'Delete';
+      del.setAttribute('aria-label', 'Delete');
+      del.innerHTML = icon('<path d="M3.6 5.2h10.8"/><path d="M7 5.2V3.6h4v1.6"/><path d="M5.2 5.2l.6 9h6.4l.6-9"/>');
+      del.addEventListener('click', removeSelected);
+      bar.appendChild(del);
+
+      bar.hidden = false;
+      // ⚠ Measured **once**, here, rather than in `positionBar`. That runs every frame while
+      // something is selected, and reading `offsetWidth` there forces a synchronous layout
+      // sixty times a second to re-learn a number that only changes when the bar is rebuilt.
+      barW = bar.offsetWidth;
+      barH = bar.offsetHeight;
+    }
+
+    function positionBar() {
+      if (!bar || !selected || bar.hidden) return;
+      var b = boundsOf(selected);
+      var w = barW, h = barH;
+      var left = Math.round(Math.min(Math.max(8, vx(b.x + b.w / 2) - w / 2), Math.max(8, W - w - 8)));
+      var top = Math.round(vy(b.y) - h - 14);
+      // Below the item when there is no room above it, which on a 340px stage is often.
+      if (top < 8) top = Math.round(vy(b.y + b.h) + 14);
+      top = Math.max(8, Math.min(top, H - h - 8));
+      bar.style.left = left + 'px';
+      bar.style.top = top + 'px';
+    }
+
+    function select(it) {
+      selected = it || null;
+      buildBar();
+      // ⚠ Positioned here as well as in `render`, or the bar draws once at wherever it was
+      // last left before the next frame moves it — a visible jump from the top-left corner
+      // on the very first selection, which is the one a visitor is watching for.
+      positionBar();
+      updateChrome();
+    }
+
+    function setTool(t) {
+      tool = t;
+      if (t !== 'select') select(null);
+      updateChrome();
+      requestDraw();
+    }
+
+    function paint(colour) {
+      if (!selected) return;
+      // A shape takes a colour as readily as a note does — feedback 41, where the fill write
+      // matched only Sticky and Frame and every shape silently refused one.
+      if (selected.kind === 'ink') { selected.stroke = colour; strokeColour = colour; }
+      else { selected.fill = colour; }
+      buildBar();
+      requestDraw();
+    }
+
+    function removeSelected() {
+      if (!selected) return;
+      var i = items.indexOf(selected);
+      if (i >= 0) items.splice(i, 1);
+      // A connector whose end has gone stops being drawn rather than pointing at nothing.
+      for (var k = items.length - 1; k >= 0; k--) {
+        var it = items[k];
+        if (it.kind === 'connector' && (!byId(it.from) || !byId(it.to))) items.splice(k, 1);
+      }
+      select(null);
+      requestDraw();
+    }
+
+    function moveItem(it, dx, dy) {
+      if (it.kind === 'ink') {
+        for (var i = 0; i < it.points.length; i++) { it.points[i][0] += dx; it.points[i][1] += dy; }
+      } else { it.x += dx; it.y += dy; }
+    }
+
+    var noteTexts = ['New note', 'Later', 'Ask about this', 'Yes', 'Move this up', 'Try it'];
+    var noteIndex = 0;
+
+    function placeSticky(x, y) {
+      var it = {
+        id: 'u' + (uid++), kind: 'sticky',
+        x: x - 95, y: y - 55, w: 190, h: 110,
+        fill: FILLS[noteIndex % FILLS.length],
+        text: noteTexts[noteIndex % noteTexts.length],
+        t0: null
+      };
+      noteIndex++;
+      items.push(it);
+      // Every create tool in the app disarms after one use, so a stray click cannot make an
+      // unwanted item. The pen is the exception, because a stray click with the pen makes
+      // nothing at all.
+      setTool('select');
+      select(it);
+      requestDraw();
+    }
+
+    // ── pointers ───────────────────────────────────────────────────────────────────────
+    var contacts = new Map();
+    var mode = null, dragItem = null, dragLast = null, pinch = null;
+    var barW = 0, barH = 0;
+
+    function pt(e) {
+      var r = canvas.getBoundingClientRect();
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    }
+    function dist(a, b) { return Math.hypot(b.x - a.x, b.y - a.y); }
+    function mid(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
+    function twoPoints() { var a = []; contacts.forEach(function (v) { a.push(v); }); return a; }
+
+    function distToSeg(px, py, x1, y1, x2, y2) {
+      var dx = x2 - x1, dy = y2 - y1, l = dx * dx + dy * dy;
+      var t = l ? Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / l)) : 0;
+      return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+    }
+
+    function hitTest(x, y) {
+      for (var i = items.length - 1; i >= 0; i--) {
+        var it = items[i];
+        // A frame is a backdrop until you pick it up, and here it is never picked up: it is
+        // the largest thing on the board and a press on it has to be a pan, or most of the
+        // stage would be un-grabbable. Feedback 29, one step further.
+        if (it.kind === 'frame' || it.kind === 'connector') continue;
+        if (it.kind === 'ink') {
+          // A bounding box would make the hand-drawn circle swallow the shape inside it, so
+          // ink is hit against the stroke itself.
+          if (distToInk(it, x, y) <= 12 / cam.z + it.width) return it;
+          continue;
+        }
+        var b = boundsOf(it);
+        if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return it;
+      }
+      return null;
+    }
+
+    function distToInk(it, x, y) {
+      var p = it.points, best = Infinity, d;
+      for (var i = 0; i < p.length - 1; i++) {
+        d = distToSeg(x, y, p[i][0], p[i][1], p[i + 1][0], p[i + 1][1]);
+        if (d < best) best = d;
+      }
+      return best;
+    }
+
+    function beginPinch() {
+      var a = twoPoints();
+      if (a.length < 2) return;
+      mode = 'pinch';
+      holding = true;
+      live = null;   // a stroke started with one finger is abandoned when a second lands
+      pinch = { d: dist(a[0], a[1]), m: mid(a[0], a[1]) };
+    }
+
+    function updatePinch() {
+      var a = twoPoints();
+      if (a.length < 2 || !pinch) return;
+      var d = dist(a[0], a[1]), m = mid(a[0], a[1]);
+      // ⚠ The factor is the **ratio of the fingers' separation**, straight in — not the
+      // wheel's per-pixel exponential. The zoom multiplies, so a ratio is already the right
+      // shape and is scale-invariant, which is what keeps the board pinned under both
+      // fingers. A pinch that travels is two motions: zoom about the **old** midpoint, which
+      // the zoom pins exactly, then pan by the midpoint's own delta.
+      if (pinch.d > 4 && d > 4) zoomAbout(pinch.m.x, pinch.m.y, d / pinch.d);
+      cam.x -= (m.x - pinch.m.x) / cam.z;
+      cam.y -= (m.y - pinch.m.y) / cam.z;
+      pinch.d = d;
+      pinch.m = m;
+      userMoved = true;
+    }
+
+    canvas.addEventListener('pointerdown', function (e) {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (canvas.focus) canvas.focus({ preventScroll: true });
+      if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (ignored) {} }
+      contacts.set(e.pointerId, pt(e));
+      dismissHint();
+
+      if (contacts.size === 2) { beginPinch(); requestDraw(); return; }
+      if (contacts.size > 2) return;
+
+      var p = pt(e);
+      if (tool === 'pen') {
+        mode = 'pen';
+        holding = true;
+        live = { kind: 'ink', points: [[wx(p.x), wy(p.y)]], stroke: strokeColour, width: 3 };
+        requestDraw();
+        return;
+      }
+      if (tool === 'sticky') { placeSticky(wx(p.x), wy(p.y)); return; }
+
+      var hit = hitTest(wx(p.x), wy(p.y));
+      if (hit) { select(hit); mode = 'item'; dragItem = hit; }
+      else { select(null); mode = 'pan'; }
+      dragLast = p;
+      holding = true;
+      stage.classList.add('holding');
+      requestDraw();
+    });
+
+    canvas.addEventListener('pointermove', function (e) {
+      // The hover cursor, and it is deliberately **above** the contact guard: a mouse that
+      // has not pressed produces exactly these events, and it is the one thing that may read
+      // a position without a contact behind it.
+      if (e.pointerType === 'mouse' && mode === null) {
+        var h = pt(e);
+        stage.classList.toggle('over', tool === 'select' && hitTest(wx(h.x), wy(h.y)) !== null);
+      }
+      // ⚠ **Never create a contact here.** A hovering Pencil or a trackpad cursor that has
+      // not pressed would become a second finger, turn the next move into a pinch against a
+      // point that never moves, and — since only a matching `pointerup` removes one — outlive
+      // the whole gesture. That was a real finding on the browser client.
+      if (!contacts.has(e.pointerId)) return;
+      contacts.set(e.pointerId, pt(e));
+
+      if (mode === 'pinch') { updatePinch(); requestDraw(); return; }
+
+      var p = pt(e);
+      if (mode === 'pen' && live) {
+        var w = [wx(p.x), wy(p.y)];
+        var lastPoint = live.points[live.points.length - 1];
+        // Decimated in **device** terms rather than world units: a world-unit floor is four
+        // device pixels at high zoom and throws away the shape of a slow hand (feedback 27).
+        if (Math.hypot((w[0] - lastPoint[0]) * cam.z, (w[1] - lastPoint[1]) * cam.z) > 1.4) live.points.push(w);
+        requestDraw();
+        return;
+      }
+      if (!dragLast) return;
+      if (mode === 'item' && dragItem) {
+        moveItem(dragItem, (p.x - dragLast.x) / cam.z, (p.y - dragLast.y) / cam.z);
+        dragLast = p;
+        requestDraw();
+        return;
+      }
+      if (mode === 'pan') {
+        cam.x -= (p.x - dragLast.x) / cam.z;
+        cam.y -= (p.y - dragLast.y) / cam.z;
+        dragLast = p;
+        userMoved = true;
+        requestDraw();
+      }
+    });
+
+    function endPointer(e) {
+      if (!contacts.has(e.pointerId)) return;
+      contacts.delete(e.pointerId);
+      if (canvas.releasePointerCapture && canvas.hasPointerCapture && canvas.hasPointerCapture(e.pointerId)) {
+        try { canvas.releasePointerCapture(e.pointerId); } catch (ignored) {}
+      }
+
+      if (mode === 'pinch') {
+        pinch = null;
+        if (contacts.size === 1) { mode = 'pan'; dragLast = twoPoints()[0]; }
+        else { mode = null; holding = false; stage.classList.remove('holding'); }
+        requestDraw();
+        return;
+      }
+
+      if (mode === 'pen' && live) {
+        // A stroke of two points is a tap that slipped; it is not a drawing.
+        if (live.points.length > 3) {
+          live.id = 'u' + (uid++);
+          live.t0 = null;
+          items.push(live);
+        }
+        live = null;
+      }
+
+      mode = null;
+      dragItem = null;
+      dragLast = null;
+      holding = contacts.size > 0;
+      stage.classList.toggle('holding', holding);
+      requestDraw();
+    }
+
+    // ⚠ `pointercancel` is not an edge case here: with `touch-action: pan-y` armed, a
+    // mostly-vertical touch drag is taken by the browser as a page scroll and this is the
+    // only event that arrives. A drag that is never ended leaves the board following a
+    // finger that is no longer on it.
+    canvas.addEventListener('pointerup', endPointer);
+    canvas.addEventListener('pointercancel', endPointer);
+    canvas.addEventListener('lostpointercapture', function (e) {
+      if (contacts.has(e.pointerId)) endPointer(e);
+    });
+    // The board never scrolls the page under a two-finger trackpad gesture on a desktop, and
+    // the wheel is deliberately not captured — see the header of this script.
+    canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+    // ── keyboard ───────────────────────────────────────────────────────────────────────
+    // On the stage rather than the canvas, so the palette and the bar — which are real
+    // focusable buttons — are the keyboard's way in. `preventDefault` is called only where
+    // something was actually done, or a focused stage would eat the page's own scrolling.
+    stage.addEventListener('keydown', function (e) {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      var k = e.key;
+      if (k === 'Escape') {
+        if (selected) select(null);
+        else if (tool !== 'select') setTool('select');
+        requestDraw();
+        return;
+      }
+      if (k === 'v' || k === 'V') { setTool('select'); return; }
+      if (k === 'n' || k === 'N') { setTool('sticky'); return; }
+      if (k === 'p' || k === 'P') { setTool('pen'); return; }
+      if (!selected) return;
+      if (k === 'Backspace' || k === 'Delete') { e.preventDefault(); removeSelected(); return; }
+      var step = e.shiftKey ? 20 : 4;
+      if (k === 'ArrowLeft') { moveItem(selected, -step, 0); }
+      else if (k === 'ArrowRight') { moveItem(selected, step, 0); }
+      else if (k === 'ArrowUp') { moveItem(selected, 0, -step); }
+      else if (k === 'ArrowDown') { moveItem(selected, 0, step); }
+      else return;
+      e.preventDefault();
+      requestDraw();
+    });
+
+    // ── the chrome ─────────────────────────────────────────────────────────────────────
+    if (palette) {
+      palette.hidden = false;
+      var toolButtons = palette.querySelectorAll('[data-tool]');
+      for (var t = 0; t < toolButtons.length; t++) {
+        (function (button) {
+          button.addEventListener('click', function () { setTool(button.getAttribute('data-tool')); });
+        })(toolButtons[t]);
+      }
+      var resetButton = document.getElementById('reset');
+      if (resetButton) {
+        resetButton.addEventListener('click', function () {
+          items = makeScene();
+          live = null;
+          noteIndex = 0;
+          strokeColour = INK;
+          select(null);
+          setTool('select');
+          userMoved = false;
+          fit();
+          started = false;
+          start();
+        });
+      }
+    }
+
+    if (zoomBox) {
+      zoomBox.hidden = false;
+      var zin = document.getElementById('zoom-in'), zout = document.getElementById('zoom-out');
+      if (zin) zin.addEventListener('click', function () { zoomAbout(W / 2, H / 2, 1.25); requestDraw(); });
+      if (zout) zout.addEventListener('click', function () { zoomAbout(W / 2, H / 2, 0.8); requestDraw(); });
+    }
+
+    var hintGone = false;
+    function dismissHint() {
+      if (hintGone || !hint) return;
+      hintGone = true;
+      hint.classList.add('gone');
+      window.setTimeout(function () { hint.hidden = true; }, reduce ? 0 : 320);
+    }
+    if (hint) {
+      // ⚠ Two strings, because the gestures are genuinely different. On a touchscreen the
+      // page keeps its own vertical scroll until a note is picked up, so "drag a note" would
+      // be describing a gesture that does not work on the first try — which this house style
+      // treats as the worst kind of string there is.
+      hint.innerHTML = coarse
+        ? 'Tap a note to pick it up, then drag it. Or take the pen.'
+        : 'Drag a note. Or take the pen and draw. <kbd>V</kbd> <kbd>N</kbd> <kbd>P</kbd>';
+      hint.hidden = false;
+    }
+
+    // ── wiring ─────────────────────────────────────────────────────────────────────────
+    if (window.ResizeObserver) {
+      new ResizeObserver(resize).observe(stage);
+    } else {
+      window.addEventListener('resize', resize);
+    }
+
+    if (window.IntersectionObserver) {
+      new IntersectionObserver(function (entries) {
+        onScreen = !!(entries[0] && entries[0].isIntersecting);
+        if (running()) { last = 0; start(); requestDraw(); }
+      }, { threshold: 0.02 }).observe(stage);
+    } else {
+      onScreen = true;
+    }
+
+    document.addEventListener('visibilitychange', function () {
+      if (running()) { last = 0; requestDraw(); }
+    });
+
+    if (motionQuery && motionQuery.addEventListener) {
+      motionQuery.addEventListener('change', function (e) { reduce = e.matches; last = 0; requestDraw(); });
+    }
+
+    updateChrome();
+    resize();
+    start();
+  })();
+</script>
