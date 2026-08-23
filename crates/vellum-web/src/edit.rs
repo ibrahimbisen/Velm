@@ -1235,6 +1235,51 @@ pub fn velm_select_all() -> u32 {
     u32::try_from(edit.selection().len()).unwrap_or(u32::MAX)
 }
 
+/// What a right-click at a screen point should offer, having first made the selection right.
+///
+/// Answers `"selection"` or `"canvas"` — which of `tools.js`'s two row lists to draw — and
+/// `""` when the viewer cannot be reached, where the page falls back to asking how many items
+/// are selected. That fallback is honest and it is worse: it cannot select the item under the
+/// pointer, so a right-click on an unselected sticky offers the canvas rows.
+///
+/// **This is a separate verb from `press` rather than a flag on it, because a menu is not a
+/// click**, and the three rules that make it one are all about what it must *not* do:
+///
+/// - A right-click on an **unselected** item selects it first, so the rows act on the thing
+///   under the pointer rather than on whatever was picked a minute ago.
+/// - One **inside** an existing selection leaves it alone. Right-clicking one of five picked
+///   items still offers all five — replacing the selection there is the single most annoying
+///   thing a canvas application can do.
+/// - One on **bare board** does not clear the selection. A request for a menu is not a
+///   dismissal, and the desktop's `--demo context-menu` measures exactly this.
+///
+/// The first two are `EditState::press`'s own rules, reached by handing it `additive = false`
+/// only when the hit is new; the third is why bare board is answered without touching the
+/// selection at all. All three live here rather than in the page because only this side has
+/// the scene — a hit test in JavaScript would be a second derivation of what is under the
+/// pointer, and it would be the one that decides what a menu row acts on.
+#[wasm_bindgen]
+pub fn context_target(x: f64, y: f64) -> String {
+    let Some(held) = viewer() else { return String::new() };
+    let Ok(mut viewer) = held.try_borrow_mut() else { return String::new() };
+    let ratio = crate::input::ratio();
+    let at = viewer.camera.screen_to_world(vellum_scene::ScreenPoint::new(x * ratio, y * ratio));
+    let crate::Viewer { edit, projection, .. } = &mut *viewer;
+    let view: &Projection = projection;
+    match view.scene().hit_test_where(at, |id| pickable(id, view)) {
+        // Already picked, alone or among others: the rows act on everything held.
+        Some(id) if edit.selection().contains(&id) => "selection".to_owned(),
+        Some(id) => {
+            edit.select_only(id);
+            "selection".to_owned()
+        }
+        // ⚠ Deliberately no `edit.clear()` here. Bare board keeps whatever is selected; the
+        // canvas rows — paste, select all — do not act on a selection, so leaving one held
+        // costs nothing and clearing it would throw away a selection the user is looking at.
+        None => "canvas".to_owned(),
+    }
+}
+
 /// Escape, and the page's own "deselect" control.
 #[wasm_bindgen]
 pub fn velm_clear_selection() {

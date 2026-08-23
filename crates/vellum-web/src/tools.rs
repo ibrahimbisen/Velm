@@ -783,6 +783,14 @@ impl ToolState {
     }
 }
 
+thread_local! {
+    /// How many draw-list entries the last `push_preview` added — read by `velm_tool_report`
+    /// and by nothing else. A `Cell` rather than a field on `ToolState` because the painter
+    /// holds that by shared reference, and widening it to `&mut` for one counter would put a
+    /// mutable borrow through the whole paint pass.
+    static DREW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Draw whatever gesture is in flight.
 ///
 /// ⚠ **The list must be in the *board* view.** Everything below is in camera-relative world
@@ -800,7 +808,11 @@ pub fn push_preview(
     projection: &Projection,
     theme: &Theme,
 ) {
-    let Some(preview) = tools.preview(projection) else { return };
+    let Some(preview) = tools.preview(projection) else {
+        DREW.with(|count| count.set(0));
+        return;
+    };
+    let before = list.pushed();
     let zoom = camera.zoom();
     let outline = (PREVIEW_WIDTH / zoom) as f32;
 
@@ -965,6 +977,14 @@ pub fn push_preview(
             }
         }
     }
+
+    // ⚠ **What was actually pushed, not what was asked for.** `is_placing` says a gesture is
+    // live and says nothing about whether anything reached the screen — and *that* is the
+    // defect this application has now shipped three times (feedback 7 the pen, 23 the frame,
+    // 34 the agent prompt): state accumulating where the painter cannot see it, so the tool
+    // appears to do nothing until the button comes up. A fixture reading `is_placing` alone
+    // would have passed through all three.
+    DREW.with(|count| count.set(list.pushed().saturating_sub(before)));
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1503,23 +1523,27 @@ pub fn tool_refusal(name: &str) -> String {
 /// - `points` — how many samples the pen has kept, which is what tells a working decimation
 ///   from a filter that is throwing the hand's movement away;
 /// - `doomed` — how many items the eraser has swept over but not yet removed;
+/// - `drawn` — how many draw-list entries the **last painted frame's** preview added, which
+///   is the assertion `placing` cannot make: a gesture can be perfectly live and reach the
+///   painter through nothing at all;
 /// - `items` — the projection's item count, so a creation and an undo can each be measured
 ///   against it.
 #[wasm_bindgen]
 pub fn velm_tool_report() -> String {
-    let Some(held) = viewer() else { return "select 0 0 0 0".to_owned() };
-    let Ok(viewer) = held.try_borrow() else { return "select 0 0 0 0".to_owned() };
+    let Some(held) = viewer() else { return "select 0 0 0 0 0".to_owned() };
+    let Ok(viewer) = held.try_borrow() else { return "select 0 0 0 0 0".to_owned() };
     let (points, doomed) = match viewer.tools.gesture.as_ref() {
         Some(Gesture::Stroke { points }) => (points.len(), 0),
         Some(Gesture::Erase { doomed, .. }) => (0, doomed.len()),
         _ => (0, 0),
     };
     format!(
-        "{} {} {} {} {}",
+        "{} {} {} {} {} {}",
         viewer.tools.tool().name(),
         u8::from(viewer.tools.is_placing()),
         points,
         doomed,
-        viewer.projection.len()
+        viewer.projection.len(),
+        DREW.with(std::cell::Cell::get)
     )
 }

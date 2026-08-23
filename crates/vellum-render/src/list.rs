@@ -263,6 +263,27 @@ impl DrawList {
         self.push_meshes(0..self.meshes.indices().len() as u32);
     }
 
+    /// How many instances of any kind have been pushed, plus the mesh indices.
+    ///
+    /// ⚠ Not a measure of anything drawn on screen — a batch with a zero-alpha colour counts
+    /// here and paints nothing. It exists for **one** question, asked by a fixture in a crate
+    /// where no test is ever compiled: *did this code path reach the painter at all?* Taking
+    /// the count either side of a call answers it, and nothing else available to a browser
+    /// does. The alternative was making four `pub(crate)` slice accessors public, which would
+    /// let a caller read instance data it has no business reading in order to count it.
+    ///
+    /// This application has shipped "state accumulated where the painter cannot see it" three
+    /// times — the pen, the frame preview, the agent prompt row — each written by somebody who
+    /// had read the entry about the last one. A number that goes up is what tells the two
+    /// apart, and the only cheaper way to know is to look at the screen.
+    pub fn pushed(&self) -> usize {
+        self.quads.len()
+            + self.shapes.len()
+            + self.images.len()
+            + self.glyphs.len()
+            + self.meshes.indices().len()
+    }
+
     pub fn meshes(&self) -> &MeshBatch {
         &self.meshes
     }

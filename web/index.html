@@ -133,7 +133,9 @@
     }
     library.querySelector('.note').textContent =
       'Your boards live on your own server and are never uploaded anywhere else. ' +
-      'Editing is not available in a browser yet — the desktop app is still where a board is changed.';
+      'A board opened from this list can be edited, and every change is pushed to your server ' +
+      'as it is made — a tab can be closed by the operating system with no warning, so nothing ' +
+      'is ever held here waiting to be saved.';
     document.getElementById('canvas').hidden = true;
     status.hidden = true;
     library.hidden = false;
@@ -223,6 +225,13 @@
         }
         const { runPerfFixture } = await import('./selftest.js');
         await runPerfFixture(velm);
+      }
+      if (params.get('selftest') === 'edit') {
+        for (let i = 0; i < 200 && velm.camera_report() === 'none'; i++) {
+          await new Promise(r => setTimeout(r, 50));
+        }
+        const { runEditFixture } = await import('./selftest.js');
+        await runEditFixture(velm, document.getElementById('canvas'));
       }
       if (params.get('selftest') === 'touch') {
         const { runTouchFixture } = await import('./selftest.js');

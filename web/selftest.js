@@ -255,3 +255,149 @@ function median(xs) {
   const sorted = [...xs].sort((a, b) => a - b);
   return sorted[Math.floor(sorted.length / 2)];
 }
+
+/**
+ * Every verb the six new modules added, driven through the real listeners.
+ *
+ * ⚠ **This is the only check any of it will ever get.** `vellum-web` is
+ * `#![cfg(target_arch = "wasm32")]`, so `cargo test` compiles it to nothing and there is not
+ * one runnable test in ~9,000 lines. What it replaces is not a unit test — it is the *absence*
+ * of one, in a repository whose own record names uncalled code as its signature defect nine
+ * times over.
+ *
+ * So every step dispatches a real `PointerEvent` or `KeyboardEvent` at the real canvas and then
+ * reads the answer back out of the module. Nothing calls a handler directly: that is trap 9,
+ * where every layer was green and the keystroke never arrived, and a fixture entering below the
+ * listener would have passed through the whole bug.
+ *
+ * **Two of the eleven checks are mid-gesture, and they are the ones worth the trouble.** A tool
+ * that previews nothing and a tool that previews correctly are indistinguishable from the
+ * finished item — that is feedback 7 (the pen), feedback 23 (the frame) and feedback 34 (the
+ * agent prompt), the same defect three times, each written by somebody who had read the entry
+ * before. The only thing that catches it is stopping without releasing and asking.
+ */
+export async function runEditFixture(mod, canvas) {
+  const failed = [];
+  const notes = [];
+  const check = (ok, said) => { (ok ? notes : failed).push(said); };
+  const box = canvas.getBoundingClientRect();
+  const at = (fx, fy) => ({ x: box.left + box.width * fx, y: box.top + box.height * fy });
+  const nums = (name) => (typeof mod[name] === 'function' ? mod[name]().split(' ').map(Number) : []);
+  const frame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+  let id = 1;
+  const point = (type, p, extra = {}) => {
+    canvas.dispatchEvent(new PointerEvent(type, {
+      pointerId: id, pointerType: 'mouse', isPrimary: true, button: 0, buttons: type === 'pointerup' ? 0 : 1,
+      clientX: p.x, clientY: p.y, bubbles: true, cancelable: true, ...extra,
+    }));
+  };
+
+  // ─────────────────────────── 1. a tool creates, and previews while it does ───────────────
+  const before = nums('velm_edit_report')[4];
+  if (typeof mod.set_tool === 'function' && mod.set_tool('sticky') !== false) {
+    id += 1;
+    point('pointerdown', at(0.30, 0.30));
+    point('pointermove', at(0.40, 0.42));
+    await frame();
+    // ⚠ Mid-drag, deliberately. `placing` is 1 and `items` has NOT moved: a preview that had
+    // already committed its item looks identical in a screenshot and is the worse bug.
+    const [, placing, , , during, drawn] = nums('velm_tool_report');
+    check(placing === 1, `a sticky's gesture is live mid-drag (placing=${placing})`);
+    // ⚠ **The assertion `placing` cannot make.** A gesture can be perfectly live and reach the
+    // painter through nothing at all — which is feedback 7, 23 and 34, the same defect three
+    // times. `drawn` is what the last painted frame's preview actually pushed.
+    check(drawn > 0, `and it is on screen: the preview pushed ${drawn} draw-list entries`);
+    check(during === before, `with the board still untouched while it is (${during} items)`);
+    point('pointerup', at(0.40, 0.42));
+    await frame();
+    const after = nums('velm_edit_report')[4];
+    check(after === before + 1, `releasing created it: ${before} items -> ${after}`);
+    // Every create tool but the pen and the eraser disarms itself, or the next click makes a
+    // second sticky nobody asked for.
+    const armed = typeof mod.current_tool === 'function' ? mod.current_tool() : '?';
+    check(armed === 'select', `and the tool disarmed itself (now "${armed}")`);
+  } else {
+    failed.push('the sticky tool would not arm');
+  }
+
+  // ─────────────────────────── 2. grips, and the no-edge-handles rule ──────────────────────
+  const [offered] = nums('velm_handle_report');
+  check(offered === 9, `a lone selected item offers 9 grips (got ${offered})`);
+  const grip = (typeof mod.velm_handle_points === 'function' ? mod.velm_handle_points() : '')
+    .split(' ').map(g => g.split(':')).find(g => g[0] === 'BottomRight');
+  if (grip) {
+    const ratio = window.devicePixelRatio || 1;
+    // The report is in **physical** pixels, because the device-ratio conversion lives in
+    // `input.rs` alone. A client event is in CSS pixels, so it converts back here.
+    const from = { x: box.left + Number(grip[1]) / ratio, y: box.top + Number(grip[2]) / ratio };
+    const to = { x: from.x + 90, y: from.y + 90 };
+    id += 1;
+    point('pointerdown', from);
+    point('pointermove', to);
+    await frame();
+    const [, mode, carried] = nums('velm_handle_report');
+    check(mode === 1 && carried === 1, `pressing it resizes (mode=${mode}, carrying ${carried})`);
+    point('pointerup', to);
+    await frame();
+  } else {
+    failed.push('no bottom-right grip was offered, so a resize cannot be driven');
+  }
+
+  // ─────────────────────────── 3. a caret takes the keyboard ───────────────────────────────
+  const centre = at(0.35, 0.36);
+  canvas.dispatchEvent(new MouseEvent('dblclick', {
+    clientX: centre.x, clientY: centre.y, bubbles: true, cancelable: true,
+  }));
+  await frame();
+  const field = document.querySelector('textarea[aria-hidden="true"]');
+  const [open] = nums('velm_caret_report');
+  check(open === 1 && Boolean(field), 'a double click opens a caret and focuses its field');
+  if (field) {
+    // ⚠ Through the **field**, not through the module. On a tablet this element is the only
+    // reason a keyboard appears at all, and a fixture that skipped it would pass on a build
+    // where nothing was ever appended to the document.
+    for (const ch of 'Velm') {
+      field.dispatchEvent(new KeyboardEvent('keydown', { key: ch, bubbles: true, cancelable: true }));
+    }
+    await frame();
+    const [, , cursor, , chars, group] = nums('velm_caret_report');
+    check(chars === 4 && cursor === 4, `typing reached the document: ${chars} chars, cursor ${cursor}`);
+    check(group === 1, 'and the whole word is one undo group, not four');
+    field.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await frame();
+    const [closed, , , , , stillOpen] = nums('velm_caret_report');
+    // ⚠ The assertion that matters. A group left open breaks the *next* grouped operation and
+    // every one after it, for the life of the tab — trap 11, three times over.
+    check(closed === 0 && stillOpen === 0, 'Escape ended the session and closed its group');
+  }
+
+  // ─────────────────────────── 4. the right button, on an item and on bare board ───────────
+  if (typeof mod.context_target === 'function') {
+    const onItem = mod.context_target(centre.x, centre.y);
+    check(onItem === 'selection', `right-clicking an item offers the item rows ("${onItem}")`);
+    const held = nums('velm_edit_report')[1];
+    const bare = mod.context_target(box.left + box.width * 0.92, box.top + box.height * 0.92);
+    const after = nums('velm_edit_report')[1];
+    // A request for a menu is not a click: bare board must not throw the selection away.
+    check(bare === 'canvas' && after === held,
+      `and bare board offers the canvas rows without dropping the selection (${held} -> ${after})`);
+  } else {
+    failed.push('context_target is missing, so a right-click on an unselected item offers the wrong rows');
+  }
+
+  // ─────────────────────────── 5. find, on the word just typed ─────────────────────────────
+  if (typeof mod.find === 'function') {
+    let answer = {};
+    try { answer = JSON.parse(mod.find('Velm')); } catch (error) { answer = {}; }
+    const hits = Array.isArray(answer.matches) ? answer.matches.length : 0;
+    check(hits > 0, `search found the word that was just typed (${hits} match(es))`);
+  }
+
+  const line = failed.length === 0
+    ? `edit fixture: all ${notes.length} checks passed — ${notes.join('; ')}`
+    : `edit fixture FAILED ${failed.length} of ${failed.length + notes.length}: ${failed.join('; ')}`;
+  mod.verdict(line);
+  console.log(line);
+  return failed.length === 0;
+}
