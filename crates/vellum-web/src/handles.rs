@@ -147,13 +147,6 @@ pub struct Aim {
 }
 
 impl Aim {
-    /// A mouse on a 1x display — the conservative default, and what a caller with no event
-    /// in hand should use.
-    #[must_use]
-    pub const fn mouse() -> Self {
-        Self { coarse: false, device_ratio: 1.0 }
-    }
-
     /// The reach, in **world** units, for a selection whose shorter on-screen side is
     /// `extent` device pixels.
     ///
@@ -444,11 +437,6 @@ impl Handles {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    #[must_use]
-    pub const fn is_dragging(&self) -> bool {
-        self.drag.is_some()
     }
 
     /// What is on offer this instant, taking a live gesture into account.

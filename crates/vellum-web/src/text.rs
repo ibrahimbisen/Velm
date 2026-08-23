@@ -170,10 +170,24 @@ struct Greek {
 /// for the real numbers means shaping — which is exactly the work being avoided, on exactly
 /// the blocks it is least worth doing. `vellum-app`'s `GreekLines::Estimated` makes the same
 /// trade and its comment says so. The advance is measured for Inter at a mixed-case average.
-const LINE_HEIGHT: f32 = 1.25;
+pub(crate) const LINE_HEIGHT: f32 = 1.25;
 const AVERAGE_ADVANCE: f32 = 0.5;
 
 impl TextLayer {
+    /// The layout a block was shaped into this frame, the origin its glyphs were placed at,
+    /// and the scale they were drawn at.
+    ///
+    /// ⚠ **Valid only between `queue` and `flush`** — `flush` takes `pending`. `crate::caret`
+    /// measures the caret against these three so that where the caret is drawn and where the
+    /// glyphs are drawn cannot come to disagree, which is the whole failure the desktop's
+    /// `Block::scale` seam exists to prevent.
+    pub(crate) fn placed(&self, item: SceneId, slot: u16) -> Option<(&Layout, [f32; 2], f32)> {
+        let key = Key { item, slot };
+        let (_, origin, zoom, _) = self.pending.iter().rev().find(|entry| entry.0 == key)?;
+        let layout = self.layouts.get(&key).map(|held| &held.layout)?;
+        Some((layout, *origin, *zoom))
+    }
+
     pub fn new() -> Result<Self, String> {
         // `with_fonts` deliberately, not `new`: `new` scans the system's fonts, which is a
         // no-op on wasm but does real work natively, and this crate only ever runs on wasm.

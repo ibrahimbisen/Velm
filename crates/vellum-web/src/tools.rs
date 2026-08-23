@@ -1282,6 +1282,19 @@ pub fn pointer_move(viewer: &mut crate::Viewer, at: WorldPoint) -> bool {
 /// just made an item is not a request to open the page of whatever was underneath it.
 pub fn pointer_up(viewer: &mut crate::Viewer) -> bool {
     let Some(what) = viewer.tools.release() else { return false };
+    // ⚠ **Editing can be switched off *between* the press and the release, and this is the
+    // only place that can refuse the write.** `velm_set_editing(false)` cancels `edit.rs`'s
+    // gesture and knows nothing about this one, and on a touchscreen the sequence is
+    // ordinary rather than exotic: one finger mid-drag on the canvas, another on the page's
+    // own switch. Without this an item lands on a board whose editing was just turned off.
+    //
+    // `release` has already run, so the gesture is dropped and the tool disarmed exactly as
+    // it would have been — the one thing left to refuse is the document write. That is
+    // feedback 27's rule at the point where the gesture's *contract* ends rather than where
+    // the pointer does.
+    if !viewer.edit.enabled() {
+        return false;
+    }
     let crate::Viewer { board, projection, edit, push, .. } = viewer;
 
     let outcome: Result<Option<DocId>, String> = match what {

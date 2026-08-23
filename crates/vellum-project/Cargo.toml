@@ -24,6 +24,16 @@ vellum-table.workspace = true
 vellum-chart.workspace = true
 vellum-mindmap.workspace = true
 vellum-flow.workspace = true
+# `export` turns a projection into the exporter's own document. It is here rather than in
+# either front end because a board must export identically from both, and the adapter is
+# where line breaks, auto-fit sizes and connector routes are decided — three things that
+# would otherwise be two derivations able to disagree about what a board looks like on paper.
+vellum-export.workspace = true
+# `export` names a shape by the same string the SDF path does.
+vellum-shapes.workspace = true
+# `edit` walks graphemes and words. The caret's motion is the same on both front ends, and it
+# is the one place in this crate that needs to know what a user considers "one character".
+unicode-segmentation.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # `theme` converts the chrome's accent choice and an agent's chat colourway into canvas

@@ -855,11 +855,21 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
   palette.setAttribute('aria-orientation', 'vertical');
 
   const toolButtons = new Map();
-  const armTool = (id) => {
-    if (!can('set_tool')) return;
-    invoke('set_tool', id);
+  const showArmed = (id) => {
     state.tool = id;
     for (const [key, node] of toolButtons) node.setAttribute('aria-pressed', String(key === id));
+  };
+  const armTool = (id) => {
+    if (!can('set_tool')) return;
+    // ⚠ **The answer is the refusal.** Two of the fourteen tools are not in this build, and a
+    // button that goes pressed for a tool that did not arm is this file's own prohibited
+    // shape: an enabled-looking control for a gesture that will not happen.
+    if (invoke('set_tool', id) === false) return;
+    // Arming a tool ends a text session. The caret holds an undo group open for its whole
+    // life, so anything that starts a new gesture has to close it — feedback 27's rule, and
+    // the third place in this application that has had to learn it.
+    if (can('velm_caret_commit')) invoke('velm_caret_commit');
+    showArmed(id);
   };
 
   for (const group of TOOL_GROUPS) {
@@ -1728,12 +1738,94 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
     surface.addEventListener('contextmenu', (event) => event.preventDefault());
   }
 
+  // ------------------------------------------------------------------ the caret's keyboard
+
+  // ⚠ **A hidden focused `<textarea>`, not a bare `keydown` on the window.**
+  //
+  // A `<canvas>` cannot take text input, so on a tablet — which is why this client exists —
+  // a keydown listener gives a board you cannot type into at all: **iOS raises the software
+  // keyboard only for a focused editable element.** So one exists, offscreen, and the caret
+  // reads its events.
+  //
+  // Offscreen rather than hidden, and the distinction is the whole trick: `display: none` and
+  // `visibility: hidden` cannot take focus, so either of them puts the keyboard back where it
+  // was. A 1×1 element at `left: -9999px` is focusable and invisible.
+  //
+  // What this costs, stated rather than discovered later: an IME composes into the field and
+  // will double-insert, because nothing here listens for `compositionstart`. The desktop's
+  // IME is itself listed as *wired and unverified*; this is a known gap, not a claim.
+  const field = doc.createElement('textarea');
+  field.setAttribute('aria-hidden', 'true');
+  field.tabIndex = -1;
+  field.autocapitalize = 'off';
+  field.autocomplete = 'off';
+  field.spellcheck = false;
+  field.style.cssText =
+    'position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;padding:0;border:0';
+
+  const caretOpen = () => Boolean(can('velm_caret_open_at'));
+  const commitCaret = () => {
+    if (can('velm_caret_commit')) invoke('velm_caret_commit');
+  };
+
+  const onDoubleClick = (event) => {
+    if (!caretOpen()) return;
+    if (invoke('velm_caret_open_at', event.clientX, event.clientY) === true) {
+      // Cleared before focusing, or the field accumulates every character typed this session
+      // and a paste into it would carry the lot.
+      field.value = '';
+      field.focus({ preventScroll: true });
+    }
+  };
+  const onFieldKeyDown = (event) => {
+    field.value = '';
+    const answer = invoke('velm_caret_key', event.key, event.metaKey, event.ctrlKey,
+      event.shiftKey, event.altKey);
+    // 0 — not ours, let the board's bindings have it. 1 — handled, stop here. 2 — the
+    // *browser* has to finish it: a clipboard chord, whose `copy`/`cut`/`paste` events are
+    // only produced if the keydown is left alone. Preventing 2 is how a paste stops arriving,
+    // which is trap 9 in the other direction and worth the three-valued answer.
+    if (answer === 1) event.preventDefault();
+  };
+  const onFieldCopy = (event) => {
+    if (!event.clipboardData) return;
+    event.clipboardData.setData('text/plain', invoke('velm_caret_selection') || '');
+    event.preventDefault();
+  };
+  const onFieldCut = (event) => {
+    if (!event.clipboardData) return;
+    event.clipboardData.setData('text/plain', invoke('velm_caret_cut') || '');
+    event.preventDefault();
+  };
+  const onFieldPaste = (event) => {
+    if (!event.clipboardData) return;
+    invoke('velm_caret_insert', event.clipboardData.getData('text/plain'));
+    event.preventDefault();
+  };
+  // ⚠ Both of these are the same rule as the desktop's tab switch and its quit path: **give
+  // every way a gesture can end without a release a call to the thing that closes it.** A
+  // session left open holds an undo group open, and the next grouped operation on the board
+  // fails — for the rest of the session, on every later move, delete and restyle.
+  const onFieldBlur = () => commitCaret();
+  const onHidden = () => {
+    if (doc.hidden) commitCaret();
+  };
+
+  canvas.addEventListener('dblclick', onDoubleClick);
+  field.addEventListener('keydown', onFieldKeyDown);
+  field.addEventListener('copy', onFieldCopy);
+  field.addEventListener('cut', onFieldCut);
+  field.addEventListener('paste', onFieldPaste);
+  field.addEventListener('blur', onFieldBlur);
+  doc.addEventListener('visibilitychange', onHidden);
+
   // ------------------------------------------------------------------ mounting
 
   // After the canvas, like `chrome.js`, so a positioned element paints above the static
   // canvas on DOM order alone and the page's own fixed panels — the status line, the board
   // list — still paint above these.
-  canvas.insertAdjacentElement('afterend', palette);
+  canvas.insertAdjacentElement('afterend', field);
+  field.insertAdjacentElement('afterend', palette);
   palette.insertAdjacentElement('afterend', undo);
   undo.insertAdjacentElement('afterend', bar);
   bar.insertAdjacentElement('afterend', menu);
@@ -1787,6 +1879,17 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerup', cancelPress);
       canvas.removeEventListener('pointercancel', cancelPress);
+      // The text session goes down before its keyboard does, or it holds an undo group open
+      // on a board the palette has stopped being able to reach.
+      commitCaret();
+      canvas.removeEventListener('dblclick', onDoubleClick);
+      field.removeEventListener('keydown', onFieldKeyDown);
+      field.removeEventListener('copy', onFieldCopy);
+      field.removeEventListener('cut', onFieldCut);
+      field.removeEventListener('paste', onFieldPaste);
+      field.removeEventListener('blur', onFieldBlur);
+      doc.removeEventListener('visibilitychange', onHidden);
+      field.remove();
       for (const surface of [palette, undo, bar, menu, pop]) surface.remove();
       if (mounted === session) mounted = null;
     },
@@ -1804,6 +1907,12 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
     && (can('selection_summary') || can('history_state'))) {
     const poll = () => {
       if (!session.live) return;
+      // ⚠ A create tool **disarms itself** after one placement — every tool but the pen and
+      // the eraser does — so the palette has to read what is armed rather than remember what
+      // it last asked for. Without this the sticky button stays lit over a board that is back
+      // on Select, which is the interface lying about what the next click will do.
+      const armed = invoke('current_tool');
+      if (typeof armed === 'string' && armed !== state.tool) showArmed(armed);
       refresh();
       placeUndo();
       win.requestAnimationFrame(poll);

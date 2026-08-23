@@ -614,6 +614,17 @@ impl EditState {
         self.sync(projection);
     }
 
+    /// Selects exactly `id`, dropping whatever was held.
+    ///
+    /// The one thing a create gesture needs and `press` cannot give it: a newly added item is
+    /// topmost among its siblings, but a **frame** takes a negative z band, so pressing at its
+    /// own centre would pick up whatever is drawn on top of it. `crate::tools` calls this
+    /// after the projection has been rebuilt, so the scene id exists.
+    pub fn select_only(&mut self, id: SceneId) {
+        self.selection.clear();
+        self.selection.push(id);
+    }
+
     pub fn clear(&mut self) {
         self.selection.clear();
     }
@@ -681,7 +692,7 @@ impl EditState {
 /// Handed to `Scene::hit_test_where` rather than applied to `hit_test`'s answer. See
 /// [`EditState::press`] for the whole argument; the short version is that a filter applied
 /// afterwards turns a rejected item into a hole in the board.
-fn pickable(id: SceneId, projection: &Projection) -> bool {
+pub(crate) fn pickable(id: SceneId, projection: &Projection) -> bool {
     projection.get(id).is_some_and(|projected| {
         !projected.item.style.locked && !clipped_by_frame(projected, projection)
     })
@@ -729,7 +740,7 @@ fn marquee_hits_visible(projection: &Projection, rect: WorldRect) -> Vec<SceneId
 /// means a group has leaked from somewhere. Closing it and refusing this operation is the
 /// rescue `Editor::edit` performs for the same reason: the alternative is a board on which
 /// no grouped operation works again until the tab is reloaded. The next operation succeeds.
-fn grouped<T>(board: &mut Board, f: impl FnOnce(&mut Board) -> T) -> Result<T, String> {
+pub(crate) fn grouped<T>(board: &mut Board, f: impl FnOnce(&mut Board) -> T) -> Result<T, String> {
     if let Err(error) = board.begin_undo_group() {
         // Not `?` — closing the leaked group is the whole point of being here.
         board.end_undo_group();
@@ -746,7 +757,7 @@ fn grouped<T>(board: &mut Board, f: impl FnOnce(&mut Board) -> T) -> Result<T, S
 /// failed part way has usually already changed the document, and a projection left stale
 /// does not merely draw the old board — it *hit-tests* the old board, so clicks land where
 /// items used to be. That is `Editor::edit`'s hardest-won line and it is the same here.
-fn resettle(board: &Board, projection: &mut Projection) {
+pub(crate) fn resettle(board: &Board, projection: &mut Projection) {
     if let Err(error) = projection.rebuild(board) {
         log::error!("velm edit: laying the board out again: {error}");
     }
@@ -1087,7 +1098,7 @@ pub fn pointer_cancel(viewer: &mut crate::Viewer) {
 ///
 /// Silently nothing when there is no server behind this board — a static `board.bin` has
 /// nowhere to push to, and that is the ordinary development case rather than an error.
-fn announce(push: &mut Option<crate::push::Pusher>, board: &Board) {
+pub(crate) fn announce(push: &mut Option<crate::push::Pusher>, board: &Board) {
     if let Some(pusher) = push.as_mut() {
         pusher.note_edit();
         pusher.tick(board);
@@ -1107,7 +1118,7 @@ fn announce(push: &mut Option<crate::push::Pusher>, board: &Board) {
 /// including `web`, so a `RefCell` collision here is not a caught panic and a line in the
 /// console — it is a dead tab with nothing on screen and nothing in the log. `None` means
 /// "not now", which for a key press is exactly the right answer.
-fn viewer() -> Option<Rc<RefCell<crate::Viewer>>> {
+pub(crate) fn viewer() -> Option<Rc<RefCell<crate::Viewer>>> {
     crate::VIEWER.with(|slot| slot.try_borrow().ok().and_then(|held| held.clone()))
 }
 

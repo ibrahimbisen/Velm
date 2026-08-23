@@ -17,6 +17,11 @@ path = "src/main.rs"
 # model -- are reimplemented instead, because the server's paths differ anyway and copying
 # ~200 lines is cheaper than making a GUI crate a server dependency.
 [dependencies]
+# Miro's clipboard decoder and the import pipeline, for `POST /api/v1/import`. Native only,
+# and that is the whole reason the route exists here rather than in the tab: it reaches
+# `vellum-link/net` for a link card's metadata, and a browser cannot fetch a third party's
+# page anyway — CORS refuses it. So the server does the import and the tab asks it to.
+vellum-import.workspace = true
 anyhow.workspace = true
 # The HTTP head parser, and nothing else -- no I/O, no runtime. Already in `Cargo.lock` by
 # way of `ureq`'s own `ureq-proto`, so `velmd serve` adds no new entry to the lock file.
@@ -27,3 +32,8 @@ serde = { workspace = true }
 serde_json.workspace = true
 vellum-doc.workspace = true
 vellum-store.workspace = true
+
+[dev-dependencies]
+# `paste.rs`'s happy-path fixture synthesises a real Miro clipboard payload — base64 over
+# Miro's own byte shift — with the same encoder the decoder was written against.
+base64.workspace = true

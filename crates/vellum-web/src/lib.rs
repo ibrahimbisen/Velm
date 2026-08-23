@@ -83,6 +83,7 @@ const FIT_MARGIN: f64 = 0.02;
 mod badges;
 mod board;
 mod card;
+mod caret;
 mod clip;
 mod edit;
 mod find;
@@ -93,9 +94,11 @@ mod widgets;
 mod images;
 mod layout;
 mod input;
+mod handles;
 mod shapes;
 mod strokes;
 mod text;
+mod tools;
 
 /// Everything a frame needs, once startup has resolved.
 struct Viewer {
@@ -151,6 +154,12 @@ struct Viewer {
     edit: edit::EditState,
     /// The board's own words, indexed on demand.
     finder: find::Finder,
+    /// The armed tool and the create gesture in flight.
+    tools: tools::ToolState,
+    /// Resize and rotate grips, and the transform one of them is driving.
+    handles: handles::Handles,
+    /// The on-canvas caret, when a text session is open.
+    caret: caret::CaretState,
 }
 
 thread_local! {
@@ -626,6 +635,9 @@ async fn boot(
         push,
         edit: edit::EditState::new(),
         finder: find::Finder::new(),
+        tools: tools::ToolState::new(),
+        handles: handles::Handles::new(),
+        caret: caret::CaretState::new(),
     }));
 
     // Prove the board actually drew, rather than trusting that it did.
@@ -1263,12 +1275,35 @@ impl Viewer {
             );
         }
 
+        // The resize and rotate grips, after the rings and in the same board view.
+        handles::push(
+            &mut list,
+            board,
+            &self.camera,
+            theme,
+            &self.edit,
+            &mut self.handles,
+            &mut self.projection,
+        );
+        // The create gesture in flight — a placing box, a live pen stroke, the eraser's
+        // sweep, a pending connector. ⚠ **This line is what stops the pen and the frame
+        // appearing to do nothing until the button comes up** — feedback 7, 23 and 34, three
+        // times, each written by somebody who had read the entry before it.
+        tools::push_preview(&mut list, &self.camera, &self.tools, &self.projection, theme);
+
         list.use_view(screen);
+        // ⚠ **The order of the next four lines is load-bearing.** `measure` reads
+        // `TextLayer::placed`, which `flush` empties — so a caret measured after the flush
+        // has nothing to measure against. The wash goes under the glyphs and the caret over
+        // them, which is the only arrangement where selected text stays readable.
+        caret::measure(&mut self.caret, &self.text, &self.projection, &self.camera);
+        caret::push_selection(&self.caret, &mut list, theme.accent);
         self.text.flush(&self.device, &self.queue, self.renderer.atlas_mut(), &mut list);
         // Separate from the flush above, and it must stay separate: a fitted board is
         // entirely greeked, so folding this into a function that returns early when nothing
         // was shaped makes the one case it exists for the one case it never runs in.
         self.text.flush_greeked(&mut list);
+        caret::push_caret(&self.caret, &mut list, theme.accent);
         self.text.retain_visible(&on_screen);
         self.strokes.retain_visible(&on_screen);
         self.shapes.retain_visible(&on_screen);

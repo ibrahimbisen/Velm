@@ -534,18 +534,19 @@ mod tests {
         }
     }
 
-    /// The cap is `sync`'s, and this fails if that number is ever tightened past what a real
-    /// payload weighs — which would break this route silently, as a 400 about a body that did
-    /// not arrive.
-    #[test]
-    fn the_shared_body_cap_still_clears_a_real_miro_payload() {
-        assert!(
-            crate::sync::MAX_BODY >= 4 * 1024 * 1024,
-            "the shared body cap is now {} bytes; the measured reference payload is 1.1 MB and \
-             this route has no cap of its own",
-            crate::sync::MAX_BODY
-        );
-    }
+    /// The cap is `sync`'s, and this fails the **build** if that number is ever tightened past
+    /// what a real payload weighs — which would break this route silently, as a 400 about a
+    /// body that did not arrive.
+    ///
+    /// A `const` block rather than a `#[test]`, because both sides are constants and clippy is
+    /// right that a run-time assertion over two of them asserts nothing the compiler did not
+    /// already know. This form is strictly stronger: it fails at `cargo build`, not at
+    /// `cargo test`, so the number cannot be lowered on a branch nobody ran the suite on.
+    const _: () = assert!(
+        crate::sync::MAX_BODY >= 4 * 1024 * 1024,
+        "the shared body cap no longer clears a real Miro payload; the measured reference is \
+         1.1 MB and this route has no cap of its own"
+    );
 
     #[test]
     fn a_title_is_read_from_the_query_and_nothing_else_is() {

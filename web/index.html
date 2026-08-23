@@ -206,6 +206,14 @@
         mountInspector(velm, { canvas });
       }
 
+      // Find on the board. ⚠ **Outside the `editable` gate on purpose**: searching is a read,
+      // and a read-only board — the static `./board.bin` route, which is the one anybody can
+      // publish — is exactly where it is wanted most. Mounted last so that tools.js's capture
+      // keydown registers first, which is what makes Escape a ladder rather than a race: find
+      // stands down when `defaultPrevented` is already set.
+      const { mountFind } = await import('./find.js');
+      mountFind(velm, { canvas: document.getElementById('canvas') });
+
       // A gesture fixture, on request. `?selftest=touch` drives real PointerEvents at the
       // real canvas and reports what the camera did — the only honest check of an input
       // path, and the only one that can be run on the iPad by the person holding it.

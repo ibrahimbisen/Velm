@@ -375,7 +375,7 @@ fn sync_one(data: &Path, id: &str, since: &Version, delta: &[u8]) -> anyhow::Res
 /// meant a machine that restarts nightly adding a permanent multi-megabyte snapshot to a
 /// user's board file every day with nothing that ever cleans it up — a growth defect in
 /// exactly the file RULE ZERO exists to protect.
-fn before_the_web(db: &mut BoardDb, board: &Board) -> anyhow::Result<()> {
+pub(crate) fn before_the_web(db: &mut BoardDb, board: &Board) -> anyhow::Result<()> {
     let taken = db
         .restore_points()?
         .iter()

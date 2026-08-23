@@ -55,3 +55,207 @@ jobs:
       # The reference-board tests skip cleanly here — the Miro exports they measure
       # against are hundreds of megabytes of real board content and are not in the
       # repository. A skip prints its reason and is never mistaken for a pass.
+
+  # ---------------------------------------------------------------------------
+  # Every push to main that gets past `check` becomes a version, a tag, a signed
+  # and notarized bundle, and a GitHub release with a DMG attached.
+  #
+  # This lives in `ci.yml` rather than its own `release.yml` on purpose. `needs:`
+  # only reaches inside one workflow, and the alternatives are both worse: a
+  # separate workflow either runs clippy and the whole suite a second time, or it
+  # ships a release from a commit whose tests are red. `workflow_run` decouples
+  # them properly and is a known footgun — it evaluates against the default
+  # branch's copy of itself and needs the triggering SHA threaded through by hand.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Version, sign, notarize and publish
+    needs: check
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
+      && !contains(github.event.head_commit.message, '[skip release]')
+    runs-on: macos-latest          # Apple Silicon; the DMG is named arm64 for that reason
+    timeout-minutes: 90
+    permissions:
+      contents: write              # to push the version commit, the tag, and the release
+    # Two pushes a minute apart would otherwise both read 1.1.0, both compute 1.2.0,
+    # and the second would either fail its push or tag a version that already exists.
+    # Not `cancel-in-progress` — a half-cancelled release is a tag with no build behind it.
+    concurrency:
+      group: velm-release
+      cancel-in-progress: false
+
+    steps:
+      # Fail before anything is written. Signing happens after the version has been
+      # bumped, committed and pushed, so a missing secret discovered there would leave
+      # a tag on main with no release behind it. Names are checked, values never printed.
+      - name: Check the signing secrets are present
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          missing=()
+          for name in MACOS_CERT_P12 MACOS_CERT_PASSWORD MACOS_SIGN_IDENTITY \
+                      APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
+            [[ -n "${!name}" ]] || missing+=("$name")
+          done
+          if (( ${#missing[@]} )); then
+            echo "::error::missing repository secrets: ${missing[*]}"
+            echo "See the release section of README.md for how to create each one."
+            exit 1
+          fi
+          echo "all six signing secrets are set"
+
+      # `fetch-depth: 0` so the existing tags are visible — the job refuses to
+      # re-tag a version that is already out.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The `check` job builds debug; this one builds the `dist` profile into a
+          # different target subdirectory, so they share nothing and a shared key would
+          # just make each evict the other.
+          key: dist
+
+      # `make-app.sh` draws the .icns with PIL in an inline heredoc, because macOS has
+      # no command-line SVG rasteriser. Runners do not ship Pillow.
+      - name: Install Pillow, which draws the icon
+        run: |
+          python3 -m pip install --break-system-packages --quiet Pillow \
+            || python3 -m pip install --quiet Pillow
+          python3 -c 'import PIL; print("Pillow", PIL.__version__)'
+
+      # Minor every push, at the user's choice: 1.1.0 -> 1.2.0 -> 1.3.0.
+      #
+      # `[workspace.package] version` in Cargo.toml is the only place a version is
+      # written. `make-app.sh` stamps the plist from it and the About dialog reads
+      # `env!("CARGO_PKG_VERSION")`, so this one line moves all three.
+      - name: Work out the next version
+        run: |
+          set -euo pipefail
+          # Rebase before reading, so a push that landed while `check` was running is
+          # taken into account rather than clobbered.
+          git pull --rebase origin main
+
+          read_version() {
+            awk '/^\[workspace\.package\]/{f=1} f && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.toml
+          }
+          CURRENT="$(read_version)"
+          [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::cannot parse the version in Cargo.toml: '$CURRENT'"; exit 1; }
+
+          IFS=. read -r MAJOR MINOR _PATCH <<< "$CURRENT"
+          NEXT="$MAJOR.$((MINOR + 1)).0"
+
+          if git rev-parse -q --verify "refs/tags/v$NEXT" >/dev/null; then
+            echo "::error::tag v$NEXT already exists — a previous run got part of the way."
+            exit 1
+          fi
+
+          # Anchored to the [workspace.package] block so that no dependency's own
+          # `version = "..."` further down the file can be caught by it.
+          sed -i '' -e '/^\[workspace\.package\]/,/^\[/ s/^version = ".*"/version = "'"$NEXT"'"/' Cargo.toml
+          [[ "$(read_version)" == "$NEXT" ]] \
+            || { echo "::error::the Cargo.toml rewrite did not take"; exit 1; }
+
+          # The lockfile records every workspace member's version. Committing the bump
+          # without it leaves a dirty tree in every clone the moment anyone builds.
+          # `--offline` because nothing here should reach the network; the fallback is
+          # for a cargo old enough not to take the flag.
+          cargo update --workspace --offline \
+            || cargo metadata --offline --format-version 1 >/dev/null
+          grep -q "version = \"$NEXT\"" Cargo.lock \
+            || { echo "::error::Cargo.lock did not pick up $NEXT"; exit 1; }
+
+          echo "VERSION=$NEXT" >> "$GITHUB_ENV"
+          echo "$CURRENT -> $NEXT"
+
+      # RULE ONE: commits are authored by the person accountable for them. This is the
+      # address already in `[workspace.package] authors`, not github-actions[bot], and
+      # nothing here writes a Co-Authored-By trailer or a "generated with" line.
+      #
+      # A push made with the default GITHUB_TOKEN does not trigger another workflow run,
+      # which is what stops this bumping the version for ever.
+      - name: Commit, tag and push
+        run: |
+          set -euo pipefail
+          git config user.name "Ibrahim Bisen"
+          git config user.email "33014532+ibrahimbisen@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Velm $VERSION"
+          git tag -a "v$VERSION" -m "Velm $VERSION"
+          git push origin HEAD:main --follow-tags
+
+      # A throwaway keychain, with a password made up here so it need not be a secret.
+      # The certificate never touches the runner's login keychain.
+      - name: Import the Developer ID certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/velm-signing.keychain-db"
+          KPASS="$(uuidgen)"
+          P12="$RUNNER_TEMP/cert.p12"
+
+          security create-keychain -p "$KPASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"   # no auto-lock mid-build
+          security unlock-keychain -p "$KPASS" "$KEYCHAIN"
+
+          ( umask 077; printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$P12" )
+          security import "$P12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" \
+                  -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$P12"
+
+          # Without this, codesign asks for permission to use the key through a GUI
+          # prompt that no one is there to answer, and the step hangs until the timeout.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+                  -s -k "$KPASS" "$KEYCHAIN" >/dev/null
+
+          # Put it on the search path ahead of the login keychain, which is what
+          # `codesign --sign "Developer ID Application: ..."` searches by name.
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      # `dist` is the shipping profile: fat LTO, one codegen unit, ~19MB against
+      # release's 22MB. It is also the memory-hungry one — if this step is ever killed
+      # for memory on a runner, `PROFILE=release` (thin LTO) is the whole fix.
+      #
+      # The destination argument is not optional: make-app.sh defaults to ~/Desktop.
+      - name: Build the bundle
+        run: PROFILE=dist ./scripts/make-app.sh "$RUNNER_TEMP/stage"
+
+      - name: Sign, notarize, staple and package
+        env:
+          VELM_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          DMG="$RUNNER_TEMP/Velm-$VERSION-macos-arm64.dmg"
+          ./scripts/sign-release.sh "$RUNNER_TEMP/stage/Velm.app" "$DMG"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+
+      # `--generate-notes` lists the commits and their authors and adds nothing else.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v$VERSION" \
+            --title "Velm $VERSION" \
+            --generate-notes \
+            "$DMG"
+
+      - name: Remove the signing keychain
+        if: always()
+        run: |
+          security list-keychain -d user -s login.keychain-db || true
+          security delete-keychain "$RUNNER_TEMP/velm-signing.keychain-db" || true

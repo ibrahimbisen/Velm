@@ -35,16 +35,22 @@
 //!
 //! - `snapshot` / `blobs` — one board's document bytes and one board's pictures, which is
 //!   what a browser client consumes. `serve` is these two with the HTTP put back on.
-//! - `serve` — the read-only server. Every route is a `GET`; there is no route that could
-//!   change a board. ⚠ It does open boards with SQLite, so **point `--data` at a copy** —
-//!   `serve.rs` refuses the desktop app's own directory by name rather than trusting this
-//!   sentence to be read.
+//! - `serve` — the server the browser talks to. ⚠ **Four routes write**, and this line said
+//!   the opposite for as long as there were none: `POST /sync` merges a client's edits into a
+//!   board, `POST /api/v1/import` creates one from a Miro clipboard payload, `POST
+//!   /api/v1/boards` creates an empty one, and `.../rename` changes a title inside a document.
+//!   None of them can destroy a board and none of them removes or renames a file. What is
+//!   still true is the sentence that follows, and it is the one that matters most: it opens
+//!   boards with SQLite, so **point `--data` at a copy** — `serve.rs` refuses the desktop
+//!   app's own directory by name rather than trusting this sentence to be read.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod manage;
 mod manifest;
 mod migrate;
+mod paste;
 mod serve;
 mod sync;
 

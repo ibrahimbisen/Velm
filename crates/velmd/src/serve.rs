@@ -49,7 +49,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::sync;
+use crate::{manage, paste, sync};
 use vellum_store::{BlobStore, BoardDb, Hash, list_boards};
 
 /// How many connections are served at once.
@@ -127,9 +127,13 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     // being true the moment `/sync` landed, and a banner that overstates what a program will
     // not do is worse than no banner: it is the `locked: false` trap printed to a terminal.
     println!("This program never removes a file.");
-    println!("`POST /sync` is the one route that changes a board, and it only ever *merges* —");
-    println!("a Loro update cannot remove what it did not add, and a labelled restore point is");
-    println!("taken before the first change any board ever receives from the web.");
+    println!("Three routes change what is on disk and none of them can destroy a board.");
+    println!("`POST /sync` only ever *merges* — a Loro update cannot remove what it did not");
+    println!("add, and a labelled restore point is taken before the first change any board");
+    println!("ever receives from the web. `POST /api/v1/import` and `POST /api/v1/boards`");
+    println!("only ever *create*, at a name nothing was using, claimed exclusively so the");
+    println!("kernel refuses rather than this program having to remember. A board's name is");
+    println!("changed inside the document; no file is ever renamed.");
     println!("It does open boards with SQLite, which writes a -wal sidecar: point --data at");
     println!("a copy, never at the directory the desktop app is using.");
 
@@ -353,17 +357,50 @@ fn serve_one(server: &Server, stream: TcpStream) {
     // arm is not optional — a POST does not go through `route`, which is where the log line
     // and the 500 live, so without it a poisoned lock is a silently dropped connection.
     if method == "POST" {
-        let Some(id) = sync::board_id(path) else {
+        // ⚠ **Four routes answer POST now, and the 405 below has to name all of them.** An
+        // error string that mentions only sync is a false claim in the one place a person
+        // reads when they are already confused about why nothing happened.
+        //
+        // The dispatch is an enum rather than four `if`s with four bodies, because everything
+        // after it — the length cap, the timeout raise, the body read, the 500 — is the same
+        // for all four and was worth writing once. What differs is exactly two things: how
+        // many bytes the route will accept, and which function gets them.
+        enum Post<'a> {
+            Sync(&'a str),
+            Import,
+            Create,
+            /// Capitalised, and that is not a style preference: `tests/rule_zero.rs` greps
+            /// this crate for a bare `rename(` and would fire on the lowercase spelling.
+            Rename(&'a str),
+        }
+        let post = if let Some(id) = sync::board_id(path) {
+            Some(Post::Sync(id))
+        } else if paste::is_import(path) {
+            Some(Post::Import)
+        } else if manage::is_create(path) {
+            Some(Post::Create)
+        } else {
+            manage::rename_target(path).map(Post::Rename)
+        };
+        let Some(post) = post else {
             let _ = respond(
                 &stream,
                 405,
                 "text/plain",
-                b"only a board's sync route answers POST\n",
+                b"POST answers a board's sync route, the importer, and making or naming a board\n",
                 origin.as_deref(),
             );
             return;
         };
-        let length = match sync::content_length(&headers) {
+        // ⚠ **A name is a kilobyte and a board is megabytes, so the cap is per route** — and
+        // it is checked here, before a byte of body is read, rather than after. `manage` owns
+        // its own parser for the sentences: sync's refusal says *"that sync request is too
+        // large"*, and an operator who reads that after a failed **create** goes looking in
+        // the wrong file.
+        let length = match match post {
+            Post::Create | Post::Rename(_) => manage::content_length(&headers),
+            Post::Sync(_) | Post::Import => sync::content_length(&headers),
+        } {
             Ok(length) => length,
             Err(refusal) => {
                 let _ = respond(
@@ -391,11 +428,20 @@ fn serve_one(server: &Server, stream: TcpStream) {
             );
             return;
         };
-        // The same decode the snapshot route needs, for the same reason — and it is the
-        // sibling check that found it: a board reachable for reading and not for syncing
-        // would be a board that loads and then silently never updates.
-        let id = percent_decode(id);
-        if let Err(error) = sync::handle(server, &id, &body, &stream) {
+        // One 500 path for all four. The `Err` arm is not optional and not shared with
+        // anything: a POST never reaches `route`, which is where the log line and the 500
+        // otherwise live.
+        let answered = match post {
+            // Decoded, because a board id is a file stem and real ones have spaces in them.
+            // The same decode the snapshot route needs, and it was the sibling check that
+            // found it: a board reachable for reading and not for syncing would be a board
+            // that loads and then silently never updates.
+            Post::Sync(id) => sync::handle(server, &percent_decode(id), &body, &stream),
+            Post::Import => paste::handle(server, query, &body, &stream),
+            Post::Create => manage::create(server, &body, &stream),
+            Post::Rename(id) => manage::rename_board(server, &percent_decode(id), &body, &stream),
+        };
+        if let Err(error) = answered {
             eprintln!("velmd: {}: {error:#}", printable(path));
             let _ = respond(&stream, 500, "text/plain", b"something went wrong\n", origin.as_deref());
         }
@@ -859,7 +905,7 @@ fn is_unprintable(c: char) -> bool {
         )
 }
 
-fn percent_decode(raw: &str) -> String {
+pub(crate) fn percent_decode(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -901,7 +947,7 @@ fn percent_decode(raw: &str) -> String {
 /// Hand-rolled because a board's title comes off a board file and goes into a response: a
 /// title containing a quote would otherwise produce JSON the client cannot parse, and a
 /// title is user content, so "that will not happen" is not a position worth taking.
-fn json_string(raw: &str) -> String {
+pub(crate) fn json_string(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 2);
     out.push('"');
     for c in raw.chars() {

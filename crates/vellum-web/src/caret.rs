@@ -435,6 +435,15 @@ fn line_target(layout: &Layout, text: &str, cursor: usize, delta: i32) -> usize 
 /// three refusals `crate::edit::pickable` applies to a press, asked through that very
 /// function so a caret cannot open on something a click cannot reach.
 ///
+/// ⚠ **Refused outright while editing is off, and that is a posture rule rather than a
+/// convenience.** `crate::edit`'s header states the contract: an edit made in a tab lives
+/// only in that tab until the push half is trusted, so *"with editing off, this file changes
+/// no behaviour at all … nothing can write to the document"*. A caret is a document write —
+/// `flush` calls `Board::set_text` — so a session that could open behind the switch would be
+/// the one hole in it. Gating `begin` is enough to close it: [`key`], [`insert`], [`press`]
+/// and [`cut`] all require a session, and `velm_set_editing(false)` settles the one that
+/// might exist.
+///
 /// ⚠ **[`settle`] on the first line, and it is not tidiness.** The assignment below
 /// *overwrites* whatever session was there, and a session that has taken one keystroke owns
 /// an open Loro undo group. Dropping it that way leaks the group, and trap 11 is what that
@@ -443,6 +452,9 @@ fn line_target(layout: &Layout, text: &str, cursor: usize, delta: i32) -> usize 
 /// clicking into another is two undo steps, and the first one's words have to be written
 /// before the second's session begins.
 pub fn begin(viewer: &mut crate::Viewer, scene: SceneId, replacing: bool) -> bool {
+    if !viewer.edit.enabled() {
+        return false;
+    }
     settle(viewer);
 
     let crate::Viewer { caret, projection, .. } = viewer;
@@ -997,7 +1009,19 @@ pub fn velm_caret_open_at(x: f64, y: f64) -> bool {
         let at = viewer
             .camera
             .screen_to_world(ScreenPoint::new(x * ratio, y * ratio));
-        let Some(scene) = viewer.projection.scene().hit_test(at) else {
+        // ⚠ `hit_test_where`, never `hit_test` then a filter. `scene.rs` states the rule and
+        // `crate::edit::press` repeats it: the predicate is applied *before* "topmost", so a
+        // locked sticky lying over a frame stays transparent instead of becoming a hole that
+        // no caret can open through. Filtered afterwards, double-clicking one would answer
+        // "nothing to edit" rather than opening the frame's title beneath it.
+        // Scoped, so the shared borrow of the projection is provably over before `settle`
+        // and `begin` take the viewer mutably below.
+        let hit = {
+            let view: &Projection = &viewer.projection;
+            view.scene()
+                .hit_test_where(at, |id| crate::edit::pickable(id, view))
+        };
+        let Some(scene) = hit else {
             // A double click on bare board still ends whatever was being typed.
             settle(viewer);
             return false;

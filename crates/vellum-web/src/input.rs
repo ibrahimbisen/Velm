@@ -223,8 +223,31 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                             event.client_x() as f64 * ratio,
                             event.client_y() as f64 * ratio,
                         ));
-                        // ⇧ adds to the selection rather than replacing it.
-                        crate::edit::pointer_down(&mut viewer, at, event.shift_key());
+                        // ⚠ **A ladder, and the order is the behaviour.**
+                        //
+                        // The caret goes first because it is the only layer that has to act
+                        // when it does *not* claim the press: inside its own item it moves
+                        // the caret, and anywhere else it **ends the session**, which is what
+                        // closes the undo group it has been holding open since the first
+                        // keystroke. Everything below it therefore runs with no caret up.
+                        //
+                        // Then an armed create tool, which owns the press outright — that is
+                        // what "armed" means, and it is why pressing over a selected item
+                        // with the sticky tool places a sticky rather than picking the item
+                        // up. Then the grips, which sit *on* an item's own outline, so a
+                        // press that reached the edit layer would move the item instead of
+                        // resizing it. Only then the selection.
+                        let aim = crate::handles::Aim {
+                            coarse: event.pointer_type() == "touch",
+                            device_ratio: ratio,
+                        };
+                        let claimed = crate::caret::press(&mut viewer, at)
+                            || crate::tools::pointer_down(&mut viewer, at)
+                            || crate::handles::pointer_down(&mut viewer, at, aim);
+                        if !claimed {
+                            // ⇧ adds to the selection rather than replacing it.
+                            crate::edit::pointer_down(&mut viewer, at, event.shift_key());
+                        }
                     }
                 }
             },
@@ -270,6 +293,8 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                         // up is put back rather than carried along — moving an item and the
                         // camera at once is the shape `Input::cancel_gesture` exists for on
                         // the desktop.
+                        crate::handles::pointer_cancel(&mut viewer);
+                        crate::tools::pointer_cancel(&mut viewer);
                         crate::edit::pointer_cancel(&mut viewer);
                         // ⚠ **The factor is a ratio of separations, not an exponential of a
                         // pixel delta.** `zoom_by` multiplies, so a ratio is already the
@@ -316,7 +341,10 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                                 event.client_x() as f64 * ratio,
                                 event.client_y() as f64 * ratio,
                             ));
-                            if crate::edit::pointer_move(&mut viewer, at) {
+                            if crate::handles::pointer_move(&mut viewer, at, event.shift_key())
+                                || crate::tools::pointer_move(&mut viewer, at)
+                                || crate::edit::pointer_move(&mut viewer, at)
+                            {
                                 return;
                             }
                         }
@@ -373,7 +401,10 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                 // changed.
                 {
                     let Ok(mut viewer) = viewer.try_borrow_mut() else { return };
-                    if crate::edit::pointer_up(&mut viewer) {
+                    if crate::handles::pointer_up(&mut viewer)
+                        || crate::tools::pointer_up(&mut viewer)
+                        || crate::edit::pointer_up(&mut viewer)
+                    {
                         return;
                     }
                 }
@@ -450,7 +481,9 @@ pub fn attach(canvas: &web_sys::HtmlCanvasElement, viewer: Rc<RefCell<Viewer>>) 
                 // leaves items drawn where they are not, against a document that never
                 // changed — and `pointercancel` is routine on a touchscreen.
                 if let Ok(mut viewer) = viewer.try_borrow_mut() {
-                    crate::edit::pointer_cancel(&mut viewer);
+                    crate::handles::pointer_cancel(&mut viewer);
+                        crate::tools::pointer_cancel(&mut viewer);
+                        crate::edit::pointer_cancel(&mut viewer);
                 }
             },
         );

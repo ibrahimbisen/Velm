@@ -33,6 +33,7 @@ wasm-bindgen --target web --no-typescript --out-dir web/dist \
 # `web/*.html` glob would also copy `probe.html`, a diagnostic that has no business in a
 # deployed bundle. `boards.html` is the front door; `index.html` opens one board.
 cp web/index.html web/selftest.js web/chrome.js web/boards.html web/boards.js \
+   web/find.js \
    web/tools.js web/inspect.js web/dist/
 
 echo "web/dist ready — $(du -h web/dist/vellum_web_bg.wasm | cut -f1) of wasm"

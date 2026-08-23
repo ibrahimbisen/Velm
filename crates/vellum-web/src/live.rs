@@ -575,6 +575,14 @@ fn tick(wake: bool) {
 /// must never let the local user undo work that was not theirs. This client has no undo at
 /// all, which makes the point moot today and worth writing down for the day it does not.
 pub(crate) fn merge(viewer: &mut Viewer, updates: &[Vec<u8>]) -> Result<usize, String> {
+    // ⚠ A background merge must not end an edit in progress — feedback 34, where a link fetch
+    // landing mid-caret re-raised the undo-group toast that had just been removed. A command
+    // is something the user asked for a moment ago and closing their edit to serve it is
+    // reasonable; bytes arriving from another machine are not. Nothing is lost: `live` still
+    // holds the version it polled with, so these updates are offered again on the next tick.
+    if crate::caret::busy(viewer) {
+        return Ok(0);
+    }
     let mut applied = 0usize;
     let mut failure: Option<String> = None;
     for delta in updates {

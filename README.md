@@ -9,7 +9,7 @@ boards that make a browser-based canvas crawl.
 
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-00A38C)](#license)
 [![Platform](https://img.shields.io/badge/platform-macOS-1A1D1F)](#platform-support)
-[![Release](https://img.shields.io/badge/release-1.1.0-00A38C)](https://github.com/ibrahimbisen/Velm/releases)
+[![Release](https://img.shields.io/github/v/release/ibrahimbisen/Velm?color=00A38C&label=release)](https://github.com/ibrahimbisen/Velm/releases)
 
 </div>
 
@@ -146,19 +146,15 @@ Every one of these is a fixture you can produce yourself:
 
 ### Download it
 
-1. Get **`Velm-1.1.0-macos-arm64.dmg`** from [Releases](https://github.com/ibrahimbisen/Velm/releases).
+1. Get the latest **`Velm-<version>-macos-arm64.dmg`** from
+   [Releases](https://github.com/ibrahimbisen/Velm/releases).
 2. Open it and drag **Velm** into your Applications folder.
-3. **The first launch needs one extra step.** Velm is ad-hoc signed and **not
-   notarized** — notarization needs a paid Apple Developer account. So macOS will refuse
-   to open it once, saying it cannot check it for malicious software. Either:
-   - open **System Settings ▸ Privacy & Security**, scroll down, and click **Open
-     Anyway** next to the message about Velm; or
-   - run this once in Terminal:
-     ```bash
-     xattr -dr com.apple.quarantine /Applications/Velm.app
-     ```
+3. Double-click it. That is the whole of it — every release is signed with an Apple
+   Developer ID and notarized by Apple, so there is no Gatekeeper warning and nothing
+   to allow in System Settings.
 
-   You only do this once. Afterwards it opens like any other app.
+Apple Silicon only. Releases before 1.2.0 were ad-hoc signed and will still ask you to
+approve them under **System Settings ▸ Privacy & Security**.
 
 Your boards live in `~/Library/Application Support/Vellum/`. Nothing is sent anywhere;
 there is no account and no sync.
@@ -183,6 +179,34 @@ and about four and a half minutes:
 ```bash
 PROFILE=dist ./scripts/make-app.sh /Applications
 ```
+
+### Releases
+
+Every push to `main` that passes CI cuts one, with no manual step: the minor version is
+bumped in `[workspace.package]`, tagged, built with the shipping profile, signed with a
+Developer ID under the hardened runtime, notarized by Apple, stapled, wrapped in a DMG
+and published. `.github/workflows/ci.yml` is the whole of it; put `[skip release]` in a
+commit message to push without cutting one.
+
+The version is written in exactly one place — `[workspace.package] version` in the root
+`Cargo.toml`. `scripts/make-app.sh` stamps `Info.plist` from it and the About dialog
+reads `env!("CARGO_PKG_VERSION")`, so they cannot disagree.
+
+Signing needs six repository secrets. A fork will not have them, and the release job
+fails on the first step naming the ones it is missing rather than part-way through:
+
+| Secret | What it is |
+| --- | --- |
+| `MACOS_CERT_P12` | base64 of a Developer ID Application certificate exported as `.p12` |
+| `MACOS_CERT_PASSWORD` | the password that `.p12` was exported with |
+| `MACOS_SIGN_IDENTITY` | e.g. `Developer ID Application: Name (TEAMID)` |
+| `APPLE_API_KEY_P8` | base64 of an App Store Connect API key (`.p8`) |
+| `APPLE_API_KEY_ID` | that key's Key ID |
+| `APPLE_API_ISSUER_ID` | that key's Issuer ID |
+
+`scripts/sign-release.sh` does the signing half and runs by hand too. With no API key in
+the environment it signs, verifies and builds the DMG but skips notarization, which is
+the way to check that the hardened runtime has not broken anything before pushing.
 
 ---
 
