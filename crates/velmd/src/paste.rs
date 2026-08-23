@@ -484,6 +484,7 @@ mod tests {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 token: None,
                 app_origin: None,
+                behind_https: false,
             },
             boards: Mutex::new(()),
         }

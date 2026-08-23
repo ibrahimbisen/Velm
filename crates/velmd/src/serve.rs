@@ -95,6 +95,21 @@ pub struct Config {
     pub addr: SocketAddr,
     pub token: Option<String>,
     pub app_origin: Option<String>,
+    /// Whether this server is reached over HTTPS, stated rather than guessed.
+    ///
+    /// ⚠ **It used to be inferred from a forwarding header, and that fails permissively on the
+    /// most ordinary nginx config there is.** `location / { proxy_pass http://127.0.0.1:8787; }`
+    /// sets none of `X-Forwarded-For`, `X-Real-IP` or `Forwarded` — nginx adds nothing on its
+    /// own — so the peer looked like loopback, the guess said "not secure", and the session
+    /// cookie for an HTTPS site went out **without `Secure`**. One plaintext request to the
+    /// same host after that — a typo'd `http://`, an HSTS gap, an `<img src="http://…">` on
+    /// any page — puts a credential for every board its owner can see on the wire in clear.
+    ///
+    /// A heuristic that carries a security decision has to fail closed, and this one could
+    /// not: it cannot tell "no proxy" from "a quiet proxy". So it is a flag the operator sets,
+    /// `--behind-https`, and the hosting instructions say to. Loopback development needs
+    /// nothing, because a cookie without `Secure` is correct there.
+    pub behind_https: bool,
 }
 
 /// Everything a request handler needs, shared across connection threads.
@@ -334,8 +349,20 @@ fn serve_one(server: &Server, stream: TcpStream) {
     // from "wrong token".
     let head_only = method == "HEAD";
     HEAD_ONLY.with(|flag| flag.set(head_only));
-    if method != "GET" && method != "POST" && !head_only {
-        let _ = respond(&stream, 405, "text/plain", b"this server only answers GET\n", origin.as_deref());
+    // ⚠ **`DELETE` joined this list with signing out, and forgetting it cost a sign-out that
+    // silently did nothing.** This guard sits sixty lines above the `DELETE` arm that answers
+    // `/api/v1/session`, so the arm was unreachable: measured, sign-out answered 405 and the
+    // session stayed live — the browser dropped its cookie and the credential kept working.
+    // The message names the methods too, because "this server only answers GET" was already
+    // false the day `/sync` landed.
+    if !matches!(method.as_str(), "GET" | "POST" | "DELETE") && !head_only {
+        let _ = respond(
+            &stream,
+            405,
+            "text/plain",
+            b"this server answers GET, POST and DELETE\n",
+            origin.as_deref(),
+        );
         return;
     }
 
@@ -907,6 +934,12 @@ fn respond_inner(
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Content Too Large",
+        // ⚠ Both added with the account routes, and both are the trap this table already
+        // records: an unlisted number falls through to the `_` arm below and puts
+        // `HTTP/1.1 415 Internal Server Error` on the wire — a status line that contradicts
+        // itself, from a server telling a client what to fix.
+        415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
@@ -1017,7 +1050,22 @@ pub(crate) fn printable(raw: &str) -> String {
 /// `index.html` is still served at its own name, which is what every board link the picker
 /// builds points at.
 fn static_target(path: &str) -> &str {
-    if path == "/" { "boards.html" } else { path.trim_start_matches('/') }
+    match path {
+        // ⚠ **The front door is the home page, and it has moved twice.** It served
+        // `index.html` — which opens *one* board and falls back to a placeholder list its own
+        // code calls obsolete — then `boards.html`, and now the page that says what Velm is.
+        // Each move was right at the time and each left prose behind claiming the last one, so
+        // the rule is worth stating: `/` is where a stranger arrives, and a stranger has not
+        // signed in and does not know what this is.
+        "/" => "home.html",
+        // A named route, so the sign-in page can be linked to and bookmarked without the
+        // `.html` — it is the one address a person might type.
+        "/signin" | "/signin/" => "signin.html",
+        // Kept, because every link this application has ever emitted points at it and a board
+        // list that 404s is worse than one reachable by two names.
+        "/boards" | "/boards/" => "boards.html",
+        _ => path.trim_start_matches('/'),
+    }
 }
 
 /// Whether a character must not reach a terminal.
@@ -1176,6 +1224,7 @@ mod tests {
             addr: format!("{ip}:8787").parse().unwrap(),
             token: token.map(str::to_owned),
             app_origin: None,
+                    behind_https: false,
         };
         assert!(check_exposure(&config("127.0.0.1", None)).is_ok(), "loopback needs no token");
         assert!(check_exposure(&config("0.0.0.0", None)).is_err(), "a public bind was allowed");
@@ -1274,13 +1323,25 @@ mod tests {
         assert_eq!(printable("a\u{2029}b"), "a.b");
     }
 
+    /// ⚠ The root has moved twice — `index.html`, then `boards.html`, now the home page — and
+    /// each move left prose behind claiming the previous one. This test is named for what it
+    /// asserts rather than for what the answer happens to be today, so the next move renames
+    /// it rather than quietly changing a string inside a test called *"is the board list"*.
     #[test]
-    fn the_root_is_the_board_list_and_not_one_board() {
-        assert_eq!(static_target("/"), "boards.html");
-        // Both pages keep their own names: every link the picker builds points at the second.
+    fn the_root_is_the_page_a_stranger_should_land_on() {
+        assert_eq!(static_target("/"), "home.html");
+        // The two named routes: typed, bookmarked, or linked without an extension.
+        assert_eq!(static_target("/signin"), "signin.html");
+        assert_eq!(static_target("/boards"), "boards.html");
+        // Every page keeps its own name too — every link the picker builds uses these.
         assert_eq!(static_target("/boards.html"), "boards.html");
         assert_eq!(static_target("/index.html"), "index.html");
+        assert_eq!(static_target("/home.html"), "home.html");
         assert_eq!(static_target("/vellum_web_bg.wasm"), "vellum_web_bg.wasm");
+        // ⚠ A named route must not be reachable with a traversal glued to it: these are exact
+        // matches, so anything else falls through to the trim and then to `static_file`'s own
+        // check, which is where the defence actually lives.
+        assert_eq!(static_target("/signin/../boards"), "signin/../boards");
     }
 
     #[test]

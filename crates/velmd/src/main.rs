@@ -66,7 +66,7 @@ USAGE:
     velmd snapshot --board <FILE> --out <FILE>
     velmd blobs    --board <FILE> --blobs <DIR> --out <DIR>
     velmd serve    --data <DIR> --blobs <DIR> [--web <DIR>] [--addr <IP:PORT>]
-                   [--app-origin <URL>]     (token: $VELMD_TOKEN)
+                   [--app-origin <URL>] [--behind-https]  (token: $VELMD_TOKEN)
     velmd --version
 
 Nothing in this program removes a file. Migration copies; it never moves.
@@ -135,6 +135,10 @@ fn run(args: &[String]) -> anyhow::Result<()> {
                 token: std::env::var("VELMD_TOKEN").ok().filter(|t| !t.is_empty()),
                 app_origin: optional(args, "--app-origin")
                     .map(|p| p.to_string_lossy().into_owned()),
+                // ⚠ Stated, never guessed — see `Config::behind_https`. Set it whenever a
+                // TLS-terminating proxy sits in front, which is every internet deployment
+                // this program documents.
+                behind_https: args.iter().any(|a| a == "--behind-https"),
             })
         }
         "import" => {

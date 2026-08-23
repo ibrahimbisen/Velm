@@ -327,6 +327,23 @@ struct Session {
 /// The cookie's name.
 const COOKIE: &str = "velm_session";
 
+/// The same cookie, under the prefix a browser enforces.
+///
+/// ⚠ **`__Host-` is the only defence against a sibling subdomain fixing somebody's session.**
+/// A host-only cookie and a `Domain=`-scoped one of the same name are indistinguishable to a
+/// server: both arrive in one `Cookie:` header and the reader takes the first. So whoever
+/// controls *any* host under the registrable domain — a blog, an abandoned CNAME, a
+/// shared-hosting subdomain — can set `velm_session=<an id they signed in with>;
+/// Domain=example.com`, and RFC 6265 §5.4 lets them order it first. The victim then uses the
+/// site believing they are themselves, and every board they make is filed under the attacker's
+/// name.
+///
+/// The prefix makes that impossible at the browser: `__Host-` is refused unless the cookie is
+/// `Secure`, `Path=/` and has **no** `Domain`, which is precisely the shape a sibling cannot
+/// forge. It requires `Secure`, so it is used only when this server knows it is on HTTPS —
+/// and on plain loopback, where a sibling subdomain does not exist, the plain name is correct.
+const COOKIE_HOST_PREFIXED: &str = "__Host-velm_session";
+
 /// How many bytes of OS randomness a session id is, before hex.
 ///
 /// 32 bytes is 256 bits, which is not a number chosen for a threat model — it is the point
@@ -916,7 +933,21 @@ impl Accounts {
 
     /// Whether any account exists. `serve.rs` reads this to decide whether the gate applies.
     pub fn any(&self) -> bool {
-        !self.accounts.is_empty()
+        // ⚠ **Three states, not one, and the two extra ones are why this is not
+        // `!self.accounts.is_empty()`.** That expression answers *how many records parsed*,
+        // which is a different question from *does this server have accounts* — and the gate
+        // reads this, so the difference is the gate turning itself off.
+        //
+        // A file that could not be read, one whose every line was damaged, and — the sharpest
+        // — one written by a **newer** velmd, where `replay` skips each record on a version
+        // mismatch without counting it as damage, all leave `accounts` empty. On a tokenless
+        // server that answers "no accounts", which stops the gating, which serves every board
+        // to anybody, silently and with nothing printed.
+        //
+        // So: yes if any record parsed, yes if the file was unreadable, and yes if setup has
+        // been closed — because setup closes when an account is made and never reopens, so a
+        // closed setup is proof an account existed even when none is loaded now.
+        !self.accounts.is_empty() || self.unreadable || !self.setup_open()
     }
 
     /// The founding account — the first one ever created here.
@@ -1508,7 +1539,16 @@ fn session_cookie(headers: &BTreeMap<String, String>) -> Option<String> {
         // perfectly good session cookie sitting after one would never be found. The bug is
         // invisible in the obvious test, where ours is the only cookie in the header.
         let Some((name, value)) = pair.split_once('=') else { continue };
-        if name.trim() == COOKIE {
+        // ⚠ **Either name, and the prefixed one first.** The server may have been restarted
+        // with `--behind-https` added or removed since a cookie was issued, and a browser
+        // holding the other name would otherwise be silently anonymous — which presents as
+        // "signing in does nothing", the hardest kind of report to act on.
+        //
+        // Accepting the plain name is not a downgrade: `__Host-` is a rule the **browser**
+        // enforces when *setting*, so an attacker on a sibling subdomain still cannot make one
+        // — and on the deployment where they could set the plain name, we did not issue it.
+        let name = name.trim();
+        if name == COOKIE_HOST_PREFIXED || name == COOKIE {
             let value = value.trim();
             return (!value.is_empty()).then(|| value.to_owned());
         }
@@ -1541,11 +1581,53 @@ fn credentials(body: &[u8]) -> Option<Credentials> {
     serde_json::from_slice(body).ok()
 }
 
+/// Whether this request was sent by a program rather than forged by a web page.
+///
+/// ⚠ **This is the whole CSRF defence for the two routes that need no authentication, and
+/// without it a page the owner merely visits can take the server permanently.**
+///
+/// The attack is a plain HTML form, no JavaScript needed beyond a submit, and no reply read:
+///
+/// ```html
+/// <form action="http://127.0.0.1:8787/api/v1/accounts" method="POST" enctype="text/plain">
+///   <input name='{"username":"mallory","password":"a-long-enough-passphrase","x":"' value='"}'>
+/// </form>
+/// ```
+///
+/// `enctype="text/plain"` writes `name=value`, which lands as
+/// `{"username":"mallory","password":"…","x":"="}` — valid JSON, and `serde` ignores the extra
+/// field. On a server with no accounts yet that request **creates the founder**: it owns every
+/// board with no ownership record — which is every board that was in the directory before
+/// accounts existed — it cannot be removed, and setup never reopens. The owner's only repair
+/// is editing `accounts.json` by hand.
+///
+/// `SameSite=Strict` does not help: there is no cookie to withhold, because the attack is
+/// trying to *create* the credential rather than to use one.
+///
+/// The fix is structural rather than a token, and it is one line of reasoning:
+/// `application/json` is **not** on the CORS safelist, so a form cannot send it and a
+/// cross-origin `fetch` that tries is stopped by a preflight this server answers on its own
+/// terms. Requiring it means the request had to come from a program that was allowed to talk
+/// to us — which is exactly the population these two routes are for.
+fn sent_as_json(headers: &BTreeMap<String, String>) -> bool {
+    headers.get("content-type").is_some_and(|value| {
+        // The media type only: a charset parameter is legal and common, and refusing
+        // `application/json; charset=utf-8` would refuse half the clients that get it right.
+        value
+            .split(';')
+            .next()
+            .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+    })
+}
+
 /// What the limiter and the cookie need to know about this connection.
-fn wire_of(headers: &BTreeMap<String, String>, stream: &TcpStream) -> Wire {
+fn wire_of(headers: &BTreeMap<String, String>, stream: &TcpStream, server_is_https: bool) -> Wire {
     let through_a_proxy = proxied(headers);
     let peer = stream.peer_addr().ok();
-    let loopback = peer.is_some_and(|address| match address.ip() {
+    // ⚠ Kept, and it is the *limiter's* question rather than the cookie's now: a loopback
+    // caller is this machine, so it is not budgeted the way a stranger is. The cookie's
+    // `Secure` used to be inferred from this and no longer is — see `Config::behind_https`.
+    let _loopback = peer.is_some_and(|address| match address.ip() {
         std::net::IpAddr::V4(v4) => v4.is_loopback(),
         std::net::IpAddr::V6(v6) => v6.is_loopback(),
     });
@@ -1566,7 +1648,11 @@ fn wire_of(headers: &BTreeMap<String, String>, stream: &TcpStream) -> Wire {
         //
         // Not loopback, or forwarded from somewhere else: the cookie must never cross a
         // plain-text hop, because it is a bearer credential for every board its owner can see.
-        secure: !loopback || through_a_proxy,
+        // ⚠ From the operator's own flag, never from a forwarding header — see
+        // `Config::behind_https` for the nginx config that made the guess wrong. `loopback`
+        // and `through_a_proxy` still decide the *rate limiter's* view of who is calling,
+        // which is what they were always sound for.
+        secure: server_is_https,
     }
 }
 
@@ -1594,15 +1680,28 @@ fn wire_of(headers: &BTreeMap<String, String>, stream: &TcpStream) -> Wire {
 /// expiry is the authority: [`expired`] is what actually ends one, on both clocks. A client
 /// that ignores the `Max-Age` entirely presents a stale id and is told no.
 fn cookie(id: Option<&str>, secure: bool) -> String {
-    let secure = if secure { "; Secure" } else { "" };
+    // The prefixed name is only legal with `Secure`, so the two travel together — see
+    // [`COOKIE_HOST_PREFIXED`]. A browser silently ignores a `__Host-` cookie that breaks the
+    // rule, which would present as sign-in appearing to work and every later request being
+    // anonymous, so this pairing is not a tidy-up.
+    let (name, secure) = if secure { (COOKIE_HOST_PREFIXED, "; Secure") } else { (COOKIE, "") };
     match id {
         Some(id) => format!(
-            "Set-Cookie: {COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}",
+            "Set-Cookie: {name}={id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}",
             SESSION_MAX.as_secs()
         ),
         // Clearing: an empty value and a zero age. `Path` must match the one it was set with
         // or the browser keeps the original alongside it and sign-out silently does nothing.
-        None => format!("Set-Cookie: {COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}"),
+        None => {
+            // ⚠ **Both names**, because a server told to clear a session cannot know which it
+            // issued: `--behind-https` may have been added or removed since, and a sign-out
+            // that leaves the other one behind leaves a live credential in the browser.
+            format!(
+                "Set-Cookie: {COOKIE_HOST_PREFIXED}=; Path=/; HttpOnly; SameSite=Strict; \
+                 Max-Age=0; Secure\r\nSet-Cookie: {COOKIE}=; Path=/; HttpOnly; \
+                 SameSite=Strict; Max-Age=0"
+            )
+        }
     }
 }
 
@@ -1618,10 +1717,25 @@ pub fn sign_in(
     stream: &TcpStream,
 ) -> anyhow::Result<()> {
     let origin = server.config.app_origin.as_deref();
+    // ⚠ **The CSRF check, and it is first.** See [`sent_as_json`]: without it a plain HTML
+    // form on any page the owner visits can reach this route, because `enctype="text/plain"`
+    // can be made to spell valid JSON. 415 rather than 400, because the request was
+    // well-formed and the *type* is what was refused — and a client that gets this back has
+    // been told exactly what to change.
+    if !sent_as_json(headers) {
+        return respond_with(
+            stream,
+            415,
+            "text/plain",
+            b"send application/json\n",
+            origin,
+            &[],
+        );
+    }
     let Some(creds) = credentials(body) else {
         return respond_with(stream, 400, "text/plain", b"send {\"username\",\"password\"}\n", origin, &[]);
     };
-    let wire = wire_of(headers, stream);
+    let wire = wire_of(headers, stream, server.config.behind_https);
 
     // ⚠ The lock is dropped before anything is written to the socket — `manage.rs`'s rule,
     // and it matters more here: a sign-in holds the lock across an Argon2 verification
@@ -1677,7 +1791,7 @@ pub fn sign_out(
     stream: &TcpStream,
 ) -> anyhow::Result<()> {
     let origin = server.config.app_origin.as_deref();
-    let wire = wire_of(headers, stream);
+    let wire = wire_of(headers, stream, server.config.behind_https);
     if let Some(presented) = session_cookie(headers) {
         let mut accounts =
             server.accounts.lock().map_err(|_| anyhow::anyhow!("accounts lock poisoned"))?;
@@ -1725,6 +1839,21 @@ pub fn create_account(
     stream: &TcpStream,
 ) -> anyhow::Result<()> {
     let origin = server.config.app_origin.as_deref();
+    // ⚠ **The CSRF check, and it is first.** See [`sent_as_json`]: without it a plain HTML
+    // form on any page the owner visits can reach this route, because `enctype="text/plain"`
+    // can be made to spell valid JSON. 415 rather than 400, because the request was
+    // well-formed and the *type* is what was refused — and a client that gets this back has
+    // been told exactly what to change.
+    if !sent_as_json(headers) {
+        return respond_with(
+            stream,
+            415,
+            "text/plain",
+            b"send application/json\n",
+            origin,
+            &[],
+        );
+    }
     let Some(creds) = credentials(body) else {
         return respond_with(stream, 400, "text/plain", b"send {\"username\",\"password\"}\n", origin, &[]);
     };
