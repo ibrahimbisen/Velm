@@ -25,19 +25,19 @@ const SCREEN: Vec2 = vec2(1440.0, 900.0);
 const STRIP: f32 = vellum_ui::theme::TAB_STRIP_HEIGHT;
 
 /// Translucent chrome · Align objects · Fetch link previews · Transparency ▸ ·
-/// Accent colour ▸ · Keyboard shortcuts · Documentation · About — the last group in the
-/// ☰ menu, and all of it.
+/// Accent colour ▸ · Settings… · Keyboard shortcuts · Documentation · About — the last
+/// group in the ☰ menu, and all of it.
 ///
 /// The count is pinned rather than derived because it is what makes the *index* arithmetic
 /// below trustworthy: several tests reach a specific row by position, and a row silently
 /// appearing above one of them would move every click after it without failing anything.
-/// It has moved three times — twice upward as rows were added to a band in the middle of
-/// the group, then 14 → 8 when that whole band was archived out — which is precisely the event
-/// it exists to make visible. Every one of those three times the two clicks below were on
-/// rows **0** and **4** and the rows that came and went sat well beneath them, so neither
-/// needed re-aiming, which is the fact this constant is here to establish rather than
-/// assume.
-const PREFERENCES_ROWS: usize = 8;
+/// It has moved four times — twice upward as rows were added to a band in the middle of
+/// the group, then 14 → 8 when that whole band was archived out, then 8 → 9 when *Settings…*
+/// arrived — which is precisely the event it exists to make visible. Every one of those four
+/// times the two clicks below were on rows **0** and **4** and the rows that came and went
+/// sat well beneath them, so neither needed re-aiming, which is the fact this constant is
+/// here to establish rather than assume.
+const PREFERENCES_ROWS: usize = 9;
 
 /// The top of the menu bar, which now starts under the strip.
 const MENU_TOP: f32 = STRIP;
@@ -1468,9 +1468,9 @@ fn the_preferences_menu_switches_the_material_off() {
     assert!(chrome.translucency());
 
     // Translucent chrome · Align objects · Fetch link previews · Transparency ▸ ·
-    // Accent colour ▸ · Keyboard shortcuts · Documentation · About. No Appearance submenu: the app
-    // is light only — *"i want only light mode"* — but the accent *is* a choice now, which
-    // is a different question from which palette the app is in.
+    // Accent colour ▸ · Settings… · Keyboard shortcuts · Documentation · About. No Appearance
+    // submenu: the app is light only — *"i want only light mode"* — but the accent *is* a
+    // choice now, which is a different question from which palette the app is in.
     let rows = group_rows(&ctx, &mut chrome, &state, 3);
     assert_eq!(rows.len(), PREFERENCES_ROWS, "the Preferences group: {rows:?}");
 

@@ -411,7 +411,7 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
     // ⚠ Not a live region. The camera changes on every frame of a pan, and a screen reader
     // asked to announce that would talk continuously for the length of the gesture.
     readout.setAttribute('aria-live', 'off');
-    readout.textContent = '—';
+    readout.textContent = '-';
   }
 
   // Groups, joined by a divider only where there is something on both sides of it. Built this

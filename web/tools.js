@@ -735,7 +735,7 @@ function control(doc, { className, label, hint, icon, fn, mod, run, pressed }) {
     // Names the export rather than apologising vaguely. Somebody reading this tooltip is
     // either the user, who learns that the feature is not in this build, or the person
     // building the wasm half, who learns exactly which function to write.
-    node.title = `${label} — this build has no ${fn}()`;
+    node.title = `${label}: this build has no ${fn}()`;
   }
   return node;
 }
@@ -1063,7 +1063,7 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
         node.addEventListener('click', () => runRow(key));
       } else {
         node.disabled = true;
-        node.title = `${row.label} — this build has no ${wants(row)}()`;
+        node.title = `${row.label}: this build has no ${wants(row)}()`;
       }
       menu.append(node);
     }
@@ -1132,7 +1132,7 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
     // refused. Handing over a zero-byte file with the right name is the shape this
     // application refuses everywhere else: it looks exactly like success until it is opened.
     if (typeof text !== 'string' || text.length === 0) {
-      say('Nothing came out — this board has nothing to export.');
+      say('Nothing came out. This board has nothing to export.');
       return;
     }
     handOver(text, spec.name, spec.media);
@@ -1141,7 +1141,7 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
     // to hand over, and the caveat is about the pictures alone.
     if (missing > 0) {
       say(
-        `Downloaded. ${missing} picture${missing === 1 ? '' : 's'} exported as placeholders — ` +
+        `Downloaded. ${missing} picture${missing === 1 ? '' : 's'} exported as placeholders, because ` +
         'a browser holds them as textures, not as bytes, so there are no pixels here to write.',
       );
     } else {
@@ -1235,7 +1235,7 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
           node.addEventListener('click', () => { closePopover(); armTool(tool.id); });
         } else {
           node.disabled = true;
-          node.title = `${tool.label} — this build has no set_tool()`;
+          node.title = `${tool.label}: this build has no set_tool()`;
         }
         body.append(node);
       }
@@ -1383,7 +1383,7 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
       node.addEventListener('click', () => swatchPopover(node, colour, apply, { clearable }));
     } else {
       node.disabled = true;
-      node.title = `${label} — this build has no style_selection()`;
+      node.title = `${label}: this build has no style_selection()`;
     }
     return node;
   }
@@ -1453,7 +1453,7 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
           node.addEventListener('click', () => runRow(key));
         } else {
           node.disabled = true;
-          node.title = `${ROWS[key].label} — this build has no ${wants(ROWS[key])}()`;
+          node.title = `${ROWS[key].label}: this build has no ${wants(ROWS[key])}()`;
         }
         bar.append(node);
       } else if (id === 'more') {

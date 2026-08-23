@@ -5,7 +5,7 @@
      its own pinch and a page zoom on top of it fights the camera. This page is a document:
      pinching it to read is the browser doing its job. -->
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Velm — the infinite canvas that draws only what you are looking at</title>
+<title>Velm: the infinite canvas that draws only what you are looking at</title>
 <!-- ⚠ Kept under ~160 characters: search engines truncate there, and a description cut
      mid-clause is one that stops making its own claim before the caveat arrives. -->
 <meta name="description" content="An infinite-canvas whiteboard written in Rust. GPU-drawn, and it renders only what is on screen. Free, open source, on a server you own.">
@@ -814,7 +814,7 @@
       <h1>An infinite canvas that <em>stays fast</em> as it fills up.</h1>
       <p class="lede measure">
         Velm is a whiteboard written in Rust. It draws your board straight on the GPU and
-        draws only what is on screen — so a hundred thousand things cost the same per frame
+        draws only what is on screen, so a hundred thousand things cost the same per frame
         as two hundred, as long as you are looking at two hundred of them. Open it on a Mac,
         or in a browser on whatever machine you are sitting at.
       </p>
@@ -838,7 +838,7 @@
        ══════════════════════════════════════════════════════════════════════════════════ -->
   <div class="stage-shell">
     <p class="sr">
-      An interactive demonstration board: a frame titled “Q3 — what ships” holding three
+      An interactive demonstration board: a frame titled “Q3: what ships” holding three
       sticky notes, a rounded shape labelled “Release 1.3”, a connector between two of them
       and two hand-drawn pen strokes, with two more notes and an ellipse loose on the canvas
       beside it. It can be drawn on with a pointer. The buttons that follow choose a tool,
@@ -849,13 +849,13 @@
 
       <div class="palette" id="palette" role="group" aria-label="Board tools" hidden>
         <!-- The keys are the app's own: V select, N note, P pen. -->
-        <button class="tool" type="button" data-tool="select" aria-pressed="true" title="Select — V" aria-label="Select tool">
+        <button class="tool" type="button" data-tool="select" aria-pressed="true" title="Select (V)" aria-label="Select tool">
           <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M5.4 2.6a.6.6 0 0 1 .95-.49l9.1 6.6a.6.6 0 0 1-.3 1.08l-3.86.3 2.2 4.3a.6.6 0 0 1-.28.82l-1.5.72a.6.6 0 0 1-.8-.3l-2.15-4.4-2.5 2.72a.6.6 0 0 1-1.04-.4z"/></svg>
         </button>
-        <button class="tool" type="button" data-tool="sticky" aria-pressed="false" title="Sticky note — N" aria-label="Sticky note tool">
+        <button class="tool" type="button" data-tool="sticky" aria-pressed="false" title="Sticky note (N)" aria-label="Sticky note tool">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M3.4 3.4h13.2v8.4l-4.8 4.8H3.4z"/><path d="M16.6 11.8h-4.8v4.8"/></svg>
         </button>
-        <button class="tool" type="button" data-tool="pen" aria-pressed="false" title="Pen — P" aria-label="Pen tool">
+        <button class="tool" type="button" data-tool="pen" aria-pressed="false" title="Pen (P)" aria-label="Pen tool">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M3.6 16.4l1-3.6L13.2 4.2a1.7 1.7 0 0 1 2.4 2.4l-8.6 8.6z"/><path d="M11.8 5.6 14.2 8"/></svg>
         </button>
         <span class="tool-rule" aria-hidden="true"></span>
@@ -882,7 +882,7 @@
   <div class="wrap">
     <p class="stage-note">
       That board is drawn by this page's own 2D-canvas code, so you can put your hands on one
-      before signing into anything. <strong>It is not the real renderer</strong> — the real
+      before signing into anything. <strong>It is not the real renderer.</strong> The real
       one is Rust on WebGPU, and it is what every number below was taken from.
     </p>
     <p class="stage-note nojs">
@@ -903,7 +903,7 @@
       <div class="figures">
         <div class="fig">
           <span class="n">100<span class="u">fps</span></span>
-          <p>On a <strong>100,000-item</strong> board with 233 items on screen — 9.96&nbsp;ms a frame. And the same 9.96&nbsp;ms with all 596 items of a real board drawn at once.</p>
+          <p>On a <strong>100,000-item</strong> board with 233 items on screen: 9.96&nbsp;ms a frame. And the same 9.96&nbsp;ms with all 596 items of a real board drawn at once.</p>
         </div>
         <div class="fig">
           <span class="n">18.5<span class="u">MB</span></span>
@@ -926,7 +926,7 @@
       </p>
 
       <p class="note provenance">
-        One machine — an 8-core, 8&nbsp;GB Apple Silicon MacBook, August 2026 — from the
+        One machine (an 8-core, 8&nbsp;GB Apple Silicon MacBook, August 2026), from the
         app's own HUD averaged over 45 seconds, and <code>ps</code> for the memory, summed
         across all fourteen of Miro's processes because one PID badly undercounts Electron.
         <strong>100&nbsp;fps is that display's refresh rate</strong>: no dropped frames, not a
@@ -950,8 +950,8 @@
       <p class="label">What it is</p>
       <h2>Everything it does, and everything it does not.</h2>
       <p class="sub measure">
-        A shorter list than Miro's, partly on purpose and partly because it is not done —
-        and cheaper to read the right-hand column now than to find it out in a fortnight.
+        A shorter list than Miro's, partly on purpose and partly because it is not done.
+        Cheaper to read the right-hand column now than to find it out in a fortnight.
       </p>
 
       <div class="split">
@@ -981,7 +981,7 @@
               <h4>Keep track of them</h4>
               <p>As many boards as you like, several open at once in tabs, in folders,
                 starred. Deleting one puts it in <em>Recently deleted</em>, where it stays
-                until you say otherwise — nothing here expires a board on a timer.</p>
+                until you say otherwise. Nothing here expires a board on a timer.</p>
             </li>
             <li>
               <h4>Work in both places</h4>
@@ -992,7 +992,7 @@
               <h4>Find something, and take it out</h4>
               <p>Search a word anywhere on the board you have open, including inside a table
                 cell or on a mind-map node. Export SVG and CSV from a tab, PNG and PDF as
-                well on the Mac — text at the size it is actually drawn at.</p>
+                well on the Mac, with text at the size it is actually drawn at.</p>
             </li>
           </ul>
         </div>
@@ -1000,11 +1000,11 @@
         <div class="col">
           <h3>What it does not</h3>
           <p class="note">Some of this was cut deliberately and some is unfinished. Which is
-            which is said each time — they are not the same promise.</p>
+            which is said each time, because they are not the same promise.</p>
           <ul class="items">
             <li>
               <h4>Being on a board with other people, live <span class="why">cut on purpose</span></h4>
-              <p>No cursors, no presence, no comments, no voting — on the Mac either. Velm
+              <p>No cursors, no presence, no comments, no voting. Not on the Mac either. Velm
                 is a single-player tool. This is the biggest thing on the list and the first
                 to check against how you actually work.</p>
             </li>
@@ -1015,8 +1015,8 @@
             <li>
               <h4>Embeds that play on the board <span class="why">cut on purpose</span></h4>
               <p>A video link becomes a card with its poster and a ▶ that opens your
-                browser. A live embed needs a whole browser engine per card — 60 to
-                150&nbsp;MB idle, each — and could not zoom, be hidden by a frame, or
+                browser. A live embed needs a whole browser engine per card, 60 to
+                150&nbsp;MB idle for each one, and it could not zoom, be hidden by a frame, or
                 export.</p>
             </li>
             <li>
@@ -1032,7 +1032,7 @@
               <h4>Windows, Intel Macs, and phones</h4>
               <p>Apple Silicon is the supported platform. Intel Macs and Windows can be
                 built from source; neither has a published binary and neither is tested.
-                There is no app in either phone store — on a tablet, the browser client is
+                There is no app in either phone store. On a tablet, the browser client is
                 the answer, with real pinch and pan.</p>
             </li>
           </ul>
@@ -1059,7 +1059,7 @@
           <li>
             <h4>Nothing here runs a program on your machine</h4>
             <p>A browser tab has no subprocesses. Anything that would drive another program
-              on your computer belongs to the desktop app — structural, not unfinished.</p>
+              on your computer belongs to the desktop app. That is structural, not unfinished.</p>
           </li>
         </ul>
       </div>
@@ -1101,7 +1101,7 @@
           On the 596-widget board all of this was measured against, <strong>596 of 596
           widgets came across and 532 of them losslessly</strong>, including all 219 pen
           strokes. Ask Miro's own REST API for that board and it lists 577 items, of which
-          <strong>310 — 54% — come back with no content at all</strong>: a position, and
+          <strong>310 of them, 54%, come back with no content at all</strong>: a position, and
           <code>isSupported: false</code>. That is every one of those 219 strokes and all 91
           link cards, while the response still counts them and looks complete. The clipboard
           carries them in full, which is why Velm reads the clipboard. The other 64 arrive
@@ -1123,8 +1123,8 @@
       <p class="label">Pricing</p>
       <h2>There isn't any.</h2>
       <p class="sub measure">
-        Velm is free and open source under MIT or Apache-2.0, at your option — licensed
-        that way rather than for now. You run the server, so there is nobody in the middle to
+        Velm is free and open source under MIT or Apache-2.0, at your option. Licensed
+        that way, rather than just for now. You run the server, so there is nobody in the middle to
         bill you and nobody else holding your boards.
       </p>
 
@@ -1142,13 +1142,13 @@
         <div>
           <span class="big">No account with us</span>
           <p>There is no “us”. The only account is the one on the server you are reading this
-            from — and on the Mac there is no account and no server at all.</p>
+            from, and on the Mac there is no account and no server at all.</p>
         </div>
       </div>
 
       <p class="note provenance">
         Signing in exists because a server is shared: the first account made owns it, and
-        every board has one owner. Passwords are never stored — an Argon2id hash is. Nothing
+        every board has one owner. Passwords are never stored. An Argon2id hash is. Nothing
         in <code>velmd</code> phones home, and there is no telemetry in it.
       </p>
     </div>
@@ -1161,7 +1161,7 @@
           <p class="label">The desktop app</p>
           <h2>Where Velm started, and where it is fastest.</h2>
           <p class="sub">
-            No account, no sync service, no server — the Mac app keeps its boards in a
+            No account, no sync service, no server. The Mac app keeps its boards in a
             folder on your own machine. It is what reads a <code>.rtb</code> backup, exports
             PNG and PDF, and carries a native menu bar.
           </p>
@@ -1488,7 +1488,7 @@
 
     function makeScene() {
       return [
-        { id: 'frame', kind: 'frame', x: -560, y: -240, w: 520, h: 360, title: 'Q3 — what ships', t0: 0 },
+        { id: 'frame', kind: 'frame', x: -560, y: -240, w: 520, h: 360, title: 'Q3: what ships', t0: 0 },
         { id: 's1', kind: 'sticky', x: -532, y: -212, w: 224, h: 120, fill: FILLS[0], text: 'Ship the browser client', t0: 150 },
         { id: 's2', kind: 'sticky', x: -292, y: -212, w: 224, h: 120, fill: FILLS[1], text: 'Sync both ways', t0: 220 },
         { id: 's3', kind: 'sticky', x: -532, y: -62, w: 224, h: 120, fill: FILLS[2], text: 'Sign every release', t0: 290 },

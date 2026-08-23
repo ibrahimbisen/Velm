@@ -24,6 +24,10 @@
 # The private working log. See RULES.md for the parts a contributor needs.
 /CLAUDE.md
 
+# The agent workspace: the project docs, the lessons, the skills and the agents.
+# The docs and the lessons carry the same private content CLAUDE.md does.
+/.claude/
+
 # macOS folder metadata.
 .DS_Store
 

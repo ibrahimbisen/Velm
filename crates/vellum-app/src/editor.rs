@@ -458,6 +458,29 @@ impl Editor {
         self.merge_failures = 0;
     }
 
+    /// Stop this board's round trip.
+    ///
+    /// The previous [`crate::sync::Sync`] is dropped, which stops its worker: the worker
+    /// returns when its `Sender` goes. The board is left ready to be attached again, which is
+    /// how `ActiveState::attach_sync_to_hot_board` rebuilds it lazily on the next frame.
+    ///
+    /// ⚠ **This is what makes signing in and out work at runtime.** A `Sync` moved a *clone*
+    /// of its credential into its worker thread, and a worker never changes its mind — so
+    /// without a detach, signing in changes nothing until the app restarts and signing out
+    /// keeps syncing with the credential that was just given up.
+    ///
+    /// The two `clear` lines mirror [`Self::attach_sync`]'s own body for its own stated
+    /// reason: a queued update belongs to a server this board is no longer talking to, and a
+    /// failure count from it says nothing about the next one.
+    ///
+    /// RULE ZERO: this drops a thread and a channel. It opens no file, holds no path, and
+    /// does not touch the document.
+    pub fn detach_sync(&mut self) {
+        self.sync = None;
+        self.remote.clear();
+        self.merge_failures = 0;
+    }
+
     /// What the sync is doing — for the HUD, and for the sentence a failure needs.
     pub fn sync_state(&self) -> Option<&crate::sync::Sync> {
         self.sync.as_ref()
@@ -1125,11 +1148,36 @@ mod tests {
         editor.note_merge(false);
         editor.attach_sync(crate::sync::Sync::new(
             "http://127.0.0.1:1".to_owned(),
-            String::new(),
+            crate::sync::Credential::None,
             "scratch".to_owned(),
         ));
         assert!(editor.take_remote().is_empty(), "a stale update survived a new sync");
         assert!(!editor.merges_are_failing(), "a stale failure count survived a new sync");
+    }
+
+    /// Detaching is what makes a runtime sign-in work at all, so the property worth pinning
+    /// is that the board comes out of it ready to be attached again rather than merely quiet.
+    #[test]
+    fn detaching_stops_the_conversation_and_leaves_the_board_alone() {
+        let (_home, mut editor) = editor();
+        let before = editor.board().title();
+        editor.attach_sync(crate::sync::Sync::new(
+            "http://127.0.0.1:1".to_owned(),
+            crate::sync::Credential::None,
+            "scratch".to_owned(),
+        ));
+        assert!(editor.sync_state().is_some());
+        editor.hold_remote(vec![1, 2, 3]);
+        editor.note_merge(false);
+
+        editor.detach_sync();
+        assert!(editor.sync_state().is_none(), "the round trip survived a detach");
+        assert!(editor.take_remote().is_empty(), "an update for the old server was kept");
+        assert!(!editor.merges_are_failing(), "a failure count from the old server was kept");
+        assert!(!editor.sync_now(), "a detached board has nothing to ask");
+        // RULE ZERO, asserted rather than asserted-in-prose: a detach is a thread and a
+        // channel going away, and it must not be a change to the document.
+        assert_eq!(editor.board().title(), before, "detaching changed the board");
     }
 
     fn sticky(x: f64, y: f64) -> NewItem {

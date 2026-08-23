@@ -451,7 +451,7 @@ export function describeFailure(context) {
       title: hasToken ? 'That passphrase is not right.' : 'This server needs a passphrase.',
       detail: hasToken
         ? `${host} answered 401. The passphrase is the VELMD_TOKEN the server was started with.`
-        : `${host} is holding boards behind a passphrase — the VELMD_TOKEN it was started with.`,
+        : `${host} is holding boards behind a passphrase, the VELMD_TOKEN it was started with.`,
     };
   }
 
@@ -459,7 +459,7 @@ export function describeFailure(context) {
     return {
       want: 'server',
       title: 'That address answered, but it is not a Velm server.',
-      detail: `${host} did not answer /api/v1/health with a velmd version. Check the address, and the port — velmd's own default is 8787.`,
+      detail: `${host} did not answer /api/v1/health with a velmd version. Check the address, and the port. velmd's own default is 8787.`,
     };
   }
 
@@ -478,7 +478,7 @@ export function describeFailure(context) {
     return {
       want: 'server',
       title: 'A page on https cannot reach a server on http.',
-      detail: `This page is served over https and ${host} is http, so the browser blocks the request before it is sent. Give the server https, or open this page from the server itself — which is what velmd serve --web does.`,
+      detail: `This page is served over https and ${host} is http, so the browser blocks the request before it is sent. Give the server https, or open this page from the server itself, which is what velmd serve --web does.`,
     };
   }
 
@@ -494,7 +494,7 @@ export function describeFailure(context) {
     return {
       want: 'retry',
       title: 'The server answered, and this page is not allowed to read it.',
-      detail: `${host} replied, but without a header naming ${pageOrigin || 'this page'} the browser hides the answer. Start velmd with --app-origin ${pageOrigin || 'https://this-page'} — or open the boards from the server's own address, where no such header is needed.`,
+      detail: `${host} replied, but without a header naming ${pageOrigin || 'this page'} the browser hides the answer. Start velmd with --app-origin ${pageOrigin || 'https://this-page'}, or open the boards from the server's own address, where no such header is needed.`,
     };
   }
 
@@ -514,7 +514,7 @@ export function describeFailure(context) {
     /* as above */
   }
   if (hostname && isPrivateHost(hostname) && !isPrivateHost(originHost(pageOrigin))) {
-    detail += ' A page on the public internet is also blocked from reaching a private address by the browser itself, which looks exactly like this — reaching that server needs a name and a certificate of its own.';
+    detail += ' A page on the public internet is also blocked from reaching a private address by the browser itself, which looks exactly like this. Reaching that server needs a name and a certificate of its own.';
   }
   return { want: 'server', title: `Could not reach ${host}.`, detail };
 }
@@ -578,6 +578,24 @@ export function relativeTime(atMs, nowMs) {
   return plural(Math.floor(seconds / 31536000), 'year');
 }
 
+/**
+ * "3 days left", for something that stops working at a date in the future.
+ *
+ * ⚠ Not [`relativeTime`], and the difference is not cosmetic: that function answers *"how long
+ * ago"* and returns `"just now"` for every stamp in the future, so an invite code with a
+ * fortnight left on it would be labelled as though it had just been made.
+ *
+ * Rounded **up**, so a code with twenty hours left says "1 day left" rather than "0 days left".
+ * `null` for a date that has passed or a value that is not one, and the caller says nothing at
+ * all in that case rather than saying something wrong.
+ */
+export function daysLeft(atMs, nowMs) {
+  const left = Number(atMs) - Number(nowMs);
+  if (!Number.isFinite(left) || left <= 0) return null;
+  const days = Math.ceil(left / 86400000);
+  return days === 1 ? '1 day left' : `${days} days left`;
+}
+
 /** `library.rs:454` — "1 item" for one, "N items" otherwise. */
 export function itemCountLabel(count) {
   const n = Number(count);
@@ -621,6 +639,16 @@ export function normalizeLibrary(payload) {
       space: typeof row.space === 'string' && row.space ? row.space : null,
       trashed: row.trashed == null ? null : toMillis(row.trashed) || null,
       thumbnail: typeof row.thumbnail === 'string' ? row.thumbnail : null,
+      // ⚠ **Both of these degrade to "the server did not say", and the two absences mean
+      // different things.** `owner` missing is a server that does not report ownership, and
+      // the page must not conclude from that that nobody owns the board: it falls back to
+      // showing the Share button to an admin alone, who may share anything anyway. `shared`
+      // missing is a server with no route that lists who a board is shared with, so the panel
+      // draws one sentence saying so rather than an empty list, which would read as nobody.
+      owner: typeof row.owner === 'string' && row.owner ? row.owner : null,
+      shared: Array.isArray(row.shared)
+        ? row.shared.filter((name) => typeof name === 'string' && name !== '')
+        : null,
     });
   }
 
@@ -798,7 +826,7 @@ export function nothingHere(scope, search = '') {
     case 'starred':
       return 'No starred boards yet';
     case 'trash':
-      return 'Nothing deleted — boards you delete wait here until you empty it';
+      return 'Nothing deleted yet. Boards you delete wait here until you empty it';
     case 'space':
       return 'Nothing in this folder yet';
     default:
@@ -1211,6 +1239,27 @@ const IDS = {
   change: 'velm-change',
   forget: 'velm-forget',
   retry: 'velm-retry',
+  // ── Invite codes. Admin only, and every one of these stays hidden until `whoami` says so.
+  invitesOpen: 'velm-invites-open',
+  invites: 'velm-invites',
+  invitesMake: 'velm-invites-make',
+  invitesFresh: 'velm-invites-fresh',
+  invitesValue: 'velm-invites-value',
+  invitesCopy: 'velm-invites-copy',
+  invitesSaid: 'velm-invites-said',
+  invitesList: 'velm-invites-list',
+  invitesEmpty: 'velm-invites-empty',
+  invitesClose: 'velm-invites-close',
+  // ── Sharing one board. Opened from a card, so there is no button for it in the header.
+  share: 'velm-share',
+  shareTitle: 'velm-share-title',
+  shareUser: 'velm-share-user',
+  shareGo: 'velm-share-go',
+  shareTake: 'velm-share-take',
+  shareSaid: 'velm-share-said',
+  shareList: 'velm-share-list',
+  shareNone: 'velm-share-none',
+  shareClose: 'velm-share-close',
 };
 
 /**
@@ -1277,6 +1326,63 @@ async function readJson(response, timeoutMs, win) {
   }
 }
 
+/** The same read, as text. `velmd` answers a refusal `text/plain` on the account routes. */
+async function readText(response, timeoutMs, win) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      response.text(),
+      new Promise((_, reject) => {
+        timer = win.setTimeout(() => reject(new Error('body timed out')), timeoutMs);
+      }),
+    ]);
+  } catch {
+    return '';
+  } finally {
+    if (timer !== null) win.clearTimeout(timer);
+  }
+}
+
+/**
+ * A sentence the server wrote, made safe to put on this page.
+ *
+ * ⚠ **This is the first string off the wire that this file repeats to the reader**, and it is
+ * the exact rule `signin.js`'s `serverReason` already applies, written out again here rather
+ * than shared because these two files share no module. Control characters and the Cf
+ * direction-altering band become spaces, runs of whitespace collapse, and there is a hard cap:
+ * a refusal whose body is an entire HTML error page is not a sentence, and pasting one into a
+ * panel makes the panel the whole screen.
+ *
+ * The code points are written as numbers rather than as a character class **on purpose**: a
+ * literal U+202E in a source file is invisible in every editor and reverses the line it sits
+ * on, so a class spelled with the characters themselves is a hazard in the code that exists to
+ * defuse one.
+ *
+ * ⚠ Safe to *repeat* is not safe to *trust*, and only the first is this function's job. What
+ * stops a `<script>` in a refusal running is that every caller writes with `textContent`.
+ */
+export function serverSaid(text) {
+  if (typeof text !== 'string') return null;
+  const clean = Array.from(text)
+    .map((ch) => {
+      const code = ch.codePointAt(0);
+      const hidden =
+        code < 0x20 ||
+        (code >= 0x7f && code <= 0x9f) ||
+        (code >= 0x200b && code <= 0x200f) ||
+        code === 0x2028 ||
+        code === 0x2029 ||
+        (code >= 0x202a && code <= 0x202e) ||
+        (code >= 0x2066 && code <= 0x2069);
+      return hidden ? ' ' : ch;
+    })
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (clean === '') return null;
+  return clean.length > 160 ? `${clean.slice(0, 160)}…` : clean;
+}
+
 export function mount(options = {}) {
   const doc = options.document ?? document;
   const win = options.window ?? window;
@@ -1305,6 +1411,8 @@ export function mount(options = {}) {
   let token = params.get('token') || storedToken || null;
   wireImport();
   wireNewBoard();
+  wireInvites();
+  wireShare();
 
   // ⚠ A token that arrived in the URL is taken out of the address bar, and is stored **only
   // when there is nothing to overwrite**.
@@ -1337,6 +1445,30 @@ export function mount(options = {}) {
 
   /** Everything on the wire, once a server has answered. */
   let library = { boards: [], spaces: [], legacy: true };
+  /**
+   * Who is signed in on **this page's own origin**, or `null`.
+   *
+   * `{ username, admin }` from `GET /api/v1/whoami`, re-asked on every `connect`. Three things
+   * read it: the line under the heading, the *Invite someone* button, and whether a card gets a
+   * Share button.
+   *
+   * ⚠ **`null` on a remote server, always, and that is correct rather than a limitation.** A
+   * session is a `SameSite=Strict` cookie, so it never leaves this origin; velmd's CORS answer
+   * carries no `Access-Control-Allow-Credentials`, so it could not be sent even if it did; and
+   * the server resolves the caller of an invite or a share from the cookie alone, never from
+   * the `Authorization: Bearer` passphrase this page uses for a remote server. So a remote
+   * server has no account controls, and drawing them would be drawing three buttons whose only
+   * possible answer is 401.
+   */
+  let me = null;
+  /**
+   * Which board the share panel is about, or `null` when the panel is closed.
+   *
+   * Declared beside `me` rather than beside the functions that use it, because `wireShare`
+   * attaches its listeners at the top of `mount` and a `let` reached later in the body would be
+   * in its temporal dead zone for anything that ran in between.
+   */
+  let sharing = null;
   /** What the reader is looking at. In memory only: it is a view, not a preference. */
   const state = { scope: { kind: 'recent' }, grouping: 'folders', layout: 'grid', search: '' };
   let columns = 1;
@@ -1410,7 +1542,7 @@ export function mount(options = {}) {
     el.sub.textContent = 'Not connected.';
     show(el.message, {
       title: `This link points Velm at ${label(server.base)}.`,
-      detail: 'That is not a server this browser has used before. Check the address before connecting — every board on the list below would open as a page that server serves.',
+      detail: 'That is not a server this browser has used before. Check the address before connecting, because every board on the list below would open as a page that server serves.',
     });
     openConnectForm();
     el.forget.hidden = false;
@@ -1462,6 +1594,14 @@ export function mount(options = {}) {
     hide(el.message);
     hide(el.warning);
     hide(el.connect);
+    // Both account panels close on a reconnect, and `me` is dropped. Connecting can change
+    // which server is being asked, and an invite list or a share panel left open across that
+    // would be showing one server's answer under another server's name.
+    hide(el.invites);
+    hide(el.share);
+    el.invitesOpen.hidden = true;
+    me = null;
+    sharing = null;
     drawn = false;
     el.boards.replaceChildren();
     if (el.sidebar) {
@@ -1516,6 +1656,12 @@ export function mount(options = {}) {
     if (version === null) {
       return failed({ ...context, phase: 'health', reason: 'not-velmd' });
     }
+
+    // ⚠ Before the board list, because the list is what the Share buttons are drawn from and
+    // `me` decides which of them exist. Asked only on this page's own origin — see `me` — and
+    // allowed to fail: an older velmd has no such route, a signed-out visitor gets a 401, and
+    // both mean the same thing here, which is that there are no account controls to draw.
+    me = server.local ? await askWhoami() : null;
 
     // ⚠ The passphrase goes in a header, not the query string. Cross-origin that costs a
     // preflight, which `serve.rs` answers 204 with the CORS headers on it; what it buys is a
@@ -1636,9 +1782,16 @@ export function mount(options = {}) {
       held === 0
         ? 'This server is not holding any boards yet.'
         : `${held} ${held === 1 ? 'board' : 'boards'}, most recently changed first.`;
-    el.where.textContent = `${label(server.base)} · velmd ${version}`;
+    // ⚠ Who is signed in goes on the line that already names the machine, rather than on a line
+    // of its own. It is the same class of fact — *which server, which build, which account* —
+    // and it is here because some cards now carry a Share button and some do not: without a
+    // name on screen, which ones do is a mystery the page has no answer for.
+    el.where.textContent = me
+      ? `${label(server.base)} · velmd ${version} · signed in as ${me.username}`
+      : `${label(server.base)} · velmd ${version}`;
     el.change.hidden = false;
     el.forget.hidden = false;
+    el.invitesOpen.hidden = !(me && me.admin);
 
     // ⚠ Named before it is discovered. The list is an ordinary fetch and the board is a GPU, so
     // an http server on a LAN lists perfectly and then opens to a blank canvas.
@@ -1704,7 +1857,7 @@ export function mount(options = {}) {
       // *Delete permanently* are both desktop-only, and this is the one scope where leaving
       // them out silently would be confusing — a page of boards you deleted with nothing to do
       // about them reads as broken until somebody says so.
-      el.boards.append(noteLine('velm-lib-note', 'Nothing here has been removed — these boards are still on your server. Restoring one, and emptying this for good, are done in the Velm app.'));
+      el.boards.append(noteLine('velm-lib-note', 'Nothing here has been removed. These boards are still on your server, and restoring one, or emptying this for good, are done in the Velm app.'));
     }
 
     if (visible.length === 0) {
@@ -2041,7 +2194,7 @@ export function mount(options = {}) {
       const pin = icon(doc, 'pin', { size: 12 });
       pin.classList.add('velm-lib-pin');
       button.append(pin);
-      button.title = `${space.name} — pinned`;
+      button.title = `${space.name} (pinned)`;
     }
     const label = doc.createElement('span');
     label.className = 'velm-lib-name';
@@ -2087,10 +2240,12 @@ export function mount(options = {}) {
       node.href = buildViewerUrl(server, board.id, token, win.location.href);
     }
     const exact = describeBoard(board);
-    if (exact) node.title = `${board.title} — ${exact}`;
+    if (exact) node.title = `${board.title} · ${exact}`;
 
     node.append(well(board), titleLine(board.title), metaRow(board));
-    return node;
+    // ⚠ Returns the card itself on every board that cannot be shared, so the common case is the
+    // node it always was and the grid's own unit does not change.
+    return withShare(node, board, 'card');
   }
 
   /** The picture, or the mark where there is none. */
@@ -2238,7 +2393,7 @@ export function mount(options = {}) {
 
       const folder = doc.createElement('span');
       folder.className = 'velm-lib-folder';
-      folder.textContent = board.space || '—';
+      folder.textContent = board.space || '-';
       row.append(folder);
 
       const items = doc.createElement('span');
@@ -2261,7 +2416,7 @@ export function mount(options = {}) {
         star.append(icon(doc, 'star', { filled: true, size: 14 }));
         row.append(star);
       }
-      list.append(row);
+      list.append(withShare(row, board, 'row'));
     }
     return list;
   }
@@ -2360,7 +2515,7 @@ export function mount(options = {}) {
           return;
         }
         el.sub.textContent = answer.timedOut
-          ? 'That took too long — the board may still have been made. Reload to see.'
+          ? 'That took too long. The board may still have been made, so reload to see.'
           : 'Could not make the board.';
         return;
       }
@@ -2403,7 +2558,7 @@ export function mount(options = {}) {
           return;
         }
         pasted = html;
-        said(`Ready — ${Math.round(html.length / 1024)} KB of board. Give it a name.`, false);
+        said(`Ready. ${Math.round(html.length / 1024)} KB of board, so give it a name.`, false);
       });
     }
     if (el.importGo) {
@@ -2414,7 +2569,7 @@ export function mount(options = {}) {
         }
         const name = (el.importName && el.importName.value.trim()) || 'Miro import';
         el.importGo.disabled = true;
-        said('Bringing it across — this reads every widget, so it takes a moment.', false);
+        said('Bringing it across. This reads every widget, so it takes a moment.', false);
         // ⚠ The passphrase in a header, never the query string, for the reason the board list
         // gives: a URL is in history and in every access log between here and the server.
         const headers = { 'content-type': 'text/html; charset=utf-8' };
@@ -2427,7 +2582,7 @@ export function mount(options = {}) {
         el.importGo.disabled = false;
         if (answer.error) {
           said(answer.timedOut
-            ? 'That took too long. The board may still have arrived — reload this page to see.'
+            ? 'That took too long. The board may still have arrived, so reload this page to see.'
             : 'Could not reach your server.', true);
           return;
         }
@@ -2444,7 +2599,7 @@ export function mount(options = {}) {
         const short = made.degraded
           ? `${made.items} items, ${made.degraded} of them simplified`
           : `${made.items} items`;
-        said(`Brought "${made.title}" across — ${short}. Reloading the list…`, false);
+        said(`Brought "${made.title}" across, ${short}. Reloading the list…`, false);
         pasted = null;
         // Reloaded rather than a card appended by hand: the list is drawn from the server's
         // own answer, and building a second way to add a row to it is a second thing that can
@@ -2452,6 +2607,457 @@ export function mount(options = {}) {
         win.setTimeout(() => win.location.reload(), 1200);
       });
     }
+  }
+
+  // ── accounts: who is signed in, invite codes, and sharing one board ───────
+
+  /**
+   * Every request on an account route, with the two options that are never left to a default.
+   *
+   * `credentials: 'same-origin'` is stated rather than inherited, for `signin.js`'s reason:
+   * saying it is what makes the intent survive a later edit. The cookie must ride on a request
+   * to this server and must never be attached to one anywhere else, and `include` would be that
+   * mistake. It would not even work, because velmd's CORS answer carries no
+   * `Access-Control-Allow-Credentials`.
+   *
+   * ⚠ **No `Authorization: Bearer` header, on any of these.** The board routes send the
+   * passphrase; these must not. The server resolves the caller of an invite or a share from the
+   * session cookie alone, so a passphrase here would be a secret sent on a request that has no
+   * use for it.
+   */
+  function accountRequest(path, init, timeoutMs) {
+    return request(apiUrl(server.base, path), { cache: 'no-store', credentials: 'same-origin', ...init }, timeoutMs);
+  }
+
+  /** A body this server will accept. See `signin.js`: JSON is half the CSRF defence. */
+  function jsonBody(method, payload) {
+    return {
+      method,
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(payload),
+    };
+  }
+
+  /**
+   * Who is signed in, or `null`.
+   *
+   * Allowed to fail in every way it can: an older velmd has no such route, a signed-out visitor
+   * gets a 401, and a server reached with a passphrase alone gets a 401 too. All three mean the
+   * same thing on this page, which is that there is nothing to draw.
+   */
+  async function askWhoami() {
+    const answer = await accountRequest('whoami', { headers: { accept: 'application/json' } }, HEALTH_TIMEOUT_MS);
+    if (answer.error || answer.response.status !== 200) return null;
+    const body = await readJson(answer.response, HEALTH_TIMEOUT_MS, win);
+    if (!body || typeof body.username !== 'string' || body.username === '') return null;
+    return { username: body.username, admin: body.admin === true };
+  }
+
+  /**
+   * One sentence for a refusal, chosen by status.
+   *
+   * ⚠ **The status decides the sentence wherever this page knows more than the server's body
+   * does, and the body wins everywhere else.** A 401 and a 403 are worth a fixed sentence,
+   * because the next action is the same every time and the server's own words do not name it. A
+   * 400 is the opposite: only the server knows whether a mint was refused for the cap on open
+   * codes or for a clock that is not set, and only it knows which rule a username broke. A 503
+   * is the same, and its sentence already names the person to go and ask.
+   */
+  function refusedBecause(status, said) {
+    if (status === 401) return 'You are not signed in on this server any more. Reload this page and sign in again.';
+    if (status === 403) return 'Your account is not allowed to do that.';
+    if (status === 404) return 'This server does not have that. It may be an older velmd, so update it.';
+    if (status === 429) return 'Your server has stopped taking these for a moment. Wait, and try again.';
+    if (said) return `Your server refused it: ${said}`;
+    if (status >= 500) return `Something went wrong inside your server (${status}). The error will be on the terminal where velmd serve is running.`;
+    return `Your server refused it (${status}).`;
+  }
+
+  /** Read the refusal, then say it. One place, so every panel says it the same way. */
+  async function refusalFrom(response) {
+    const said = serverSaid(await readText(response, BOARDS_TIMEOUT_MS, win));
+    return refusedBecause(response.status, said);
+  }
+
+  function saidIn(node, message, bad) {
+    node.textContent = message;
+    node.dataset.bad = bad ? 'true' : 'false';
+  }
+
+  /**
+   * Bring a panel that has just been unhidden onto the screen.
+   *
+   * `block: 'nearest'` so a panel already in view is not scrolled at all: a page that jumps when
+   * nothing needed to move reads as a page that lost its place. Guarded because `mount` is built
+   * to run under a harness, and a stub node has no `scrollIntoView`.
+   */
+  function bringIntoView(node) {
+    if (typeof node.scrollIntoView !== 'function') return;
+    node.scrollIntoView({ block: 'nearest' });
+  }
+
+  /**
+   * Invite codes: make one, read the ones waiting, revoke one.
+   *
+   * ⚠ **The list is re-fetched after every mint and every revoke rather than edited in place.**
+   * The server is the only thing that knows which codes are open — one may have been spent from
+   * another browser a second ago — and a list this page maintained itself would be a second
+   * account of the truth with nothing keeping the two in step.
+   */
+  function wireInvites() {
+    el.invitesOpen.addEventListener('click', () => {
+      el.invites.hidden = false;
+      el.invitesOpen.hidden = true;
+      // One panel at a time. Two open at once is two lists of names on one screen with nothing
+      // saying which belongs to which.
+      hide(el.share);
+      bringIntoView(el.invites);
+      void loadInvites();
+    });
+
+    el.invitesClose.addEventListener('click', () => {
+      el.invites.hidden = true;
+      el.invitesOpen.hidden = !(me && me.admin);
+      // ⚠ The code goes off the screen with the panel. It is still on the server and still in
+      // the list above, so nothing is lost; what is gained is that a secret is not left painted
+      // on a page nobody is looking at.
+      el.invitesFresh.hidden = true;
+      el.invitesValue.textContent = '';
+      saidIn(el.invitesSaid, '', false);
+    });
+
+    el.invitesMake.addEventListener('click', () => void mintInvite());
+    el.invitesCopy.addEventListener('click', () => void copyTheCode());
+  }
+
+  async function mintInvite() {
+    el.invitesMake.disabled = true;
+    saidIn(el.invitesSaid, 'Making a code…', false);
+    const answer = await accountRequest('invites', jsonBody('POST', {}), BOARDS_TIMEOUT_MS);
+    el.invitesMake.disabled = false;
+    if (answer.error) {
+      saidIn(el.invitesSaid, answer.timedOut
+        ? 'That took too long. A code may still have been made, so press Done and open this again to see.'
+        : 'Could not reach your server.', true);
+      return;
+    }
+    const { status } = answer.response;
+    if (status !== 200 && status !== 201) {
+      saidIn(el.invitesSaid, await refusalFrom(answer.response), true);
+      return;
+    }
+    const body = await readJson(answer.response, BOARDS_TIMEOUT_MS, win);
+    if (!body || typeof body.code !== 'string' || body.code === '') {
+      saidIn(el.invitesSaid, 'Your server answered something this page could not read.', true);
+      return;
+    }
+    // ⚠ `textContent`, and this is the only node on the page that ever holds a code.
+    el.invitesValue.textContent = body.code;
+    el.invitesFresh.hidden = false;
+    const days = Number(body.days);
+    // The lifetime comes from the server, never from a number written here: a page that says
+    // fourteen days about a server that gives seven is the quiet lie this repository has been
+    // burned by before.
+    saidIn(el.invitesSaid, Number.isFinite(days) && days > 0
+      ? `Give this to one person. It works once, and it stops working in ${days} ${days === 1 ? 'day' : 'days'}.`
+      : 'Give this to one person. It works once.', false);
+    await loadInvites();
+  }
+
+  /**
+   * Copy the code, or say honestly why it could not be copied.
+   *
+   * ⚠ `navigator.clipboard` is undefined outside a secure context, and this page is opened over
+   * plain http on a home network more often than not. The fallback is not a second copy path,
+   * it is the sentence that points at the one already there: the code is `user-select: all`, so
+   * one tap or one click selects all of it.
+   */
+  async function copyTheCode() {
+    const code = el.invitesValue.textContent;
+    if (!code) return;
+    const clipboard = win.navigator && win.navigator.clipboard;
+    if (!clipboard || typeof clipboard.writeText !== 'function') {
+      saidIn(el.invitesSaid, 'This browser will not copy for a page served over http. Tap the code to select it, then copy it yourself.', true);
+      return;
+    }
+    try {
+      await clipboard.writeText(code);
+      saidIn(el.invitesSaid, 'Copied. Send it to the person yourself, and to nobody else.', false);
+    } catch {
+      saidIn(el.invitesSaid, 'This browser would not copy it. Tap the code to select it, then copy it yourself.', true);
+    }
+  }
+
+  async function loadInvites() {
+    const answer = await accountRequest('invites', { headers: { accept: 'application/json' } }, BOARDS_TIMEOUT_MS);
+    el.invitesList.replaceChildren();
+    if (answer.error) {
+      el.invitesEmpty.hidden = false;
+      el.invitesEmpty.textContent = 'Could not read the codes that are waiting.';
+      return;
+    }
+    if (!answer.response.ok) {
+      el.invitesEmpty.hidden = false;
+      el.invitesEmpty.textContent = await refusalFrom(answer.response);
+      return;
+    }
+    const rows = await readJson(answer.response, BOARDS_TIMEOUT_MS, win);
+    // Open ones only. A spent, revoked or expired code is not a thing anybody can do anything
+    // with, and a list of dead codes under a heading that says *waiting* is four kinds of row
+    // for one kind of question.
+    //
+    // ⚠ A row with no `state` at all counts as open, deliberately: an older shape that names
+    // only the codes it is still holding must not draw an empty list on a server that has some.
+    const open = Array.isArray(rows)
+      ? rows.filter((row) => row && typeof row.code === 'string' && row.code !== '' && (row.state == null || row.state === 'open'))
+      : [];
+    el.invitesEmpty.hidden = open.length > 0;
+    el.invitesEmpty.textContent = 'No codes are waiting.';
+    for (const row of open) el.invitesList.append(inviteRow(row));
+  }
+
+  function inviteRow(row) {
+    const item = doc.createElement('li');
+
+    const name = doc.createElement('span');
+    name.className = 'velm-row-name';
+    // ⚠ `textContent`. Every string on this row came off the wire.
+    name.textContent = row.code;
+    item.append(name);
+
+    const when = doc.createElement('span');
+    when.className = 'velm-row-when';
+    const left = daysLeft(toMillis(row.expires), Date.now());
+    if (left) when.textContent = left;
+    item.append(when);
+
+    const revoke = doc.createElement('button');
+    revoke.type = 'button';
+    revoke.className = 'btn btn-danger';
+    revoke.textContent = 'Revoke';
+    revoke.addEventListener('click', () => void revokeInvite(row.code, revoke));
+    item.append(revoke);
+    return item;
+  }
+
+  /**
+   * Kill one code.
+   *
+   * ⚠ **The code goes in the path, which is the one place on this page a secret is put in a
+   * URL.** It is forced by the wire — `DELETE /api/v1/invites/{code}` — and it is accepted
+   * rather than overlooked, for the reason the server's own design gives: the effect of the
+   * request is to kill the value it names, so what a reverse proxy writes into its access log
+   * is already dead by the time the line is written. `encodeURIComponent` because a code is
+   * arbitrary text until the server has folded it, and a `/` in one would otherwise be a
+   * different route.
+   *
+   * No body, so no content type and no CSRF check on the far end. `SameSite=Strict` is the
+   * defence here, which is the same one sign-out already relies on.
+   */
+  async function revokeInvite(code, button) {
+    button.disabled = true;
+    saidIn(el.invitesSaid, 'Revoking…', false);
+    const answer = await accountRequest(`invites/${encodeURIComponent(code)}`, { method: 'DELETE' }, BOARDS_TIMEOUT_MS);
+    button.disabled = false;
+    if (answer.error) {
+      saidIn(el.invitesSaid, 'Could not reach your server.', true);
+      return;
+    }
+    if (!answer.response.ok) {
+      saidIn(el.invitesSaid, await refusalFrom(answer.response), true);
+      return;
+    }
+    // If the code on screen is the one just revoked, take it off the screen: a code in a panel
+    // that no longer works is a code somebody reads out.
+    if (el.invitesValue.textContent === code) {
+      el.invitesFresh.hidden = true;
+      el.invitesValue.textContent = '';
+    }
+    saidIn(el.invitesSaid, 'That code will not work now.', false);
+    await loadInvites();
+  }
+
+  /**
+   * May the signed-in account hand this board to somebody?
+   *
+   * The same rule the server enforces: the owner, or an admin. ⚠ **The `owner` degradation is
+   * the interesting half.** A velmd that does not report ownership on the board list leaves
+   * `owner` null on every row, and the honest answer there is to offer the control to an admin
+   * alone — an admin may share anything, so nothing is offered that would be refused. An owner
+   * who is not an admin loses the button on such a server, which is a missing control rather
+   * than a broken one.
+   *
+   * A board in the trash is refused outright. Handing somebody a board you have deleted is not
+   * a thing anybody means to do, and this page cannot restore one.
+   */
+  function canShare(board) {
+    if (!me) return false;
+    if (board.trashed) return false;
+    if (me.admin) return true;
+    return board.owner !== null && board.owner === me.username;
+  }
+
+  /**
+   * Put a Share button beside a card or a row, when there is one to put.
+   *
+   * ⚠ **Beside, not inside.** A card is an `<a href>` and a row is an `<a href>`, and a button
+   * inside an anchor has no single answer across browsers: the press may follow the link. So
+   * the anchor keeps its own node and gains a sibling, inside a wrapper that takes no size of
+   * its own. A board with no Share button is returned untouched, so the common case adds no
+   * element at all.
+   */
+  function withShare(node, board, shape) {
+    if (!canShare(board)) return node;
+    const cell = doc.createElement('div');
+    cell.className = shape === 'row' ? 'velm-rowcell' : 'velm-cell';
+    const button = doc.createElement('button');
+    button.type = 'button';
+    button.className = 'btn velm-share-btn';
+    button.textContent = 'Share';
+    // An attribute, set as a property, so a board title off the wire never becomes markup.
+    button.title = `Share ${board.title}`;
+    button.addEventListener('click', () => openShare(board));
+    cell.append(node, button);
+    return cell;
+  }
+
+  function wireShare() {
+    el.shareClose.addEventListener('click', () => {
+      hide(el.share);
+      sharing = null;
+      el.shareUser.value = '';
+      saidIn(el.shareSaid, '', false);
+    });
+    el.shareGo.addEventListener('click', () => void changeShare(true));
+    el.shareTake.addEventListener('click', () => void changeShare(false));
+  }
+
+  function openShare(board) {
+    sharing = board;
+    hide(el.invites);
+    el.invitesOpen.hidden = !(me && me.admin);
+    el.share.hidden = false;
+    el.shareTitle.textContent = `Share ${board.title}`;
+    el.shareUser.value = '';
+    saidIn(el.shareSaid, '', false);
+    drawShareList(board);
+    bringIntoView(el.share);
+    try {
+      el.shareUser.focus();
+    } catch {
+      /* a harness has no focus */
+    }
+  }
+
+  /**
+   * Who this board is already shared with.
+   *
+   * ⚠ **There is no route that asks.** The list is drawn only when the board list itself
+   * carried the fact, and when it did not the panel says so in one sentence — because an empty
+   * list under a heading that says *Who can open it* reads as *nobody*, which would be a claim
+   * this page cannot make.
+   */
+  function drawShareList(board) {
+    el.shareList.replaceChildren();
+    if (board.shared === null) {
+      el.shareNone.hidden = false;
+      el.shareNone.textContent = 'This server does not say who a board is shared with. Type a username and use the two buttons above.';
+      return;
+    }
+    if (board.shared.length === 0) {
+      el.shareNone.hidden = false;
+      el.shareNone.textContent = 'Only you, so far.';
+      return;
+    }
+    el.shareNone.hidden = true;
+    for (const username of board.shared) {
+      const item = doc.createElement('li');
+      const name = doc.createElement('span');
+      name.className = 'velm-row-name';
+      name.textContent = username;
+      const take = doc.createElement('button');
+      take.type = 'button';
+      take.className = 'btn btn-danger';
+      take.textContent = 'Take away';
+      take.addEventListener('click', () => {
+        el.shareUser.value = username;
+        void changeShare(false);
+      });
+      item.append(name, take);
+      el.shareList.append(item);
+    }
+  }
+
+  /**
+   * Give this board to a username, or take it away.
+   *
+   * One field and two buttons, and the two halves are **not symmetrical on the wire**:
+   *
+   * ```text
+   * POST   boards/{id}/share              {"username"}   application/json
+   * DELETE boards/{id}/share/{username}   no body
+   * ```
+   *
+   * ⚠ **The `DELETE` puts the username in the path and sends no body, and a symmetrical one
+   * answers 405.** This file asked for `DELETE boards/{id}/share` with `{"username"}` and got
+   * "DELETE answers signing out, revoking an invite code, and unsharing a board" back, because
+   * the server's whole `DELETE` block reads no request body at all. That is deliberate there
+   * rather than an omission: an HTML form can send only `GET` and `POST`, so a `DELETE` with no
+   * body cannot be forged cross-site by a form at all, and it needs no `Content-Type` check to
+   * say so. The path shape is the safer one, so this half moved rather than the server's.
+   *
+   * ⚠ The username is trimmed and nothing else. The server folds the case and decides which
+   * characters a name may hold; a client that folded it too would be a second copy of that rule
+   * with nothing keeping the two in step.
+   */
+  async function changeShare(give) {
+    if (!sharing) return;
+    const username = el.shareUser.value.trim();
+    if (username === '') {
+      saidIn(el.shareSaid, 'Type the username of somebody with an account on this server.', true);
+      el.shareUser.focus();
+      return;
+    }
+    el.shareGo.disabled = true;
+    el.shareTake.disabled = true;
+    saidIn(el.shareSaid, give ? 'Giving access…' : 'Taking access away…', false);
+    const board = encodeURIComponent(sharing.id);
+    const answer = give
+      ? await accountRequest(
+        `boards/${board}/share`,
+        jsonBody('POST', { username }),
+        BOARDS_TIMEOUT_MS,
+      )
+      : await accountRequest(
+        `boards/${board}/share/${encodeURIComponent(username)}`,
+        { method: 'DELETE' },
+        BOARDS_TIMEOUT_MS,
+      );
+    el.shareGo.disabled = false;
+    el.shareTake.disabled = false;
+    if (answer.error) {
+      saidIn(el.shareSaid, answer.timedOut
+        ? 'That took too long. Reload this page to see whether it went through.'
+        : 'Could not reach your server.', true);
+      return;
+    }
+    if (!answer.response.ok) {
+      saidIn(el.shareSaid, await refusalFrom(answer.response), true);
+      return;
+    }
+
+    // ⚠ The page's own copy of the board list is updated so the list below and the next open of
+    // this panel agree with what just happened. It is not a second account of the truth: the
+    // next `connect` throws all of it away and asks the server again.
+    if (sharing.shared !== null) {
+      const kept = sharing.shared.filter((name) => name !== username);
+      sharing.shared = give ? [...kept, username] : kept;
+      drawShareList(sharing);
+    }
+    saidIn(el.shareSaid, give
+      ? `${username} can open this board now. They will find it on their own boards page.`
+      : `${username} cannot open this board any more.`, false);
+    el.shareUser.value = '';
   }
 
   function openConnectForm(opts = {}) {

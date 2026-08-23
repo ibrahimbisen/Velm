@@ -1440,7 +1440,7 @@ export function mountInspector(mod, { canvas, open = false } = {}) {
   const toggle = el('button', 'velm-inspect-toggle');
   toggle.type = 'button';
   toggle.setAttribute('aria-label', 'Properties');
-  toggle.title = 'Properties — what is selected, and its size, colour and position';
+  toggle.title = 'Properties: what is selected, and its size, colour and position';
   toggle.innerHTML = svg(ICON_PANEL);
 
   const panel = el('div', PANEL_CLASS);

@@ -136,6 +136,12 @@ impl Menu {
                     Entry::Sub(Submenu::Transparency),
                     Entry::Sub(Submenu::Accent),
                     Separator,
+                    // The whole page, in its own band under the individual switches. The
+                    // settings hold the account now, and a menu is the wrong shape for a
+                    // form: three fields and a submit that can fail need somewhere that
+                    // stays open while you type into it.
+                    Item(C::OpenSettings),
+                    Separator,
                     Item(C::KeyboardShortcuts),
                     Item(C::Documentation),
                     Item(C::About),
@@ -476,6 +482,14 @@ pub enum Command {
     SetStartView,
     PresentationMode,
     // Preferences
+    /// Opens the settings page — the board library's own [`Settings`
+    /// scope](crate::LibraryScope::Settings), not a modal.
+    ///
+    /// A row rather than only a sidebar click, because the page now holds the account: the
+    /// address of the server your boards sync to, and who you are on it. That is the one
+    /// setting somebody goes looking for while they cannot find anything, so it carries the
+    /// shortcut every macOS application binds to preferences.
+    OpenSettings,
     ToggleTranslucency,
     /// Whether link cards may fetch their own titles and preview images.
     ///
@@ -558,6 +572,7 @@ impl Command {
         Self::GoToStartView,
         Self::SetStartView,
         Self::PresentationMode,
+        Self::OpenSettings,
         Self::ToggleTranslucency,
         Self::ToggleLinkPreviews,
         Self::ToggleAlignObjects,
@@ -621,6 +636,7 @@ impl Command {
             Self::GoToStartView => "Go to start view",
             Self::SetStartView => "Set start view here",
             Self::PresentationMode => "Presentation mode",
+            Self::OpenSettings => "Settings…",
             Self::ToggleTranslucency => "Translucent chrome",
             Self::ToggleLinkPreviews => "Fetch link previews",
             // Miro's own wording, so a user who knows the setting there finds it here.
@@ -691,7 +707,8 @@ impl Command {
             // Board, because it is the board's grid it snaps to — it reaches the user
             // through the Grid submenu, which hangs off the View group's row for it.
             Self::SnapToGrid => Menu::View,
-            Self::ToggleTranslucency
+            Self::OpenSettings
+            | Self::ToggleTranslucency
             | Self::ToggleLinkPreviews
             | Self::ToggleAlignObjects
             | Self::KeyboardShortcuts
@@ -813,6 +830,10 @@ impl Command {
             Self::ToggleMinimap => (ALT_CMD, Key::M),
             Self::TogglePropertiesPanel => (ALT_CMD, Key::P),
             Self::PresentationMode => (SHIFT_CMD, Key::P),
+            // What every macOS application binds to preferences, and what the native bar
+            // draws as ⌘,. `code_for` already maps `Key::Comma`, and the accelerator carries
+            // ⌘, so neither of `accelerator`'s two refusals applies.
+            Self::OpenSettings => (CMD, Key::Comma),
             Self::BringToFront => (SHIFT_CMD, Key::CloseBracket),
             Self::BringForward => (CMD, Key::CloseBracket),
             Self::SendBackward => (CMD, Key::OpenBracket),
@@ -863,6 +884,10 @@ impl Command {
             | Self::OpenBoard
             | Self::ImportFromMiro
             | Self::CommandPalette
+            // The settings page is *in* the library, which is the screen you are on when no
+            // board is open. Gating it on a board would put the account behind the one thing
+            // the account is needed to reach.
+            | Self::OpenSettings
             | Self::KeyboardShortcuts
             | Self::Documentation
             | Self::About => Enabled,
@@ -1352,6 +1377,9 @@ mod tests {
                 Command::OpenBoard,
                 Command::ImportFromMiro,
                 Command::CommandPalette,
+                // The settings page lives in the library, which is the screen with no board
+                // on it. Gating it on a board would hide the account behind a board.
+                Command::OpenSettings,
                 Command::ToggleTranslucency,
                 // The switch that decides whether anything is fetched at all cannot be gated
                 // on a board being open: it is a preference, not an action on a board.

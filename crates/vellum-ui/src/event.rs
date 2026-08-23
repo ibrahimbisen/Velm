@@ -33,6 +33,49 @@ pub struct GridSettings {
     pub color: Option<Color>,
 }
 
+/// A password on its way to one request. Never printed, never stored, never compared
+/// against anything but itself.
+///
+/// **The hand-written `Debug` is the mechanism, not a nicety.** [`UiEvent`] derives
+/// `Debug` and so does [`EventSink`], so a bare `String` password inside a variant is a
+/// password in whatever log line ever formats a sink. This is the same class that
+/// `vellum_app::options`' `OnceLock` and `velmd`'s *nothing that holds a secret prints it*
+/// test exist to prevent, and the precedent for writing `Debug` by hand rather than
+/// promising in prose is `vellum_app::sync::SyncReply`.
+///
+/// It has **no `Display`**, so `format!("{secret}")` does not compile. The one way to read
+/// the characters is [`Secret::expose`], which is named to be visible in a review.
+///
+/// # What this type cannot promise
+///
+/// The bytes are **not** erased from memory. `String::clear` sets a length and does not
+/// zero a buffer, egui's text field keeps its own copy including undo history, the JSON
+/// body is another, and the HTTP send buffer is a fourth. Claiming otherwise would be a
+/// failure reported as a success.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub const fn new(password: String) -> Self {
+        Self(password)
+    }
+
+    /// The characters, for the one request that needs them.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
 /// One thing the user did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiEvent {
@@ -172,6 +215,19 @@ pub enum UiEvent {
     /// chrome: a selection ring is drawn by `vellum-render`, not by egui, so
     /// `vellum_app::theme::Theme` carries the same accent and has to be told.
     AccentChanged(crate::theme::Accent),
+    /// *Sign in* was pressed on Settings ▸ Account.
+    ///
+    /// The chrome does no network work of its own, so this is the whole of what it knows:
+    /// the three things that were typed. The app normalises the address, posts, reads the
+    /// session back and reports what happened through
+    /// [`Chrome::set_account_status`](crate::Chrome::set_account_status).
+    ///
+    /// `server` is **raw**, exactly as it was typed. Normalising it in the chrome would put
+    /// a second answer to *what is a valid address* beside the app's own, and two clients
+    /// disagreeing about one input is a defect this repository has already paid for.
+    SignInRequested { server: String, username: String, password: Secret },
+    /// *Sign out* was pressed. Nothing is carried: the app knows who is signed in.
+    SignOutRequested,
 }
 
 impl UiEvent {
@@ -400,6 +456,31 @@ mod tests {
         ] {
             assert_eq!(event.id(), id);
         }
+    }
+
+    /// The reason [`Secret`] exists at all. `UiEvent` derives `Debug` and `EventSink`
+    /// derives it too, so a bare `String` password in a variant is a password in whatever
+    /// log line ever formats a sink. Asserted rather than promised, because the promise is
+    /// not the mechanism.
+    #[test]
+    fn nothing_that_holds_a_password_prints_it() {
+        let secret = Secret::new("hunter2-and-a-half".to_owned());
+        assert_eq!(secret.expose(), "hunter2-and-a-half", "the request still gets it");
+
+        let event = UiEvent::SignInRequested {
+            server: "https://boards.example.com/".to_owned(),
+            username: "sam".to_owned(),
+            password: secret.clone(),
+        };
+        let mut sink = EventSink::default();
+        sink.push(event.clone());
+
+        for printed in [format!("{secret:?}"), format!("{event:?}"), format!("{sink:?}")] {
+            assert!(!printed.contains("hunter2"), "{printed}");
+            assert!(printed.contains("redacted"), "{printed}");
+        }
+        // The rest of the event is still useful to a log line: only the password is gone.
+        assert!(format!("{event:?}").contains("sam"));
     }
 
     #[test]

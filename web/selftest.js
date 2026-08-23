@@ -203,8 +203,8 @@ export function runTouchFixture(mod, canvas) {
 
   const failed = findings.filter(([ok]) => !ok);
   const verdict = failed.length === 0
-    ? `touch PASS — ${findings.map(([, m]) => m).join('; ')}`
-    : `touch FAIL (${failed.length}/${findings.length}) — ${failed.map(([, m]) => m).join('; ')}`;
+    ? `touch PASS: ${findings.map(([, m]) => m).join('; ')}`
+    : `touch FAIL (${failed.length}/${findings.length}): ${failed.map(([, m]) => m).join('; ')}`;
   mod.verdict(verdict);
   console.log(verdict);
   return failed.length === 0;
@@ -237,7 +237,7 @@ export function runPerfFixture(mod, frames = 120) {
       const worstOpening = Math.max(...opening);
       const steady = measured.slice(10);
       const line =
-        `perf — ${measured.length} frames: median ${at(0.5).toFixed(1)}ms ` +
+        `perf: ${measured.length} frames, median ${at(0.5).toFixed(1)}ms ` +
         `(${(1000 / at(0.5)).toFixed(0)}fps), 95th ${at(0.95).toFixed(1)}ms, ` +
         `worst ${sorted[sorted.length - 1].toFixed(1)}ms; ` +
         `first 10 frames worst ${worstOpening.toFixed(1)}ms, ` +
@@ -418,7 +418,7 @@ export async function runEditFixture(mod, canvas) {
   }
 
   const line = failed.length === 0
-    ? `edit fixture: all ${notes.length} checks passed — ${notes.join('; ')}`
+    ? `edit fixture: all ${notes.length} checks passed. ${notes.join('; ')}`
     : `edit fixture FAILED ${failed.length} of ${failed.length + notes.length}: ${failed.join('; ')}`;
   mod.verdict(line);
   console.log(line);

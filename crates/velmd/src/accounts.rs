@@ -1,11 +1,16 @@
 //! Accounts: who may sign in, and which boards they may see.
 //!
 //! ```text
-//! GET    /api/v1/whoami      {"username":…,"admin":…}  or 401
-//! POST   /api/v1/session     {"username","password"}   -> 204 + Set-Cookie
-//! DELETE /api/v1/session                               -> 204 + a cleared cookie
-//! POST   /api/v1/accounts    admin only, except the very first one
-//! GET    /api/v1/accounts    admin only: usernames, never hashes
+//! GET    /api/v1/whoami       {"username":…,"admin":…}  or 401
+//! POST   /api/v1/session      {"username","password"}   -> 204 + Set-Cookie
+//! DELETE /api/v1/session                                -> 204 + a cleared cookie
+//! POST   /api/v1/accounts     admin only, except the very first one and an invite code
+//! GET    /api/v1/accounts     admin only: usernames, never hashes
+//! POST   /api/v1/invites      admin only  -> {"code","expires","days"}
+//! GET    /api/v1/invites      admin only: every code and the state it is in
+//! DELETE /api/v1/invites/{code}                         -> 204
+//! POST   /api/v1/boards/{id}/share             {"username"}  -> 204
+//! DELETE /api/v1/boards/{id}/share/{username}                -> 204
 //! ```
 //!
 //! # ⚠ The bearer token still works, unchanged, and that is not negotiable
@@ -116,7 +121,9 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 
-use crate::serve::{Server, json_string, printable, proxied, respond_with, same_secret};
+use crate::serve::{
+    Server, board_by_id, json_string, printable, proxied, respond_with, same_secret,
+};
 use crate::sync::Refusal;
 
 // ----- the wire ---------------------------------------------------------------------------
@@ -144,6 +151,71 @@ pub fn is_accounts(path: &str) -> bool {
 /// Whether this path is the identity route.
 pub fn is_whoami(path: &str) -> bool {
     path == PATH_WHOAMI
+}
+
+pub const PATH_INVITES: &str = "/api/v1/invites";
+
+/// The prefix one invite code hangs off, for `DELETE /api/v1/invites/{code}`.
+const PATH_INVITE_PREFIX: &str = "/api/v1/invites/";
+
+/// The prefix and the two tails that spell the two share routes.
+///
+/// Sharing lives here rather than in [`crate::manage`] because everything it changes lives
+/// here: the shared list is a field on [`Ownership`], the `shared` key is a field on
+/// [`Record`], and [`Accounts::allowed`] is what reads it. `manage.rs` owns a board's *file*
+/// and its *name*; this owns who may see it. The **path shape** is copied from
+/// [`crate::manage::rename_target`], which is the closest precedent for a route hanging off
+/// one board.
+const PATH_BOARD_PREFIX: &str = "/api/v1/boards/";
+const PATH_SHARE_SUFFIX: &str = "/share";
+const PATH_SHARE_INFIX: &str = "/share/";
+
+/// Whether this path is the invite route — `POST` to mint one, `GET` to list them.
+pub fn is_invites(path: &str) -> bool {
+    path == PATH_INVITES
+}
+
+/// The invite code in a revoke path, or `None` if this is not one.
+///
+/// Stricter than [`crate::manage::rename_target`], which does not refuse an id holding a `/`:
+/// a code has a fixed alphabet, so a segment with a slash in it is not one. That is defence
+/// in depth rather than the security boundary — [`fold_code`] refuses a `/` anyway, because
+/// it is not in [`CODE_ALPHABET`] — and it keeps `DELETE /api/v1/invites/a/b` from being read
+/// as a code called `a/b`.
+pub fn revoke_target(path: &str) -> Option<&str> {
+    let code = path.strip_prefix(PATH_INVITE_PREFIX)?;
+    (!code.is_empty() && !code.contains('/')).then_some(code)
+}
+
+/// The board id in `POST /api/v1/boards/{id}/share`, or `None` if this is not one.
+///
+/// The id is compared against file stems that came out of a directory listing, never joined
+/// onto a directory — the same rule [`crate::manage::rename_target`] states. A stem cannot
+/// hold a `/`, so one that does is refused here rather than left to match nothing later.
+pub fn share_target(path: &str) -> Option<&str> {
+    let id = path.strip_prefix(PATH_BOARD_PREFIX)?.strip_suffix(PATH_SHARE_SUFFIX)?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// The board id and the username in `DELETE /api/v1/boards/{id}/share/{username}`.
+///
+/// ⚠ **The username is in the path rather than in a body, and that is a decision.** A
+/// `DELETE` in this server carries no body — signing out does not, and neither does revoking
+/// an invite code — so a body here would mean a second `content_length` and a second body
+/// read inside `serve.rs`'s `DELETE` block, which exists precisely because those two routes
+/// need neither. It is also the safe direction for CSRF: an HTML form can send only `GET` and
+/// `POST`, so nothing forgeable by a form can reach a `DELETE` at all.
+///
+/// A username is letters, digits and `. - _` ([`fold_username`]), so it never needs escaping
+/// in a path segment and a segment holding a `/` is not one.
+pub fn unshare_target(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix(PATH_BOARD_PREFIX)?;
+    let (id, username) = rest.split_once(PATH_SHARE_INFIX)?;
+    let usable = !id.is_empty()
+        && !id.contains('/')
+        && !username.is_empty()
+        && !username.contains('/');
+    usable.then_some((id, username))
 }
 
 /// Paths that must answer without a bearer token, whatever else the gate decides.
@@ -210,19 +282,18 @@ pub fn content_length(headers: &BTreeMap<String, String>) -> Result<usize, Refus
 
 /// Signed in, and not allowed to do this anyway.
 ///
-/// ⚠ **`serve::respond` must learn this arm, and 409 and 429 below with it.** It maps a
-/// status to its reason phrase from a fixed list of eight and an unlisted number falls
-/// through to *"Internal Server Error"*, so today this would put `HTTP/1.1 403 Internal
-/// Server Error` on the wire. `manage.rs` met the same wall and answered by using a status
-/// the responder already spoke, which was right there because **200 was equally correct** for
-/// what it was saying.
+/// ⚠ **`serve::respond_inner`'s reason table has to hold every status this file sends**, and
+/// for two releases it did not. It maps a status to its reason phrase from a fixed list and
+/// an unlisted number falls through to *"Internal Server Error"*, so a 403 went out as
+/// `HTTP/1.1 403 Internal Server Error` — a status line that contradicts itself, from a
+/// server telling a client what to fix. This doc used to say *"`respond`'s match gains three
+/// arms"*; **only 415 and 429 landed**, and 403 and 409 were live on the wire, mislabelled,
+/// the whole time. All four arms are in that table now.
 ///
-/// Here it is not. 400 does not mean *"you are not an admin"*, 401 means *"authenticate"* to
-/// somebody who already has, and a client that branches on the code — which is every client,
-/// since nobody parses a reason phrase — would be told the wrong thing. So the codes are
-/// correct and `respond`'s match gains three arms. That change ships in the same hunk as
-/// `respond_with`, which this file needs regardless: a cookie is a header and `respond` can
-/// write no header this file can choose.
+/// The codes themselves were never the negotiable part. 400 does not mean *"you are not an
+/// admin"*, 401 means *"authenticate"* to somebody who already has, and a client that
+/// branches on the code — which is every client, since nobody parses a reason phrase — would
+/// be told the wrong thing.
 const FORBIDDEN: u16 = 403;
 
 /// That username is taken.
@@ -452,6 +523,201 @@ struct Failures {
     since: Instant,
 }
 
+// ----- invite codes -------------------------------------------------------------------------
+
+/// Crockford base32: the digits and the 22 letters that are not I, L, O or U.
+///
+/// The four letters left out are the four a person confuses with a digit when they read a
+/// code down a telephone or type it on a phone keyboard. [`fold_code`] puts three of them
+/// back where they can only have meant a digit.
+const CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// How many characters a code is.
+///
+/// Twelve from 32 symbols is **60 bits**, shown as `K7QM-3XPT-9WNZ`. With the cap of
+/// [`MAX_OPEN_INVITES`] open at once, a guesser expects 2^60 / (2 × 32) ≈ 1.8 × 10^16
+/// attempts — and every attempt is refused inside [`Accounts`] under the one accounts
+/// `Mutex`, so guesses are serialised across the whole process. There is no offline attack on
+/// this: the verifier is the file that already holds the boards.
+const CODE_CHARS: usize = 12;
+
+/// How many characters between the hyphens a person reads a code by.
+const CODE_GROUP: usize = 4;
+
+/// How long a code stays open. Fourteen days.
+///
+/// A code sitting unspent for ever in a file that gets backed up is a standing door. Two
+/// weeks is longer than it takes somebody to answer a message and shorter than it takes them
+/// to forget the message existed.
+///
+/// ⚠ **This runs on the wall clock, not on an [`Instant`].** A session dies with the process,
+/// so a monotonic clock is right for it; an invite outlives a restart, so its age has to
+/// survive one. The consequence: a clock stepped backwards makes a code live longer and one
+/// stepped forwards kills it early. On a machine with NTP that is a step of seconds against a
+/// window of two weeks.
+const INVITE_LIFE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+// ⚠ **These two constants spell the same number and they are next to each other for that
+// reason.** [`Change::Refused`] carries a `&'static str`, which cannot hold a formatted
+// value, so the cap's number is typed twice. Kept adjacent so that changing one is an edit on
+// the next line, and pinned by `the_cap_and_its_refusal_agree` so that a change to one alone
+// fails the suite rather than shipping a sentence that lies about the rule.
+/// How many codes may be open at once.
+const MAX_OPEN_INVITES: usize = 32;
+
+/// What an admin is told at that cap. Names [`MAX_OPEN_INVITES`]'s number.
+const TOO_MANY_INVITES: &str =
+    "there are already 32 codes waiting; revoke one before you make another\n";
+
+/// The one sentence for every code this server will not accept.
+///
+/// ⚠ **Unknown, spent, revoked, expired and malformed all get this**, for the reason
+/// [`Accounts::sign_in`] gives one sentence for a wrong password and a username that does not
+/// exist. Telling somebody that a code *was* real but has expired is an oracle that says they
+/// hit a live value.
+///
+/// ⚠ **It says to wait, and that is not politeness.** A wrong code spends this address's
+/// failure budget, which is the **same** budget sign-in uses ([`MAX_FAILURES`] in
+/// [`WINDOW`]), so ten wrong codes stop sign-in from that address for fifteen minutes too.
+/// Telling the person to ask for another code would send them back to a server that is going
+/// to refuse the new one as well.
+const BAD_CODE: &str =
+    "that invite code is not one this server is waiting for; check it and wait a moment \
+     before you try again\n";
+
+/// One invite code, as replayed from the log.
+///
+/// ⚠ **No `#[derive(Debug)]`, and the redaction below is written by hand.** The code is a
+/// bearer credential: whoever holds it gets an account on this server. It joins [`Account`]'s
+/// pattern for the same reason — see the module header on feedback 34's four latent derives.
+///
+/// The code is stored **in the clear**, and the argument is worth writing down because a
+/// reviewer will challenge it. `accounts.json` lives inside `--data`, beside the `.vellum`
+/// files, so **anybody who can read that file already has the boards**. Hashing the code
+/// would defend against a reader of the file who does not have the directory, and there is no
+/// such reader; the same file already holds the Argon2 hashes, which are what an offline
+/// cracker actually wants, and [`open_for_append`] sets `0o600` for exactly that reason. What
+/// plaintext buys is real for a household: an admin can re-read a code they minted and lost,
+/// and revoke can name the code itself rather than needing a second, non-secret id beside it.
+/// `blake3` is already a dependency of this crate and is **deliberately unused here**, named
+/// so the next reader does not conclude it was overlooked.
+#[derive(Clone)]
+struct Invite {
+    /// Canonical: uppercase, ungrouped, [`CODE_CHARS`] long. The hyphens are display only.
+    code: String,
+    /// The username of the admin who minted it.
+    by: String,
+    /// Seconds since the epoch. Expiry is measured from here.
+    at: u64,
+    /// The account this code made, once it has made one. A code is spent once.
+    used_by: Option<String>,
+    used_at: Option<u64>,
+    revoked_at: Option<u64>,
+}
+
+impl std::fmt::Debug for Invite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Everything except the code, which is the whole secret. Replaced by a fixed word
+        // rather than by its length, which is itself a fact somebody chose.
+        f.debug_struct("Invite")
+            .field("code", &"<redacted>")
+            .field("by", &self.by)
+            .field("at", &self.at)
+            .field("used_by", &self.used_by)
+            .field("used_at", &self.used_at)
+            .field("revoked_at", &self.revoked_at)
+            .finish()
+    }
+}
+
+/// A fresh code: [`CODE_CHARS`] symbols from the operating system's own generator.
+fn new_invite_code() -> String {
+    let mut bytes = [0u8; CODE_CHARS];
+    // ⚠ `OsRng` and nothing else, for the reason [`new_session_id`] gives: a code is a bearer
+    // credential, and a userspace PRNG is a seed somebody has to have got right.
+    OsRng.fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(CODE_CHARS);
+    for byte in bytes {
+        // 256 divides by 32 exactly, so masking to five bits is uniform. No rejection loop
+        // and no modulo bias: `byte % 26` would make some symbols 1.2 times as likely.
+        out.push(CODE_ALPHABET[(byte & 0x1F) as usize] as char);
+    }
+    out
+}
+
+/// A code as a person typed it, reduced to the one spelling this file stores and compares.
+///
+/// Returns `None` for anything that is not a code, with no reason attached: every refusal on
+/// this route is [`BAD_CODE`], so a reason string here would be a second sentence nobody ever
+/// sends. Grouping, case and spaces are all forgiven, because a person reads a code off a
+/// message and types it into a phone.
+fn fold_code(raw: &str) -> Option<String> {
+    let mut folded = String::with_capacity(CODE_CHARS);
+    for ch in raw.chars() {
+        if ch == '-' || ch.is_ascii_whitespace() {
+            continue;
+        }
+        // ⚠ Before any `as u8`. A non-ASCII character truncates to a byte that can land
+        // inside the alphabet: `'İ' as u8` is not `'İ'`.
+        if !ch.is_ascii() {
+            return None;
+        }
+        let ch = match ch.to_ascii_uppercase() {
+            // Crockford's own read aliases. The alphabet leaves these out; a person who typed
+            // one meant the digit beside it, and refusing costs a support message.
+            //
+            // `U` is **not** aliased. It is out of the alphabet on purpose and there is no
+            // digit it resembles.
+            'I' | 'L' => '1',
+            'O' => '0',
+            other => other,
+        };
+        if !CODE_ALPHABET.contains(&(ch as u8)) {
+            return None;
+        }
+        if folded.len() == CODE_CHARS {
+            return None;
+        }
+        folded.push(ch);
+    }
+    (folded.len() == CODE_CHARS).then_some(folded)
+}
+
+/// A stored code, hyphenated for reading aloud: `K7QM-3XPT-9WNZ`.
+fn grouped(code: &str) -> String {
+    let mut out = String::with_capacity(code.len() + code.len() / CODE_GROUP);
+    for (index, ch) in code.chars().enumerate() {
+        if index > 0 && index % CODE_GROUP == 0 {
+            out.push('-');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Whether this code can still be spent. See [`INVITE_LIFE`] on the clock it uses.
+fn invite_is_open(invite: &Invite, now: u64) -> bool {
+    invite.used_by.is_none()
+        && invite.revoked_at.is_none()
+        && now < invite.at.saturating_add(INVITE_LIFE.as_secs())
+}
+
+/// The word the admin list shows for one code.
+///
+/// ⚠ Expiry is evaluated **here and at redemption, never at replay**: "expired" is a function
+/// of now, and replay happens at boot.
+fn invite_state(invite: &Invite, now: u64) -> &'static str {
+    if invite.used_by.is_some() {
+        "used"
+    } else if invite.revoked_at.is_some() {
+        "revoked"
+    } else if invite_is_open(invite, now) {
+        "open"
+    } else {
+        "expired"
+    }
+}
+
 // ----- the store ----------------------------------------------------------------------------
 
 /// Everything this file knows, and the only thing that writes `accounts.json`.
@@ -471,6 +737,16 @@ pub struct Accounts {
     founder: Option<String>,
     /// Board id (its file stem) to who owns it.
     boards: BTreeMap<String, Ownership>,
+    /// Canonical invite code to invite, spent and revoked ones included.
+    ///
+    /// ⚠ **This is the only unbounded map on this struct, and it is said out loud rather
+    /// than discovered.** `sessions` is capped at [`MAX_SESSIONS`], and `failures` and
+    /// `attempts` at [`MAX_TRACKED`]. Spent and expired invites are never compacted out of an
+    /// append-only file, so this grows by one entry for every code ever minted here and is
+    /// rebuilt in full on every restart. [`MAX_OPEN_INVITES`] caps how many may be *open*, not
+    /// how many may exist. Only an admin can add to it, and a household mints a few dozen
+    /// codes in a lifetime, so the bound is the admin rather than a number.
+    invites: BTreeMap<String, Invite>,
     /// Session id to session.
     sessions: BTreeMap<String, Session>,
     /// A real Argon2id hash of a password nobody has, verified against when the username is
@@ -494,6 +770,8 @@ impl std::fmt::Debug for Accounts {
             .field("log", &self.log)
             .field("accounts", &self.accounts.len())
             .field("boards", &self.boards.len())
+            // A count, never the contents: the map's **key** is an invite code.
+            .field("invites", &self.invites.len())
             .field("sessions", &self.sessions.len())
             .field("setup_open", &self.setup_open)
             .field("unreadable", &self.unreadable)
@@ -529,7 +807,7 @@ fn is_false(flag: &bool) -> bool {
 /// being ignored is what lets a file written by a newer build parse here; the container
 /// default is what lets one written by an older build parse, from before a field existed.
 ///
-/// ⚠ No `#[derive(Debug)]`: `hash` is on it.
+/// ⚠ No `#[derive(Debug)]`: `hash` is on it, and `code` joined it.
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
 struct Record {
@@ -547,19 +825,32 @@ struct Record {
     owner: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     shared: Vec<String>,
-    /// Seconds since the epoch, for a person reading the file. **Nothing reads it back.**
+    /// An invite code, canonical and ungrouped.
+    ///
+    /// On an `invite` or an `invite-revoked` record it is the code itself. On an `account`
+    /// record it is the code that was **spent** to make that account — see
+    /// [`Accounts::apply`] on why spending has no record of its own.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    code: String,
+    /// The username of the admin who minted an invite code.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    by: String,
+    /// Seconds since the epoch, for a person reading the file. ⚠ **`at` on an `invite`
+    /// record is the one exception to the line below: [`INVITE_LIFE`] is measured from it.**
     ///
     /// ⚠ Seconds, and said out loud: `library_api::TrashedBoard::at` carries the same unit
     /// beside a sibling in milliseconds, and CLAUDE.md records `unix_now() * 1_000` — a clock
-    /// that ticks once a second — costing an animation its whole existence. Since no decision
-    /// here depends on it, a wrong unit is cosmetic, which is exactly why it is worth saying
-    /// that it *is* seconds rather than leaving somebody to guess.
+    /// that ticks once a second — costing an animation its whole existence. It used to decide
+    /// nothing at all; an invite's expiry now reads it, so a wrong unit here would make every
+    /// code either immortal or born dead.
     at: u64,
 }
 
 const KIND_ACCOUNT: &str = "account";
 const KIND_ACCOUNT_REMOVED: &str = "account-removed";
 const KIND_BOARD: &str = "board";
+const KIND_INVITE: &str = "invite";
+const KIND_INVITE_REVOKED: &str = "invite-revoked";
 
 fn now_seconds() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs())
@@ -579,6 +870,7 @@ impl Accounts {
             accounts: BTreeMap::new(),
             founder: None,
             boards: BTreeMap::new(),
+            invites: BTreeMap::new(),
             sessions: BTreeMap::new(),
             // ⚠ **Hashed here, at construction, rather than pasted in as a constant.** The
             // decoy has to have been produced by *these* parameters or the timing it exists
@@ -677,14 +969,45 @@ impl Accounts {
                 if self.founder.is_none() {
                     self.founder = Some(record.username.clone());
                 }
+                let username = record.username;
+                let at = record.at;
                 self.accounts.insert(
-                    record.username.clone(),
+                    username.clone(),
                     Account {
-                        username: record.username,
+                        username: username.clone(),
                         hash: record.hash,
                         admin: record.admin,
                     },
                 );
+                // ⚠ **There is no `invite-used` record. Spending is carried by the `account`
+                // record itself**, and that is the decision that matters most in this format:
+                // redemption is one append, one line, one `sync_all`. Two records would have
+                // a window between them, and a crash in that window would leave either an
+                // account with a live code — single use broken — or a spent code with no
+                // account. A torn write loses both together, which is the recoverable state.
+                if !record.code.is_empty() {
+                    let code = record.code;
+                    // `or_insert_with`, not `get_mut`. An account record naming a code whose
+                    // `invite` line has not been seen yet — a reordered or hand-edited file —
+                    // would otherwise leave the code open, which is the unsafe direction. A
+                    // placeholder marked spent closes it, and the real `invite` line arriving
+                    // later hits the `or_insert_with` below and is ignored.
+                    let invite = self.invites.entry(code.clone()).or_insert_with(|| Invite {
+                        code,
+                        by: String::new(),
+                        at,
+                        used_by: None,
+                        used_at: None,
+                        revoked_at: None,
+                    });
+                    // First write wins here, unlike every other key in this replay: a code is
+                    // spent once, and a second account naming it is a hand-edit rather than a
+                    // state change.
+                    if invite.used_by.is_none() {
+                        invite.used_by = Some(username);
+                        invite.used_at = Some(at);
+                    }
+                }
             }
             KIND_ACCOUNT_REMOVED => {
                 self.accounts.remove(&record.username);
@@ -709,6 +1032,34 @@ impl Accounts {
                     Ownership { owner: record.owner, shared: record.shared },
                 );
             }
+            KIND_INVITE => {
+                if record.code.is_empty() {
+                    return;
+                }
+                let code = record.code;
+                let (by, at) = (record.by, record.at);
+                // `or_insert_with`, not `insert`: a duplicate `invite` line — a hand-edit, two
+                // files concatenated — must not wipe the used or revoked state a later line
+                // already recorded.
+                self.invites.entry(code.clone()).or_insert_with(|| Invite {
+                    code,
+                    by,
+                    at,
+                    used_by: None,
+                    used_at: None,
+                    revoked_at: None,
+                });
+            }
+            KIND_INVITE_REVOKED => {
+                if let Some(invite) = self.invites.get_mut(&record.code) {
+                    invite.revoked_at = Some(record.at);
+                }
+            }
+            // ⚠ **`KIND_ACCOUNT_REMOVED` touches no invite, and that is deliberate.** It is
+            // handled above and is named again here because this is where somebody will
+            // reach to "tidy up": removing the account a code created must not bring the code
+            // back. `removing_an_invited_account_does_not_bring_its_code_back` pins it.
+            //
             // An unknown kind from a newer build. Skipped for the reason `v` is.
             _ => {}
         }
@@ -1145,6 +1496,27 @@ impl Accounts {
     fn holder_of(&self, presented: &str) -> Option<String> {
         self.sessions.keys().find(|held| same_secret(held.as_str(), presented)).cloned()
     }
+
+    /// The stored code equal to the presented one **and still spendable**, or nothing.
+    ///
+    /// ⚠ **Compared with [`same_secret`], never with `BTreeMap::get`**, for the reason
+    /// [`Accounts::identity_of`] gives: a map lookup on a client-presented secret compares
+    /// keys byte by byte with an early return, which is the timing oracle spelled with a
+    /// container instead of a `==`. Every code is [`CODE_CHARS`] long, so `same_secret`'s
+    /// honest length check leaks nothing. A miss scans the whole map; a hit stops at the
+    /// matching key, which leaks that code's sort position to somebody who already holds it.
+    ///
+    /// `presented` must already be folded. `now` is wall-clock seconds — see [`INVITE_LIFE`].
+    fn open_invite(&self, presented: &str, now: u64) -> Option<String> {
+        let held = self.invites.keys().find(|held| same_secret(held.as_str(), presented)).cloned()?;
+        let invite = self.invites.get(&held)?;
+        invite_is_open(invite, now).then_some(held)
+    }
+
+    /// How many codes are still spendable, for [`MAX_OPEN_INVITES`].
+    fn open_invites(&self, now: u64) -> usize {
+        self.invites.values().filter(|invite| invite_is_open(invite, now)).count()
+    }
 }
 
 /// Whether a session has run out either way. See [`SESSION_IDLE`] and [`SESSION_MAX`].
@@ -1178,13 +1550,36 @@ fn new_session_id() -> String {
 
 /// What an account change decided, before anything is written to the socket.
 ///
-/// ⚠ No `#[derive(Debug)]`: nothing here carries a secret today, and a derive is what lets
-/// the next field carry one silently.
+/// ⚠ **No `#[derive(Debug)]`, and that stopped being a nicety the day [`Change::Minted`]
+/// landed.** This doc used to say *"nothing here carries a secret today"*; `Minted` carries a
+/// live invite code, which is a bearer credential for an account on this server. The missing
+/// derive is now the mechanism rather than the precaution, and adding one would put a code
+/// into the first `{change:?}` somebody writes while chasing a 403.
 enum Change {
     Made(Identity),
+    /// The account is not there, or the code is not open. See [`Accounts::revoke_invite`] on
+    /// why revoking answers this whatever the code was.
     Gone,
+    /// A board's shared list is now what the request asked for, whether or not a record had
+    /// to be written for it.
+    Recorded,
+    /// ⚠ Carries a live invite code. See the note on this enum.
+    Minted {
+        /// Grouped for reading: `K7QM-3XPT-9WNZ`.
+        code: String,
+        /// Wall-clock seconds. See [`INVITE_LIFE`].
+        expires: u64,
+    },
     Taken,
-    NotAllowed,
+    /// Signed in, and not allowed to do this. ⚠ **It carries its own sentence**, because
+    /// four different rules answer 403 now — only an admin may create an account on a server
+    /// that has one, may mint a code, may revoke one, and only a board's owner or an admin
+    /// may share it — and one shared sentence would tell three of them the wrong thing.
+    NotAllowed(&'static str),
+    /// The invite code offered is not one this server will accept. See [`BAD_CODE`].
+    BadCode,
+    /// This address has spent its failure budget. See [`MAX_FAILURES`].
+    Throttled,
     Refused(&'static str),
     Broken,
 }
@@ -1208,21 +1603,82 @@ impl Accounts {
     /// non-empty, setup is shut, and the second request is refused for want of an admin
     /// session. There is no window because there is no gap between the test and the write.
     ///
-    /// Once one account exists this needs an admin, for ever. The only way back to an open
-    /// setup is an empty `accounts.json`, which nothing in this program can produce.
+    /// Once one account exists this needs an admin, for ever, **or an invite code**.
+    ///
+    /// # The three ways this succeeds, checked in this order
+    ///
+    /// 1. **Setup.** [`Accounts::setup_open`] is true. No caller and no code are needed, any
+    ///    `code` in the body is ignored and never spent, and the account is forced `admin`.
+    /// 2. **An admin.** `by` is an admin. `admin` comes from the body. A code is ignored.
+    /// 3. **A code.** No admin caller, and `code` names an invite that is open. The account
+    ///    is forced **`admin: false`** whatever the body asked for.
+    ///
+    /// ⚠ **An invite cannot exist while setup is open, and that is provable rather than
+    /// checked.** `setup_open` is true only when the file was absent or zero bytes; minting
+    /// appends a record, which makes it non-empty; and minting needs an [`Identity`], which
+    /// needs an account, which needs an `account` record. So case 1 can never be silently
+    /// consuming a real code. It is written as an *ordering* rather than as an assertion so
+    /// that a future change which does let an invite exist here degrades to "the code was
+    /// ignored" rather than to "the code was silently spent".
+    ///
+    /// ⚠ **A file that cannot be read refuses the whole request, code or no code.** An
+    /// unreadable log is a log whose invites cannot be verified, and a gate degraded to its
+    /// default is a gate that is open. That is the first line of this function and it is the
+    /// same rule `sign_in` follows.
+    ///
+    /// # Where the expensive work sits
+    ///
+    /// The 19 MiB Argon2 hash is **behind a valid code**. A wrong-code flood costs a body
+    /// parse, a lock and a constant-time scan. A valid code with a too-short password is
+    /// refused before the hash and **the code is not spent**, so the person retries with a
+    /// longer one; the same is true of a username already taken.
     fn create_account(
         &mut self,
         raw_username: &str,
         password: &str,
         admin: bool,
+        code: &str,
         by: Option<&Identity>,
+        wire: &Wire,
     ) -> Change {
+        // ⚠ Seven parameters counting `self`, which is **exactly** clippy's
+        // `too_many_arguments` threshold: the lint fires above seven, so this passes with
+        // zero headroom. An eighth needs a struct, not another parameter.
         if self.unreadable {
             return Change::Broken;
         }
         let first = self.setup_open();
+        // The canonical code this request spent, once it is known to be spendable.
+        let mut redeemed: Option<String> = None;
         if !first && !by.is_some_and(|caller| caller.admin) {
-            return Change::NotAllowed;
+            if code.is_empty() {
+                return Change::NotAllowed(
+                    "only an admin may create an account on a server that has one\n",
+                );
+            }
+            // ⚠ **Malformed is refused before the limiter is touched**, the rule `sign_in`
+            // follows for a username that will not fold: a code with the wrong number of
+            // characters is a client bug or a typo rather than a guess, and spending the
+            // address's budget on it would let a fumbling family member lock out sign-in.
+            let Some(folded) = fold_code(code) else {
+                return Change::BadCode;
+            };
+            let now = Instant::now();
+            if let Some(address) = &wire.address
+                && self.address_is_over_budget(address, now)
+            {
+                return Change::Throttled;
+            }
+            let Some(held) = self.open_invite(&folded, now_seconds()) else {
+                if let Some(address) = &wire.address {
+                    self.record_failure(address.clone(), now);
+                }
+                return Change::BadCode;
+            };
+            // ⚠ **A successful redemption does not clear the address's record**, unlike a
+            // successful sign-in. Clearing on success would let somebody holding one valid
+            // code reset their guessing budget at will.
+            redeemed = Some(held);
         }
         let username = match fold_username(raw_username) {
             Ok(username) => username,
@@ -1238,8 +1694,15 @@ impl Accounts {
             return Change::Broken;
         };
         // The first account is always an admin whatever the body asked for; every later one
-        // is what the admin making it asked for.
-        let admin = first || admin;
+        // is what the admin making it asked for; and an account made with a code never is.
+        //
+        // ⚠ `self.accounts.is_empty()` rather than `first` alone. They are the same today,
+        // and they come apart the moment anything other than a signed-in admin can write to
+        // this log — a file holding only board records, or only records from a newer build,
+        // loads with no accounts and setup closed. An account made there must still be an
+        // admin, or the server has accounts and nobody who can manage them, and setup does
+        // not reopen.
+        let admin = if redeemed.is_some() { false } else { self.accounts.is_empty() || admin };
 
         let record = Record {
             v: VERSION,
@@ -1247,6 +1710,9 @@ impl Accounts {
             username: username.clone(),
             hash: hash.clone(),
             admin,
+            // Empty unless a code was spent, and `skip_serializing_if` keeps it out of the
+            // line entirely when it is. This one field is what makes redemption one record.
+            code: redeemed.clone().unwrap_or_default(),
             at: now_seconds(),
             ..Record::default()
         };
@@ -1267,7 +1733,247 @@ impl Accounts {
         self.setup_open = false;
         self.accounts
             .insert(username.clone(), Account { username: username.clone(), hash, admin });
+        // The same fold `apply` performs on replay, so a running server and a restarted one
+        // agree about which codes are spent without the fact being stored twice.
+        if let Some(held) = &redeemed {
+            let at = record.at;
+            let invite = self.invites.entry(held.clone()).or_insert_with(|| Invite {
+                code: held.clone(),
+                by: String::new(),
+                at,
+                used_by: None,
+                used_at: None,
+                revoked_at: None,
+            });
+            if invite.used_by.is_none() {
+                invite.used_by = Some(username.clone());
+                invite.used_at = Some(at);
+            }
+        }
         Change::Made(Identity { username, admin })
+    }
+
+    /// Mint one invite code.
+    ///
+    /// ⚠ **The bearer token cannot reach this, and that is a decision rather than an
+    /// oversight.** `Caller::Token` is not an [`Identity`], and the handler resolves its
+    /// caller through [`identity`], which reads the session cookie alone. Letting the token
+    /// mint would let an invite record exist on a server with no accounts, which closes setup
+    /// with `accounts` empty — and the first account made after that would be whatever the
+    /// body asked for, would become the founder, and would own every board with no ownership
+    /// record. What it costs is stated: an operator who has the token and has lost the admin
+    /// password cannot make accounts. That is already true today and is not a regression.
+    fn create_invite(&mut self, by: &Identity) -> Change {
+        if self.unreadable {
+            return Change::Broken;
+        }
+        if !by.admin {
+            return Change::NotAllowed("only an admin may make an invite code\n");
+        }
+        let at = now_seconds();
+        if at == 0 {
+            // ⚠ [`now_seconds`] answers 0 when the clock is before the epoch, and
+            // `0 + INVITE_LIFE` is a date in 1970 — so every code would be born expired with
+            // no sign of why. A 400 blaming the client is slightly wrong for a server fault
+            // and is cheaper than a status arm for a state that needs a clock set before 1970.
+            return Change::Refused("this server's clock is not set, so a code cannot be dated\n");
+        }
+        if self.open_invites(at) >= MAX_OPEN_INVITES {
+            return Change::Refused(TOO_MANY_INVITES);
+        }
+        // A plain map lookup, and that is correct here: the value is one this process just
+        // generated rather than one a client presented, so there is no remote channel to
+        // leak through. Four tries against a 2^60 space is a formality; refusing after them
+        // is better than a loop whose exit depends on a generator.
+        let mut code = String::new();
+        for _ in 0..4 {
+            let candidate = new_invite_code();
+            if !self.invites.contains_key(&candidate) {
+                code = candidate;
+                break;
+            }
+        }
+        if code.is_empty() {
+            return Change::Broken;
+        }
+        let record = Record {
+            v: VERSION,
+            kind: KIND_INVITE.to_owned(),
+            code: code.clone(),
+            by: by.username.clone(),
+            at,
+            ..Record::default()
+        };
+        if let Err(error) = self.append(&record) {
+            // The path and the reason, never the record: it holds the code.
+            eprintln!(
+                "velmd: could not record an invite code in {}: {}",
+                printable(&self.log.display().to_string()),
+                printable(&error.to_string())
+            );
+            return Change::Broken;
+        }
+        self.invites.insert(code.clone(), Invite {
+            code: code.clone(),
+            by: by.username.clone(),
+            at,
+            used_by: None,
+            used_at: None,
+            revoked_at: None,
+        });
+        Change::Minted {
+            code: grouped(&code),
+            expires: at.saturating_add(INVITE_LIFE.as_secs()),
+        }
+    }
+
+    /// Revoke one invite code.
+    ///
+    /// ⚠ **[`Change::Gone`] in every reachable case, like signing out.** The desired state is
+    /// reached whether the code was open, spent, revoked already or never a code at all, and
+    /// the admin surface re-fetches the list, which is where the truth shows. A spent code is
+    /// **not** revoked and writes nothing: spent is spent, and a revoke record after a use
+    /// would be noise in a file that is never compacted.
+    fn revoke_invite(&mut self, raw_code: &str, by: &Identity) -> Change {
+        if self.unreadable {
+            return Change::Broken;
+        }
+        if !by.admin {
+            return Change::NotAllowed("only an admin may revoke an invite code\n");
+        }
+        let Some(code) = fold_code(raw_code) else {
+            return Change::Gone;
+        };
+        let at = now_seconds();
+        let Some(held) = self.open_invite(&code, at) else {
+            return Change::Gone;
+        };
+        let record = Record {
+            v: VERSION,
+            kind: KIND_INVITE_REVOKED.to_owned(),
+            code: held.clone(),
+            at,
+            ..Record::default()
+        };
+        if let Err(error) = self.append(&record) {
+            eprintln!(
+                "velmd: could not record an invite change in {}: {}",
+                printable(&self.log.display().to_string()),
+                printable(&error.to_string())
+            );
+            return Change::Broken;
+        }
+        if let Some(invite) = self.invites.get_mut(&held) {
+            invite.revoked_at = Some(at);
+        }
+        Change::Gone
+    }
+
+    /// Add somebody to a board's shared list, or take them off it.
+    ///
+    /// # ⚠ Why this exists at all
+    ///
+    /// [`Accounts::allowed`] has read a per-board shared list since accounts landed,
+    /// [`Ownership`] has held one, and [`Record`] has serialised one — and **no route ever
+    /// put a name in it**. So an invited family member signed in and saw an empty board list,
+    /// which makes an invite code useless on its own. This is that route's rule engine.
+    ///
+    /// # The rules
+    ///
+    /// - **Only the board's owner, or an admin.** Not every signed-in account, and *not*
+    ///   somebody the board was merely shared with: sharing is not a transferable power, or
+    ///   one share puts the board one hop from everybody.
+    /// - **The name must be an account here.** Refused with a sentence rather than accepted
+    ///   silently, because a share that names nobody looks exactly like a share that worked.
+    ///   It tells the caller that a username exists; they are the board's owner or an admin,
+    ///   and an admin can already list every account.
+    /// - **A board with no ownership record belongs to the founder**, which is
+    ///   [`Accounts::owner_of`]'s existing rule and covers every board that was in the data
+    ///   directory before accounts were switched on. The founder can therefore share those.
+    /// - ⚠ **The record keeps the owner it already named**, resolved only when there is none
+    ///   to keep. `owner_of`'s fall back to the founder is *derived*, never written down: an
+    ///   admin sharing a board whose owner has been removed must not materialise themselves
+    ///   as its owner, or an account made again with that name never gets the board back.
+    /// - **Append-only, and the last record wins on replay**, which is how [`Accounts::apply`]
+    ///   already reads `KIND_BOARD`. Nothing is rewritten.
+    /// - **Nothing is written when the list is already what was asked for**, so sharing twice
+    ///   costs one line rather than two, and unsharing a name that is not there costs none.
+    ///
+    /// ⚠ The board's **file** is not checked to exist, and that is the lock rule rather than
+    /// laziness: finding a board needs `Server::boards`, and this runs under the accounts
+    /// lock, which must never be held at the same time. `serve.rs` calls
+    /// [`may_see`] before this, which answers 404 for a board this caller cannot see and is
+    /// the check a stranger meets.
+    ///
+    /// ⚠ The bearer token cannot reach this either, for [`Accounts::create_invite`]'s reason:
+    /// the handler resolves an [`Identity`] from the session cookie, and `Caller::Token` is
+    /// not one.
+    fn set_share(&mut self, board: &str, raw_username: &str, by: &Identity, add: bool) -> Change {
+        if self.unreadable {
+            return Change::Broken;
+        }
+        if board.is_empty() {
+            return Change::Refused("that is not a board on this server\n");
+        }
+        // Resolved, so that the founder's fallback applies to a board with no record.
+        let resolved = self.owner_of(board).map(str::to_owned);
+        if resolved.as_deref() != Some(by.username.as_str()) && !by.admin {
+            return Change::NotAllowed("only a board's owner, or an admin, may share it\n");
+        }
+        let Ok(username) = fold_username(raw_username) else {
+            return Change::Refused("that is not a username on this server\n");
+        };
+        if !self.accounts.contains_key(&username) {
+            return Change::Refused("there is no account with that name on this server\n");
+        }
+        let recorded = self.boards.get(board).cloned();
+        // ⚠ The stored owner verbatim when there is one. See the note above.
+        let owner = match &recorded {
+            Some(record) => record.owner.clone(),
+            None => match resolved {
+                Some(founder) => founder,
+                // No accounts and no founder. Unreachable through a session, since a session
+                // needs an account; refused rather than written as a record with no owner,
+                // which `apply` would skip on the next restart.
+                None => return Change::Refused("that is not a board on this server\n"),
+            },
+        };
+        let mut shared = recorded.map(|record| record.shared).unwrap_or_default();
+        if username == owner {
+            // The owner already sees it. Nothing to record either way.
+            return Change::Recorded;
+        }
+        if shared.contains(&username) == add {
+            return Change::Recorded;
+        }
+        if add {
+            shared.push(username);
+            // Sorted so that the same set of people is the same line whatever order they
+            // were added in, which is what makes a file diff readable.
+            shared.sort();
+        } else {
+            shared.retain(|held| held != &username);
+        }
+        let record = Record {
+            v: VERSION,
+            kind: KIND_BOARD.to_owned(),
+            board: board.to_owned(),
+            owner: owner.clone(),
+            shared: shared.clone(),
+            at: now_seconds(),
+            ..Record::default()
+        };
+        if let Err(error) = self.append(&record) {
+            eprintln!(
+                "velmd: could not record who may see {} in {}: {}",
+                printable(board),
+                printable(&self.log.display().to_string()),
+                printable(&error.to_string())
+            );
+            return Change::Broken;
+        }
+        self.boards.insert(board.to_owned(), Ownership { owner, shared });
+        Change::Recorded
     }
 
     /// Remove an account. Boards it owned revert to the founder.
@@ -1295,7 +2001,7 @@ impl Accounts {
             return Change::Broken;
         }
         if !by.admin {
-            return Change::NotAllowed;
+            return Change::NotAllowed("only an admin may remove an account\n");
         }
         let Ok(username) = fold_username(raw_username) else {
             return Change::Refused("that is not a username on this server\n");
@@ -1370,6 +2076,18 @@ impl Accounts {
     /// must not fail, it is wrong the moment a board arrives afterwards, and a board that
     /// appeared between the listing and the write would be owned by nobody. A rule that
     /// answers for boards that do not exist yet cannot go stale.
+    /// Who owns this board and who it is shared with, if this account is entitled to know.
+    ///
+    /// See [`sharing_of`], the route-facing wrapper, for why this is not [`Self::allowed`]
+    /// and why it is not folded together with [`Self::set_share`]'s identical-looking rule.
+    fn sharing_seen_by(&self, board: &str, by: &Identity) -> Option<(String, Vec<String>)> {
+        let owner = self.owner_of(board)?.to_owned();
+        if owner != by.username && !by.admin {
+            return None;
+        }
+        Some((owner, self.boards.get(board).map(|r| r.shared.clone()).unwrap_or_default()))
+    }
+
     fn owner_of(&self, board: &str) -> Option<&str> {
         match self.boards.get(board) {
             // A recorded owner whose account is gone falls through to the founder, which is
@@ -1506,6 +2224,30 @@ pub fn may_see(server: &Server, board: &str, caller: Option<&Caller>) -> bool {
     })
 }
 
+/// Who owns this board and who it is shared with, for a caller entitled to know.
+///
+/// `None` means *"do not tell this caller"*, and it is the answer in three different cases
+/// that all deserve the same silence: the caller is neither the owner nor an admin, the
+/// caller is the bearer token rather than an account, or there is no owner to name at all.
+/// The board list simply omits both keys, and `web/boards.js` already treats an absent
+/// `shared` as "this server does not say" rather than as "nobody" — the two readings differ
+/// and the client was written for the distinction before this function existed.
+///
+/// ⚠ **The rule is [`Accounts::set_share`]'s rule, restated deliberately rather than shared.**
+/// Both are "the owner, or an admin", and it is tempting to factor them into one predicate.
+/// They answer different questions: this one guards *knowing who has access*, that one guards
+/// *changing it*, and a later decision to let anyone a board is shared with see the other
+/// names would move this one and must not move that one. Two call sites, two sentences.
+///
+/// ⚠ **Not [`Accounts::allowed`], which is a weaker gate.** Everyone a board is shared with
+/// passes `allowed`, so building the list from it would tell each of them the names of all the
+/// others. That is a disclosure the contract never promised.
+/// The rule itself lives on [`Accounts`] so a test can reach it without an HTTP server.
+pub fn sharing_of(server: &Server, board: &str, caller: Option<&Caller>) -> Option<(String, Vec<String>)> {
+    let Some(Caller::Account(identity)) = caller else { return None };
+    server.accounts.lock().ok()?.sharing_seen_by(board, identity)
+}
+
 /// Record a newly created board's owner. Called after a create or an import.
 ///
 /// A failure is logged and not fatal: the board exists, and an unrecorded board belongs to
@@ -1576,8 +2318,29 @@ fn session_cookie(headers: &BTreeMap<String, String>) -> Option<String> {
 struct Credentials {
     username: String,
     password: String,
-    /// Only read when an admin is creating somebody else. The first account forces it true.
+    /// Only read when an admin is creating somebody else. The first account forces it true,
+    /// and an account made with an invite code forces it false.
     admin: bool,
+    /// The invite code this request offers, or `""`.
+    ///
+    /// Optional through the container's `#[serde(default)]`, so a client written before
+    /// invite codes existed sends the same body it always did.
+    code: String,
+}
+
+/// The body of a share request: the person to add or to take off.
+///
+/// ⚠ No `#[derive(Debug)]` by reflex here either. It holds no secret today, and that
+/// sentence is exactly what [`Change`]'s doc used to say.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Sharing {
+    username: String,
+}
+
+/// Read a share body, or say it is not one.
+fn sharing(body: &[u8]) -> Option<Sharing> {
+    serde_json::from_slice(body).ok()
 }
 
 /// Read the body, or say why it is not one.
@@ -1855,9 +2618,16 @@ pub fn whoami(
 
 /// `POST /api/v1/accounts` — make an account.
 ///
-/// Unauthenticated **only** while this server has never been set up, in which case the
-/// account it makes is the owner. See [`Accounts::create_account`] for how the race between
-/// two setup requests is closed.
+/// Unauthenticated in two cases and no others: while this server has never been set up, in
+/// which case the account it makes is the owner, and when the body carries an invite code,
+/// which **is** the credential the request presents. See [`Accounts::create_account`] for how
+/// the race between two setup requests is closed and for the order the three ways are checked
+/// in.
+///
+/// ⚠ **`Content-Type: application/json` is required, and it is checked first.** That is the
+/// whole CSRF defence on this route — see [`sent_as_json`], where the `enctype="text/plain"`
+/// form that founds a server from any page the owner visits is written out. It matters more
+/// now, not less: a forged request that could carry a code would be a forged account.
 pub fn create_account(
     server: &Server,
     headers: &BTreeMap<String, String>,
@@ -1886,11 +2656,175 @@ pub fn create_account(
     // ⚠ Resolved **before** the accounts lock is taken, because `identity` takes it too and a
     // `Mutex` is not reentrant: taking it twice on one thread is a deadlock, not an error.
     let caller = identity(server, headers);
+    let wire = wire_of(headers, stream, server.config.behind_https);
 
     let change = {
         let mut accounts =
             server.accounts.lock().map_err(|_| anyhow::anyhow!("accounts lock poisoned"))?;
-        accounts.create_account(&creds.username, &creds.password, creds.admin, caller.as_ref())
+        accounts.create_account(
+            &creds.username,
+            &creds.password,
+            creds.admin,
+            &creds.code,
+            caller.as_ref(),
+            &wire,
+        )
+    };
+    answer_change(stream, change, origin)
+}
+
+/// `POST /api/v1/invites` — an admin mints one code.
+///
+/// ⚠ **The body is required to be JSON and is then not read.** It may be `{}`. There is no
+/// `days` knob and no `admin` knob: a code always makes an ordinary account with a fixed
+/// life, and an admin who wants a second admin creates that account directly through
+/// `POST /api/v1/accounts`, which already honours `admin: true`. The content type is checked
+/// because it is the CSRF defence — see [`sent_as_json`] — and a route that mints a
+/// credential is exactly one worth forging.
+pub fn create_invite(
+    server: &Server,
+    headers: &BTreeMap<String, String>,
+    _body: &[u8],
+    stream: &TcpStream,
+) -> anyhow::Result<()> {
+    let origin = server.config.app_origin.as_deref();
+    if !sent_as_json(headers) {
+        return respond_with(stream, 415, "text/plain", b"send application/json\n", origin, &[]);
+    }
+    // Before the lock, and `Caller::Token` cannot produce one — see
+    // [`Accounts::create_invite`] on why the bearer token may not mint.
+    let Some(caller) = identity(server, headers) else {
+        return respond_with(stream, 401, "text/plain", b"not signed in\n", origin, &[]);
+    };
+    let change = {
+        let mut accounts =
+            server.accounts.lock().map_err(|_| anyhow::anyhow!("accounts lock poisoned"))?;
+        accounts.create_invite(&caller)
+    };
+    if matches!(change, Change::Minted { .. }) {
+        // ⚠ The minter's username, and **never the code**. A code in a log line is a code in
+        // whatever collects that log.
+        eprintln!("velmd: {} made an invite code", printable(&caller.username));
+    }
+    answer_change(stream, change, origin)
+}
+
+/// `GET /api/v1/invites` — an admin lists them.
+pub fn list_invites(
+    server: &Server,
+    headers: &BTreeMap<String, String>,
+    stream: &TcpStream,
+) -> anyhow::Result<()> {
+    let origin = server.config.app_origin.as_deref();
+    let Some(caller) = identity(server, headers) else {
+        return respond_with(stream, 401, "text/plain", b"not signed in\n", origin, &[]);
+    };
+    if !caller.admin {
+        return respond_with(
+            stream,
+            FORBIDDEN,
+            "text/plain",
+            b"only an admin may list invite codes\n",
+            origin,
+            &[],
+        );
+    }
+    let body = {
+        let accounts =
+            server.accounts.lock().map_err(|_| anyhow::anyhow!("accounts lock poisoned"))?;
+        invite_rows(&accounts, now_seconds())
+    };
+    respond_with(stream, 200, "application/json", body.as_bytes(), origin, &[])
+}
+
+/// `DELETE /api/v1/invites/{code}` — an admin revokes one.
+///
+/// ⚠ **The code lands in the request line, so a reverse proxy's access log records it.** That
+/// is acceptable and is worth saying out loud: the effect of the request is to kill the value
+/// it names, so what the proxy writes is dead by the time the line is written. No other route
+/// carries a code in a URL.
+///
+/// No [`sent_as_json`] check, because a `DELETE` carries no body — the same reasoning
+/// [`sign_out`] gives. An HTML form can send only `GET` and `POST`, so nothing a page can
+/// forge reaches a `DELETE` at all, and `SameSite=Strict` is the second layer.
+pub fn revoke_invite(
+    server: &Server,
+    headers: &BTreeMap<String, String>,
+    code: &str,
+    stream: &TcpStream,
+) -> anyhow::Result<()> {
+    let origin = server.config.app_origin.as_deref();
+    let Some(caller) = identity(server, headers) else {
+        return respond_with(stream, 401, "text/plain", b"not signed in\n", origin, &[]);
+    };
+    let change = {
+        let mut accounts =
+            server.accounts.lock().map_err(|_| anyhow::anyhow!("accounts lock poisoned"))?;
+        accounts.revoke_invite(code, &caller)
+    };
+    answer_change(stream, change, origin)
+}
+
+/// `POST /api/v1/boards/{id}/share` — let one more account see this board.
+///
+/// The board id arrives already percent-decoded from `serve.rs`, for the reason the snapshot
+/// route gives: a board id is a file stem and real ones have spaces in them.
+pub fn share_board(
+    server: &Server,
+    headers: &BTreeMap<String, String>,
+    board: &str,
+    body: &[u8],
+    stream: &TcpStream,
+) -> anyhow::Result<()> {
+    let origin = server.config.app_origin.as_deref();
+    if !sent_as_json(headers) {
+        return respond_with(stream, 415, "text/plain", b"send application/json\n", origin, &[]);
+    }
+    let Some(request) = sharing(body) else {
+        return respond_with(stream, 400, "text/plain", b"send {\"username\"}\n", origin, &[]);
+    };
+    let Some(caller) = identity(server, headers) else {
+        return respond_with(stream, 401, "text/plain", b"not signed in\n", origin, &[]);
+    };
+    // ⚠ **Sharing asks whether the board exists; unsharing does not, and the asymmetry is
+    // deliberate.** `may_see` in `serve.rs` answers a question about *permission*, and
+    // `owner_of` gives every board with no ownership record to the founder — so the founder
+    // "may see" a board that was never created, and a typed board id that matches nothing
+    // reached this function and appended a perfectly good record for a board nobody can open.
+    // The person who typed it was told 204 and the account they meant to invite saw nothing.
+    //
+    // 404 with the same sentence every read route uses, so a stranger cannot learn that a
+    // board exists by being told they may not share it.
+    if board_by_id(&server.config.data, board).is_none() {
+        return respond_with(stream, 404, "text/plain", b"no such board\n", origin, &[]);
+    }
+    let change = {
+        let mut accounts =
+            server.accounts.lock().map_err(|_| anyhow::anyhow!("accounts lock poisoned"))?;
+        accounts.set_share(board, &request.username, &caller, true)
+    };
+    answer_change(stream, change, origin)
+}
+
+/// `DELETE /api/v1/boards/{id}/share/{username}` — take one account off a board.
+///
+/// The username is a path segment rather than a body — see [`unshare_target`] for why. No
+/// [`sent_as_json`] check, for [`revoke_invite`]'s reason.
+pub fn unshare_board(
+    server: &Server,
+    headers: &BTreeMap<String, String>,
+    board: &str,
+    username: &str,
+    stream: &TcpStream,
+) -> anyhow::Result<()> {
+    let origin = server.config.app_origin.as_deref();
+    let Some(caller) = identity(server, headers) else {
+        return respond_with(stream, 401, "text/plain", b"not signed in\n", origin, &[]);
+    };
+    let change = {
+        let mut accounts =
+            server.accounts.lock().map_err(|_| anyhow::anyhow!("accounts lock poisoned"))?;
+        accounts.set_share(board, username, &caller, false)
     };
     answer_change(stream, change, origin)
 }
@@ -1937,6 +2871,53 @@ fn rows(accounts: &Accounts) -> String {
     format!("[{}]", rows.join(","))
 }
 
+/// The invite list as JSON. Pure, so a test can assert the wire shape without a socket.
+///
+/// ⚠ Built by hand from named fields, exactly like [`rows`], so a field added to [`Invite`]
+/// cannot join the answer by accident. `state` is one of `open`, `used`, `revoked` or
+/// `expired`; `used_by` and `used_at` appear on a `used` row alone.
+///
+/// Newest first, then by code, so the code the admin has just minted is at the top and the
+/// order is total.
+fn invite_rows(accounts: &Accounts, now: u64) -> String {
+    let mut invites: Vec<&Invite> = accounts.invites.values().collect();
+    invites.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.code.cmp(&b.code)));
+    let rows: Vec<String> = invites
+        .iter()
+        .map(|invite| {
+            let mut fields = vec![
+                format!("\"code\":{}", json_string(&grouped(&invite.code))),
+                format!("\"by\":{}", json_string(&invite.by)),
+                format!("\"at\":{}", invite.at),
+                format!("\"expires\":{}", invite.at.saturating_add(INVITE_LIFE.as_secs())),
+                format!("\"state\":{}", json_string(invite_state(invite, now))),
+            ];
+            if let (Some(used_by), Some(used_at)) = (&invite.used_by, invite.used_at) {
+                fields.push(format!("\"used_by\":{}", json_string(used_by)));
+                fields.push(format!("\"used_at\":{used_at}"));
+            }
+            format!("{{{}}}", fields.join(","))
+        })
+        .collect();
+    format!("[{}]", rows.join(","))
+}
+
+/// The body a mint answers with.
+///
+/// ⚠ **A function rather than a `format!` inside [`answer_change`]**, so the test asserts the
+/// bytes the client actually reads. `the_signed_out_answer_carries_the_key_the_client_branches_on`
+/// records what a tested half and an untested seam cost last time.
+///
+/// `days` is sent for the reason `whoami` sends `session_days`: the client prints it in a
+/// sentence and should not do date arithmetic to get it.
+fn minted_body(code: &str, expires: u64) -> String {
+    format!(
+        "{{\"code\":{},\"expires\":{expires},\"days\":{}}}",
+        json_string(code),
+        INVITE_LIFE.as_secs() / 86_400
+    )
+}
+
 /// Write the response for a finished [`Change`]. Called with the accounts lock already gone.
 fn answer_change(
     stream: &TcpStream,
@@ -1957,15 +2938,31 @@ fn answer_change(
             // [`FORBIDDEN`].
             respond_with(stream, 200, "application/json", body.as_bytes(), origin, &[])
         }
-        Change::Gone => respond_with(stream, 204, "text/plain", b"", origin, &[]),
+        Change::Gone | Change::Recorded => {
+            respond_with(stream, 204, "text/plain", b"", origin, &[])
+        }
+        Change::Minted { code, expires } => {
+            let body = minted_body(&code, expires);
+            respond_with(stream, 200, "application/json", body.as_bytes(), origin, &[])
+        }
         Change::Taken => {
             respond_with(stream, CONFLICT, "text/plain", b"there is already an account with that name\n", origin, &[])
         }
-        Change::NotAllowed => respond_with(
+        Change::NotAllowed(reason) => {
+            respond_with(stream, FORBIDDEN, "text/plain", reason.as_bytes(), origin, &[])
+        }
+        // ⚠ 403 rather than 401. The request was not missing a credential; the credential it
+        // presented is not one this server will take. See [`BAD_CODE`] on why unknown, spent,
+        // revoked and expired all read the same.
+        Change::BadCode => {
+            respond_with(stream, FORBIDDEN, "text/plain", BAD_CODE.as_bytes(), origin, &[])
+        }
+        // The same sentence sign-in gives, because it is the same budget.
+        Change::Throttled => respond_with(
             stream,
-            FORBIDDEN,
+            TOO_MANY,
             "text/plain",
-            b"only an admin may create an account on a server that has one\n",
+            b"too many attempts just now; wait a moment and try again\n",
             origin,
             &[],
         ),
@@ -2037,9 +3034,46 @@ mod tests {
     }
 
     fn found(store: &mut Accounts, user: &str, password: &str) -> Identity {
-        match store.create_account(user, password, false, None) {
+        match store.create_account(user, password, false, "", None, &client_at(SOMEWHERE)) {
             Change::Made(identity) => identity,
             _ => panic!("the first account was refused"),
+        }
+    }
+
+    /// Make an account the way a setup request or an admin does: no code, and a wire that is
+    /// nobody in particular.
+    ///
+    /// It exists to absorb the two parameters [`Accounts::create_account`] gained with invite
+    /// codes, so that the fourteen call sites in this module stay one line each.
+    fn add(
+        store: &mut Accounts,
+        user: &str,
+        password: &str,
+        admin: bool,
+        by: Option<&Identity>,
+    ) -> Change {
+        store.create_account(user, password, admin, "", by, &client_at(SOMEWHERE))
+    }
+
+    /// Make an account the way an invited person does: no caller, and the code they typed.
+    fn redeem(store: &mut Accounts, user: &str, password: &str, code: &str, wire: &Wire) -> Change {
+        store.create_account(user, password, false, code, None, wire)
+    }
+
+    /// Mint one code, or panic naming what stopped it. Returns the **grouped** spelling, the
+    /// one the client is given; `fold_code` turns it back into the map's key.
+    fn mint(store: &mut Accounts, by: &Identity) -> String {
+        match store.create_invite(by) {
+            Change::Minted { code, .. } => code,
+            _ => panic!("an admin could not mint an invite code"),
+        }
+    }
+
+    /// The identity a [`Change::Made`] carries, or a panic.
+    fn made(change: Change) -> Identity {
+        match change {
+            Change::Made(identity) => identity,
+            _ => panic!("that account was refused"),
         }
     }
 
@@ -2100,10 +3134,10 @@ mod tests {
         // ⚠ `Some(&owner)`, and the first version of this test had `None` — which is refused
         // for want of an admin **before** the rules below are ever reached, so both
         // assertions passed while testing the authorisation check twice.
-        let short = store.create_account("sam", "short", false, Some(&owner));
+        let short = add(&mut store, "sam", "short", false, Some(&owner));
         assert!(matches!(short, Change::Refused(_)), "a five-character password was accepted");
         let confusable =
-            store.create_account("\u{43e}wner", "a-long-enough-passphrase", false, Some(&owner));
+            add(&mut store, "\u{43e}wner", "a-long-enough-passphrase", false, Some(&owner));
         assert!(matches!(confusable, Change::Refused(_)), "a Cyrillic lookalike was accepted");
     }
 
@@ -2123,8 +3157,11 @@ mod tests {
         // The second request that arrived with the first. Under the real lock this is the
         // same thread reaching the same function after the append — which is why the race is
         // closed by the lock rather than by a check.
-        let second = store.create_account("stranger", "another-long-passphrase", true, None);
-        assert!(matches!(second, Change::NotAllowed), "a stranger claimed a second owner account");
+        let second = add(&mut store, "stranger", "another-long-passphrase", true, None);
+        assert!(
+            matches!(second, Change::NotAllowed(_)),
+            "a stranger claimed a second owner account"
+        );
 
         // And it stays closed across a restart, which is where a whole-file write would have
         // been able to lose it.
@@ -2146,8 +3183,21 @@ mod tests {
         let mut store = Accounts::open(&data);
         assert!(!store.setup_open(), "a damaged file was read as a server nobody has set up");
         assert!(store.unreadable);
-        let refused = store.create_account("stranger", "another-long-passphrase", false, None);
+        let refused = add(&mut store, "stranger", "another-long-passphrase", false, None);
         assert!(matches!(refused, Change::Broken), "a damaged file still let somebody sign up");
+        // ⚠ And a code cannot rescue it either: an unreadable log is a log whose invites
+        // cannot be verified, and the safe answer to "cannot prove it" is no.
+        let with_code = redeem(
+            &mut store,
+            "stranger",
+            "another-long-passphrase",
+            "K7QM-3XPT-9WNZ",
+            &client_at(SOMEWHERE),
+        );
+        assert!(
+            matches!(with_code, Change::Broken),
+            "an unverifiable code was treated as a valid one"
+        );
         let refused = attempt(&mut store, "owner", "a-long-enough-passphrase", &client_at(SOMEWHERE));
         assert!(matches!(refused, Outcome::Broken), "a damaged file still let somebody sign in");
     }
@@ -2194,7 +3244,7 @@ mod tests {
         let mut store = Accounts::open(&hand_repaired);
         assert!(!store.tail_is_newline, "the fixture did not produce the state under test");
         assert!(matches!(
-            store.create_account("sam", "another-long-passphrase", false, Some(&owner)),
+            add(&mut store, "sam", "another-long-passphrase", false, Some(&owner)),
             Change::Made(_)
         ));
 
@@ -2212,7 +3262,7 @@ mod tests {
         let owner = found(&mut store, "owner", "a-long-enough-passphrase");
         let after_one = std::fs::read_to_string(data.join(LOG)).unwrap();
 
-        store.create_account("sam", "another-long-passphrase", false, Some(&owner));
+        add(&mut store, "sam", "another-long-passphrase", false, Some(&owner));
         let after_two = std::fs::read_to_string(data.join(LOG)).unwrap();
 
         assert!(after_two.starts_with(&after_one), "an earlier record was rewritten");
@@ -2226,16 +3276,16 @@ mod tests {
     fn only_an_admin_may_make_an_account_and_a_taken_name_is_refused() {
         let mut store = Accounts::open(&scratch("admin-only"));
         let owner = found(&mut store, "owner", "a-long-enough-passphrase");
-        let sam = match store.create_account("sam", "another-long-passphrase", false, Some(&owner)) {
+        let sam = match add(&mut store, "sam", "another-long-passphrase", false, Some(&owner)) {
             Change::Made(identity) => identity,
             _ => panic!("an admin could not make an account"),
         };
         assert!(!sam.admin, "a plain account was made an admin");
 
-        let by_sam = store.create_account("kit", "a-third-long-passphrase", false, Some(&sam));
-        assert!(matches!(by_sam, Change::NotAllowed), "a non-admin made an account");
+        let by_sam = add(&mut store, "kit", "a-third-long-passphrase", false, Some(&sam));
+        assert!(matches!(by_sam, Change::NotAllowed(_)), "a non-admin made an account");
 
-        let taken = store.create_account("SAM", "a-fourth-long-passphrase", false, Some(&owner));
+        let taken = add(&mut store, "SAM", "a-fourth-long-passphrase", false, Some(&owner));
         assert!(matches!(taken, Change::Taken), "a taken name was reused across a case change");
     }
 
@@ -2245,7 +3295,7 @@ mod tests {
         let data = scratch("remove-account");
         let mut store = Accounts::open(&data);
         let owner = found(&mut store, "owner", "a-long-enough-passphrase");
-        let sam = match store.create_account("sam", "another-long-passphrase", false, Some(&owner)) {
+        let sam = match add(&mut store, "sam", "another-long-passphrase", false, Some(&owner)) {
             Change::Made(identity) => identity,
             _ => panic!("an admin could not make an account"),
         };
@@ -2263,6 +3313,650 @@ mod tests {
             matches!(store.remove_account("owner", &owner), Change::Refused(_)),
             "the founder was removable, which would orphan every board with no record"
         );
+    }
+
+    // ----- invite codes ---------------------------------------------------------------------
+
+    #[test]
+    fn an_invite_code_is_never_the_same_twice() {
+        let codes: std::collections::BTreeSet<String> =
+            (0..64).map(|_| new_invite_code()).collect();
+        assert_eq!(codes.len(), 64, "the invite code generator repeats itself");
+        for code in &codes {
+            assert_eq!(code.len(), CODE_CHARS, "a code is not {CODE_CHARS} characters");
+            assert!(
+                code.bytes().all(|byte| CODE_ALPHABET.contains(&byte)),
+                "a code held a symbol outside the alphabet"
+            );
+            // The four Crockford leaves out, because a person confuses each with a digit.
+            assert!(!code.contains(['I', 'L', 'O', 'U']), "a code held a confusable letter");
+        }
+    }
+
+    #[test]
+    fn a_code_is_read_the_way_a_person_types_it() {
+        let canonical = "K7QM3XPT9WNZ";
+        for spelling in [
+            "K7QM3XPT9WNZ",
+            "K7QM-3XPT-9WNZ",
+            "k7qm-3xpt-9wnz",
+            " K7QM 3XPT 9WNZ ",
+            "K7QM-3xpt 9WNZ",
+        ] {
+            assert_eq!(fold_code(spelling).as_deref(), Some(canonical), "{spelling}");
+        }
+        // Crockford's read aliases: the letters the alphabet leaves out, put back where they
+        // can only have meant the digit beside them.
+        assert_eq!(fold_code("IL0000000000").as_deref(), Some("110000000000"));
+        assert_eq!(fold_code("O00000000000").as_deref(), Some("000000000000"));
+        // ⚠ `U` is refused rather than aliased. It is out of the alphabet on purpose and
+        // there is no digit it resembles.
+        assert!(fold_code("U00000000000").is_none(), "U was aliased to something");
+        assert!(fold_code("K7QM3XPT9WN").is_none(), "eleven characters were accepted");
+        assert!(fold_code("K7QM3XPT9WNZ1").is_none(), "thirteen characters were accepted");
+        // ⚠ Refused **before** any `as u8`: `'İ' as u8` is not `'İ'`, and the truncated byte
+        // can land inside the alphabet.
+        assert!(fold_code("K7QM3XPT9WN\u{130}").is_none(), "a non-ASCII character was folded");
+        assert!(fold_code("").is_none());
+        assert!(fold_code("nonsense").is_none());
+        assert_eq!(grouped(canonical), "K7QM-3XPT-9WNZ", "the display form is not grouped");
+    }
+
+    /// ⚠ `Caller::Token` cannot reach [`Accounts::create_invite`] at all — it takes an
+    /// [`Identity`], and only `identity_of` and `create_account` mint one. That is the second
+    /// half of the rule this test pins; it cannot be written as an assertion because the
+    /// unwanted call does not typecheck, which is the stronger form.
+    #[test]
+    fn only_an_admin_may_mint_a_code() {
+        let mut store = Accounts::open(&scratch("mint-admin-only"));
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let sam = made(add(&mut store, "sam", "another-long-passphrase", false, Some(&owner)));
+
+        let Change::NotAllowed(reason) = store.create_invite(&sam) else {
+            panic!("a non-admin minted an invite code");
+        };
+        assert!(reason.contains("admin"), "the refusal does not say who may do this");
+        assert!(store.invites.is_empty(), "a refused mint still recorded a code");
+    }
+
+    #[test]
+    fn a_minted_code_survives_a_restart() {
+        let data = scratch("code-restart");
+        let mut store = Accounts::open(&data);
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let code = mint(&mut store, &owner);
+
+        let mut reopened = Accounts::open(&data);
+        assert_eq!(reopened.invites.len(), 1, "the invite record did not replay");
+        let made_it = redeem(
+            &mut reopened,
+            "sam",
+            "another-long-passphrase",
+            &code,
+            &client_at(SOMEWHERE),
+        );
+        assert!(matches!(made_it, Change::Made(_)), "a code did not survive a restart");
+    }
+
+    #[test]
+    fn a_code_creates_one_account_and_is_then_spent() {
+        let data = scratch("code-spent-once");
+        let mut store = Accounts::open(&data);
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let code = mint(&mut store, &owner);
+
+        let sam = made(redeem(
+            &mut store,
+            "sam",
+            "another-long-passphrase",
+            &code,
+            &client_at(SOMEWHERE),
+        ));
+        assert_eq!(sam.username, "sam");
+
+        let again = redeem(
+            &mut store,
+            "kit",
+            "a-third-long-passphrase",
+            &code,
+            &client_at(SOMEWHERE),
+        );
+        assert!(matches!(again, Change::BadCode), "one code made two accounts");
+
+        // And the spend is in the file, not only in memory: it is carried by the `account`
+        // record's own `code` field, which is what makes redemption one line.
+        let mut reopened = Accounts::open(&data);
+        let after_restart = redeem(
+            &mut reopened,
+            "kit",
+            "a-third-long-passphrase",
+            &code,
+            &client_at(SOMEWHERE),
+        );
+        assert!(matches!(after_restart, Change::BadCode), "a restart reopened a spent code");
+    }
+
+    #[test]
+    fn an_account_made_with_a_code_is_never_an_admin() {
+        let mut store = Accounts::open(&scratch("code-never-admin"));
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let code = mint(&mut store, &owner);
+
+        // The body asks for an admin. The code decides, not the body.
+        let asked_for_admin = store.create_account(
+            "sam",
+            "another-long-passphrase",
+            true,
+            &code,
+            None,
+            &client_at(SOMEWHERE),
+        );
+        let sam = made(asked_for_admin);
+        assert!(!sam.admin, "an invited account made itself an admin");
+    }
+
+    /// ⚠ **The replay bug this format predicts.** Removing the account a code created must
+    /// not bring the code back: `KIND_ACCOUNT_REMOVED` writes nothing about invites and
+    /// `apply` touches none, so the spend outlives the account.
+    #[test]
+    fn removing_an_invited_account_does_not_bring_its_code_back() {
+        let data = scratch("removed-account-code");
+        let mut store = Accounts::open(&data);
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let code = mint(&mut store, &owner);
+        made(redeem(&mut store, "sam", "another-long-passphrase", &code, &client_at(SOMEWHERE)));
+
+        assert!(matches!(store.remove_account("sam", &owner), Change::Gone));
+
+        let mut reopened = Accounts::open(&data);
+        let reused = redeem(
+            &mut reopened,
+            "sam",
+            "a-third-long-passphrase",
+            &code,
+            &client_at(SOMEWHERE),
+        );
+        assert!(matches!(reused, Change::BadCode), "removing an account reopened its code");
+    }
+
+    #[test]
+    fn a_revoked_code_is_refused_and_stays_refused_after_a_restart() {
+        let data = scratch("code-revoked");
+        let mut store = Accounts::open(&data);
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let code = mint(&mut store, &owner);
+
+        assert!(matches!(store.revoke_invite(&code, &owner), Change::Gone));
+        // Revoking twice is harmless and writes nothing the second time — the desired state
+        // is reached either way, exactly as for signing out.
+        assert!(matches!(store.revoke_invite(&code, &owner), Change::Gone));
+        let refused = redeem(
+            &mut store,
+            "sam",
+            "another-long-passphrase",
+            &code,
+            &client_at(SOMEWHERE),
+        );
+        assert!(matches!(refused, Change::BadCode), "a revoked code still made an account");
+
+        let mut reopened = Accounts::open(&data);
+        let still = redeem(
+            &mut reopened,
+            "sam",
+            "another-long-passphrase",
+            &code,
+            &client_at(SOMEWHERE),
+        );
+        assert!(matches!(still, Change::BadCode), "a restart un-revoked a code");
+    }
+
+    /// ⚠ The clock is a `u64` of wall-clock seconds, so this is arithmetic rather than
+    /// `Instant` gymnastics: the invite's own `at` is moved to 1970 and no `checked_sub` is
+    /// needed. `INVITE_LIFE` is wall-clock precisely because a code outlives a restart.
+    #[test]
+    fn a_code_stops_working_after_its_life() {
+        let mut store = Accounts::open(&scratch("code-expiry"));
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let code = mint(&mut store, &owner);
+        let key = fold_code(&code).expect("a minted code folds");
+
+        store.invites.get_mut(&key).expect("the code is in the map").at = 1;
+        assert_eq!(store.open_invites(now_seconds()), 0, "an expired code still counts as open");
+
+        let refused = redeem(
+            &mut store,
+            "sam",
+            "another-long-passphrase",
+            &code,
+            &client_at(SOMEWHERE),
+        );
+        assert!(matches!(refused, Change::BadCode), "a code outlived its life");
+    }
+
+    /// ⚠ The budget a wrong code spends is the **same** one sign-in uses, which is why
+    /// [`BAD_CODE`] tells the person to wait rather than to ask for another code.
+    #[test]
+    fn a_wrong_code_costs_the_address_its_budget() {
+        let mut store = Accounts::open(&scratch("code-budget"));
+        found(&mut store, "owner", "a-long-enough-passphrase");
+        let guesser = client_at("198.51.100.7");
+
+        for n in 0..MAX_FAILURES {
+            let refused =
+                redeem(&mut store, &format!("sam{n}"), "another-long-passphrase", "K7QM3XPT9WNZ", &guesser);
+            assert!(matches!(refused, Change::BadCode), "guess {n} was not refused");
+        }
+        let over = redeem(&mut store, "sam", "another-long-passphrase", "K7QM3XPT9WNZ", &guesser);
+        assert!(matches!(over, Change::Throttled), "the address budget did not apply to codes");
+
+        // And it is that address's budget alone, which is what makes this a rate limit
+        // rather than a way to shut the household out.
+        let elsewhere =
+            redeem(&mut store, "sam", "another-long-passphrase", "K7QM3XPT9WNZ", &client_at("203.0.113.4"));
+        assert!(matches!(elsewhere, Change::BadCode), "one guesser spent everybody's budget");
+    }
+
+    /// ⚠ Malformed is refused **before** the limiter is touched, the rule `sign_in` follows
+    /// for a username that will not fold. A family member fumbling a code should not be able
+    /// to lock sign-in out for their own house.
+    #[test]
+    fn a_malformed_code_is_refused_before_the_limiter_is_touched() {
+        let mut store = Accounts::open(&scratch("code-malformed"));
+        found(&mut store, "owner", "a-long-enough-passphrase");
+
+        for _ in 0..MAX_FAILURES + 5 {
+            let refused = redeem(
+                &mut store,
+                "sam",
+                "another-long-passphrase",
+                "nonsense",
+                &client_at(SOMEWHERE),
+            );
+            assert!(matches!(refused, Change::BadCode));
+        }
+        assert!(store.failures.is_empty(), "a code that is not a code spent the address budget");
+    }
+
+    /// ⚠ Setup wins outright and the code is not read, not validated and **not spent** —
+    /// written as an ordering rather than as an assertion, so that a future change which does
+    /// let an invite exist here degrades to "the code was ignored".
+    #[test]
+    fn setting_up_ignores_any_code_in_the_body() {
+        let data = scratch("setup-ignores-code");
+        let mut store = Accounts::open(&data);
+
+        let owner = made(redeem(
+            &mut store,
+            "owner",
+            "a-long-enough-passphrase",
+            "K7QM-3XPT-9WNZ",
+            &client_at(SOMEWHERE),
+        ));
+        assert!(owner.admin, "the first account is not an admin");
+        assert!(store.invites.is_empty(), "a code the server never minted was recorded as spent");
+
+        let text = std::fs::read_to_string(data.join(LOG)).unwrap();
+        assert!(!text.contains("K7QM"), "an ignored code was written into the log");
+    }
+
+    /// The invariant of the founder rule: an invite cannot exist while setup is open.
+    #[test]
+    fn an_invite_cannot_exist_while_setup_is_open() {
+        let data = scratch("invite-and-setup");
+        let mut store = Accounts::open(&data);
+        assert!(store.setup_open(), "a fresh data directory is not offering setup");
+        assert!(store.invites.is_empty());
+
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        mint(&mut store, &owner);
+        assert!(!store.setup_open(), "setup stayed open after a code was minted");
+
+        // And in the other direction: any `invite` record makes the file non-empty, so a
+        // store that loads one has setup closed before it reads a single account.
+        let reopened = Accounts::open(&data);
+        assert!(!reopened.setup_open(), "a file holding an invite reopened setup");
+        assert_eq!(reopened.invites.len(), 1);
+    }
+
+    /// Append-only, asserted on the bytes, for the invite records too.
+    #[test]
+    fn the_log_only_ever_grows_when_a_code_is_made_and_spent() {
+        let data = scratch("invite-append-only");
+        let mut store = Accounts::open(&data);
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let after_founding = std::fs::read_to_string(data.join(LOG)).unwrap();
+
+        let code = mint(&mut store, &owner);
+        let after_mint = std::fs::read_to_string(data.join(LOG)).unwrap();
+        assert!(after_mint.starts_with(&after_founding), "minting rewrote an earlier record");
+        assert_eq!(after_mint.lines().count(), after_founding.lines().count() + 1);
+
+        made(redeem(&mut store, "sam", "another-long-passphrase", &code, &client_at(SOMEWHERE)));
+        let after_redeem = std::fs::read_to_string(data.join(LOG)).unwrap();
+        assert!(after_redeem.starts_with(&after_mint), "redeeming rewrote an earlier record");
+        assert_eq!(
+            after_redeem.lines().count(),
+            after_mint.lines().count() + 1,
+            "redeeming wrote more than one record, so a crash can split an account from its code"
+        );
+    }
+
+    /// ⚠ **The wire body, not the function that feeds it** — the seam
+    /// `the_signed_out_answer_carries_the_key_the_client_branches_on` exists to record.
+    #[test]
+    fn the_mint_answer_carries_the_keys_the_client_branches_on() {
+        let mut store = Accounts::open(&scratch("mint-answer"));
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let at = now_seconds();
+
+        let Change::Minted { code, expires } = store.create_invite(&owner) else {
+            panic!("an admin could not mint an invite code");
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&minted_body(&code, expires)).expect("valid JSON");
+
+        let shown = parsed["code"].as_str().expect("the code must be a string");
+        assert_eq!(shown.len(), CODE_CHARS + 2, "the code is not grouped for reading");
+        assert_eq!(shown.matches('-').count(), 2);
+        let ungrouped = shown.replace('-', "");
+        assert_eq!(
+            fold_code(shown).as_deref(),
+            Some(ungrouped.as_str()),
+            "the code that goes out does not fold back to the one that is stored"
+        );
+        assert!(
+            parsed["expires"].as_u64().is_some_and(|when| when > at),
+            "the expiry is not in the future"
+        );
+        assert_eq!(
+            parsed["days"],
+            serde_json::json!(INVITE_LIFE.as_secs() / 86_400),
+            "the client prints this in a sentence and should not do date arithmetic"
+        );
+    }
+
+    #[test]
+    fn the_invite_list_says_which_codes_are_still_open() {
+        let mut store = Accounts::open(&scratch("invite-list"));
+        let now = 1_750_000_000u64;
+        let life = INVITE_LIFE.as_secs();
+        let mut put = |code: &str, at: u64, used: Option<&str>, revoked: Option<u64>| {
+            store.invites.insert(code.to_owned(), Invite {
+                code: code.to_owned(),
+                by: "owner".to_owned(),
+                at,
+                used_by: used.map(str::to_owned),
+                used_at: used.map(|_| at + 10),
+                revoked_at: revoked,
+            });
+        };
+        put("AAAAAAAAAAAA", now - 10, None, None);
+        put("BBBBBBBBBBBB", now - 20, Some("sam"), None);
+        put("CCCCCCCCCCCC", now - 30, None, Some(now - 25));
+        put("DDDDDDDDDDDD", now - life - 1, None, None);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&invite_rows(&store, now)).expect("valid JSON");
+        let rows = parsed.as_array().expect("an array");
+        assert_eq!(rows.len(), 4);
+
+        let states: Vec<&str> = rows.iter().map(|row| row["state"].as_str().unwrap()).collect();
+        assert_eq!(states, ["open", "used", "revoked", "expired"], "newest first, by state");
+
+        let used = &rows[1];
+        assert_eq!(used["used_by"], serde_json::json!("sam"));
+        assert!(used["used_at"].as_u64().is_some(), "a used row does not say when");
+        assert!(rows[0]["used_by"].is_null(), "an open row claimed it was used");
+        assert_eq!(
+            rows[0]["code"],
+            serde_json::json!("AAAA-AAAA-AAAA"),
+            "the list does not group the code the way a person reads it"
+        );
+        assert_eq!(rows[0]["expires"], serde_json::json!(now - 10 + life));
+    }
+
+    #[test]
+    fn a_code_cannot_be_minted_past_the_cap() {
+        let mut store = Accounts::open(&scratch("invite-cap"));
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+
+        let first = mint(&mut store, &owner);
+        for _ in 1..MAX_OPEN_INVITES {
+            mint(&mut store, &owner);
+        }
+        let Change::Refused(reason) = store.create_invite(&owner) else {
+            panic!("the cap on open codes did not apply");
+        };
+        assert_eq!(reason, TOO_MANY_INVITES);
+
+        // Revoking one makes room, because the cap counts open codes rather than every code
+        // that has ever existed.
+        assert!(matches!(store.revoke_invite(&first, &owner), Change::Gone));
+        assert!(matches!(store.create_invite(&owner), Change::Minted { .. }));
+    }
+
+    /// ⚠ A `&'static str` cannot hold a formatted number, so the cap is typed twice. This is
+    /// what stops the two from drifting apart into a sentence that lies about the rule.
+    #[test]
+    fn the_cap_and_its_refusal_agree() {
+        assert!(
+            TOO_MANY_INVITES.contains(&MAX_OPEN_INVITES.to_string()),
+            "the refusal at the cap does not name the cap's number: {TOO_MANY_INVITES}"
+        );
+    }
+
+    // ----- sharing a board --------------------------------------------------------------------
+
+    /// The route that was missing: `Accounts::allowed` has read a shared list since accounts
+    /// landed, and nothing could put a name in it.
+    #[test]
+    fn a_shared_board_is_visible_to_the_person_it_was_shared_with() {
+        let mut store = Accounts::open(&scratch("share-visible"));
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let sam = made(add(&mut store, "sam", "another-long-passphrase", false, Some(&owner)));
+        store.claim("plans", "owner").unwrap();
+        assert!(!store.allowed("plans", &Caller::Account(sam.clone())));
+
+        // Spelt the way the person typed it; folded the way every username is.
+        assert!(matches!(store.set_share("plans", "Sam", &owner, true), Change::Recorded));
+        assert!(
+            store.allowed("plans", &Caller::Account(sam)),
+            "the board was shared and is still invisible"
+        );
+        assert_eq!(store.boards["plans"].shared, vec!["sam".to_owned()]);
+    }
+
+    /// ⚠ Sharing is not a transferable power. One share must not put a board one hop from
+    /// everybody on the server.
+    #[test]
+    fn only_the_owner_or_an_admin_may_share_a_board() {
+        let mut store = Accounts::open(&scratch("share-authority"));
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let sam = made(add(&mut store, "sam", "another-long-passphrase", false, Some(&owner)));
+        let kit = made(add(&mut store, "kit", "a-third-long-passphrase", false, Some(&owner)));
+        store.claim("sams-plans", "sam").unwrap();
+
+        // The owner may.
+        assert!(matches!(store.set_share("sams-plans", "kit", &sam, true), Change::Recorded));
+
+        // Somebody it was merely shared with may not, even though they can see it.
+        assert!(store.allowed("sams-plans", &Caller::Account(kit.clone())));
+        let Change::NotAllowed(reason) = store.set_share("sams-plans", "owner", &kit, true) else {
+            panic!("a board was shared on by somebody it was only shared with");
+        };
+        assert!(reason.contains("owner"), "the refusal does not say who may do this");
+
+        // An admin may, and doing so does not make the board theirs.
+        assert!(matches!(store.set_share("sams-plans", "owner", &owner, true), Change::Recorded));
+        assert_eq!(store.owner_of("sams-plans"), Some("sam"), "an admin sharing took the board");
+    }
+
+    #[test]
+    fn sharing_with_a_name_that_has_no_account_is_refused_and_records_nothing() {
+        let data = scratch("share-unknown-name");
+        let mut store = Accounts::open(&data);
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        store.claim("plans", "owner").unwrap();
+        let before = std::fs::read_to_string(data.join(LOG)).unwrap();
+
+        let Change::Refused(reason) = store.set_share("plans", "nobody", &owner, true) else {
+            panic!("a board was shared with an account that does not exist");
+        };
+        assert!(reason.contains("account"), "the refusal does not say what is wrong");
+        assert_eq!(
+            std::fs::read_to_string(data.join(LOG)).unwrap(),
+            before,
+            "a refused share still wrote a record"
+        );
+    }
+
+    /// ⚠ **Being shared with a board must not tell you who else was.**
+    ///
+    /// `allowed` says yes to everybody a board is shared with, so building the list from it
+    /// would hand each of them the names of all the others. The board list carries `owner` and
+    /// `shared` only for the owner and for an admin, and the difference between "the server
+    /// did not say" and "nobody" is what the absent keys mean on the wire.
+    #[test]
+    fn a_shared_account_is_not_told_who_else_the_board_is_shared_with() {
+        let data = scratch("share-disclosure");
+        let mut store = Accounts::open(&data);
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let sam = made(add(&mut store, "sam", "another-long-passphrase", false, Some(&owner)));
+        let kim = made(add(&mut store, "kim", "a-third-long-passphrase", false, Some(&owner)));
+        let boss = made(add(&mut store, "boss", "a-fourth-long-passphrase", true, Some(&owner)));
+        store.claim("plans", "owner").unwrap();
+        assert!(matches!(store.set_share("plans", "sam", &owner, true), Change::Recorded));
+        assert!(matches!(store.set_share("plans", "kim", &owner, true), Change::Recorded));
+
+        let (whose, names) = store.sharing_seen_by("plans", &owner).expect("the owner may know");
+        assert_eq!(whose, "owner");
+        // Sorted, not in the order they were added, so the list reads the same on every replay.
+        assert_eq!(names, vec!["kim".to_owned(), "sam".to_owned()]);
+
+        // An admin may know, because an admin may change it.
+        assert!(store.sharing_seen_by("plans", &boss).is_some(), "an admin was refused the list");
+
+        // Sam and Kim can both open the board, and neither may learn that the other can.
+        for who in [&sam, &kim] {
+            assert!(
+                store.allowed("plans", &Caller::Account(who.clone())),
+                "the fixture is wrong: {} cannot open the board", who.username
+            );
+            assert!(
+                store.sharing_seen_by("plans", who).is_none(),
+                "{} was told who else the board is shared with", who.username
+            );
+        }
+    }
+
+    #[test]
+    fn unsharing_takes_the_board_back() {
+        let data = scratch("share-undo");
+        let mut store = Accounts::open(&data);
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let sam = made(add(&mut store, "sam", "another-long-passphrase", false, Some(&owner)));
+        store.claim("plans", "owner").unwrap();
+
+        assert!(matches!(store.set_share("plans", "sam", &owner, true), Change::Recorded));
+        assert!(matches!(store.set_share("plans", "sam", &owner, false), Change::Recorded));
+        assert!(!store.allowed("plans", &Caller::Account(sam.clone())), "unsharing did nothing");
+
+        // The empty list is a record like any other, so the last one wins on replay.
+        let reopened = Accounts::open(&data);
+        assert!(
+            !reopened.allowed("plans", &Caller::Account(sam)),
+            "a restart brought a removed share back"
+        );
+    }
+
+    #[test]
+    fn sharing_survives_a_restart() {
+        let data = scratch("share-restart");
+        let mut store = Accounts::open(&data);
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let sam = made(add(&mut store, "sam", "another-long-passphrase", false, Some(&owner)));
+        store.claim("plans", "owner").unwrap();
+        assert!(matches!(store.set_share("plans", "sam", &owner, true), Change::Recorded));
+
+        let reopened = Accounts::open(&data);
+        assert!(reopened.allowed("plans", &Caller::Account(sam)), "a share did not replay");
+        assert_eq!(reopened.owner_of("plans"), Some("owner"));
+    }
+
+    /// Every board that was in the data directory before accounts existed has no ownership
+    /// record, and `owner_of` gives those to the founder. So the founder can share them —
+    /// which is the whole point, since that is ~45 of them.
+    #[test]
+    fn the_founder_can_share_a_board_that_has_no_owner_record() {
+        let mut store = Accounts::open(&scratch("share-unrecorded"));
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        let sam = made(add(&mut store, "sam", "another-long-passphrase", false, Some(&owner)));
+        assert!(!store.boards.contains_key("an-old-board"), "the fixture is not the state under test");
+
+        assert!(matches!(store.set_share("an-old-board", "sam", &owner, true), Change::Recorded));
+        assert!(store.allowed("an-old-board", &Caller::Account(sam)));
+        assert_eq!(store.owner_of("an-old-board"), Some("owner"), "the founder did not stay owner");
+
+        // And somebody else's board is still not theirs to share.
+        store.claim("sams-plans", "sam").unwrap();
+        let kit = made(add(&mut store, "kit", "a-third-long-passphrase", false, Some(&owner)));
+        assert!(matches!(
+            store.set_share("sams-plans", "owner", &kit, true),
+            Change::NotAllowed(_)
+        ));
+    }
+
+    /// The file is never compacted, so a route that writes a record for a state it is already
+    /// in is a route that grows the file every time somebody presses the button twice.
+    #[test]
+    fn sharing_twice_records_nothing_the_second_time() {
+        let data = scratch("share-idempotent");
+        let mut store = Accounts::open(&data);
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        add(&mut store, "sam", "another-long-passphrase", false, Some(&owner));
+        add(&mut store, "kit", "a-third-long-passphrase", false, Some(&owner));
+        store.claim("plans", "owner").unwrap();
+
+        assert!(matches!(store.set_share("plans", "sam", &owner, true), Change::Recorded));
+        let after_one = std::fs::read_to_string(data.join(LOG)).unwrap();
+
+        assert!(matches!(store.set_share("plans", "sam", &owner, true), Change::Recorded));
+        // Taking off somebody who was never on, and sharing with the owner, are the same
+        // no-op from the other two directions.
+        assert!(matches!(store.set_share("plans", "kit", &owner, false), Change::Recorded));
+        assert!(matches!(store.set_share("plans", "owner", &owner, true), Change::Recorded));
+
+        assert_eq!(
+            std::fs::read_to_string(data.join(LOG)).unwrap(),
+            after_one,
+            "a share that changed nothing still wrote a line"
+        );
+    }
+
+    /// ⚠ **`owner_of`'s fall back to the founder is derived and must never be written down.**
+    /// An admin sharing a board whose recorded owner has been removed must not materialise
+    /// themselves as its owner, or an account made again with that name never gets it back.
+    #[test]
+    fn sharing_a_removed_accounts_board_does_not_take_it_over() {
+        let mut store = Accounts::open(&scratch("share-keeps-owner"));
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
+        add(&mut store, "sam", "another-long-passphrase", false, Some(&owner));
+        let kit = made(add(&mut store, "kit", "a-third-long-passphrase", false, Some(&owner)));
+        store.claim("sams-plans", "sam").unwrap();
+
+        assert!(matches!(store.remove_account("sam", &owner), Change::Gone));
+        assert_eq!(store.owner_of("sams-plans"), Some("owner"), "the fallback did not apply");
+
+        assert!(matches!(store.set_share("sams-plans", "kit", &owner, true), Change::Recorded));
+        assert_eq!(
+            store.boards["sams-plans"].owner, "sam",
+            "sharing rewrote the recorded owner, so the board can never revert"
+        );
+
+        // Sam comes back, and the board is theirs again — which is what the fallback is for.
+        add(&mut store, "sam", "a-fourth-long-passphrase", false, Some(&owner));
+        assert_eq!(store.owner_of("sams-plans"), Some("sam"));
+        assert!(store.allowed("sams-plans", &Caller::Account(kit)));
     }
 
     // ----- sessions -----------------------------------------------------------------------
@@ -2318,7 +4012,7 @@ mod tests {
     fn a_session_does_not_carry_a_stale_admin_flag() {
         let mut store = Accounts::open(&scratch("live-admin"));
         let owner = found(&mut store, "owner", "a-long-enough-passphrase");
-        store.create_account("sam", "another-long-passphrase", true, Some(&owner));
+        add(&mut store, "sam", "another-long-passphrase", true, Some(&owner));
 
         let id = match attempt(&mut store, "sam", "another-long-passphrase", &client_at(SOMEWHERE)) {
             Outcome::SignedIn { id, .. } => id,
@@ -2482,7 +4176,7 @@ mod tests {
     fn a_non_owner_cannot_see_another_accounts_board() {
         let mut store = Accounts::open(&scratch("visibility"));
         let owner = found(&mut store, "owner", "a-long-enough-passphrase");
-        let sam = match store.create_account("sam", "another-long-passphrase", false, Some(&owner)) {
+        let sam = match add(&mut store, "sam", "another-long-passphrase", false, Some(&owner)) {
             Change::Made(identity) => identity,
             _ => panic!("an admin could not make an account"),
         };
@@ -2513,7 +4207,7 @@ mod tests {
         let data = scratch("ownership-restart");
         let mut store = Accounts::open(&data);
         let owner = found(&mut store, "owner", "a-long-enough-passphrase");
-        store.create_account("sam", "another-long-passphrase", false, Some(&owner));
+        add(&mut store, "sam", "another-long-passphrase", false, Some(&owner));
         store.claim("sams-plans", "sam").unwrap();
 
         let reopened = Accounts::open(&data);
@@ -2531,7 +4225,7 @@ mod tests {
     #[test]
     fn nothing_that_holds_a_secret_prints_it() {
         let mut store = Accounts::open(&scratch("no-secrets-printed"));
-        found(&mut store, "owner", "a-long-enough-passphrase");
+        let owner = found(&mut store, "owner", "a-long-enough-passphrase");
         let id = match attempt(&mut store, "owner", "a-long-enough-passphrase", &client_at(SOMEWHERE)) {
             Outcome::SignedIn { id, .. } => id,
             _ => panic!("the right password did not sign in"),
@@ -2553,6 +4247,20 @@ mod tests {
         let listed = rows(&store);
         assert!(!listed.contains(&hash), "a hash reached the account list");
         assert!(listed.contains("owner"));
+
+        // ⚠ **An invite code is a bearer credential too**, and it is stored in the clear, so
+        // the only thing keeping it out of a log is that no type carrying one derives `Debug`.
+        // `Change` has no derive for exactly this reason; `Change::Minted` holds a live code.
+        let code = mint(&mut store, &owner);
+        let key = fold_code(&code).expect("a minted code folds");
+        let printed = format!("{store:?}");
+        assert!(!printed.contains(&key), "an invite code reached a Debug");
+        assert!(!printed.contains(&code), "an invite code reached a Debug");
+        let invite = format!("{:?}", store.invites[&key]);
+        assert!(!invite.contains(&key), "an invite code reached its own Debug");
+        assert!(invite.contains("owner"), "who minted it is not a secret and should be there");
+        // The mint log line names the minter and never the code. `create_invite` writes
+        // `velmd: {by} made an invite code`, and there is no other formatting of one.
     }
 
     // ----- the wire ---------------------------------------------------------------------------
@@ -2584,18 +4292,49 @@ mod tests {
         assert!(is_session("/api/v1/session"));
         assert!(is_accounts("/api/v1/accounts"));
         assert!(is_whoami("/api/v1/whoami"));
+        assert!(is_invites("/api/v1/invites"));
         assert!(!is_session("/api/v1/sessions"));
         assert!(!is_accounts("/api/v1/accounts/sam"));
+        assert!(!is_invites("/api/v1/invites/"));
+
+        assert_eq!(revoke_target("/api/v1/invites/K7QM-3XPT-9WNZ"), Some("K7QM-3XPT-9WNZ"));
+        assert_eq!(revoke_target("/api/v1/invites"), None);
+        assert_eq!(revoke_target("/api/v1/invites/"), None);
+        assert_eq!(revoke_target("/api/v1/invites/a/b"), None);
+
+        assert_eq!(share_target("/api/v1/boards/plans/share"), Some("plans"));
+        // Percent-encoded, because a board id is a file stem and real ones have spaces in them.
+        assert_eq!(share_target("/api/v1/boards/last%20quarter/share"), Some("last%20quarter"));
+        assert_eq!(share_target("/api/v1/boards//share"), None);
+        assert_eq!(share_target("/api/v1/boards/plans"), None);
+        assert_eq!(share_target("/api/v1/boards/a/b/share"), None);
+        // ⚠ The two share routes must not read each other's paths.
+        assert_eq!(share_target("/api/v1/boards/plans/share/sam"), None);
+
+        assert_eq!(unshare_target("/api/v1/boards/plans/share/sam"), Some(("plans", "sam")));
+        assert_eq!(unshare_target("/api/v1/boards/plans/share"), None);
+        assert_eq!(unshare_target("/api/v1/boards/plans/share/"), None);
+        assert_eq!(unshare_target("/api/v1/boards//share/sam"), None);
+        assert_eq!(unshare_target("/api/v1/boards/plans/share/a/b"), None);
 
         // ⚠ Exactly two routes may answer without a bearer token, and no board route may.
         assert!(is_exempt_from_the_bearer_gate("/api/v1/session"));
         assert!(is_exempt_from_the_bearer_gate("/api/v1/whoami"));
-        // ⚠ `/api/v1/accounts` is **not** exempt by path, and that is still right: once a
-        // server is set up, only an admin may add an account. Its first-run carve-out is in
-        // `serve.rs`, conditioned on there being no accounts yet, so it cannot outlive setup.
-        for gated in
-            ["/api/v1/accounts", "/api/v1/boards", "/api/v1/library", "/api/v1/blobs/abc"]
-        {
+        // ⚠ `/api/v1/accounts` is **not** exempt by path, and that is what keeps `GET` on it
+        // admin-only. Its carve-out is a **condition** in `serve.rs` — `POST` alone — which is
+        // wide enough for a browser founding a server or redeeming an invite code, and narrow
+        // enough that the account listing stays behind the gate. Every invite and share route
+        // needs an admin or an owner, so all of them are gated outright.
+        for gated in [
+            "/api/v1/accounts",
+            "/api/v1/invites",
+            "/api/v1/invites/K7QM3XPT9WNZ",
+            "/api/v1/boards",
+            "/api/v1/boards/plans/share",
+            "/api/v1/boards/plans/share/sam",
+            "/api/v1/library",
+            "/api/v1/blobs/abc",
+        ] {
             assert!(!is_exempt_from_the_bearer_gate(gated), "{gated} escaped the bearer gate");
         }
     }
@@ -2659,6 +4398,24 @@ mod tests {
         assert!(check_password(&empty.password).is_err());
         let extra = credentials(br#"{"username":"sam","password":"another-long-passphrase","future":1}"#);
         assert_eq!(extra.expect("an unknown key should be ignored").username, "sam");
+
+        // ⚠ The invite code rides on the same body, and it is optional: a client written
+        // before codes existed sends exactly what it always did and must still work.
+        let with_code = credentials(
+            br#"{"username":"sam","password":"another-long-passphrase","code":"K7QM-3XPT-9WNZ"}"#,
+        );
+        assert_eq!(with_code.expect("a body with a code parses").code, "K7QM-3XPT-9WNZ");
+        let without = credentials(br#"{"username":"sam","password":"another-long-passphrase"}"#);
+        assert_eq!(
+            without.expect("a body with no code parses").code,
+            "",
+            "a missing code did not default to empty, so an old client cannot sign up"
+        );
+
+        // The share body is its own type, for the same reasons.
+        assert!(sharing(b"not json").is_none());
+        assert_eq!(sharing(br#"{"username":"sam"}"#).expect("valid").username, "sam");
+        assert_eq!(sharing(b"{}").expect("an empty object parses").username, "");
     }
 
     #[test]

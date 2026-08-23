@@ -615,6 +615,47 @@ impl Chrome {
         self.library.settings_tab = tab;
     }
 
+    /// What the app knows about the account, for Settings ▸ Account. Called every frame.
+    ///
+    /// **It writes the app's half of [`AccountFields`](crate::library::AccountFields) and
+    /// never the three text buffers.** Those belong to the person typing, and a per-frame
+    /// write would replace what they were half way through entering, sixty times a second.
+    /// The one place the app seeds a buffer is [`Self::seed_account`], which runs once.
+    ///
+    /// `signed_in_as` and `signed_in_to` are ignored unless `state` is
+    /// [`AccountState::SignedIn`](crate::library::AccountState::SignedIn); the page draws
+    /// neither in any other state.
+    pub fn set_account_status(
+        &mut self,
+        state: crate::library::AccountState,
+        signed_in_as: &str,
+        signed_in_to: &str,
+        message: Option<&str>,
+    ) {
+        let account = &mut self.library.account;
+        account.state = state;
+        // Compared before assigning, so an unchanged sentence is not a fresh `String` per
+        // frame. The page reads these; nothing else does.
+        if account.signed_in_as != signed_in_as {
+            account.signed_in_as = signed_in_as.to_owned();
+        }
+        if account.signed_in_to != signed_in_to {
+            account.signed_in_to = signed_in_to.to_owned();
+        }
+        if account.message.as_deref() != message {
+            account.message = message.map(str::to_owned);
+        }
+    }
+
+    /// Fills the address and the name in from what was saved last time.
+    ///
+    /// **Once, at startup**, and never again: this writes buffers the person is otherwise the
+    /// only owner of. See [`Self::set_account_status`] for the half that is safe per frame.
+    pub fn seed_account(&mut self, server: &str, username: &str) {
+        self.library.account.server = server.to_owned();
+        self.library.account.username = username.to_owned();
+    }
+
     /// Shows a transient message.
     pub fn toast(&mut self, ctx: &Context, toast: Toast) {
         let now = ctx.input(|i| i.time);

@@ -58,6 +58,7 @@ pub mod menubar;
 pub mod mesh;
 pub mod mindmap;
 pub mod options;
+pub mod signin;
 pub mod sync;
 pub mod session;
 pub mod shapes;

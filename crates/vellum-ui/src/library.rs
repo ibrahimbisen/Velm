@@ -34,13 +34,15 @@
 //! the rest of the crate does. That is what lets the whole screen be driven from a
 //! test with synthetic clicks and no store behind it.
 
-use crate::event::{EventSink, LibraryEvent, UiEvent};
+use crate::event::{EventSink, LibraryEvent, Secret, UiEvent};
 use crate::icon::Icon;
 use crate::theme::{
     CARD_PADDING, Palette, SIDEBAR_WIDTH, card_frame, numeric, panel_title, radius,
     screen_title, space,
 };
-use crate::widgets::{ICON_STROKE, hairline, icon_button, search_field, section_header};
+use crate::widgets::{
+    ICON_STROKE, hairline, icon_button, search_field, section_header, text_field,
+};
 use egui::{
     Align, CornerRadius, CursorIcon, Id, Layout, Rect, Response, Sense, Stroke,
     StrokeKind, TextureId, Ui, UiBuilder, Vec2, containers::Popup, vec2,
@@ -156,31 +158,33 @@ pub enum Scope {
 
 /// Which page of the settings you are on.
 ///
-/// # One page today, and the type stays anyway
+/// # The strip appears here for the first time
 ///
-/// The strip is **not drawn while there is a single page** — a tab bar with one tab is a
-/// control that cannot do anything, which is worse than no control because it invites the
-/// click that proves it. [`settings`] skips it on `ALL.len() == 1` and keeps the subtitle,
-/// which is the half that was carrying information.
+/// It was **not drawn while there was a single page** — a tab bar with one tab is a control
+/// that cannot do anything, which is worse than no control because it invites the click that
+/// proves it. [`settings`] still skips it on `ALL.len() == 1`; with [`Self::Account`] there
+/// are two, so the strip is drawn.
 ///
-/// The type survives the strip because it is what makes a second page cheap: it is `pub`,
-/// `vellum_app::shell` resolves `--show settings:<tab>` through [`Self::label`], and a page
-/// reached by a click and nothing else is unphotographable without that. Collapsing it to
-/// nothing would mean rebuilding the strip, the diagnostic and the app's plumbing together
-/// the next time the settings outgrow one screen.
+/// The type survived the strip for exactly this moment: it is `pub`, `vellum_app::shell`
+/// resolves `--show settings:<tab>` through [`Self::label`], and a page reached by a click
+/// and nothing else is unphotographable without that. So `--show settings:Account` needed no
+/// change to the app at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsTab {
     /// Appearance and board behaviour: the application's own settings.
     #[default]
     General,
+    /// The server your boards sync to, and who you are on it.
+    Account,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 1] = [Self::General];
+    pub const ALL: [Self; 2] = [Self::General, Self::Account];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Account => "Account",
         }
     }
 
@@ -188,7 +192,77 @@ impl SettingsTab {
     pub const fn subtitle(self) -> &'static str {
         match self {
             Self::General => "How Velm looks, and how a board behaves as you work on it.",
+            Self::Account => "Which server your boards sync to, and who you are on it.",
         }
+    }
+}
+
+/// Whether this machine is signed in to a server, as far as the interface knows.
+///
+/// The app owns this value: it is written by
+/// [`Chrome::set_account_status`](crate::Chrome::set_account_status) once a frame and read
+/// here. The page never sets it, because the page cannot know — a sign-in is a request on a
+/// worker thread that answers some frames later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccountState {
+    /// No session. The three fields are editable and *Sign in* is offered.
+    #[default]
+    SignedOut,
+    /// A request is out. The fields are disabled, because changing one now would describe a
+    /// request that has already left.
+    SigningIn,
+    /// A session is held. The address and the name are shown as text, and *Sign out* is
+    /// offered in place of the button.
+    SignedIn,
+}
+
+/// Settings ▸ Account's own memory between frames: what is being typed, and what the app
+/// last said about it.
+///
+/// # Why it is not on [`SettingsView`]
+///
+/// `SettingsView` is `Copy` and rebuilt from scratch every frame, so a `&mut String` cannot
+/// live there. This is state the interface owns across frames, which is what [`LibraryState`]
+/// is for.
+///
+/// # The two halves have different owners, and mixing them is a bug
+///
+/// - `server`, `username` and `password` belong to **the person typing**. Nothing outside
+///   this page writes them once the page is open, or a per-frame update would fight the
+///   keyboard sixty times a second.
+/// - `state`, `signed_in_as`, `signed_in_to` and `message` belong to **the app**, and are
+///   replaced every frame.
+///
+/// `Debug` is written by hand because [`LibraryState`] derives it and this holds a password.
+#[derive(Default)]
+pub struct AccountFields {
+    /// The address as typed, raw. The app normalises it; see
+    /// [`UiEvent::SignInRequested`](crate::UiEvent::SignInRequested).
+    pub server: String,
+    pub username: String,
+    pub password: String,
+    pub state: AccountState,
+    /// Who the app says is signed in. Empty unless `state` is
+    /// [`AccountState::SignedIn`].
+    pub signed_in_as: String,
+    /// The address the app actually used, after normalising. Shown so the person can see
+    /// that `boards.example.com` became `https://boards.example.com/`.
+    pub signed_in_to: String,
+    /// One sentence from the app, or `None` when nothing has failed.
+    pub message: Option<String>,
+}
+
+impl std::fmt::Debug for AccountFields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountFields")
+            .field("server", &self.server)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("state", &self.state)
+            .field("signed_in_as", &self.signed_in_as)
+            .field("signed_in_to", &self.signed_in_to)
+            .field("message", &self.message)
+            .finish()
     }
 }
 
@@ -231,6 +305,8 @@ pub struct LibraryState {
     pub scope: Scope,
     /// Which page of the settings is open. Ignored on every other scope.
     pub settings_tab: SettingsTab,
+    /// Settings ▸ Account's fields and status. Ignored on every other page.
+    pub account: AccountFields,
     pub layout: LayoutMode,
     /// How **All boards** is arranged. Ignored by every other scope.
     pub grouping: Grouping,
@@ -539,7 +615,14 @@ pub(crate) fn show(
         // The settings page holds no boards, so it returns before the grid is built at all
         // rather than filtering an empty list through it and landing on *"No boards here"*.
         if state.scope == Scope::Settings {
-            settings(ui, palette, &mut state.settings_tab, settings_view, events);
+            settings(
+                ui,
+                palette,
+                &mut state.settings_tab,
+                settings_view,
+                &mut state.account,
+                events,
+            );
             return;
         }
 
@@ -2256,6 +2339,57 @@ mod tests {
         }
     }
 
+    /// All three account states draw, and none of them signs anybody in or out on its own.
+    ///
+    /// The Account page is the first one in this crate with a *submit*, so the failure worth
+    /// pinning is a button that fires from being drawn. `SigningIn` and `SignedIn` are the
+    /// two states `--show settings:Account` cannot photograph, which makes this the only
+    /// automated cover they have.
+    #[test]
+    fn every_account_state_draws_and_signs_nobody_in_by_itself() {
+        for state in [AccountState::SignedOut, AccountState::SigningIn, AccountState::SignedIn] {
+            let mut library = LibraryState {
+                scope: Scope::Settings,
+                settings_tab: SettingsTab::Account,
+                account: AccountFields {
+                    server: "boards.example.com".to_owned(),
+                    username: "sam".to_owned(),
+                    password: "a password".to_owned(),
+                    state,
+                    signed_in_as: "sam".to_owned(),
+                    signed_in_to: "https://boards.example.com/".to_owned(),
+                    message: Some("That username and password do not match.".to_owned()),
+                },
+                ..LibraryState::default()
+            };
+            let events = run(&[], &mut library);
+            assert!(events.is_empty(), "the {state:?} page emitted {events:?} on its own");
+            assert_eq!(library.account.state, state, "the page changed its own state");
+            assert_eq!(
+                library.account.password, "a password",
+                "the page cleared the password without a click"
+            );
+        }
+    }
+
+    /// `LibraryState` derives `Debug` and now holds a password, so the redaction has to hold
+    /// here as well as on `Secret`. Same shape as `event::tests`, one level up.
+    #[test]
+    fn the_library_state_does_not_print_a_password() {
+        let library = LibraryState {
+            account: AccountFields {
+                password: "hunter2-and-a-half".to_owned(),
+                username: "sam".to_owned(),
+                ..AccountFields::default()
+            },
+            ..LibraryState::default()
+        };
+        let printed = format!("{library:?}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(printed.contains("redacted"), "{printed}");
+        assert!(printed.contains("sam"), "the rest is still loggable: {printed}");
+    }
+
     /// It draws, and it emits nothing untouched.
     ///
     /// Worth its own test beyond `every_scope_and_layout_draws`: this page is the only one
@@ -2395,6 +2529,7 @@ fn settings(
     palette: Palette,
     tab: &mut SettingsTab,
     view: &SettingsView,
+    account: &mut AccountFields,
     events: &mut EventSink,
 ) {
     // The strip, then one line saying what this page is for. Above the scroll area, so it
@@ -2427,8 +2562,163 @@ fn settings(
         ui.set_max_width(space::of(140));
         match tab {
             SettingsTab::General => general_settings(ui, palette, view, events),
+            SettingsTab::Account => account_settings(ui, palette, account, events),
         }
     });
+}
+
+/// Settings ▸ Account: the server, who you are on it, and the button that joins the two.
+///
+/// # Signing in is optional and this page says so
+///
+/// *"update the app so that the signing in is optional in the settings and i have to give a
+/// url sign in and password … so i want it to connect to the correct server not just any
+/// server"*. An application with nothing typed here behaves exactly as it did: no thread, no
+/// socket and no request. Nothing on this page is required to open, edit or save a board.
+///
+/// # Every state is drawn, including the two that are waiting
+///
+/// A form whose only feedback is that nothing happened is a form people press twice. So a
+/// request in flight disables the fields and says *Signing in*, and a refusal puts one
+/// sentence under the button. The sentences come from the app, because the app is the half
+/// that saw the answer.
+fn account_settings(
+    ui: &mut Ui,
+    palette: Palette,
+    account: &mut AccountFields,
+    events: &mut EventSink,
+) {
+    let editable = account.state == AccountState::SignedOut;
+
+    section(ui, palette, "Server");
+    if account.state == AccountState::SignedIn {
+        // Static text, not a field. The address a session was minted against cannot be
+        // edited under it: the cookie belongs to that host and to no other.
+        setting(
+            ui,
+            palette,
+            "Address",
+            "Your boards sync here. Sign out to use a different server.",
+            |ui| {
+                ui.label(
+                    egui::RichText::new(account.signed_in_to.as_str()).color(palette.muted),
+                );
+            },
+        );
+    } else {
+        setting(
+            ui,
+            palette,
+            "Address",
+            "The web address of your Velm server. Ask the person who runs it. Start it with \
+             https, or your password crosses the network as plain text.",
+            |ui| {
+                ui.add_enabled_ui(editable, |ui| {
+                    text_field(
+                        ui,
+                        palette,
+                        Id::new("vellum-account-server"),
+                        &mut account.server,
+                        "boards.example.com",
+                        false,
+                    );
+                });
+            },
+        );
+    }
+
+    section(ui, palette, "Sign in");
+    if account.state == AccountState::SignedIn {
+        setting(
+            ui,
+            palette,
+            "Signed in as",
+            "Only the boards this account owns or was shared will sync.",
+            |ui| {
+                ui.label(egui::RichText::new(account.signed_in_as.as_str()).color(palette.text));
+            },
+        );
+        if ui.button("Sign out").clicked() {
+            events.push(UiEvent::SignOutRequested);
+        }
+    } else {
+        setting(ui, palette, "Username", "The name you use on that server.", |ui| {
+            ui.add_enabled_ui(editable, |ui| {
+                text_field(
+                    ui,
+                    palette,
+                    Id::new("vellum-account-username"),
+                    &mut account.username,
+                    "Username",
+                    false,
+                );
+            });
+        });
+        // Enter on the password field submits, the way it does in every sign-in form.
+        // Latched out of the closure because `setting` owns the layout the field is drawn in.
+        let mut entered = false;
+        setting(
+            ui,
+            palette,
+            "Password",
+            "Velm sends it to your server once, to start a session. It is written to no \
+             file on this machine.",
+            |ui| {
+                ui.add_enabled_ui(editable, |ui| {
+                    let field = text_field(
+                        ui,
+                        palette,
+                        Id::new("vellum-account-password"),
+                        &mut account.password,
+                        "Password",
+                        true,
+                    );
+                    // **Read before anything requests focus.** Nothing on this page does,
+                    // and that is why this works — `TextEdit` signals Enter only by
+                    // surrendering focus, and a `request_focus` above this line would take it
+                    // back synchronously and make this false for ever. The rename dialog
+                    // carries the long version; `text_field`'s own doc carries the rule.
+                    entered = field.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                });
+            },
+        );
+
+        let complete = !account.server.trim().is_empty()
+            && !account.username.trim().is_empty()
+            && !account.password.is_empty();
+        let label = if account.state == AccountState::SigningIn { "Signing in…" } else { "Sign in" };
+        let pressed = ui.add_enabled(editable && complete, egui::Button::new(label)).clicked();
+        if (pressed || entered) && editable && complete {
+            // **`take`, not `clone`.** The field is cleared on the same frame the event is
+            // pushed, which is the whole of what this page can honestly promise about the
+            // password: it stops being on screen and stops being one of the copies this
+            // crate holds. `Secret`'s own doc lists the copies that remain.
+            let server = account.server.trim().to_owned();
+            let username = account.username.trim().to_owned();
+            let password = Secret::new(std::mem::take(&mut account.password));
+            events.push(UiEvent::SignInRequested { server, username, password });
+        }
+    }
+
+    if let Some(message) = account.message.as_deref() {
+        ui.add_space(space::UNIT);
+        ui.label(
+            egui::RichText::new(message).color(palette.muted).size(crate::theme::text::LABEL),
+        );
+    }
+
+    ui.add_space(space::of(3));
+    ui.label(
+        egui::RichText::new(
+            "To make an account, open your server's sign-in page in a browser. You need a \
+             code from the person who runs the server.",
+        )
+        .color(palette.faint)
+        .size(crate::theme::text::LABEL),
+    );
+
+    ui.add_space(space::of(8));
 }
 
 /// Appearance and board behaviour — the application's own settings.

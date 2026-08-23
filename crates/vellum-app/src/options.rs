@@ -387,6 +387,17 @@ pub fn is_loopback(server: &str) -> bool {
     host.parse::<std::net::Ipv4Addr>().is_ok_and(|address| address.is_loopback())
 }
 
+/// Seconds between round trips, when nobody says otherwise.
+///
+/// Three seconds. Fast enough that moving a sticky on the iPad appears on the Mac before you
+/// have looked away from it, slow enough that an idle board is twenty requests a minute
+/// rather than a thousand. A failure backs off on its own from here.
+///
+/// It was a `const` inside [`parse_args`] and is `pub` now because sync can be turned on from
+/// Settings ▸ Account as well as from a flag, and a second cadence written out beside this
+/// one is two numbers that drift apart.
+pub const DEFAULT_SYNC_PERIOD: f64 = 3.0;
+
 /// What `main` should do after parsing.
 #[derive(Debug, PartialEq)]
 pub enum Command {
@@ -398,10 +409,6 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command> {
     let mut options = Options::default();
     let mut args = args.into_iter();
     let mut sync_server: Option<String> = None;
-    /// Three seconds. Fast enough that moving a sticky on the iPad appears on the Mac before
-    /// you have looked away from it, slow enough that an idle board is twenty requests a
-    /// minute rather than a thousand. A failure backs off on its own from here.
-    const DEFAULT_SYNC_PERIOD: f64 = 3.0;
     let mut sync_period = DEFAULT_SYNC_PERIOD;
 
     while let Some(arg) = args.next() {

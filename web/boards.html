@@ -4,7 +4,7 @@
      handles its own pinch and a browser zoom on top of it fights the camera. This page is a
      document: pinching it to read a long board name is the browser doing its job. -->
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Velm — your boards</title>
+<title>Your boards · Velm</title>
 
 <!--
   ══════════════════════════════════════════════════════════════════════════════════════
@@ -773,6 +773,113 @@
   }
   #velm-import-said[data-bad="true"] { color: var(--danger); }
 
+  /* ── Accounts: the invite panel and the share panel ─────────────────────────────────
+     Both are `.panel`, so they take the connect form's own frame, field and hint rules and
+     add nothing to the page's vocabulary except the code readout. They are wider than the
+     connect form because each one carries a list.
+
+     ⚠ Neither is drawn unless `boards.js` has an answer from `GET /api/v1/whoami` that says
+     the person may use it. A control that is on screen and answers 403 is the described
+     gesture this repository has a standing rule against. */
+  #velm-invites, #velm-share { max-width: 60ch; }
+  #velm-invites h2, #velm-share h2 {
+    font-size: var(--t-panel);
+    font-weight: 400;
+    margin: 0 0 var(--pad);
+    /* A board title arrives here over the wire, so it is written with `textContent` and it is
+       kept to one line: a board called by a paragraph would push the whole panel down. */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .panel-actions { display: flex; flex-wrap: wrap; gap: var(--pad); margin-top: var(--pad); }
+
+  /* ── The code, once it is made ──────────────────────────────────────────────────────
+     ⚠ **This is the one thing on the page that has to be readable across a room and over a
+     telephone**, so it is the one thing set larger than the screen title. Monospace, because
+     the alphabet drops `O`, `I`, `L` and `U` precisely so that no two characters look alike,
+     and a proportional face gives that back. `user-select: all` makes one tap or one click
+     select the whole code, which is the fallback whenever the clipboard is not available:
+     `navigator.clipboard` is undefined on a plain http address, and this page is opened over
+     plain http on a home network more often than not. */
+  .velm-code {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    margin: 12px 0;
+    padding: 12px;
+    border: 1px solid var(--accent);
+    border-radius: var(--r-small);
+    background: var(--accent-soft);
+  }
+  .velm-code-value {
+    margin: 0;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    user-select: all;
+    -webkit-user-select: all;
+    font: 24px/1.3 var(--mono);
+    letter-spacing: 0.08em;
+    color: var(--on-accent-soft);
+  }
+  .velm-code .btn { flex: none; }
+
+  /* ── A list of codes, or of people ──────────────────────────────────────────────────
+     A plain list, one row each, with the destructive verb at the end of its own row. The row
+     grows to 44 on a coarse pointer for the same reason every other row on this page does. */
+  .velm-rows { list-style: none; margin: 0 0 12px; padding: 0; }
+  .velm-rows li {
+    display: flex;
+    align-items: center;
+    gap: var(--pad);
+    min-height: 32px;
+    padding: var(--unit) 0;
+    border-bottom: 1px solid var(--border);
+  }
+  @media (pointer: coarse) { .velm-rows li { min-height: 44px; } }
+  .velm-rows .velm-row-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font: var(--t-numeric)/1.4 var(--mono);
+    letter-spacing: 0.06em;
+  }
+  .velm-rows .velm-row-when { flex: none; color: var(--faint); font-size: var(--t-label); }
+  .velm-rows .btn { flex: none; }
+  .velm-said { margin: var(--pad) 0 0; color: var(--muted); font-size: var(--t-numeric); }
+  .velm-said[data-bad="true"] { color: var(--danger); }
+
+  /* ── The share button on a card ─────────────────────────────────────────────────────
+     ⚠ **A sibling of the card, not a child of it.** A card is an `<a href>`, and a button
+     inside an anchor is not markup a browser has one answer for: the press either follows the
+     link or does not, depending on which browser it is. So the anchor and the button are two
+     children of one wrapper, and the button is laid over the card's picture slot.
+
+     It is the last child so it is painted over the card without a `z-index`, and the wrapper
+     takes no size of its own: the card is 236 x 176 and stays the grid's unit. */
+  .velm-cell { position: relative; flex: none; }
+  .velm-share-btn {
+    position: absolute;
+    top: var(--unit);
+    left: var(--unit);
+    min-height: 20px;
+    padding: 0 var(--pad);
+    font-size: var(--t-label);
+    background: var(--surface);
+  }
+  @media (pointer: coarse) { .velm-share-btn { min-height: 44px; } }
+  /* The list layout puts it at the end of the row instead, where the row's own flex handles
+     it and nothing has to be laid over anything. The hairline moves from the row to this
+     wrapper, or it would stop short of the button and read as a row that failed to finish. */
+  .velm-rowcell { display: flex; align-items: center; border-bottom: 1px solid var(--border); }
+  .velm-rowcell > a { flex: 1 1 auto; min-width: 0; border-bottom: 0; }
+  .velm-rowcell > .velm-share-btn { position: static; margin-left: var(--pad); }
+
+  /* The two panels use the sidebar's own section label, without the sidebar's indent. */
+  #velm-invites .velm-section, #velm-share .velm-section { padding: 0; }
+
   footer { margin-top: 32px; }
   .note { margin: 0 0 12px; color: var(--muted); font-size: var(--t-numeric); max-width: 72ch; }
   .footer-actions { display: flex; flex-wrap: wrap; gap: var(--pad); }
@@ -861,6 +968,11 @@
                beside it. Two controls for one appearance with one of them permanently inert is
                the arrangement feedback 31 removed from the desktop; a comment naming where they
                come from is worth more than a placeholder that lies about being one. -->
+          <!-- ⚠ Admin only, and hidden until `GET /api/v1/whoami` on this page's **own** origin
+               has said so. A remote server reached with a passphrase never shows it: a session
+               is a `SameSite=Strict` cookie, so it cannot travel to another origin, and minting
+               is refused to a bearer token by the server on purpose. -->
+          <button class="btn" id="velm-invites-open" type="button" hidden>Invite someone</button>
           <button class="btn" id="velm-import-open" type="button" hidden>Import from Miro</button>
           <!-- ⚠ Was `hidden` with a comment reading "unhide when a create route is wired". The
                route **was** wired — `POST /api/v1/boards` — and the agent that wrote this could
@@ -903,12 +1015,93 @@
         Remember the passphrase on this device
       </label>
       <p class="hint">
-        Off, the passphrase is forgotten when this tab closes — which is what you want on a
+        Off, the passphrase is forgotten when this tab closes, which is what you want on a
         computer that is not yours. On, it stays until you press <em>Forget this device</em>.
       </p>
 
       <button class="btn" id="velm-connect-go" type="submit">Connect</button>
     </form>
+
+    <!--
+      ══ INVITE CODES ═══════════════════════════════════════════════════════════════════
+      Admin only. `boards.js` unhides the button in the header above once `GET /api/v1/whoami`
+      answers 200 with `"admin": true`, and this panel opens from that button.
+
+      ── ⚠ why the admin surface is on this page and not on an `admin.html` of its own ───
+      Because the board-sharing control on the cards below already forces this file's script to
+      learn who is signed in. Once `boards.js` holds a `whoami` answer, a second page costs a
+      fourth copy of the palette, a fourth copy of the message and panel rules, a new arm in
+      `serve.rs`'s `static_target`, and a new name in `scripts/build-web.sh`'s fixed copy list,
+      and it buys separation from a file that has already given the separation up. This page is
+      also the only place an admin already is: the invite is made for somebody who is going to
+      be given a board, and the boards are here.
+
+      ── ⚠ the code is a secret, and it appears in exactly one place ────────────────────
+      In `#velm-invites-value`, written with `textContent`. It is never put in a link, never in
+      `localStorage` or `sessionStorage`, and never on the console. The one exception is forced
+      by the wire: revoking is `DELETE /api/v1/invites/{code}`, so a revoked code passes through
+      a request line and a reverse proxy's access log. That is accepted rather than overlooked,
+      because the effect of that request is to kill the value it names: what the log keeps is
+      already dead by the time the line is written.
+    -->
+    <section class="panel" id="velm-invites" hidden>
+      <h2>Invite someone</h2>
+      <p class="hint">
+        A code lets one person make one account on this server. It works once. Give it to the
+        person yourself, because anybody who has it can use it.
+      </p>
+      <button class="btn btn-accent" id="velm-invites-make" type="button">Make a code</button>
+
+      <!-- Shown only after a code has been made. `user-select: all` is the copy path on every
+           browser; the button is the faster one where the clipboard is available. -->
+      <div class="velm-code" id="velm-invites-fresh" hidden>
+        <p class="velm-code-value" id="velm-invites-value"></p>
+        <button class="btn" id="velm-invites-copy" type="button">Copy</button>
+      </div>
+      <p class="velm-said" id="velm-invites-said"></p>
+
+      <p class="velm-section">Codes waiting</p>
+      <ul class="velm-rows" id="velm-invites-list"></ul>
+      <p class="note" id="velm-invites-empty" hidden>No codes are waiting.</p>
+
+      <button class="btn" id="velm-invites-close" type="button">Done</button>
+    </section>
+
+    <!--
+      ══ SHARING ONE BOARD ══════════════════════════════════════════════════════════════
+      Opened by the Share button on a card. `boards.js` draws that button only on a board the
+      signed-in account owns, or on every board when the account is an admin, which is the same
+      rule the server enforces on the route.
+
+      ⚠ One field and two verbs, because that is exactly what the wire has: `POST` and `DELETE`
+      on `/api/v1/boards/{id}/share`, each carrying `{"username"}`. There is no route that asks
+      who a board is already shared with, so the list below is drawn only when the board list
+      itself carries that fact, and the field works whether or not it does.
+    -->
+    <section class="panel" id="velm-share" hidden>
+      <h2 id="velm-share-title">Share</h2>
+      <p class="hint">
+        The person needs an account on this server already. Sharing lets them open the board and
+        change it. It does not let them share it with anybody else.
+      </p>
+
+      <label class="field" for="velm-share-user">Username</label>
+      <input id="velm-share-user" name="username" type="text"
+             autocomplete="off" inputmode="text" enterkeyhint="done"
+             autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
+
+      <div class="panel-actions">
+        <button class="btn btn-accent" id="velm-share-go" type="button">Give access</button>
+        <button class="btn btn-danger" id="velm-share-take" type="button">Take access away</button>
+      </div>
+      <p class="velm-said" id="velm-share-said"></p>
+
+      <p class="velm-section">Who can open it</p>
+      <ul class="velm-rows" id="velm-share-list"></ul>
+      <p class="note" id="velm-share-none" hidden></p>
+
+      <button class="btn" id="velm-share-close" type="button">Done</button>
+    </section>
 
     <!-- The bands, or one grid. `boards.js` fills this: `section.velm-band` per band on the
          Recent page and per folder on a grouped All boards, one `.velm-grid` inside each. -->
@@ -940,7 +1133,7 @@
       </ol>
       <div class="velm-import-drop" id="velm-import-drop" contenteditable="true"
            role="textbox" aria-label="Paste your Miro board here"
-           data-empty="Paste here — nothing is sent until you press the button."></div>
+           data-empty="Paste here. Nothing is sent until you press the button."></div>
       <input id="velm-import-name" type="text" autocomplete="off" placeholder="Board name">
       <button class="btn" id="velm-import-go" type="button">Bring it across</button>
       <p class="note" id="velm-import-said"></p>

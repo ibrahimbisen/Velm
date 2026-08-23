@@ -142,6 +142,18 @@ impl MenuBar {
         app.append_items(&[
             &PredefinedMenuItem::about(Some("About Velm"), Some(about)),
             &PredefinedMenuItem::separator(),
+            // ⚠ **The first custom row in this submenu.** Everything else here is a
+            // `PredefinedMenuItem`, so this is a genuinely new kind of entry rather than one
+            // more of the same, and it goes straight after About because that is where macOS
+            // puts Settings in every application. `accelerator` gives it ⌘, — `code_for`
+            // already maps `Key::Comma`, and a shortcut carrying ⌘ passes both of that
+            // function's refusals.
+            //
+            // Verify this by screenshot rather than by reasoning: whether `muda` draws a
+            // custom row correctly in the application submenu is not something the type
+            // system has an opinion about.
+            &self.row(C::OpenSettings),
+            &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::services(None),
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::hide(Some("Hide Velm")),

@@ -8,11 +8,11 @@
 <!-- ⚠ `noindex` on a sign-in page, not because it is secret — it holds nothing — but because a
      search result pointing at somebody's own server's front door is an invitation to knock. -->
 <meta name="robots" content="noindex, nofollow">
-<title>Velm — sign in</title>
+<title>Sign in · Velm</title>
 
 <!--
   ══════════════════════════════════════════════════════════════════════════════════════
-  ONE PAGE, TWO STATES — and the contract with `signin.js`
+  ONE PAGE, THREE STATES — and the contract with `signin.js`
   ══════════════════════════════════════════════════════════════════════════════════════
 
   A server with no accounts on it needs **setting up**, not signing in. Both are this file,
@@ -24,7 +24,24 @@
       401 `{"setup": true}`   no accounts yet       → the SETUP form below
       401 `{"setup": false}`  accounts exist        → the SIGN IN form below
       401, unreadable body    an older velmd        → the SIGN IN form (see `readSetupFlag`)
-      no answer at all        server down / offline → a message, and neither form
+      no answer at all        server down / offline → a message, and no form
+
+  ── the third state, and why `whoami` does not choose it ──────────────────────────────
+  Somebody who was given an **invite code** is on a server that already has accounts, so
+  `whoami` answers exactly what it answers for the person who has one: `401 {"setup": false}`.
+  The two cannot be told apart from here, and asking the server to tell them apart is the
+  wrong thing to want: a flag saying *"this server is taking new accounts"* is a fact about
+  the server that anybody who loads this page can read, and it is not one worth publishing.
+
+  So the third state is reached by a **gesture**: a quiet button under the sign-in form, and
+  a matching one that goes back. No extra round trip, no new key on the wire, and the sign-in
+  form stays the thing the page opens on, which is what it is for almost every visit.
+
+  ── ⚠ the code is a secret, and it lives in one place only ────────────────────────────
+  It is typed into the field below, put into one JSON body, and dropped. It is never in the
+  address bar, never in `localStorage`, never in `sessionStorage`, and never in a link. A
+  code in a URL is a code in history, in the referrer of the next page, and in every access
+  log between here and the server, and it stays a working credential until it is used.
 
   ── ⚠ this page only ever signs into the server that served it ────────────────────────
   There is no *Server address* field here, unlike `boards.html`, and that is structural rather
@@ -52,18 +69,22 @@
         #velm-message-detail      what to do about it — a different action per cause
       #velm-signin              form; POSTs `/api/v1/session`
         #velm-signin-user #velm-signin-pass #velm-signin-go
+        #velm-have-code           goes to the invite form
       #velm-setup               form; POSTs `/api/v1/accounts`, then signs in
         #velm-setup-user #velm-setup-pass #velm-setup-pass2 #velm-setup-go
+      #velm-invite              form; POSTs `/api/v1/accounts` with a code, then signs in
+        #velm-invite-code #velm-invite-user #velm-invite-pass #velm-invite-pass2
+        #velm-invite-go #velm-invite-back
       #velm-lifetime            the sentence naming how long a session lasts
 
-  ── ⚠ why two forms rather than one whose labels change ───────────────────────────────
+  ── ⚠ why three forms rather than one whose labels change ─────────────────────────────
   A password manager reads `autocomplete` to decide whether it is looking at a sign-in or a
   new account. One form mutating `current-password` into `new-password` at runtime is how a
   manager comes to offer a saved password into a *create* field, or to save the wrong one.
-  Two forms, each with its attributes fixed in the markup, cannot do that — and only one of
-  them is ever in the document's flow, because the other carries `hidden`.
+  Three forms, each with its attributes fixed in the markup, cannot do that — and only one of
+  them is ever in the document's flow, because the others carry `hidden`.
 
-  ── ⚠ both forms are `method="post"` and neither has an `action` ──────────────────────
+  ── ⚠ every form is `method="post"` and none has an `action` ──────────────────────────
   A `<form>` with no method **GETs**, and a GET submit puts every field in the address bar —
   so a build where `signin.js` fails to load would write the password into the URL, into
   history, and into every access log between here and the server. `method="post"` makes the
@@ -252,6 +273,24 @@
      with, so an untouched empty form is not painted red before anybody has typed anything. */
   input:user-invalid { border-color: var(--danger); }
 
+  /* ── The invite-code field ──────────────────────────────────────────────────────────
+     A code is read off a message and typed one character at a time, so it is set in the
+     monospace family and letterspaced: every count on this page's Mac twin is monospace, and
+     here it also makes `0` and `O` two different shapes at the moment somebody is copying
+     one. The alphabet has no `O`, `I`, `L` or `U` in it for that same reason.
+
+     ⚠ `text-transform` paints the field uppercase and does **not** change the value that is
+     submitted. That is deliberate: the server folds case itself, so a client that upper-cased
+     the value would be a second implementation of a rule that already exists, and a client
+     that got it wrong would refuse a code the server would have taken. See `signin.js`.
+
+     ⚠ Still 16px, for the iOS reason above, and letterspacing rather than a bigger size. */
+  input.code-field {
+    font-family: var(--mono);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+
   .hint { margin: var(--unit) 0 0; color: var(--muted); font-size: var(--t-numeric); }
   .hint code { font: var(--t-numeric)/1 var(--mono); }
   /* Reserved by `min-height` rather than shown and hidden: a per-field error that appears
@@ -361,6 +400,12 @@
 
       <button class="btn" id="velm-signin-go" type="submit">Sign in</button>
       <p class="hint" id="velm-lifetime"></p>
+
+      <!-- ⚠ `type="button"`, inside this form rather than beside it. Inside, because it then
+           appears and disappears with the form it belongs to and `hideForms()` keeps working
+           unchanged; `type="button"` because the default type of a button in a form is
+           `submit`, so leaving it off would make *I have an invite code* sign in. -->
+      <button class="btn btn-quiet" id="velm-have-code" type="button">I have an invite code</button>
     </form>
 
     <!-- ══ FIRST RUN ════════════════════════════════════════════════════════════════════
@@ -369,7 +414,7 @@
          been made and it must not depend on a fetch to be read. -->
     <form id="velm-setup" method="post" novalidate hidden>
       <p class="hint" id="velm-setup-note">
-        This server has no accounts yet. The first one <strong>owns it</strong> — it can see
+        This server has no accounts yet. The first one <strong>owns it</strong>. It can see
         every board already here, and it is the only account that can add or remove others.
       </p>
 
@@ -391,7 +436,7 @@
            form with three fields that is a person fixing the wrong box. -->
       <p class="field-error" id="velm-setup-pass-error"></p>
       <p class="hint">
-        At least 12 characters. There are no rules about capitals or symbols — length is the
+        At least 12 characters. There are no rules about capitals or symbols, because length is the
         only thing that makes a password hard to guess, and every other rule just produces
         <code>Password1!</code>.
       </p>
@@ -403,9 +448,71 @@
 
       <button class="btn" id="velm-setup-go" type="submit">Create this account</button>
       <p class="hint">
-        There is no way to reset this password — nothing here can send you an email. Keep it
+        There is no way to reset this password, because nothing here can send you an email. Keep it
         somewhere you will still have it.
       </p>
+    </form>
+
+    <!-- ══ AN INVITE CODE ════════════════════════════════════════════════════════════════
+         The FIRST RUN form's own shape, because it is the closest thing on this page that
+         already works: the same field order, the same `new-password` pair, the same error line
+         under each field. What it adds is the code, and what it takes away is the sentence
+         about owning the server — an invited account owns nothing and is never an admin, and
+         the server forces that whatever this page sends.
+
+         ⚠ The code is **first**. It is the thing that makes this form make sense, and putting
+         it after the passwords would let somebody fill in three fields before finding out they
+         are on the wrong form. It also keeps the username field next to the `new-password`
+         pair, which is the order a password manager reads. -->
+    <form id="velm-invite" method="post" novalidate hidden>
+      <p class="hint" id="velm-invite-note">
+        Someone who runs this server made this code for you. It works once, and it stops working
+        after a while, so make the account now rather than later.
+      </p>
+
+      <label class="field" for="velm-invite-code">Your invite code</label>
+      <!-- ⚠ `autocomplete="off"` and `type="text"`: a manager offered a saved password into
+           this box would be filling a field that is not one. `autocapitalize="characters"`
+           because every code is upper case, so a phone keyboard should open on the right one.
+           `spellcheck` off for the reason the username field gives: this is not a word. -->
+      <input id="velm-invite-code" name="code" type="text" required class="code-field"
+             autocomplete="off" inputmode="text" enterkeyhint="next"
+             autocapitalize="characters" autocorrect="off" spellcheck="false" maxlength="32"
+             placeholder="XXXX-XXXX-XXXX">
+      <p class="field-error" id="velm-invite-code-error"></p>
+      <p class="hint">
+        Type it as you were given it. The dashes and the capitals do not matter.
+      </p>
+
+      <label class="field" for="velm-invite-user">Choose a username</label>
+      <input id="velm-invite-user" name="username" type="text" required
+             autocomplete="username" inputmode="text" enterkeyhint="next"
+             autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="64">
+      <p class="field-error" id="velm-invite-user-error"></p>
+
+      <label class="field" for="velm-invite-pass">Choose a password</label>
+      <!-- `new-password` on both, for the reason the first-run form gives: it is what makes a
+           manager generate one and offer the same value into the confirm box. -->
+      <input id="velm-invite-pass" name="password" type="password" required minlength="12"
+             autocomplete="new-password" enterkeyhint="next" maxlength="128">
+      <p class="field-error" id="velm-invite-pass-error"></p>
+      <p class="hint">
+        At least 12 characters. There are no rules about capitals or symbols, because length is the
+        only thing that makes a password hard to guess, and every other rule just produces
+        <code>Password1!</code>.
+      </p>
+
+      <label class="field" for="velm-invite-pass2">And again</label>
+      <input id="velm-invite-pass2" name="password_confirm" type="password" required minlength="12"
+             autocomplete="new-password" enterkeyhint="go" maxlength="128">
+      <p class="field-error" id="velm-invite-pass2-error"></p>
+
+      <button class="btn" id="velm-invite-go" type="submit">Create my account</button>
+      <p class="hint">
+        There is no way to reset this password, because nothing here can send you an email. Keep it
+        somewhere you will still have it.
+      </p>
+      <button class="btn btn-quiet" id="velm-invite-back" type="button">I already have an account</button>
     </form>
 
     <!-- Shown only when nothing answered, because that is the one failure where the useful

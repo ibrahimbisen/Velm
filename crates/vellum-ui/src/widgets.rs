@@ -455,6 +455,50 @@ pub fn search_field_for(
     changed || before_len != query.len()
 }
 
+/// One line of text the user types into, in the same well the search field wears.
+///
+/// The three sign-in rows share it so an address, a name and a password read as one form
+/// rather than as three widgets that happen to sit together.
+///
+/// `masked` draws bullets instead of characters — `egui::TextEdit::password`. Nothing else
+/// in the application asks for it, which is why it is a parameter rather than a second
+/// function: two near-identical widgets is two places for the well, the width and the hint
+/// colour to drift apart.
+///
+/// **Enter is read from the returned `Response`, and it must be read before anything
+/// requests focus.** `TextEdit` signals Enter only by *surrendering* focus, and
+/// `Response::request_focus` sets focus back synchronously — so a `lost_focus()` read after it
+/// can never be true. That one line of ordering is why Enter did nothing at all in the rename
+/// dialog for a while; `crate::dialog` carries the long version of the story. Settings ▸
+/// Account reads it that way and asks for focus from nowhere, which is what makes Enter
+/// submit its form; a later caller that adds a `request_focus` has to keep the order.
+pub fn text_field(
+    ui: &mut Ui,
+    palette: Palette,
+    id: Id,
+    value: &mut String,
+    hint: &str,
+    masked: bool,
+) -> Response {
+    let mut response = None;
+    well_frame(palette).show(ui, |ui| {
+        response = Some(
+            ui.add(
+                egui::TextEdit::singleline(value)
+                    .id(id)
+                    .password(masked)
+                    .desired_width(ui.available_width().min(CONTROL_WIDTH))
+                    .frame(egui::Frame::NONE)
+                    .hint_text(hint),
+            ),
+        );
+    });
+    // `expect` rather than a default: the closure above runs unconditionally, so `None` here
+    // would mean `Frame::show` stopped calling its own body — which is not a case a caller
+    // could do anything about.
+    response.expect("well_frame ran its body")
+}
+
 /// Icon stroke weight, `docs/05-design-language.md` §3: line drawings at 1.5px,
 /// geometric, consistent optical weight. One value, so a 16px menu icon and a 40px
 /// tool button read as the same family rather than as two sets.

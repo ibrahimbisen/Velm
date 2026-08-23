@@ -129,14 +129,37 @@ struct ZoomSweep {
 /// one server for every board this person opens — plus the two things that stop a per-frame
 /// call being rude. `asked_at` is the cadence, and `reported` is what keeps a server that is
 /// down from raising the same toast every three seconds for the rest of the afternoon.
+///
+/// ⚠ **`Clone` and deliberately not `Debug`.** It is cloned because signing out has to put
+/// back the setup the flags asked for rather than turning sync off, and it holds a credential,
+/// so a derived `Debug` would be that credential in whatever log line ever formatted it —
+/// the rule `crate::options`' `OnceLock` and `crate::sync::Credential` both exist to keep.
+#[derive(Clone)]
 pub(crate) struct SyncConfig {
     pub(crate) options: crate::options::SyncOptions,
-    /// May be empty: velmd needs no token on loopback. See `ActiveState::new`'s warning.
-    pub(crate) token: String,
+    /// What the request authenticates with. May be [`crate::sync::Credential::None`]: velmd
+    /// needs nothing on loopback. See `ActiveState::new`'s warning.
+    pub(crate) credential: crate::sync::Credential,
     /// When the last round trip was asked for, or `None` before the first.
     pub(crate) asked_at: Option<Instant>,
     /// The last failure already put in front of the user.
     pub(crate) reported: Option<String>,
+}
+
+/// What the app knows about Settings ▸ Account, pushed into the chrome once a frame.
+///
+/// It holds no credential: the session lives in `SyncConfig::credential` and nowhere else.
+/// Everything here is safe to print, which is why this one derives `Debug` and that one
+/// does not.
+#[derive(Debug, Default)]
+pub(crate) struct AccountStatus {
+    pub(crate) state: vellum_ui::AccountState,
+    /// Who is signed in. Empty unless `state` is signed in.
+    pub(crate) username: String,
+    /// The address the session was minted against, normalised.
+    pub(crate) server: String,
+    /// One sentence for the page, or `None` when nothing has failed.
+    pub(crate) message: Option<String>,
 }
 
 pub(crate) struct ActiveState {
@@ -167,6 +190,22 @@ pub(crate) struct ActiveState {
     /// same server. The `Editor` holds the round trip itself, so a parked board keeps its
     /// place in the conversation across a tab switch — see `Editor::sync`.
     pub(crate) sync: Option<SyncConfig>,
+    /// The `--sync-server` and `$VELM_SYNC_TOKEN` setup exactly as it was at startup.
+    ///
+    /// Kept so **signing out restores it rather than turning sync off**. Somebody who syncs
+    /// their own boards with a bearer token today, signs in from Settings to look at
+    /// somebody else's, and signs out again gets their own setup back. Without this, signing
+    /// out of an account they never had before would silently disable the sync that has been
+    /// running since they launched the app.
+    pub(crate) startup_sync: Option<SyncConfig>,
+    /// A sign-in in flight. `None` almost always.
+    pub(crate) pending_signin: Option<crate::signin::SignIn>,
+    /// Where the account page's message comes from, and who the app believes is signed in.
+    ///
+    /// On `ActiveState` rather than in the chrome because the chrome is redrawn from this
+    /// every frame — see `vellum_ui::Chrome::set_account_status`, which writes the app's half
+    /// of the page and never the three buffers the person is typing into.
+    pub(crate) account: AccountStatus,
     /// Every open board that is **not** the one on screen, so a tab switch is a swap
     /// rather than a reload. See `crate::session` for why the hot board is hoisted out
     /// of it rather than held in it.
@@ -612,10 +651,29 @@ impl Vellum {
                 );
             }
             log::info!("sync: {} every {}s", config.server, config.period);
-            SyncConfig { options: config, token, asked_at: None, reported: None }
+            // `Bearer` even when the token is empty, rather than `None`. `auth_header` turns
+            // an empty bearer into no header at all, so the bytes on the wire are exactly what
+            // they were — and keeping the *kind* means the reply applier can still tell a
+            // flag-configured setup apart from a signed-in one, which is what decides whether
+            // a 401 is a configuration mistake to report or a session to give up on.
+            SyncConfig {
+                options: config,
+                credential: crate::sync::Credential::Bearer(token),
+                asked_at: None,
+                reported: None,
+            }
         });
 
+        // The address and the name the last sign-in used, so the page opens with them filled
+        // in. **The password is not here and never will be** — nothing on this machine stores
+        // it, which is why signing in is asked for again on every launch. Once, here: this is
+        // the only write to those buffers that is not the person's own typing.
+        shell.seed_account();
+
         let mut state = ActiveState {
+            startup_sync: sync.clone(),
+            pending_signin: None,
+            account: AccountStatus::default(),
             sync,
             occluded: false,
             recorder,
@@ -1169,6 +1227,13 @@ impl ActiveState {
         // something happens to redraw.
         self.apply_link_fetches();
 
+        // ⚠ **Before `apply_sync`, never inside it.** `apply_sync` returns early when there
+        // is no sync configured, which is exactly the signed-out state a sign-in is trying to
+        // leave — a drain inside it would never run on the one machine that needed it, and
+        // Settings ▸ Account would sit on *Signing in* for ever. One `Option` test when
+        // nothing is in flight, which is almost always.
+        self.drain_sign_in();
+
         // The sync round trip, for the same reason and in the same place: an answer that came
         // back while the window was behind another one must still land. Before the occlusion
         // guard, so a board left open on a second monitor keeps up. Two comparisons when
@@ -1484,6 +1549,12 @@ impl ActiveState {
         for (key, dirty) in parked {
             self.shell.set_tab_dirty(key, dirty);
         }
+
+        // What the app knows about the account, into Settings ▸ Account. Before the chrome
+        // draws, so the page shows this frame's state rather than the previous one's — a
+        // *Signing in* that lags a frame behind the click reads as a button that did nothing.
+        // It writes the app's half only and never the three fields being typed into.
+        self.report_account();
 
         let window = self.window.clone();
         let events = self.shell.run(&window, &facts);

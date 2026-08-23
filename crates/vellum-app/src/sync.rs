@@ -145,6 +145,64 @@ const BACKOFF_BASE: Duration = Duration::from_secs(2);
 /// time it takes them to notice they are back.
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
 
+/// What a sync request authenticates with.
+///
+/// Two credentials reach the same route, and they are not alternatives to each other in the
+/// usual sense: [`Self::Bearer`] is `$VELM_SYNC_TOKEN`, the setup that syncs this machine's
+/// own boards today and must keep working byte for byte, and [`Self::Session`] is a cookie
+/// minted by `POST /api/v1/session` when somebody signs in from Settings ▸ Account. `velmd`
+/// accepts either on `/api/v1/boards/{id}/sync`.
+///
+/// ⚠ **No derived `Debug`.** Two of the three variants hold a credential, and a derived one
+/// is that credential in whatever log line ever formats a [`Sync`]. Same reason
+/// [`SyncReply`] has a hand-written one, and the same reason `crate::options` keeps the
+/// token in a `OnceLock` rather than on a struct that derives `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Credential {
+    /// Nothing. A `velmd` bound to loopback needs none.
+    None,
+    /// `$VELM_SYNC_TOKEN`, sent as `Authorization: Bearer`. **May be empty**, which
+    /// [`auth_header`] turns into no header at all — see there for why that is not the same
+    /// as sending an empty one.
+    Bearer(String),
+    /// A session from `POST /api/v1/session`.
+    ///
+    /// ⚠ **The name is carried, not assumed.** `velmd` sets `__Host-velm_session` when it
+    /// runs behind HTTPS and `velm_session` when it does not, so hard-coding either spelling
+    /// breaks half the deployments. What the server sent is what goes back.
+    Session { name: String, value: String },
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Bearer(_) => f.write_str("Bearer(<redacted>)"),
+            // The *name* is not a secret and it is the useful half of a report: it says
+            // whether the server thinks it is behind HTTPS.
+            Self::Session { name, .. } => {
+                f.debug_struct("Session").field("name", name).field("value", &"<redacted>").finish()
+            }
+        }
+    }
+}
+
+/// The one header a credential adds, or `None`.
+///
+/// Split out of [`post`] and pure, so *"the bearer token path did not break"* is a unit test
+/// rather than a claim. The [`Credential::Bearer`] arm reproduces the two lines that were
+/// inline in `post`, empty-string guard and all: sending `Authorization: Bearer ` with an
+/// empty credential is a malformed request that some proxies answer with a 400 of their own,
+/// and a `velmd` on loopback needs no credential at all.
+pub fn auth_header(credential: &Credential) -> Option<(&'static str, String)> {
+    match credential {
+        Credential::None => None,
+        Credential::Bearer(token) if token.is_empty() => None,
+        Credential::Bearer(token) => Some(("authorization", format!("Bearer {token}"))),
+        Credential::Session { name, value } => Some(("cookie", format!("{name}={value}"))),
+    }
+}
+
 /// What came back from one round trip.
 ///
 /// `Debug` is written by hand rather than derived, because these fields are *board content*.
@@ -167,9 +225,40 @@ pub enum SyncReply {
     /// The round trip did not complete, or completed with something that is not a frame.
     /// Carries a sentence fit to put in a toast.
     Failed { detail: String },
+    /// 401 or 403. The credential is not accepted, and no amount of retrying fixes it.
+    ///
+    /// Its own variant rather than a string test on [`Self::Failed`], because what to do
+    /// about it depends on **which** credential is in use and only the caller knows that: a
+    /// bearer token that is refused is a configuration mistake to report, and a session that
+    /// is refused has expired and the right answer is to sign out and ask again. `velmd`
+    /// forgets every session when it restarts.
+    ///
+    /// Carries the same sentence [`Self::Failed`] would have, so a caller that only wants to
+    /// report it loses nothing.
+    Unauthorized { detail: String },
+    /// 404. The server has no board by that id **for this caller**.
+    ///
+    /// `velmd` answers 404 rather than 403 on purpose, so a stranger cannot learn that a
+    /// board exists. So this is not only *"no such board"*: for somebody signed in with an
+    /// account, it is also *"that board is not yours and was not shared with you"*.
+    NotFound { detail: String },
 }
 
 impl SyncReply {
+    /// The sentence a failed round trip carries, or `None` for one that succeeded.
+    ///
+    /// One accessor over the three failure variants, so the bookkeeping in [`Sync::drain`]
+    /// and the toast in the applier cannot come to disagree about which of them counts as a
+    /// failure.
+    pub fn failure_detail(&self) -> Option<&str> {
+        match self {
+            Self::Synced { .. } => None,
+            Self::Failed { detail } | Self::Unauthorized { detail } | Self::NotFound { detail } => {
+                Some(detail)
+            }
+        }
+    }
+
     /// Whether this reply has anything for `Board::apply`.
     ///
     /// ⚠ The applier must ask this rather than calling `apply` unconditionally. Handing Loro
@@ -191,6 +280,12 @@ impl std::fmt::Debug for SyncReply {
                 .field("update_bytes", &updates.len())
                 .finish(),
             Self::Failed { detail } => f.debug_struct("Failed").field("detail", detail).finish(),
+            Self::Unauthorized { detail } => {
+                f.debug_struct("Unauthorized").field("detail", detail).finish()
+            }
+            Self::NotFound { detail } => {
+                f.debug_struct("NotFound").field("detail", detail).finish()
+            }
         }
     }
 }
@@ -225,21 +320,27 @@ impl Sync {
     /// Starts the worker. It lives for the process and idles on an empty channel.
     ///
     /// `server` is the origin, with or without a trailing slash — `http://127.0.0.1:8787` or
-    /// `https://boards.example.com`. `token` is velmd's bearer token and **may be empty**: a
-    /// server bound to loopback needs none, and velmd refuses to bind a public address
-    /// without one, so "no token" is a legitimate configuration rather than a mistake.
+    /// `https://boards.example.com`. `credential` is what the request authenticates with and
+    /// **may be [`Credential::None`]**: a server bound to loopback needs nothing, and velmd
+    /// refuses to bind a public address without a token, so "no credential" is a legitimate
+    /// configuration rather than a mistake.
     ///
     /// `board_id` is the board's file stem, which is what `velmd`'s `boards_json` names a
     /// board by. Real stems have spaces in them, so it is percent-encoded into the path —
     /// see [`escape_segment`].
-    pub fn new(server: String, token: String, board_id: String) -> Self {
+    pub fn new(server: String, credential: Credential, board_id: String) -> Self {
         let endpoint = endpoint_for(&server, &board_id);
         let (outbound, requests) = channel::<Vec<u8>>();
         let (answers, inbound) = channel::<SyncReply>();
 
-        // The URL and the token are moved in rather than travelling with each request: they
-        // do not change for the life of this `Sync`, and a request that carried its own
+        // The URL and the credential are moved in rather than travelling with each request:
+        // they do not change for the life of this `Sync`, and a request that carried its own
         // address is a request that could be pointed somewhere else by a bug upstream.
+        //
+        // ⚠ **That immutability is why signing in or out drops every `Sync` rather than
+        // assigning a field.** Each worker owns a clone of the credential it was built with,
+        // so a `Sync` that is already attached keeps talking with the old one for ever.
+        // `ActiveState::recredential` is the other half of this contract.
         let worker_endpoint = endpoint.clone();
         let spawned = std::thread::Builder::new().name("velm-sync".to_owned()).spawn(move || {
             // Built once so connections are pooled across syncs. A round trip every few
@@ -249,7 +350,7 @@ impl Sync {
             // Exits when the `Sender` drops, which is what dropping the `Sync` does. No
             // shutdown flag, no poison value, nothing to forget to send.
             while let Ok(body) = requests.recv() {
-                let reply = post(&http, &worker_endpoint, &token, body);
+                let reply = post(&http, &worker_endpoint, &credential, body);
                 // The receiver is gone: the app is shutting down.
                 if answers.send(reply).is_err() {
                     return;
@@ -368,14 +469,24 @@ impl Sync {
             match self.inbound.try_recv() {
                 Ok(reply) => {
                     self.outstanding = false;
-                    match &reply {
-                        SyncReply::Synced { version, .. } => {
-                            self.since = Some(version.clone());
+                    // ⚠ **Every failure variant arms the backoff, not only `Failed`.** A 401
+                    // against a dead session and a 404 against a board this account cannot
+                    // see are both requests that will fail again next period, and without the
+                    // backoff the Mac would ask a server it is not welcome on every three
+                    // seconds for the rest of the afternoon. What the *caller* does about
+                    // each of them differs; what this bookkeeping does about them does not.
+                    match reply.failure_detail() {
+                        // `reply` is a local, so borrowing a sentence out of it and taking
+                        // `&mut self` for the bookkeeping are independent borrows.
+                        Some(detail) => self.note_failure(detail),
+                        None => {
+                            if let SyncReply::Synced { version, .. } = &reply {
+                                self.since = Some(version.clone());
+                            }
                             self.failures = 0;
                             self.retry_after = None;
                             self.last_error = None;
                         }
-                        SyncReply::Failed { detail } => self.note_failure(detail),
                     }
                     out.push(reply);
                 }
@@ -537,7 +648,11 @@ impl std::fmt::Display for FrameError {
 impl std::error::Error for FrameError {}
 
 /// The HTTP agent. One per worker, so connections are pooled across syncs.
-fn agent() -> ureq::Agent {
+///
+/// `pub(crate)` so `crate::signin`'s one-shot worker reuses these exact timeouts and this
+/// exact `http_status_as_error(false)` setting rather than building a second agent that
+/// disagrees with this one about what a 401 is.
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .user_agent(USER_AGENT)
         // A non-2xx is a *response*, not a transport failure: velmd's body carries the reason
@@ -557,13 +672,18 @@ fn agent() -> ureq::Agent {
 /// because the caller's only response to any of them is the same — report it and try again
 /// later — and a `Result` would invite an early `?` on a path whose whole job is to always
 /// answer.
-fn post(http: &ureq::Agent, endpoint: &str, token: &str, body: Vec<u8>) -> SyncReply {
+fn post(
+    http: &ureq::Agent,
+    endpoint: &str,
+    credential: &Credential,
+    body: Vec<u8>,
+) -> SyncReply {
     let mut request = http.post(endpoint).header("content-type", "application/octet-stream");
-    // Only when there is one. A velmd bound to loopback needs no token and rejects nothing,
-    // but sending `Authorization: Bearer ` — a header with an empty credential — is a
-    // malformed request that some proxies answer with a 400 of their own.
-    if !token.is_empty() {
-        request = request.header("authorization", format!("Bearer {token}"));
+    // At most one header, and which one is [`auth_header`]'s decision rather than this
+    // function's. It is pure, so the promise that the bearer path is byte-identical to what
+    // it always was is asserted by a test instead of being read off these two lines.
+    if let Some((name, value)) = auth_header(credential) {
+        request = request.header(name, value);
     }
 
     let response = match request.send(body) {
@@ -612,7 +732,16 @@ fn parse_reply(status: u16, body: &[u8]) -> SyncReply {
         // boundary. Feedback 30, twice.
         let detail: String = String::from_utf8_lossy(body).trim().chars().take(300).collect();
         let detail = if detail.is_empty() { format!("HTTP {status}") } else { detail };
-        return SyncReply::Failed { detail: format!("HTTP {status}: {detail}") };
+        // ⚠ **The sentence is the same in all three arms, and that is the point.** Splitting
+        // 401, 403 and 404 out is about what the *caller* can do next, not about what the
+        // user is told: velmd's own body carries the reason, and the status stays in front of
+        // it so a toast reads "HTTP 401: a bearer token is required" the way it always did.
+        let detail = format!("HTTP {status}: {detail}");
+        return match status {
+            401 | 403 => SyncReply::Unauthorized { detail },
+            404 => SyncReply::NotFound { detail },
+            _ => SyncReply::Failed { detail },
+        };
     }
     match unframe(body) {
         Ok((version, updates)) => {
@@ -719,17 +848,95 @@ mod tests {
 
     /// velmd's own words reach the user. *"sync failed"* against a wrong token is a report
     /// nobody can act on; *"a bearer token is required"* is one they can.
+    ///
+    /// ⚠ **A 401 is [`SyncReply::Unauthorized`] now and it used to be `Failed`.** The split
+    /// is about what the caller does next — a refused *session* has expired and the answer is
+    /// to sign out and ask again, where a refused *token* is a configuration mistake to
+    /// report — and the assertion that the sentence still names the status is what stops the
+    /// split quietly changing what the user reads.
     #[test]
-    fn a_rejection_quotes_the_server() {
+    fn a_rejection_quotes_the_server_and_says_the_credential_was_refused() {
         let reply = parse_reply(401, b"a bearer token is required\n");
-        let SyncReply::Failed { detail } = &reply else { panic!("401 is not a sync: {reply:?}") };
-        assert!(detail.contains("401"), "{detail}");
+        let SyncReply::Unauthorized { detail } = &reply else {
+            panic!("401 is a refused credential, not a sync: {reply:?}")
+        };
+        assert!(detail.contains("401"), "the toast lost the status: {detail}");
         assert!(detail.contains("a bearer token is required"), "{detail}");
+
+        // 403 reads the same, because velmd answers it for the same class of reason and the
+        // caller's response to both is identical.
+        assert!(matches!(parse_reply(403, b"nope"), SyncReply::Unauthorized { .. }));
+
+        // 404 is its own answer: for an account, it means the board is not theirs.
+        let missing = parse_reply(404, b"no such board\n");
+        let SyncReply::NotFound { detail } = &missing else { panic!("{missing:?}") };
+        assert!(detail.contains("404"), "{detail}");
 
         // A status with no body still says something.
         let empty = parse_reply(502, b"");
         let SyncReply::Failed { detail } = &empty else { panic!("502 is not a sync: {empty:?}") };
         assert!(detail.contains("502"), "{detail}");
+
+        // Every one of them is a failure to the bookkeeping, whatever the caller does next.
+        for status in [401, 403, 404, 502] {
+            assert!(
+                parse_reply(status, b"x").failure_detail().is_some(),
+                "{status} did not arm the backoff"
+            );
+        }
+    }
+
+    /// **The regression guard for the whole task.** `$VELM_SYNC_TOKEN` is what syncs this
+    /// machine's own boards today; the session cookie is new. The header the bearer path
+    /// sends has to be byte-identical to the two lines it replaced, empty-string guard
+    /// included.
+    #[test]
+    fn a_bearer_credential_still_sends_the_header_it_always_did() {
+        assert_eq!(
+            auth_header(&Credential::Bearer("a-real-token".to_owned())),
+            Some(("authorization", "Bearer a-real-token".to_owned()))
+        );
+        // The guard whose reason is written at `post`: an `Authorization: Bearer ` with an
+        // empty credential is a malformed request some proxies answer with a 400 of their own.
+        assert_eq!(auth_header(&Credential::Bearer(String::new())), None);
+        assert_eq!(auth_header(&Credential::None), None, "loopback needs nothing");
+    }
+
+    /// Whatever the server called its cookie is what goes back. velmd names it
+    /// `__Host-velm_session` behind HTTPS and `velm_session` otherwise, so a hard-coded
+    /// spelling breaks half the deployments.
+    #[test]
+    fn a_session_sends_the_cookie_the_server_named() {
+        for name in ["velm_session", "__Host-velm_session"] {
+            assert_eq!(
+                auth_header(&Credential::Session {
+                    name: name.to_owned(),
+                    value: "abc123".to_owned(),
+                }),
+                Some(("cookie", format!("{name}=abc123")))
+            );
+        }
+    }
+
+    /// `Sync` holds a credential for the life of its worker, so anything that formats one
+    /// formats it. Same rule as the reply below, and the same reason it is asserted rather
+    /// than promised.
+    #[test]
+    fn a_credential_does_not_print_itself() {
+        let printed = format!(
+            "{:?} {:?} {:?}",
+            Credential::None,
+            Credential::Bearer("a-real-token".to_owned()),
+            Credential::Session {
+                name: "__Host-velm_session".to_owned(),
+                value: "a-real-session".to_owned(),
+            }
+        );
+        assert!(!printed.contains("a-real-token"), "{printed}");
+        assert!(!printed.contains("a-real-session"), "{printed}");
+        // The cookie's *name* is kept: it says whether the server thinks it is behind HTTPS,
+        // and it is not a secret.
+        assert!(printed.contains("__Host-velm_session"), "{printed}");
     }
 
     /// A gateway that answers 200 with an HTML error page is the case that would abort the
@@ -788,7 +995,7 @@ mod tests {
     /// than microseconds, and the frame loop would take it too.
     #[test]
     fn requesting_does_not_block_the_caller() {
-        let mut sync = Sync::new(DEAD.to_owned(), String::new(), "board".to_owned());
+        let mut sync = Sync::new(DEAD.to_owned(), Credential::None, "board".to_owned());
         assert!(sync.is_ready());
         assert!(sync.request(b"version".to_vec(), Vec::new()), "the first ask goes");
         assert!(sync.outstanding(), "and it was handed to the worker, not performed here");
@@ -799,7 +1006,7 @@ mod tests {
     /// asked for — and the next frame builds a current one for nothing.
     #[test]
     fn a_second_request_is_refused_while_one_is_out() {
-        let mut sync = Sync::new(DEAD.to_owned(), String::new(), "board".to_owned());
+        let mut sync = Sync::new(DEAD.to_owned(), Credential::None, "board".to_owned());
         assert!(sync.request(b"version".to_vec(), Vec::new()));
         assert!(!sync.request(b"version".to_vec(), Vec::new()), "the second does not");
         assert!(!sync.is_ready());
@@ -808,7 +1015,7 @@ mod tests {
     /// Draining an idle `Sync` is a no-op rather than a block, because it runs every frame.
     #[test]
     fn draining_nothing_returns_nothing_and_does_not_block() {
-        let mut sync = Sync::new(DEAD.to_owned(), String::new(), "board".to_owned());
+        let mut sync = Sync::new(DEAD.to_owned(), Credential::None, "board".to_owned());
         assert!(sync.drain().is_empty());
         assert!(!sync.outstanding());
         assert!(sync.since().is_none(), "nothing has been agreed yet");
@@ -820,7 +1027,7 @@ mod tests {
     /// attempt for the life of the process and sync presents as having silently stopped.
     #[test]
     fn a_failure_leaves_the_caller_able_to_ask_again() {
-        let mut sync = Sync::new(DEAD.to_owned(), String::new(), "board".to_owned());
+        let mut sync = Sync::new(DEAD.to_owned(), Credential::None, "board".to_owned());
         sync.note_failure("a made-up failure");
         assert!(!sync.outstanding());
         assert_eq!(sync.last_error(), Some("a made-up failure"));
@@ -836,7 +1043,7 @@ mod tests {
     /// board the round after it downloaded it.
     #[test]
     fn a_reply_advances_the_marker_to_the_servers_version() {
-        let mut sync = Sync::new(DEAD.to_owned(), String::new(), "board".to_owned());
+        let mut sync = Sync::new(DEAD.to_owned(), Credential::None, "board".to_owned());
         assert!(sync.since().is_none());
         // Delivered through the channel the worker writes to, so this exercises `drain`'s own
         // bookkeeping rather than a setter written for the test.

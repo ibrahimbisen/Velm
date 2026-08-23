@@ -555,7 +555,7 @@ export function mountFind(mod, { canvas, document: docOption, open: openAtMount 
     // ⚠ Drawn, disabled, and naming the export. Absent leaves the reader wondering whether
     // they mis-remembered; present and silent is worse than both.
     toggle.disabled = true;
-    toggle.title = 'Find — this build has no find()';
+    toggle.title = 'Find: this build has no find()';
   }
 
   // ------------------------------------------------------------------ the panel
@@ -643,7 +643,7 @@ export function mountFind(mod, { canvas, document: docOption, open: openAtMount 
       keepsKeyboard(node);
     } else {
       node.disabled = true;
-      node.title = `${label} — this build has no ${missing}()`;
+      node.title = `${label}: this build has no ${missing}()`;
     }
     return node;
   };
@@ -976,7 +976,7 @@ export function mountFind(mod, { canvas, document: docOption, open: openAtMount 
       node.append(where, excerpt);
       // The row's own accessible name, so a screen reader is not read two spans with no
       // relationship between them.
-      node.setAttribute('aria-label', hit.excerpt ? `${hit.excerpt} — ${hit.where}` : hit.where);
+      node.setAttribute('aria-label', hit.excerpt ? `${hit.excerpt}, ${hit.where}` : hit.where);
       node.setAttribute('aria-current', 'false');
 
       if (canFocus) {

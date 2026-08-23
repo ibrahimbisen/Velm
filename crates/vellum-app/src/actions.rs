@@ -566,6 +566,10 @@ impl ActiveState {
                 // `Library::set_*` writes the sidecar synchronously.
                 self.shell.library.set_glass_opacity(opacity);
             }
+            UiEvent::SignInRequested { server, username, password } => {
+                self.begin_sign_in(&server, username, password);
+            }
+            UiEvent::SignOutRequested => self.sign_out(),
             UiEvent::AccentChanged(accent) => {
                 // **Not** "likewise": this one has a second half. The chrome has applied it
                 // to itself, but a selection ring is drawn by `vellum-render` and not by
@@ -719,7 +723,22 @@ impl ActiveState {
         // What must still wait is the **apply**, and it waits on the `Editor` — with the board
         // it belongs to, where a tab switch cannot deliver it to a different one. `Editor`'s
         // `remote` field carries the whole argument.
+        // ⚠ **Latched, not acted on inside the loop.** Signing out drops every board's
+        // `Sync`, which is the thing this loop is draining. Doing it here would end the
+        // iteration mid-way through somebody's replies; doing it after costs one `bool`.
+        let mut refused = false;
+        let mut unseen = false;
         for reply in self.editor.drain_sync() {
+            match &reply {
+                // The credential is not accepted. What that *means* depends on which
+                // credential is in use, and only the code below knows that.
+                crate::sync::SyncReply::Unauthorized { .. } => refused = true,
+                // For a bearer token this is an ordinary "no such board" and the toast
+                // already says so. For an account it also means the board is not theirs,
+                // which is a different sentence and is chosen below.
+                crate::sync::SyncReply::NotFound { .. } => unseen = true,
+                crate::sync::SyncReply::Failed { .. } | crate::sync::SyncReply::Synced { .. } => {}
+            }
             // `changes_the_board` rather than an inlined emptiness test. Once the two sides
             // agree, every sync answers with nothing — the steady state, not an error — and
             // queueing that would cost a full `Projection::rebuild` and an autosave delta on
@@ -734,6 +753,9 @@ impl ActiveState {
             }
         }
         self.report_sync_failure();
+        if refused || unseen {
+            self.note_refused_sync(refused, unseen);
+        }
 
         // ⚠ **Not while a gesture is holding an undo group open.** The on-canvas caret and
         // the eraser's sweep each hold one across many calls on purpose, so a typed word is
@@ -814,6 +836,178 @@ impl ActiveState {
         }
     }
 
+    /// A 401, a 403 or a 404 from the sync route, answered by what the credential is.
+    ///
+    /// # The bearer path is unchanged, and that is the point of the branch
+    ///
+    /// `$VELM_SYNC_TOKEN` syncs this machine's own boards today. A token that is refused is a
+    /// configuration mistake, and the honest answer is the toast that has always been raised
+    /// — [`Self::report_sync_failure`] has already done it by the time this runs, deduped the
+    /// way it always was. Nothing here touches that case.
+    ///
+    /// # A refused *session* has expired, and retrying cannot fix it
+    ///
+    /// `velmd` keeps its sessions in memory and forgets every one of them when it restarts;
+    /// they also idle out after twelve hours. So a 401 against a session is not a mistake to
+    /// report and retry, it is a session that is gone. Signing out here is what stops the Mac
+    /// backing off for ever against a cookie the server has never heard of, and it puts the
+    /// Account page back into the state that can do something about it.
+    ///
+    /// # A 404 for an account is not the same 404
+    ///
+    /// `velmd` answers 404 rather than 403 for a board an account may not see, deliberately,
+    /// so a stranger cannot learn that a board exists. For somebody signed in, *"no such
+    /// board"* is therefore usually *"that board is not yours"*, and the sentence says so.
+    fn note_refused_sync(&mut self, refused: bool, unseen: bool) {
+        let Some(config) = self.sync.as_ref() else { return };
+        let session = matches!(config.credential, crate::sync::Credential::Session { .. });
+        if !session {
+            // A bearer token. `report_sync_failure` has already said it, once, in the words
+            // velmd chose. Nothing to add and nothing to change.
+            return;
+        }
+        if refused {
+            log::info!("sync: the session was refused, signing out");
+            self.sign_out();
+            self.account.message = Some("Your session ended. Sign in again.".to_owned());
+            return;
+        }
+        if unseen {
+            self.account.message = Some(
+                "This board is not on your account on this server. Ask the owner to share it."
+                    .to_owned(),
+            );
+        }
+    }
+
+    // ----- signing in ----------------------------------------------------------------
+
+    /// Starts a sign-in from Settings ▸ Account.
+    ///
+    /// The address is normalised **here, on this thread**, so a typo costs no thread and is
+    /// reported on the frame it was typed. Everything past that is `crate::signin`'s worker.
+    ///
+    /// A second press while one is in flight is ignored rather than queued: the fields are
+    /// disabled in that state, so the only way to reach it is a race, and two sessions minted
+    /// for one intent is one more than anybody asked for.
+    fn begin_sign_in(&mut self, server: &str, username: String, password: vellum_ui::Secret) {
+        if self.pending_signin.is_some() {
+            return;
+        }
+        let base = match crate::signin::normalize_server(server) {
+            Ok(base) => base,
+            Err(reason) => {
+                self.account.state = vellum_ui::AccountState::SignedOut;
+                self.account.message = Some(reason.to_owned());
+                return;
+            }
+        };
+        if username.is_empty() || password.is_empty() {
+            self.account.message = Some("Type a username and a password.".to_owned());
+            return;
+        }
+        log::info!("sign-in: {base} as {username}");
+        self.account.state = vellum_ui::AccountState::SigningIn;
+        self.account.message = None;
+        self.pending_signin = Some(crate::signin::start(base, username, password));
+    }
+
+    /// Applies a sign-in answer, if one has landed. One `Option` test when nothing is out.
+    ///
+    /// ⚠ **Called on the frame path *before* [`Self::apply_sync`], never inside it.**
+    /// `apply_sync` returns early when `self.sync.is_none()`, which is exactly the signed-out
+    /// state a sign-in is trying to leave — so a drain inside it would never run on the one
+    /// machine that needed it, and the page would sit on *Signing in* for ever.
+    pub(crate) fn drain_sign_in(&mut self) {
+        let Some(pending) = self.pending_signin.as_mut() else { return };
+        let Some(reply) = pending.drain() else { return };
+        self.pending_signin = None;
+
+        match reply {
+            crate::signin::SignInReply::Ok { server, username, name, value } => {
+                // The period follows whatever the flags asked for, so a person who set
+                // `--sync-every` keeps their cadence after signing in. `DEFAULT_SYNC_PERIOD`
+                // is the same three seconds `parse_args` uses, from one place.
+                let period = self
+                    .startup_sync
+                    .as_ref()
+                    .map_or(crate::options::DEFAULT_SYNC_PERIOD, |config| config.options.period);
+                log::info!("sign-in: {server} as {username}, syncing every {period}s");
+                self.sync = Some(crate::app::SyncConfig {
+                    options: crate::options::SyncOptions { server: server.clone(), period },
+                    credential: crate::sync::Credential::Session { name, value },
+                    asked_at: None,
+                    reported: None,
+                });
+                // Not the password. There is no field for one and no key in the sidecar.
+                self.shell.library.set_sync_account(&server, &username);
+                self.account.state = vellum_ui::AccountState::SignedIn;
+                self.account.username = username;
+                self.account.server = server;
+                self.account.message = None;
+                self.recredential();
+            }
+            crate::signin::SignInReply::Refused(sentence) => {
+                self.account.state = vellum_ui::AccountState::SignedOut;
+                self.account.message = Some(sentence);
+            }
+        }
+    }
+
+    /// Gives up the session and puts the startup setup back.
+    ///
+    /// ⚠ **Signing out restores `--sync-server` rather than turning sync off.** Somebody who
+    /// syncs their own boards with a bearer token, signs in to look at somebody else's and
+    /// signs out again gets their own setup back. Turning sync off instead would silently
+    /// stop a round trip that had been running since launch and that they never asked to end.
+    ///
+    /// The session is forgotten locally rather than surrendered with `DELETE
+    /// /api/v1/session`. See the note in `crate::signin`: it idles out on the server on its
+    /// own, and a sign-out that could fail is a sign-out that leaves somebody signed in.
+    fn sign_out(&mut self) {
+        self.pending_signin = None;
+        self.sync = self.startup_sync.clone();
+        self.account.state = vellum_ui::AccountState::SignedOut;
+        self.account.username.clear();
+        self.account.server.clear();
+        self.account.message = Some("You are signed out on this Mac.".to_owned());
+        self.recredential();
+    }
+
+    /// Drops every board's round trip so the lazy attach rebuilds it with the credential that
+    /// is current **now**.
+    ///
+    /// ⚠ **This is the half of signing in that ships silently when it is missed.**
+    /// [`Self::attach_sync_to_hot_board`] returns early on a board that already has a `Sync`,
+    /// and each `Sync` moved a *clone* of its credential into its worker thread. So without
+    /// this, signing in appears to work and changes nothing until the app restarts, and
+    /// signing out keeps syncing with the credential that was just given up.
+    ///
+    /// The hot board rebuilds on the next frame. A parked board rebuilds on the frame it
+    /// becomes hot, which is the existing lazy contract rather than a new rule: `crate::sync`
+    /// is deliberately not driven while a board is parked, so a parked board with no `Sync`
+    /// is indistinguishable from a parked board with an idle one.
+    ///
+    /// RULE ZERO: this drops threads and channels. No file is opened and no board changes.
+    fn recredential(&mut self) {
+        self.editor.detach_sync();
+        for parked in self.session.iter_mut() {
+            // The accessor, not the field: `Parked`'s fields are private and this is a
+            // different module.
+            parked.editor_mut().detach_sync();
+        }
+    }
+
+    /// Pushes what the app knows about the account into the page. Once a frame.
+    ///
+    /// It writes the app's half only. The address, the username and the password on the page
+    /// belong to the person typing, and a per-frame write would replace what they were half
+    /// way through entering.
+    pub(crate) fn report_account(&mut self) {
+        let crate::app::AccountStatus { state, username, server, message } = &self.account;
+        self.shell.set_account_status(*state, username, server, message.as_deref());
+    }
+
     /// Give the board on screen its round trip, if it has not got one.
     ///
     /// Lazily, here, rather than at the two places a board opens — and that is the point.
@@ -834,9 +1028,13 @@ impl ActiveState {
             return;
         };
         log::info!("sync: {id} <-> {}", config.options.server);
+        // ⚠ The clone is what makes `Self::recredential` necessary: this credential is moved
+        // into the worker thread and that worker never changes its mind. A `Sync` that is
+        // already attached is a `Sync` that is still using whatever was current when it was
+        // built, which is why signing in and out drops them all rather than assigning a field.
         self.editor.attach_sync(crate::sync::Sync::new(
             config.options.server.clone(),
-            config.token.clone(),
+            config.credential.clone(),
             id,
         ));
     }
@@ -1569,6 +1767,17 @@ impl ActiveState {
             // the time this arm runs. Listed rather than folded into the no-op arm
             // above so the next reader is not left wondering whether it was forgotten.
             Command::TogglePropertiesPanel => {}
+            // Not a dialog. The settings are a page in the board library, so this raises a
+            // scope — and it lands on Account, which is the page the row was added for.
+            //
+            // ⚠ The home tab is brought to the front **first**, and the order is not
+            // cosmetic: `follow_tab_strip` decides the screen from whichever tab is in front,
+            // so setting the scope before it would be undone the moment it ran. Same route
+            // `Command::OpenBoard` takes into the library, then one scope on top of it.
+            Command::OpenSettings => {
+                self.show_library_tab();
+                self.shell.show_settings(vellum_ui::SettingsTab::Account);
+            }
             Command::KeyboardShortcuts => self.shell.ask(
                 |id| Dialog::reference(id, "Keyboard shortcuts", shortcut_reference(), "Close"),
                 Ask::Nothing,

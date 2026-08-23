@@ -191,30 +191,88 @@ with `-D warnings`, and do not "fix" this by weakening the native annotation.**
 
 ## 7. The server, and what it will and will not answer
 
-`velmd serve` puts the three exports behind HTTP. Six routes, and **one of them writes**:
+`velmd serve` puts the three exports behind HTTP. **Twenty-one routes, and nine of them change
+something on disk.**
 
-    GET   /api/v1/health                version and liveness — deliberately ungated
-    GET   /api/v1/boards                id, title, item count, last-modified
-    GET   /api/v1/boards/{id}/snapshot  Loro bytes, straight into `Board::from_bytes`
-    GET   /api/v1/blobs/{hash}          one picture
-    GET   /                             the board picker; the viewer is /index.html
-    POST  /api/v1/boards/{id}/sync      ⚠ the only route that changes a board
+Boards and pictures:
 
-⚠ **This table said "five routes, every one a `GET`" after `POST /sync` had shipped**, which
-is the one line in the contract somebody would read before deciding the server is safe to
-expose. It merges rather than replaces — a Loro update cannot remove what it did not add —
-and it takes a labelled restore point before the first change any board ever receives from
-the web, which is what makes the write acceptable at all. Both facts belong in the table, not
-only in the source.
+    GET    /api/v1/health                  version and liveness, deliberately ungated
+    GET    /api/v1/boards                  id, title, item count, last-modified;
+                                           plus "owner" and "shared" for a caller who is the
+                                           board's owner or an admin, and for nobody else.
+                                           Both keys are omitted rather than sent empty: the
+                                           client reads an absent "shared" as "this server
+                                           does not say" and an empty one as "nobody", and
+                                           those are different sentences.
+    GET    /api/v1/boards/{id}/snapshot    Loro bytes, straight into `Board::from_bytes`
+    GET    /api/v1/blobs/{hash}            one picture
+    GET    /api/v1/library                 the start screen: starred boards and folders
+    GET    /                               the board picker; the viewer is /index.html
+    GET    /velm-report                    the render proof, logged and never stored
+    POST   /api/v1/boards                  make a board
+    POST   /api/v1/boards/{id}/rename      {"title"}
+    POST   /api/v1/import                  paste or drop, into a new board
+    POST   /api/v1/boards/{id}/sync        ⚠ the only route that changes a board's content
 
-Four decisions worth not re-deriving:
+Accounts:
 
+    GET    /api/v1/whoami                  {"username","admin"}, or 401 {"setup","session_days"}
+    POST   /api/v1/session                 {"username","password"}, answers 204 + Set-Cookie
+    DELETE /api/v1/session                 sign out, 204 + a cleared cookie
+    GET    /api/v1/accounts                admin only: usernames, never hashes
+    POST   /api/v1/accounts                {"username","password","admin","code"}
+
+Invite codes, so somebody with no account can be given one:
+
+    POST   /api/v1/invites                 admin only, answers {"code","expires","days"}
+    GET    /api/v1/invites                 admin only: every code and the state it is in
+    DELETE /api/v1/invites/{code}          admin only, 204
+
+Sharing, so an invited person can see anything at all:
+
+    POST   /api/v1/boards/{id}/share             {"username"}, 204
+    DELETE /api/v1/boards/{id}/share/{username}  204
+
+⚠ **This table said "five routes, every one a `GET`" after `POST /sync` had shipped, and
+"six routes, and one of them writes" after ten more had.** It is the one line in the contract
+somebody reads before deciding the server is safe to expose, so a stale one is worse than
+none. `/sync` merges rather than replaces, a Loro update cannot remove what it did not add,
+and it takes a labelled restore point before the first change any board ever receives from the
+web, which is what makes that write acceptable at all.
+
+Seven decisions worth not re-deriving:
+
+- **Two ways to be authorised: a bearer token, or a session cookie.** The token is the
+  server-wide secret the desktop's sync sends and it sees every board. An account sees what it
+  owns and what has been shared with it. Accounts are a way to give other people *less* than
+  the token has, never a way to give the token less than it had.
+- **The gate fires when either is configured**, so a tokenless server that has accounts on it
+  does not have accounts deciding nothing. Exactly two paths answer without either:
+  `/api/v1/session` and `/api/v1/whoami`. A third case is a **condition**, not a path:
+  `POST /api/v1/accounts` is always let through the gate, because a browser founding a server
+  or redeeming an invite code has no credential yet and the code is in a body the gate cannot
+  read. `GET /api/v1/accounts` stays admin-only, which is why this is not a path exemption.
+- **An invite code is single use, lives fourteen days, and never makes an admin.** At most 32
+  are open at once. It is 12 Crockford base32 characters, shown as `K7QM-3XPT-9WNZ`, and it is
+  read back case-insensitively with the hyphens and spaces optional. It is stored in the clear
+  in `accounts.json`, which is the file that already holds the password hashes and sits beside
+  the boards: anybody who can read it already has the boards.
+- **Spending a code writes one record, not two.** The `account` record carries the code it
+  spent. Two records would have a window between them, and a crash in that window would leave
+  either an account with a live code or a spent code with no account.
+- **Only a board's owner, or an admin, may share it.** Not somebody it was merely shared with,
+  or one share would put the board one hop from everybody. A board with no ownership record
+  belongs to the founder, which covers every board that was in the data directory before
+  accounts existed.
 - **A board is named by its file stem and found by *scanning*, never by joining.** A joined
   path needs a traversal check that has to be right; a comparison against stems that came out
   of a directory listing cannot reach anything not already in that directory. `BoardIndex::path`
   is an absolute server path and is never sent.
 - **A blob's hash is the traversal defence, and it is total.** `Hash: FromStr` decodes exactly
   64 hex characters, so no spelling of `..` or `/` survives it.
+
+Two more, on the gate itself:
+
 - **⚠ The token gates the boards, not the client.** Getting this wrong cost a build: with the
   gate over everything, the page answered `401` to its own `<script type="module">` import and
   sat on *"Starting…"* for ever. A module fetch and `WebAssembly.instantiateStreaming` fetch

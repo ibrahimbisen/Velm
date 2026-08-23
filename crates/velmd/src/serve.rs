@@ -414,23 +414,37 @@ fn serve_one(server: &Server, stream: TcpStream) {
         Some(expected) if authorised(&headers, query, expected) => Some(accounts::Caller::Token),
         _ => accounts::identity(server, &headers).map(accounts::Caller::Account),
     };
-    // ⚠ **The first-run carve-out, and it is conditioned rather than by path.** Founding the
-    // first account is the one write a server must accept from somebody who cannot yet
+    // ⚠ **The account-creation carve-out, and it is a condition rather than a path.** Making
+    // an account is the write a server must accept from somebody who cannot yet
     // authenticate — a fresh server with `$VELMD_TOKEN` set otherwise answers 401 to its own
     // setup form, and the operator's only way in is `curl` with a header the page does not
-    // send. That is exactly what happened: both the flag and the gate were wrong, and either
-    // alone was fatal.
+    // send. That is exactly what happened once: both the flag and the gate were wrong, and
+    // either alone was fatal. Anybody adding a route here should read that sentence twice.
     //
-    // It cannot outlive setup, and that is what makes it safe rather than a hole:
-    // `setup_is_open` is false the instant an account exists, `create_account` re-checks under
-    // the same lock that closes setup — which is where the race between two setup requests is
-    // actually settled — and it is `POST` alone, so the account *listing* stays admin-only.
-    let founding = method == "POST"
-        && accounts::is_accounts(path)
-        && accounts::setup_is_open(server);
+    // ⚠ **It used to be conditioned on `setup_is_open` and no longer is**, because founding
+    // the owner is no longer the only creation a server has to take from a stranger.
+    // Redeeming an invite code is the second, and **the code is the credential the request
+    // presents** — which the gate cannot see, because the gate cannot read a body.
+    //
+    // Conditioning it on "an invite is outstanding" was the alternative and is worse: the
+    // difference between a gate 401 and a handler 403 tells an anonymous prober whether
+    // somebody has been invited here lately, and it makes the honest refusal sentence
+    // unreachable for the person who typed a spent code.
+    //
+    // What this exposes is strictly less than `/api/v1/session`, which is *path*-exempt and
+    // runs a full Argon2 verify for anybody who asks: a body parse, a lock, and a
+    // constant-time scan. The Argon2 hash sits behind a valid code.
+    //
+    // **The whole authority still lives in `Accounts::create_account`, under the accounts
+    // lock**, which is where the race between two setup requests is settled and where the
+    // three ways to succeed are ordered. And it is `POST` alone, so the account *listing*
+    // stays admin-only — which is also why this is not a line in
+    // `accounts::is_exempt_from_the_bearer_gate`: that function is by path, and a path
+    // exemption would take `GET /api/v1/accounts` out of the gate with it.
+    let creating_an_account = method == "POST" && accounts::is_accounts(path);
     if needs_token(path)
         && !accounts::is_exempt_from_the_bearer_gate(path)
-        && !founding
+        && !creating_an_account
         && gated
         && caller.is_none()
     {
@@ -445,8 +459,38 @@ fn serve_one(server: &Server, stream: TcpStream) {
     // ⚠ **Signing out is a DELETE and is answered before the POST block**, because the two
     // would otherwise both want `/api/v1/session` and the first match would win by accident
     // rather than by decision. It is also the one state-changing route that carries no body.
-    if method == "DELETE" && accounts::is_session(path) {
-        if let Err(error) = accounts::sign_out(server, &headers, &stream) {
+    if method == "DELETE" {
+        // ⚠ **Every `DELETE` is answered here, including the ones that match nothing.**
+        // Before this block ended in a 405 a `DELETE` to any other path fell past the `POST`
+        // block into `route()`, whose `_` arm ends at `static_file` — so a delete request was
+        // answered with **an HTML page**, 200. Nothing had noticed because signing out was
+        // the only `DELETE` there was.
+        let answered = if accounts::is_session(path) {
+            accounts::sign_out(server, &headers, &stream)
+        } else if let Some(code) = accounts::revoke_target(path) {
+            // Decoded, for the reason every board id is: a client may percent-encode a path
+            // segment, and `fold_code` reads what a person typed rather than what a URL says.
+            accounts::revoke_invite(server, &headers, &percent_decode(code), &stream)
+        } else if let Some((id, username)) = accounts::unshare_target(path) {
+            // Decoded, because a board id is a file stem and real ones have spaces in them.
+            let id = percent_decode(id);
+            if accounts::may_see(server, &id, caller.as_ref()) {
+                accounts::unshare_board(server, &headers, &id, &percent_decode(username), &stream)
+            } else {
+                // 404 rather than 403, the same answer and the same sentence every read route
+                // gives: a different answer here would tell a stranger the board exists.
+                respond(&stream, 404, "text/plain", b"no such board\n", origin.as_deref())
+            }
+        } else {
+            respond(
+                &stream,
+                405,
+                "text/plain",
+                b"DELETE answers signing out, revoking an invite code, and unsharing a board\n",
+                origin.as_deref(),
+            )
+        };
+        if let Err(error) = answered {
             eprintln!("velmd: {}: {error:#}", printable(path));
             let _ = respond(&stream, 500, "text/plain", b"something went wrong\n", origin.as_deref());
         }
@@ -454,14 +498,14 @@ fn serve_one(server: &Server, stream: TcpStream) {
     }
 
     if method == "POST" {
-        // ⚠ **Four routes answer POST now, and the 405 below has to name all of them.** An
+        // ⚠ **Eight routes answer POST now, and the 405 below has to name all of them.** An
         // error string that mentions only sync is a false claim in the one place a person
         // reads when they are already confused about why nothing happened.
         //
-        // The dispatch is an enum rather than four `if`s with four bodies, because everything
-        // after it — the length cap, the timeout raise, the body read, the 500 — is the same
-        // for all four and was worth writing once. What differs is exactly two things: how
-        // many bytes the route will accept, and which function gets them.
+        // The dispatch is an enum rather than eight `if`s with eight bodies, because
+        // everything after it — the length cap, the timeout raise, the body read, the 500 —
+        // is the same for all of them and was worth writing once. What differs is exactly two
+        // things: how many bytes the route will accept, and which function gets them.
         enum Post<'a> {
             Sync(&'a str),
             Import,
@@ -471,6 +515,10 @@ fn serve_one(server: &Server, stream: TcpStream) {
             Rename(&'a str),
             SignIn,
             CreateAccount,
+            CreateInvite,
+            /// The board id. Sharing is registered here rather than in `manage.rs` because
+            /// the shared list is `accounts.rs`'s state; the path shape follows `Rename`.
+            Share(&'a str),
         }
         // ⚠ Signing out is a **DELETE**, and it is answered before the POST block below,
         // because a session that could only be ended by a POST would be one a browser's own
@@ -486,6 +534,10 @@ fn serve_one(server: &Server, stream: TcpStream) {
             Some(Post::SignIn)
         } else if accounts::is_accounts(path) {
             Some(Post::CreateAccount)
+        } else if accounts::is_invites(path) {
+            Some(Post::CreateInvite)
+        } else if let Some(id) = accounts::share_target(path) {
+            Some(Post::Share(id))
         } else {
             manage::rename_target(path).map(Post::Rename)
         };
@@ -494,7 +546,8 @@ fn serve_one(server: &Server, stream: TcpStream) {
                 &stream,
                 405,
                 "text/plain",
-                b"POST answers a board's sync route, the importer, and making or naming a board\n",
+                b"POST answers a board's sync route, the importer, making or naming a board, \
+                  sharing one, signing in, making an account, and minting an invite code\n",
                 origin.as_deref(),
             );
             return;
@@ -507,7 +560,10 @@ fn serve_one(server: &Server, stream: TcpStream) {
         let length = match match post {
             // A username and a password are smaller than a board's name and much smaller
             // than a board; its own cap, so the refusal names the route the person was using.
-            Post::SignIn | Post::CreateAccount => accounts::content_length(&headers),
+            // A mint's body is `{}` and a share's is one username, so both fit far inside it.
+            Post::SignIn | Post::CreateAccount | Post::CreateInvite | Post::Share(_) => {
+                accounts::content_length(&headers)
+            }
             Post::Create | Post::Rename(_) => manage::content_length(&headers),
             Post::Sync(_) | Post::Import => sync::content_length(&headers),
         } {
@@ -579,6 +635,19 @@ fn serve_one(server: &Server, stream: TcpStream) {
             }
             Post::SignIn => accounts::sign_in(server, &headers, &body, &stream),
             Post::CreateAccount => accounts::create_account(server, &headers, &body, &stream),
+            Post::CreateInvite => accounts::create_invite(server, &headers, &body, &stream),
+            Post::Share(id) => {
+                // ⚠ The same visibility check renaming and syncing make, and the same 404:
+                // a stranger must not learn that a board exists by being told they may not
+                // share it. Who may *share* it is a stricter rule and is decided inside
+                // `share_board`, under the accounts lock, where the owner is known.
+                let id = percent_decode(id);
+                if accounts::may_see(server, &id, caller.as_ref()) {
+                    accounts::share_board(server, &headers, &id, &body, &stream)
+                } else {
+                    respond(&stream, 404, "text/plain", b"no such board\n", origin.as_deref())
+                }
+            }
         };
         if let Err(error) = answered {
             eprintln!("velmd: {}: {error:#}", printable(path));
@@ -632,12 +701,19 @@ fn route(
         // beside it — which boards are starred and which folder each is in. A second route
         // rather than four more keys on the one above, so a client written against the older
         // shape keeps working byte for byte. See `library_api`'s header.
-        // Accounts. ⚠ These three sit **outside** the bearer gate by
-        // `accounts::is_exempt_from_the_bearer_gate` — a person who has not signed in yet has
-        // no token and no cookie, so a sign-in route behind the gate could never be reached
-        // and the server could never be set up at all.
+        // Accounts. ⚠ **`whoami` alone sits outside the bearer gate here** — by
+        // `accounts::is_exempt_from_the_bearer_gate`, together with the session route, which
+        // is a POST and a DELETE and so is answered above. A person who has not signed in yet
+        // has no token and no cookie, so a route that answers *"you are nobody"* from behind
+        // the gate could never be reached and the server could never be set up at all.
+        //
+        // The other two are gated and admin-only, which is why they are not in that function:
+        // it is by **path**, so putting one there would take its `POST` out of the gate too.
         accounts::PATH_WHOAMI => accounts::whoami(server, headers, stream),
         accounts::PATH_ACCOUNTS => accounts::list_accounts(server, headers, stream),
+        // ⚠ Behind the gate, unlike the three above: listing invite codes needs an admin
+        // session, and a code in this answer is a live credential.
+        accounts::PATH_INVITES => accounts::list_invites(server, headers, stream),
         library_api::PATH => library_api::handle(server, caller, stream),
         "/api/v1/boards" => {
             let body = {
@@ -707,8 +783,21 @@ fn boards_json(
             .modified
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_millis());
+        // ⚠ **Both keys are omitted rather than sent empty when the caller may not know.**
+        // `accounts::sharing_of` answers `None` for anyone who is not the board's owner or an
+        // admin, and `web/boards.js` distinguishes an absent `shared` ("this server does not
+        // say") from an empty one ("nobody"). Sending `[]` to a caller who is simply not
+        // entitled to the list would state the second while meaning the first, and the Share
+        // panel would draw "Only you, so far." over a board that is shared with four people.
+        let sharing = match accounts::sharing_of(server, id, caller) {
+            Some((owner, shared)) => {
+                let names: Vec<String> = shared.iter().map(|name| json_string(name)).collect();
+                format!(",\"owner\":{},\"shared\":[{}]", json_string(&owner), names.join(","))
+            }
+            None => String::new(),
+        };
         rows.push(format!(
-            "{{\"id\":{},\"title\":{},\"items\":{},\"modified\":{modified}}}",
+            "{{\"id\":{},\"title\":{},\"items\":{},\"modified\":{modified}{sharing}}}",
             json_string(id),
             json_string(&index.title),
             index.item_count
@@ -965,13 +1054,22 @@ fn respond_inner(
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
+        // ⚠ **403 and 409 were missing for two releases, and they were reachable the whole
+        // time.** `accounts::FORBIDDEN` is answered for every "you are not an admin" and
+        // `accounts::CONFLICT` for every taken username, so *"that username is taken"* went
+        // out labelled `HTTP/1.1 409 Internal Server Error` — a status line that contradicts
+        // itself, from a server telling a client what to fix. `accounts.rs` predicted this in
+        // the const's own doc and said the table would gain three arms; only two of them
+        // landed, and nothing was watching the other one.
+        //
+        // The lesson is the table, not the number: an unlisted status falls through to the
+        // `_` arm below and lies about itself. **Add the arm in the same edit that first
+        // sends the status.**
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         413 => "Content Too Large",
-        // ⚠ Both added with the account routes, and both are the trap this table already
-        // records: an unlisted number falls through to the `_` arm below and puts
-        // `HTTP/1.1 415 Internal Server Error` on the wire — a status line that contradicts
-        // itself, from a server telling a client what to fix.
         415 => "Unsupported Media Type",
         429 => "Too Many Requests",
         503 => "Service Unavailable",
@@ -995,10 +1093,15 @@ fn respond_inner(
     if let Some(origin) = origin {
         // Named explicitly, never `*`: a wildcard and `Authorization` together mean any page
         // on the internet can read this person's boards from their browser.
+        // ⚠ `DELETE` belongs in the method list and was left out of it — it was already
+        // wrong for signing out, before revoking a code and unsharing a board joined. This is
+        // cosmetic on the deployment that ships, because cookie authentication cannot cross
+        // an origin under `SameSite=Strict` and the cross-origin path is bearer-token only;
+        // it is still a header that says something untrue about what this server answers.
         head.push_str(&format!(
             "Access-Control-Allow-Origin: {origin}\r\n\
              Access-Control-Allow-Headers: authorization, content-type\r\n\
-             Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+             Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
              Vary: Origin\r\n"
         ));
     }

@@ -185,6 +185,25 @@ struct Filing {
     /// the middle. An unknown string falls back to the default rather than failing the whole
     /// file to parse, which is what `#[serde(default)]` on this struct is for.
     accent: Option<String>,
+    /// The Velm server the last sign-in used, canonical — `https://boards.example.com/`.
+    ///
+    /// Not a secret, and the same shape as `theme` and `accent` above: a string, `Option`,
+    /// degrading to `None`. It is stored so the Account page opens with the address already
+    /// filled in, because it has to be typed again on every launch otherwise.
+    ///
+    /// ⚠ The reverse-compatibility note `spaces` and `grid` carry applies here too, in the
+    /// direction that matters: an **older** build reading a sidecar with this key parses it
+    /// as absent and its next `persist` writes the struct back without it. The person retypes
+    /// an address. No board is touched, because nothing on this path opens a board file.
+    sync_server: Option<String>,
+    /// The username the last sign-in used. Not a secret either, and stored for the same
+    /// reason and with the same caveat as `sync_server`.
+    ///
+    /// **The password is deliberately absent and there is no key for it.** `Filing` derives
+    /// `Debug` and [`Library::persist`] writes pretty plaintext JSON into a directory that is
+    /// in every Time Machine backup, which is exactly the posture `crate::options`' `OnceLock`
+    /// exists to hold. See `crate::signin` for what that costs.
+    sync_username: Option<String>,
     /// The board that was open when the app last closed, so the next launch can offer
     /// it rather than making the user find it again.
     last_board: Option<PathBuf>,
@@ -452,6 +471,31 @@ impl Library {
             }
             .to_owned(),
         );
+        self.persist();
+    }
+
+    /// The address the last sign-in used, or `None` if nobody has ever signed in.
+    pub fn sync_server(&self) -> Option<&str> {
+        self.filing.sync_server.as_deref()
+    }
+
+    /// The name the last sign-in used.
+    pub fn sync_username(&self) -> Option<&str> {
+        self.filing.sync_username.as_deref()
+    }
+
+    /// Records who signed in where, so the Account page opens filled in next time.
+    ///
+    /// One setter for both, because they are only ever written together — a username with no
+    /// server, or a server with somebody else's name beside it, is a page that opens with two
+    /// halves of two different sign-ins in it. One `persist` rather than two, for the same
+    /// reason the accent slider waits for the drag to end: this writes the sidecar
+    /// synchronously.
+    ///
+    /// **No password is written here, and there is no field for one.** See `crate::signin`.
+    pub fn set_sync_account(&mut self, server: &str, username: &str) {
+        self.filing.sync_server = Some(server.to_owned());
+        self.filing.sync_username = Some(username.to_owned());
         self.persist();
     }
 
@@ -1140,6 +1184,47 @@ mod tests {
             "`speech` kept its key and lost what was inside it"
         );
         assert!(library.is_starred(&path), "the rewrite this test relies on did happen");
+    }
+
+    /// The account is remembered, the password is not, and the archived keys still survive.
+    ///
+    /// Three assertions in one place because they are one property: `persist` writes the
+    /// **whole** struct, so a new field is only safe if everything already on disk comes back
+    /// out with it. The third assertion is the one that would catch a `Filing` where the new
+    /// fields were added and an old one was dropped in the same edit.
+    ///
+    /// A sidecar with no `sync_server` key is the ordinary case — every existing
+    /// `library.json` on this machine is one — and it has to read as `None` rather than fail
+    /// the parse.
+    #[test]
+    fn the_account_is_remembered_and_the_password_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("boards");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("library.json"), br#"{ "worktrees": true }"#).unwrap();
+
+        let mut library = Library::open(&root);
+        assert_eq!(library.sync_server(), None, "a sidecar with no key is not a failure");
+        assert_eq!(library.sync_username(), None);
+
+        library.set_sync_account("https://boards.example.com/", "sam");
+        assert_eq!(library.sync_server(), Some("https://boards.example.com/"));
+        assert_eq!(library.sync_username(), Some("sam"));
+
+        let bytes = std::fs::read(root.join("library.json")).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(written["sync_server"].as_str(), Some("https://boards.example.com/"));
+        assert_eq!(written["sync_username"].as_str(), Some("sam"));
+        assert_eq!(written["worktrees"].as_bool(), Some(true), "an existing key was dropped");
+        // ⚠ **The assertion this test exists for.** There is no key for a password, so there
+        // is nothing to accidentally start writing into one.
+        assert!(!text.contains("password"), "a password key appeared in the sidecar: {text}");
+
+        // And it survives a reopen, which is the whole point of writing it.
+        let reopened = Library::open(&root);
+        assert_eq!(reopened.sync_server(), Some("https://boards.example.com/"));
+        assert_eq!(reopened.sync_username(), Some("sam"));
     }
 
     /// Filing that points at a board someone deleted from the Finder has to go, or a

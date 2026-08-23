@@ -1,8 +1,23 @@
-// The way in: sign in to a `velmd` server, or set one up for the first time.
+// The way in: sign in to a `velmd` server, set one up for the first time, or join one with an
+// invite code.
 //
-// One page, two states, decided by a single `GET /api/v1/whoami` on load — the reasoning for
-// that is in `signin.html`'s own header and is not repeated here. This file is the half that
-// asks, classifies the answer, and puts one of four sentences on the screen.
+// One page, three states. Two of them are decided by a single `GET /api/v1/whoami` on load and
+// the third is reached by pressing a button — the reasoning for both is in `signin.html`'s own
+// header and is not repeated here. This file is the half that asks, classifies the answer, and
+// puts one of four sentences on the screen.
+//
+// # ⚠ The invite code is a secret, and it is handled exactly like the password
+//
+// It is read out of the field inside the submit handler, put into one JSON body, and dropped.
+// It is never written into a URL, a link, `localStorage`, `sessionStorage` or a log line, and
+// it never reaches a `?` on this page. Everything the section below says about the password
+// applies to it word for word — including what cannot be promised about the heap.
+//
+// ⚠ **This file does not validate the code, and that is deliberate.** The server folds case,
+// drops dashes and spaces, and maps the read-alike characters the alphabet leaves out. A
+// client that re-implemented any of that would be a second copy of a rule with nothing keeping
+// the two in step, and the way it fails is a page refusing a code the server would have taken.
+// So the field is trimmed, checked for being empty, and sent.
 //
 // # ⚠ The password is never stored, and "never" has an exact meaning here
 //
@@ -303,6 +318,34 @@ export function describeFailure(context = {}) {
     };
   }
 
+  // ⚠ **The invite form's own arms, and they come first because the generic ones below would
+  // otherwise be wrong on this form rather than merely vague.** A 403 there means the code was
+  // refused, and *"that username and password do not match"* would send somebody to retype two
+  // things that were both right. A 409 there means the username is taken, not that the server
+  // has just been set up by somebody else, so `restart` would throw the form away.
+  if (phase === 'invite' && (status === 401 || status === 403)) {
+    return {
+      tone: 'bad',
+      want: 'form',
+      title: 'That invite code is not one this server is waiting for.',
+      detail:
+        'Check every character and try again. A code works once, and it stops working after a ' +
+        'while, so ask whoever gave you this one for another if it keeps being refused.',
+    };
+  }
+
+  if (phase === 'invite' && status === 409) {
+    // ⚠ The second sentence is a fact, not reassurance: the server checks the name **after**
+    // the code and spends the code only once everything else has passed, so a taken username
+    // leaves the code open. Saying so is what stops somebody going away for a new one.
+    return {
+      tone: 'bad',
+      want: 'form',
+      title: 'Somebody on this server already has that username.',
+      detail: 'Choose a different one. Your code has not been used, so it still works.',
+    };
+  }
+
   if (status === 401 || status === 403) {
     // ⚠ One sentence for both halves. Never "no such user" — see this file's header for why,
     // and note that 403 is folded in here rather than given its own wording: a server that
@@ -321,10 +364,13 @@ export function describeFailure(context = {}) {
     return {
       tone: 'bad',
       want: 'wait',
-      title: 'Too many sign-in attempts.',
+      // ⚠ A refused invite code spends the same per-address budget a wrong password does, so
+      // this arm is reachable from the invite form too — and *"sign-in attempts"* would be a
+      // lie there. The advice is identical, which is why it is one arm and one ternary.
+      title: phase === 'invite' ? 'Too many attempts.' : 'Too many sign-in attempts.',
       detail:
         `Your server has stopped checking for a moment. Wait about ${seconds} ` +
-        `${seconds === 1 ? 'second' : 'seconds'} and try again — asking sooner only makes the wait longer.`,
+        `${seconds === 1 ? 'second' : 'seconds'} and try again. Asking sooner only makes the wait longer.`,
     };
   }
 
@@ -348,7 +394,7 @@ export function describeFailure(context = {}) {
       want: 'retry',
       title: 'This server does not have accounts.',
       detail:
-        'It is an older velmd, which asks for a single passphrase instead — the VELMD_TOKEN it ' +
+        'It is an older velmd, which asks for a single passphrase instead: the VELMD_TOKEN it ' +
         'was started with. Open the boards page and it will ask you for it.',
     };
   }
@@ -359,7 +405,7 @@ export function describeFailure(context = {}) {
       want: 'retry',
       title: 'Your server answered, and something went wrong inside it.',
       detail:
-        `Nothing is wrong with what you typed — the fault is on the server (${status}). The error ` +
+        `Nothing is wrong with what you typed. The fault is on the server (${status}), and the error ` +
         'will be on the terminal where velmd serve is running; that is the thing to go and read.',
     };
   }
@@ -478,6 +524,23 @@ const IDS = {
   setupPassError: 'velm-setup-pass-error',
   setupPass2Error: 'velm-setup-pass2-error',
   setupGo: 'velm-setup-go',
+  // The invite state. Same naming as the other two: `velm-<form>-<field>` and a matching
+  // `-error` line under each field.
+  invite: 'velm-invite',
+  inviteCode: 'velm-invite-code',
+  inviteUser: 'velm-invite-user',
+  invitePass: 'velm-invite-pass',
+  invitePass2: 'velm-invite-pass2',
+  inviteCodeError: 'velm-invite-code-error',
+  inviteUserError: 'velm-invite-user-error',
+  invitePassError: 'velm-invite-pass-error',
+  invitePass2Error: 'velm-invite-pass2-error',
+  inviteGo: 'velm-invite-go',
+  // The two buttons that move between the sign-in form and the invite form. They are listed
+  // here, and not treated as optional, because a state nobody can reach is the same defect as
+  // a control that does nothing: the page would simply never offer the third form.
+  haveCode: 'velm-have-code',
+  inviteBack: 'velm-invite-back',
   retry: 'velm-retry',
 };
 
@@ -508,6 +571,11 @@ export function mount(options = {}) {
   el.setupPass2.minLength = MIN_PASSWORD;
   el.setupPass.maxLength = MAX_PASSWORD;
   el.setupPass2.maxLength = MAX_PASSWORD;
+  // The invite form makes an account too, so it carries the same floor and the same ceiling.
+  el.invitePass.minLength = MIN_PASSWORD;
+  el.invitePass2.minLength = MIN_PASSWORD;
+  el.invitePass.maxLength = MAX_PASSWORD;
+  el.invitePass2.maxLength = MAX_PASSWORD;
   // ⚠ No `minLength` on the sign-in field, deliberately. An account whose password predates a
   // change to the floor must still be able to get in; a sign-in form that refuses a password
   // the server would have accepted is a lockout written by the client.
@@ -593,7 +661,8 @@ export function mount(options = {}) {
         // at all. This is the second: an HTML `<form>` on somebody else's page can only send
         // `application/x-www-form-urlencoded`, `multipart/form-data` or `text/plain`, so a
         // server that *insists* on JSON cannot be driven by a forged form even if the cookie
-        // rules ever loosened. The server has to insist, not merely accept — reported.
+        // rules ever loosened. The server does insist: `sent_as_json` runs before the body is
+        // parsed on both of these routes and answers 415, so this header is not a courtesy.
         headers: { 'content-type': 'application/json', accept: 'application/json' },
         body: JSON.stringify(payload),
       },
@@ -626,6 +695,10 @@ export function mount(options = {}) {
       'setupUserError',
       'setupPassError',
       'setupPass2Error',
+      'inviteCodeError',
+      'inviteUserError',
+      'invitePassError',
+      'invitePass2Error',
     ]) {
       el[key].textContent = '';
     }
@@ -634,6 +707,7 @@ export function mount(options = {}) {
   function hideForms() {
     el.signin.hidden = true;
     el.setup.hidden = true;
+    el.invite.hidden = true;
     el.retry.hidden = true;
   }
 
@@ -650,6 +724,7 @@ export function mount(options = {}) {
     el.sub.textContent = 'Your boards are on this server.';
     el.lifetime.textContent = sessionSentence(sessionDays);
     el.setup.hidden = true;
+    el.invite.hidden = true;
     el.retry.hidden = true;
     el.signin.hidden = false;
     focusFirstEmpty(el.signinUser, el.signinPass);
@@ -659,9 +734,33 @@ export function mount(options = {}) {
     el.title.textContent = 'Set up Velm';
     el.sub.textContent = 'Make the first account.';
     el.signin.hidden = true;
+    el.invite.hidden = true;
     el.retry.hidden = true;
     el.setup.hidden = false;
     focusFirstEmpty(el.setupUser, el.setupPass);
+  }
+
+  /**
+   * The third state: somebody was given a code.
+   *
+   * ⚠ Reached by a button and never by `begin`, because `whoami` cannot tell an invited person
+   * from an ordinary one — both are a 401 on a server that has accounts. `signin.html`'s header
+   * carries the whole argument, including why a *"this server takes new accounts"* flag is a
+   * fact worth not publishing.
+   *
+   * The message box is cleared on the way in. A refusal from the sign-in form still on screen
+   * over a different form is a sentence about the wrong thing.
+   */
+  function showInvite() {
+    el.title.textContent = 'Create your account';
+    el.sub.textContent = 'Use the code you were given.';
+    el.signin.hidden = true;
+    el.setup.hidden = true;
+    el.retry.hidden = true;
+    el.invite.hidden = false;
+    clearMessage();
+    clearFieldErrors();
+    focusFirstEmpty(el.inviteCode, el.inviteUser);
   }
 
   /**
@@ -925,6 +1024,93 @@ export function mount(options = {}) {
     });
   }
 
+  /**
+   * Make an account from an invite code, then sign in with it.
+   *
+   * `submitSetup`'s own shape, and deliberately not a shared function with it. The two forms
+   * differ in what they send, in which sentences their refusals produce, and in one of them
+   * being the only account on the server while the other can never be an admin — so folding
+   * them together would be one function with a boolean in it and two of everything inside.
+   *
+   * ⚠ The code is sent in the JSON body, never in the path and never in a query. See the file
+   * header: a code in a URL survives in history and in every access log it passes through, and
+   * it stays a working credential until somebody spends it.
+   */
+  async function submitInvite(event) {
+    event.preventDefault();
+    clearFieldErrors();
+
+    // Trimmed, and nothing else. The server folds the case, the dashes and the read-alike
+    // characters; see the file header for why this page does not.
+    const code = el.inviteCode.value.trim();
+    const username = el.inviteUser.value.trim();
+    const password = el.invitePass.value;
+    const again = el.invitePass2.value;
+
+    if (code === '') {
+      el.inviteCodeError.textContent = 'Type the code you were given.';
+      el.inviteCode.focus();
+      return;
+    }
+    if (username === '') {
+      el.inviteUserError.textContent = 'Choose a username.';
+      el.inviteUser.focus();
+      return;
+    }
+    if (password.length < MIN_PASSWORD) {
+      el.invitePassError.textContent = `At least ${MIN_PASSWORD} characters, and this one is ${password.length}.`;
+      el.invitePass.focus();
+      return;
+    }
+    if (password.length > MAX_PASSWORD) {
+      el.invitePassError.textContent = `That is longer than ${MAX_PASSWORD} characters.`;
+      el.invitePass.focus();
+      return;
+    }
+    if (again !== password) {
+      el.invitePass2Error.textContent = 'These two are not the same.';
+      el.invitePass2.focus();
+      return;
+    }
+
+    await withBusy(el.inviteGo, 'Creating…', 'Create my account', async () => {
+      const made = await post('/api/v1/accounts', { username, password, code }, SUBMIT_TIMEOUT_MS);
+      if (made.error) {
+        return failed({ phase: 'invite', network: true, timedOut: made.timedOut });
+      }
+      const { status } = made.response;
+      if (status !== 200 && status !== 201 && status !== 204) {
+        return refused('invite', made.response, el.inviteGo, 'Create my account');
+      }
+
+      // ⚠ Cleared the moment the server has taken it, and before the sign-in round trip rather
+      // than after: the code is spent from here on, and a spent code sitting in a field on a
+      // screen somebody walked away from is a secret left on a desk for no reason at all.
+      el.inviteCode.value = '';
+
+      // Sign in as a second step, for `submitSetup`'s reason: nothing in the wire contract says
+      // the account POST sets a cookie, and an account that exists but cannot be used is the
+      // worst possible first minute on somebody else's server.
+      const signedIn = await post('/api/v1/session', { username, password }, SUBMIT_TIMEOUT_MS);
+      el.invitePass.value = '';
+      el.invitePass2.value = '';
+      if (signedIn.error) {
+        return failed({ phase: 'signin', network: true, timedOut: signedIn.timedOut });
+      }
+      if (signedIn.response.status === 200 || signedIn.response.status === 204) {
+        return leaveIfTheSessionStuck();
+      }
+      // ⚠ The account exists and the code is spent, so the one thing this sentence must not do
+      // is send them back to the code. It sends them to the sign-in form instead.
+      show({
+        tone: 'note',
+        title: 'Your account is made, and signing in did not go through.',
+        detail: 'Sign in with the username and password you just chose. The code is used up now.',
+      });
+      return begin({ keepMessage: true });
+    });
+  }
+
   /** A refusal that carries a status: read what the server said, then classify it. */
   async function refused(phase, response, button, label) {
     const { text } = await readBody(response, WHOAMI_TIMEOUT_MS);
@@ -973,7 +1159,25 @@ export function mount(options = {}) {
 
   el.signin.addEventListener('submit', submitSignIn);
   el.setup.addEventListener('submit', submitSetup);
+  el.invite.addEventListener('submit', submitInvite);
   el.retry.addEventListener('click', () => void begin());
+
+  // ⚠ Both of these swap the form on screen and ask the server nothing. `begin` is the only
+  // function that decides which state a *fresh* page is in, and it stays that way: these two
+  // move between two states it has already established, so calling it here would throw away a
+  // half-typed form to be told the same thing it was told a moment ago.
+  el.haveCode.addEventListener('click', () => showInvite());
+  el.inviteBack.addEventListener('click', () => {
+    // The code and the passwords are dropped rather than left in the fields. Somebody who has
+    // decided they already have an account has no use for either, and a secret in a hidden
+    // field is still a secret in the page.
+    el.inviteCode.value = '';
+    el.invitePass.value = '';
+    el.invitePass2.value = '';
+    clearMessage();
+    clearFieldErrors();
+    showSignIn();
+  });
 
   // ⚠ Back onto this page out of the browser's cache does not re-run a module, so a form
   // restored from bfcache would still be showing "Sign in" to somebody who signed in on another

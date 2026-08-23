@@ -140,14 +140,14 @@ pub use context_bar::{ContextBarState, Control};
 pub use context_menu::{ContextMenu, ContextTarget, Row as ContextRow};
 pub use dialog::{Dialog, DialogStack, ReferenceSection, Step, Toast, ToastKind};
 pub use event::{
-    DialogEvent, DialogId, EventSink, FindEvent, GridSettings, LibraryEvent, StyleEdit,
+    DialogEvent, DialogId, EventSink, FindEvent, GridSettings, LibraryEvent, Secret, StyleEdit,
     TransformEdit, UiEvent,
 };
 pub use find::FindBar;
 pub use icon::Icon;
 pub use library::{
-    BoardCard, IMPORT_STEPS, LayoutMode as LibraryLayout, Scope as LibraryScope, SettingsTab,
-    Space, Thumbnail,
+    AccountState, BoardCard, IMPORT_STEPS, LayoutMode as LibraryLayout, Scope as LibraryScope,
+    SettingsTab, Space, Thumbnail,
 };
 pub use menu::{MenuFlags, MenuHeader};
 pub use properties::ColorTarget;

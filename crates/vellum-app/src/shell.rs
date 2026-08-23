@@ -555,6 +555,39 @@ impl Shell {
         true
     }
 
+    /// Raises Settings ▸ Account, from the menu bar, the palette or `⌘,`.
+    ///
+    /// The settings are a library *scope*, so this is a state change rather than something
+    /// opened over the top — which is why the screen has to move too. The Account page is the
+    /// one it lands on, because that is the page this command was added for.
+    pub fn show_settings(&mut self, tab: vellum_ui::SettingsTab) {
+        self.screen = Screen::Library;
+        self.chrome.set_library_scope(vellum_ui::LibraryScope::Settings);
+        self.chrome.set_settings_tab(tab);
+    }
+
+    /// Fills Settings ▸ Account's address and name in from `library.json`.
+    ///
+    /// ⚠ **Once, at startup.** These are buffers the person types into, and a second write
+    /// would replace what they were half way through entering. The per-frame half is
+    /// [`Self::set_account_status`], which touches neither.
+    pub fn seed_account(&mut self) {
+        let server = self.library.sync_server().unwrap_or_default().to_owned();
+        let username = self.library.sync_username().unwrap_or_default().to_owned();
+        self.chrome.seed_account(&server, &username);
+    }
+
+    /// What the app knows about the account, pushed into the page. Called every frame.
+    pub fn set_account_status(
+        &mut self,
+        state: vellum_ui::AccountState,
+        username: &str,
+        server: &str,
+        message: Option<&str>,
+    ) {
+        self.chrome.set_account_status(state, username, server, message);
+    }
+
     pub fn toast(&mut self, toast: Toast) {
         self.chrome.toast(&self.ctx, toast);
     }
