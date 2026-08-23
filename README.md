@@ -242,6 +242,8 @@ Full reasoning in [`docs/05-design-language.md`](docs/05-design-language.md).
 | [`docs/02-miro-formats.md`](docs/02-miro-formats.md) | Miro's clipboard, `.rtb` and SVG formats, reverse-engineered and measured |
 | [`docs/04-ui-reference.md`](docs/04-ui-reference.md) | Miro's real layout and shortcuts, so your hands already know where things are |
 | [`docs/05-design-language.md`](docs/05-design-language.md) | The palette, the glass material, and the anti-generic-design rules |
+| [`docs/08-web.md`](docs/08-web.md) | The browser client and the server it talks to: twenty-one routes, and which nine of them write |
+| [`docs/09-hosting.md`](docs/09-hosting.md) | Run your own server, so your boards reach any browser you open |
 | [`docs/features/README.md`](docs/features/README.md) | The full parity catalogue — about 120 rows, honest about the gaps |
 
 Built as eighteen crates: the document is a [Loro](https://loro.dev) CRDT (for undo and

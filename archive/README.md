@@ -16,8 +16,10 @@ of the build — there is no feature flag and no `#[cfg]` doing it.
 | `vellum-ui-agent/tests/interaction.rs.before-archive` | the interaction test file **as it stood before the archive**, whole. 532 lines and 16 functions were taken out of the live file; this is the copy that keeps them |
 | `docs/07-agent-canvas.md` | the contract — read this first if you bring the layer back |
 
-`velm-agent-canvas-orchestrator-prompt.md` is **not** here. It stays at the repository root,
-untouched, because the user named it specifically.
+`velm-agent-canvas-orchestrator-prompt.md` **is** here now. It sat at the repository root
+until the user asked for the root to be cleared, and it belongs with the layer it drives:
+the prompt plans a feature that is archived, so a reader who finds one should find the other.
+Its contents are untouched, which was the point of keeping it in the first place.
 
 ## 🛑 What deliberately did NOT move, and must not
 
