@@ -31,21 +31,10 @@ pub enum Tool {
     MindMap,
     Kanban,
     Image,
-    /// Places a live agent node. The Agent Canvas layer's headline tool, and the one of
-    /// the four that is on the palette itself rather than behind **More** — see
-    /// [`Tool::OCCASIONAL`].
-    Agent,
-    /// Places a note node: a markdown file on disk that agents read and write.
-    Note,
-    /// Places a file-tree node, scoped to one agent.
-    FileTree,
-    /// Places a browser node. Opt-in and RAM-gated; the tool exists whether or not an
-    /// engine is enabled, because the node is legible either way.
-    Browser,
 }
 
 impl Tool {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 14] = [
         Self::Select,
         Self::Hand,
         Self::Sticky,
@@ -60,10 +49,6 @@ impl Tool {
         Self::MindMap,
         Self::Kanban,
         Self::Image,
-        Self::Agent,
-        Self::Note,
-        Self::FileTree,
-        Self::Browser,
     ];
 
     /// The tools folded behind the palette's **More** button.
@@ -80,16 +65,13 @@ impl Tool {
     /// are — a note, a file tree and a browser are things you place occasionally, around
     /// the agents — but placing an agent is the layer's whole verb, and a headline feature
     /// folded behind a **More** button is one nobody discovers.
-    pub const OCCASIONAL: [Self; 9] = [
+    pub const OCCASIONAL: [Self; 6] = [
         Self::Table,
         Self::Chart,
         Self::Kanban,
         Self::MindMap,
         Self::Image,
         Self::Connector,
-        Self::Note,
-        Self::FileTree,
-        Self::Browser,
     ];
 
     /// Whether this tool lives behind **More** rather than on the palette itself.
@@ -113,10 +95,6 @@ impl Tool {
             Self::MindMap => "Mind map",
             Self::Kanban => "Kanban board",
             Self::Image => "Image",
-            Self::Agent => "Agent",
-            Self::Note => "Note",
-            Self::FileTree => "File tree",
-            Self::Browser => "Browser",
         }
     }
 
@@ -135,7 +113,6 @@ impl Tool {
             Self::Frame => Key::F,
             // `A` for an agent. It is free — `⌘A` is Select all, and a bare letter is a
             // different binding from a chord, exactly as bare `V`, `N` and `T` already are.
-            Self::Agent => Key::A,
             // Miro has no bare key for a table; `T` is text and already taken.
             Self::Table | Self::Chart | Self::MindMap | Self::Kanban => return None,
             // No bare key for the other three. Every remaining letter that reads as one of
@@ -143,7 +120,6 @@ impl Tool {
             // `F` is a frame, `B` would be the obvious browser key and is one keystroke from
             // being pressed by accident while a caret is not up. A tool nobody places daily
             // does not earn a scarce single key.
-            Self::Note | Self::FileTree | Self::Browser => return None,
             Self::Image => return None,
         })
     }
@@ -193,10 +169,6 @@ impl Tool {
             Self::MindMap => Icon::MindMap,
             Self::Kanban => Icon::Kanban,
             Self::Image => Icon::Image,
-            Self::Agent => Icon::Agent,
-            Self::Note => Icon::Note,
-            Self::FileTree => Icon::FileTree,
-            Self::Browser => Icon::Browser,
         }
     }
 
@@ -207,7 +179,6 @@ impl Tool {
             Self::Pen => Some(Flyout::Pen),
             Self::Eraser => Some(Flyout::Eraser),
             Self::Sticky => Some(Flyout::Sticky),
-            Self::Agent => Some(Flyout::Agent),
             _ => None,
         }
     }
@@ -227,13 +198,6 @@ pub enum Flyout {
     Shape,
     Pen,
     Eraser,
-    /// Which of the three roles the agent tool places: worker, orchestrator or meta.
-    ///
-    /// A flyout rather than a conversion after the fact, for the sticky's reason: the three
-    /// are configured differently from the moment they exist — an orchestrator wants a
-    /// territory drawn on the board and a cap set — so placing a worker and changing it
-    /// afterwards is an extra step every single time.
-    Agent,
     /// The tools that are not everyday work — see [`Tool::OCCASIONAL`].
     More,
 }
@@ -572,22 +536,8 @@ mod tests {
                 Some("E"),
                 Some("C"),
                 Some("F"),
-                // Table, Chart, Mind map, Kanban, Image: Miro binds no bare key to any
-                // of them, and every letter that would suit one is already a tool — `M`
-                // would suit a mind map and Miro spends it on its own *Comment*, which
-                // is cut here, so taking it would be inventing a binding rather than
-                // matching one. `K` is free but Miro does not use it either.
                 None,
                 None,
-                None,
-                None,
-                None,
-                // The Agent Canvas four. `A` is free — `⌘A` is Select all, and a bare
-                // letter is a different binding from a chord, exactly as bare `V`, `N`
-                // and `T` already are. The other three take no key: every letter that
-                // reads as one of them is already a tool the hand uses far more often,
-                // and a tool nobody places daily does not earn a scarce single key.
-                Some("A"),
                 None,
                 None,
                 None,
@@ -661,12 +611,10 @@ mod tests {
     fn only_the_tools_with_something_to_choose_open_a_flyout() {
         let with_flyout: Vec<_> =
             Tool::ALL.iter().copied().filter(|t| t.flyout().is_some()).collect();
-        // The agent tool joined when the three roles became a choice made *before*
-        // placement rather than a conversion afterwards — the sticky's own reasoning.
-        assert_eq!(
-            with_flyout,
-            vec![Tool::Sticky, Tool::Shape, Tool::Pen, Tool::Eraser, Tool::Agent]
-        );
+        // The agent tool was the fifth, and left with the archived layer — see `archive/`.
+        // The assertion is **narrowed, not relaxed**: it still names the exact set, so a tool
+        // that grows a flyout it has no choice to offer still fails here.
+        assert_eq!(with_flyout, vec![Tool::Sticky, Tool::Shape, Tool::Pen, Tool::Eraser]);
     }
 
     #[test]

@@ -364,11 +364,32 @@ fn serve_one(server: &Server, stream: TcpStream) {
     //
     // What an unauthenticated caller can therefore get is the app. What they cannot get is a
     // board, a board's name, a picture, or the fact that any board exists.
-    if needs_token(path)
-        && let Some(expected) = &server.config.token
-        && !authorised(&headers, query, expected)
+    // ⚠ **The carve-out that makes accounts reachable at all**, and it was written, tested and
+    // left with no caller — the eleventh time in this repository that a hop between a gesture
+    // and its effect had none. A browser arriving at the sign-in page has no token: it is
+    // there to obtain the thing that would authorise it. Without this a server with a
+    // `$VELMD_TOKEN` set answers 401 to its own sign-in route and no account can ever be used,
+    // on a page that looks like it is simply refusing the right password.
+    //
+    // Exactly two routes, and `accounts::is_exempt_from_the_bearer_gate` names why each: the
+    // session route, which cannot require what it hands out, and `whoami`, whose whole job is
+    // to answer *"you are nobody"*. Every board, name and picture stays behind the gate.
+    //
+    // ⚠ **Two ways to be authorised, and the gate fires when *either* is configured.** A
+    // tokenless server that has accounts on it would otherwise have accounts deciding nothing
+    // — anybody could read every board and the sign-in page would be decoration. The
+    // consequence is stated rather than discovered: a desktop syncing to a tokenless server
+    // starts answering 401 the moment the first account is made, so `$VELMD_TOKEN` is what
+    // that machine keeps using. `accounts::configured` fails **closed** on a poisoned lock,
+    // because its `false` is the answer that opens the boards.
+    let gated = server.config.token.is_some() || accounts::configured(server);
+    let caller = match &server.config.token {
+        Some(expected) if authorised(&headers, query, expected) => Some(accounts::Caller::Token),
+        _ => accounts::identity(server, &headers).map(accounts::Caller::Account),
+    };
+    if needs_token(path) && !accounts::is_exempt_from_the_bearer_gate(path) && gated && caller.is_none()
     {
-        let _ = respond(&stream, 401, "text/plain", b"a bearer token is required\n", origin.as_deref());
+        let _ = respond(&stream, 401, "text/plain", b"sign in, or send a bearer token\n", origin.as_deref());
         return;
     }
 
@@ -376,6 +397,17 @@ fn serve_one(server: &Server, stream: TcpStream) {
     // zero buffered bytes, so the body is read only once the token has passed. And the `Err`
     // arm is not optional — a POST does not go through `route`, which is where the log line
     // and the 500 live, so without it a poisoned lock is a silently dropped connection.
+    // ⚠ **Signing out is a DELETE and is answered before the POST block**, because the two
+    // would otherwise both want `/api/v1/session` and the first match would win by accident
+    // rather than by decision. It is also the one state-changing route that carries no body.
+    if method == "DELETE" && accounts::is_session(path) {
+        if let Err(error) = accounts::sign_out(server, &headers, &stream) {
+            eprintln!("velmd: {}: {error:#}", printable(path));
+            let _ = respond(&stream, 500, "text/plain", b"something went wrong\n", origin.as_deref());
+        }
+        return;
+    }
+
     if method == "POST" {
         // ⚠ **Four routes answer POST now, and the 405 below has to name all of them.** An
         // error string that mentions only sync is a false claim in the one place a person
@@ -470,9 +502,20 @@ fn serve_one(server: &Server, stream: TcpStream) {
             // found it: a board reachable for reading and not for syncing would be a board
             // that loads and then silently never updates.
             Post::Sync(id) => sync::handle(server, &percent_decode(id), &body, &stream),
-            Post::Import => paste::handle(server, query, &body, &stream),
-            Post::Create => manage::create(server, &body, &stream),
-            Post::Rename(id) => manage::rename_board(server, &percent_decode(id), &body, &stream),
+            Post::Import => paste::handle(server, query, &body, caller.as_ref(), &stream),
+            Post::Create => manage::create(server, &body, caller.as_ref(), &stream),
+            Post::Rename(id) => {
+                // ⚠ Renaming is a write to a board, so it needs the same visibility check a
+                // read does — and `may_see` answering false must give the same 404 the read
+                // gives, or the *difference* between the two answers tells a stranger the
+                // board exists.
+                let id = percent_decode(id);
+                if accounts::may_see(server, &id, caller.as_ref()) {
+                    manage::rename_board(server, &id, &body, &stream)
+                } else {
+                    respond(&stream, 404, "text/plain", b"no such board\n", origin.as_deref())
+                }
+            }
             Post::SignIn => accounts::sign_in(server, &headers, &body, &stream),
             Post::CreateAccount => accounts::create_account(server, &headers, &body, &stream),
         };
@@ -483,7 +526,7 @@ fn serve_one(server: &Server, stream: TcpStream) {
         return;
     }
 
-    let result = route(server, path, query, &headers, &stream);
+    let result = route(server, path, query, &headers, caller.as_ref(), &stream);
     if let Err(error) = result {
         eprintln!("velmd: {}: {error:#}", printable(path));
         let _ = respond(&stream, 500, "text/plain", b"something went wrong\n", origin.as_deref());
@@ -507,6 +550,7 @@ fn route(
     path: &str,
     query: &str,
     headers: &std::collections::BTreeMap<String, String>,
+    caller: Option<&crate::accounts::Caller>,
     stream: &TcpStream,
 ) -> anyhow::Result<()> {
     let origin = server.config.app_origin.as_deref();
@@ -533,12 +577,12 @@ fn route(
         // and the server could never be set up at all.
         accounts::PATH_WHOAMI => accounts::whoami(server, headers, stream),
         accounts::PATH_ACCOUNTS => accounts::list_accounts(server, headers, stream),
-        library_api::PATH => library_api::handle(server, stream),
+        library_api::PATH => library_api::handle(server, caller, stream),
         "/api/v1/boards" => {
             let body = {
                 let _guard =
                     server.boards.lock().map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
-                boards_json(&server.config.data)
+                boards_json(&server.config.data, server, caller)
             };
             respond(stream, 200, "application/json", body.as_bytes(), origin)
         }
@@ -556,7 +600,16 @@ fn route(
                 // against the stems of a directory listing rather than joining it onto a
                 // path, so a decoded `../` is a stem that does not exist rather than a way
                 // out of the directory.
-                return snapshot(server, &percent_decode(id), stream);
+                // ⚠ **The visibility check, and it belongs here rather than inside
+                // `snapshot`.** A 404 rather than a 403: telling a stranger that a board
+                // exists but is not theirs is telling them it exists. `board_by_id` already
+                // answers 404 for a name nothing holds, so the two are indistinguishable from
+                // outside, which is the point.
+                let id = percent_decode(id);
+                if !accounts::may_see(server, &id, caller) {
+                    return respond(stream, 404, "text/plain", b"no such board\n", origin);
+                }
+                return snapshot(server, &id, stream);
             }
             if let Some(hash) = path.strip_prefix("/api/v1/blobs/") {
                 return blob(server, hash, stream);
@@ -572,10 +625,20 @@ fn route(
 /// A board is named to a client by its **file stem**, which is also what
 /// [`board_by_id`] matches against — and matching rather than joining is what makes the id
 /// incapable of traversing anywhere, since it never touches the filesystem at all.
-fn boards_json(data: &Path) -> String {
+fn boards_json(
+    data: &Path,
+    server: &Server,
+    caller: Option<&crate::accounts::Caller>,
+) -> String {
     let mut rows = Vec::new();
     for index in list_boards(data).unwrap_or_default() {
         let Some(id) = index.path.file_stem().and_then(|s| s.to_str()) else { continue };
+        // ⚠ Filtered here rather than at the card: a board this caller may not see must not
+        // appear in the list at all. Its *name* and its item count are already information —
+        // "a board called Payroll exists" is most of what somebody would want to know.
+        if !accounts::may_see(server, id, caller) {
+            continue;
+        }
         // `modified` is milliseconds since the epoch, so the client formats it in the
         // reader's own locale rather than the server's. `0` for a clock the file predates,
         // which the picker renders as no date at all rather than as 1970.

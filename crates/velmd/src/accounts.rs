@@ -1374,7 +1374,7 @@ impl Accounts {
         }
         self.boards
             .get(board)
-            .is_some_and(|record| record.shared.iter().any(|with| *with == identity.username))
+            .is_some_and(|record| record.shared.contains(&identity.username))
     }
 
     /// Record who a newly created board belongs to.
@@ -1450,12 +1450,20 @@ pub fn configured(server: &Server) -> bool {
 /// and not who may *see*, which is a half-built feature that looks finished. The report names
 /// each call site; this comment exists so that a reader of this file alone cannot conclude
 /// otherwise.
-// ⚠ `allow(dead_code)` because nothing calls it **yet**, and the attribute is the marker: a
-// build that warns here is a build where board visibility is still unenforced. Delete it in
-// the same edit that adds the five call sites the doc above names.
-#[allow(dead_code)]
-pub fn may_see(server: &Server, board: &str, caller: &Caller) -> bool {
-    server.accounts.lock().is_ok_and(|accounts| accounts.allowed(board, caller))
+pub fn may_see(server: &Server, board: &str, caller: Option<&Caller>) -> bool {
+    server.accounts.lock().is_ok_and(|accounts| match caller {
+        Some(caller) => accounts.allowed(board, caller),
+        // ⚠ **No caller, and this arm fails closed.** `None` reaches here only when the gate
+        // let the request through, which happens when nothing is configured — no token and no
+        // accounts — and then every board is visible, which is what a bare local `velmd serve`
+        // has always done and what the development route depends on.
+        //
+        // But it is derived from the account store rather than assumed from the gate, because
+        // the two are separate functions and one of them could change: if an account exists,
+        // an unidentified caller sees nothing, whatever the gate happened to decide. A guard
+        // whose failure mode is permit is not a guard — feedback 45 and 48, twice recorded.
+        None => !accounts.any(),
+    })
 }
 
 /// Record a newly created board's owner. Called after a create or an import.

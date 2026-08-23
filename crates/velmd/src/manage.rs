@@ -191,7 +191,12 @@ enum Outcome {
 /// request" is a rule that would have refused four legitimate boards. Sync can be idempotent
 /// because Loro makes it so; this cannot, so it does not pretend to be. A client that cares
 /// should not retry a create it did not see fail.
-pub fn create(server: &Server, body: &[u8], stream: &TcpStream) -> anyhow::Result<()> {
+pub fn create(
+    server: &Server,
+    body: &[u8],
+    caller: Option<&crate::accounts::Caller>,
+    stream: &TcpStream,
+) -> anyhow::Result<()> {
     let origin = server.config.app_origin.as_deref();
     let name = match clean_name(body) {
         Ok(name) => name,
@@ -205,7 +210,14 @@ pub fn create(server: &Server, body: &[u8], stream: &TcpStream) -> anyhow::Resul
     // ⚠ The guard is gone by this line and the `?` is deliberately out here, exactly as
     // `sync::handle` does it: raising inside the block would hold the board lock across the
     // 500 that `serve.rs` writes, for the length of the write timeout.
-    answer(stream, outcome?, origin)
+    let made = outcome?;
+    // ⚠ **Whoever made it owns it**, recorded after the board exists and outside the lock the
+    // creation held. A failure here is logged and not fatal: an unrecorded board belongs to
+    // the founder, so the cost is "the owner owns it" rather than "nobody can open it".
+    if let (Outcome::Board { id, .. }, Some(caller)) = (&made, caller) {
+        crate::accounts::claim_board(server, id, caller);
+    }
+    answer(stream, made, origin)
 }
 
 /// `POST /api/v1/boards/{id}/rename` — change what a board is called.

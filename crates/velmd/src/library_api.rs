@@ -328,7 +328,11 @@ pub(crate) const PATH: &str = "/api/v1/library";
 /// prefix, and the check runs before `route` is reached at all, so there is nothing to
 /// remember here. That is deliberate: a per-route allow-list is a list somebody forgets to
 /// add to, and the one this route would be missing from serves the whole library.
-pub(crate) fn handle(server: &Server, stream: &TcpStream) -> anyhow::Result<()> {
+pub(crate) fn handle(
+    server: &Server,
+    caller: Option<&crate::accounts::Caller>,
+    stream: &TcpStream,
+) -> anyhow::Result<()> {
     let origin = server.config.app_origin.as_deref();
     let body = {
         // The same lock `/api/v1/boards` takes, for the same reason and not for throughput:
@@ -338,7 +342,17 @@ pub(crate) fn handle(server: &Server, stream: &TcpStream) -> anyhow::Result<()> 
         // request for the length of the write timeout.
         let _guard = server.boards.lock().map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
         let indexes = list_boards(&server.config.data).unwrap_or_default();
-        render(&indexes, &read_filing(&server.config.data))
+        // ⚠ Filtered **before** rendering, not after: a board this caller may not see must
+        // not reach the JSON at all, and its folder must not count it either — a folder
+        // reading "3 boards" that shows one is a leak of the other two's existence.
+        let visible: Vec<BoardIndex> = indexes
+            .into_iter()
+            .filter(|index| {
+                stem_of(&index.path)
+                    .is_some_and(|id| crate::accounts::may_see(server, id, caller))
+            })
+            .collect();
+        render(&visible, &read_filing(&server.config.data))
     };
     respond(stream, 200, "application/json", body.as_bytes(), origin)
 }

@@ -150,6 +150,7 @@ pub(crate) fn handle(
     server: &Server,
     query: &str,
     body: &[u8],
+    caller: Option<&crate::accounts::Caller>,
     stream: &TcpStream,
 ) -> anyhow::Result<()> {
     let origin = server.config.app_origin.as_deref();
@@ -235,6 +236,13 @@ pub(crate) fn handle(
     };
 
     report(id, &outcome);
+    // ⚠ **Whoever imported it owns it**, and it is recorded here rather than inside the
+    // pipeline: `vellum-import` knows nothing about accounts, and a board that arrives owned
+    // by nobody silently belongs to the founder — right as a fallback, wrong as the answer
+    // when somebody is signed in and asked for it.
+    if let Some(caller) = caller {
+        crate::accounts::claim_board(server, id, caller);
+    }
     respond(stream, 200, "application/json", summary(id, &title, &outcome).as_bytes(), origin)
 }
 
@@ -466,6 +474,9 @@ mod tests {
 
     fn server_for(dir: &Path) -> Server {
         Server {
+            // Fresh and empty: these tests are about the importer, and an account store that
+            // came from anywhere else would make them depend on a file none of them writes.
+            accounts: std::sync::Mutex::new(crate::accounts::Accounts::open(dir)),
             config: crate::serve::Config {
                 data: dir.join("boards"),
                 blobs: dir.join("blobs"),
@@ -661,7 +672,7 @@ mod tests {
         let server = server_for(&dir);
         let (socket, client) = a_socket_pair("not-miro");
 
-        handle(&server, "", b"<p>copied from a web page</p>", &socket).unwrap();
+        handle(&server, "", b"<p>copied from a web page</p>", None, &socket).unwrap();
         drop(socket);
 
         assert!(answer_on(client).starts_with("HTTP/1.1 400 "), "a foreign paste was accepted");
@@ -676,7 +687,7 @@ mod tests {
         let server = server_for(&dir);
         let (socket, client) = a_socket_pair("binary");
 
-        handle(&server, "", &[0x89, b'P', b'N', b'G', 0xFF, 0xFE], &socket).unwrap();
+        handle(&server, "", &[0x89, b'P', b'N', b'G', 0xFF, 0xFE], None, &socket).unwrap();
         drop(socket);
 
         assert!(answer_on(client).starts_with("HTTP/1.1 400 "));
@@ -692,7 +703,7 @@ mod tests {
         let (socket, client) = a_socket_pair("happy");
 
         let payload = clipboard(one_sticky("fan"));
-        handle(&server, "title=BMW%202020%20530i%20g30", payload.as_bytes(), &socket).unwrap();
+        handle(&server, "title=BMW%202020%20530i%20g30", payload.as_bytes(), None, &socket).unwrap();
         drop(socket);
 
         let answer = answer_on(client);
@@ -719,7 +730,7 @@ mod tests {
         let server = server_for(&dir);
         let (socket, client) = a_socket_pair("untitled");
 
-        handle(&server, "", clipboard(one_sticky("a")).as_bytes(), &socket).unwrap();
+        handle(&server, "", clipboard(one_sticky("a")).as_bytes(), None, &socket).unwrap();
         drop(socket);
 
         let answer = answer_on(client);
