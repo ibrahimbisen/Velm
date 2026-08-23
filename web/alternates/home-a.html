@@ -368,6 +368,15 @@
   .tool-rule { height: 1px; margin: 3px 4px; background: var(--line); }
   .tool svg { width: 20px; height: 20px; }
 
+  /* ⚠ On a phone the palette lies along the bottom, and this is a defect the first render
+     showed rather than a preference: the narrow camera frames the *top-left* of the board,
+     which is exactly where a vertical palette sits, so it covered the frame's own title.
+     Along the bottom it is also where a thumb already is. */
+  @media (max-width: 560px) {
+    .palette { flex-direction: row; top: auto; bottom: clamp(10px, 2vw, 20px); }
+    .tool-rule { width: 1px; height: auto; margin: 4px 3px; }
+  }
+
   /* ⚠ The context bar, and the one place this page exceeds the radius cap and the one
      shadow on it. Both are quoted from the real control: `context_bar.rs` is radius 10,
      no hairline, shadow (0,2) blur 8, 6pt spacing, 32pt controls in a 44pt frame, and a
@@ -466,7 +475,10 @@
     padding: 2px 4px;
   }
   .hint.gone { opacity: 0; }
-  @media (max-width: 520px) { .hint { display: none; } }
+  /* Below this the palette is along the bottom and there is nowhere for a line of prose to
+     sit that is not on top of the board. The board is discoverable without it — tapping a
+     note raises the bar, which is the whole invitation. */
+  @media (max-width: 560px) { .hint { display: none; } }
 
   .stage-note {
     margin: 0;
@@ -512,25 +524,37 @@
     color: var(--muted);
   }
 
-  /* ⚠ The hairline grid. The container is painted `--line` and the cells `--surface` with a
-     1px gap, so every rule between cells is exactly one hairline whatever the cells wrap
-     to — the alternative, a border on each cell, doubles up at every seam and leaves a
-     ragged edge on the last row. One border around the outside completes it. */
-  .grid {
+  /* ⚠ **Cards with a gap, not a one-pixel-gap grid over a coloured container.** That trick
+     draws every rule as exactly one hairline and is what this design would reach for — and
+     it has a failure mode that only shows up at some widths: `auto-fit` collapses an empty
+     *track*, and cannot collapse an empty *cell*, so six tiles in a four-column row leave two
+     cells showing the container's line colour as a grey slab. Measured, in the first render
+     of this page. A border per card is a pixel heavier at each seam and cannot do that. */
+  .cards {
     display: grid;
-    gap: 1px;
-    background: var(--line);
+    gap: 14px;
+    grid-template-columns: repeat(auto-fit, minmax(272px, 1fr));
+  }
+  .cards > * {
+    margin: 0;
+    padding: 22px;
+    background: var(--surface);
     border: 1px solid var(--line);
     border-radius: var(--r-medium);
-    overflow: hidden;
   }
-  .grid > * { background: var(--surface); padding: 22px; margin: 0; }
-  .g4 { grid-template-columns: repeat(auto-fit, minmax(198px, 1fr)); }
-  .g3 { grid-template-columns: repeat(auto-fit, minmax(248px, 1fr)); }
-  .g2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
 
-  /* ── the figures ──────────────────────────────────────────────────────────────────── */
-  .figures { margin-top: 34px; }
+  /* ── the figures ──────────────────────────────────────────────────────────────────
+     No boxes at all. Four numbers this size do not need to be told apart from each other,
+     and a border around each one turns the strongest thing on the page into a form. */
+  .figures {
+    margin-top: 34px;
+    padding-top: 30px;
+    border-top: 1px solid var(--line);
+    display: grid;
+    gap: 30px 34px;
+    grid-template-columns: repeat(auto-fit, minmax(208px, 1fr));
+  }
+  .fig { margin: 0; }
   .fig .n {
     display: block;
     font-size: clamp(30px, 4.4vw, 44px);
@@ -632,8 +656,8 @@
       <p class="lede measure">
         Velm is a whiteboard written in Rust. It draws your board straight on the GPU and
         draws only what is actually on screen — so a hundred thousand things cost the same
-        per frame as two hundred. Open it on a Mac, or in any browser, from a server that
-        belongs to you.
+        per frame as two hundred. Open it on a Mac, or in a browser, on whatever machine you
+        happen to be sitting at — from a server that belongs to you.
       </p>
       <p class="cta">
         <!-- The served label is `Sign in` and the served destination is `/signin`, which is
@@ -697,10 +721,9 @@
 
   <div class="wrap">
     <p class="stage-note">
-      That board is drawn by this page, in a few hundred lines of ordinary canvas code, so
-      you can put your hands on one before signing into anything. <strong>It is not the real
-      renderer</strong> — the real one is Rust on WebGPU, and it is what the numbers below
-      were taken from.
+      That board is drawn by this page's own 2D-canvas code, so you can put your hands on one
+      before signing into anything. <strong>It is not the real renderer</strong> — the real
+      one is Rust on WebGPU, and it is what every number below was taken from.
     </p>
     <p class="stage-note nojs">
       This page opens with a board you can draw on, which needs JavaScript. Everything
@@ -718,7 +741,7 @@
         None of them is a benchmark somebody recalled.
       </p>
 
-      <div class="grid g4 figures">
+      <div class="figures">
         <div class="fig">
           <span class="n">100<span class="u">fps</span></span>
           <p>On a <strong>100,000-item</strong> board with 233 items on screen. 9.96&nbsp;ms a frame — and the same 9.96&nbsp;ms with all 596 items of a real board drawn.</p>
@@ -761,10 +784,12 @@
       <h2>A whiteboard, finished rather than sketched.</h2>
       <p class="sub measure">
         Not a demo of a renderer. The things you actually reach for on a board, and they all
-        work.
+        work. Every one of them is in the desktop app; a browser tab does nearly all of it,
+        and the three things it cannot do are named further down rather than left for you to
+        find.
       </p>
 
-      <div class="grid g3 tiles">
+      <div class="cards tiles">
         <div class="tile">
           <svg viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.8 18.2l1.1-3.9L14.3 4.8a1.9 1.9 0 0 1 2.7 2.7l-9.5 9.4z"/><path d="M12.7 6.4 15.4 9.1"/></svg>
           <h3>Draw</h3>
@@ -807,14 +832,14 @@
           <h2>Copy a board. Paste it here.</h2>
           <p class="sub">
             That is the whole of it. It arrives as a new board with its sticky notes, text,
-            frames, connectors, link cards and images.
+            frames, connectors, link cards and your pen drawings.
           </p>
         </div>
         <div>
           <p>
             <strong>On the reference board, 596 of 596 widgets came across — 532 of them
-            losslessly.</strong> Including 219 pen strokes, which Miro's own API does not
-            expose at all: ask it for that board and 310 of 577 items come back with no
+            losslessly.</strong> That includes all 219 pen strokes, which Miro's own API does
+            not expose at all: ask it for that board and 310 of 577 items come back with no
             content in them.
           </p>
           <p>
@@ -841,7 +866,7 @@
         middle to pay.
       </p>
 
-      <div class="grid g3" style="margin-top:34px;">
+      <div class="cards" style="margin-top:34px;">
         <div class="tile">
           <h3>MIT or Apache-2.0</h3>
           <p>At your option. Read it, build it, fork it, ship it inside something else. The whole thing is on GitHub, including the parts of it that are unfinished.</p>
@@ -930,8 +955,9 @@
           </p>
           <p class="note">
             Intel Macs build from source and are untested. Windows is planned and has never
-            been built. Linux is not planned — though <code>velmd</code>, the server, is meant
-            for it, and the browser client runs anywhere WebGPU does.
+            been built. Linux is not planned for the app — though <code>velmd</code>, the
+            server, is meant for it and so far has only been run on macOS. The browser client
+            needs WebGPU and nothing else.
           </p>
           <p class="note">
             Deleting a board puts it in <em>Recently deleted</em>, where it stays until you
@@ -1268,7 +1294,10 @@
     // some coloured rectangles. The narrow rect frames the top-left corner of the frame
     // instead; the loose items to the right are still there, off the edge, which is what an
     // infinite canvas is supposed to look like.
-    var FOCUS_WIDE = { x: -620, y: -300, w: 640, h: 480 };
+    // The wide rect is shifted 90 units right of the frame's own centre on purpose, so the
+    // frame sits left of centre and the items loose beside it come into the window. Centred
+    // exactly, the left third of a wide stage is empty board and the loose notes are cut.
+    var FOCUS_WIDE = { x: -530, y: -300, w: 640, h: 480 };
     var FOCUS_NARROW = { x: -570, y: -262, w: 322, h: 214 };
 
     function fit() {
