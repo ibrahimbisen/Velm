@@ -147,7 +147,12 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     let actual = listener.local_addr().unwrap_or(config.addr);
 
     let boards = list_boards(&config.data).unwrap_or_default();
-    println!("velmd {} — serving {} board(s)", env!("CARGO_PKG_VERSION"), boards.len());
+    println!(
+        "velmd {} ({}) — serving {} board(s)",
+        env!("CARGO_PKG_VERSION"),
+        &env!("VELM_GIT_SHA")[..7.min(env!("VELM_GIT_SHA").len())],
+        boards.len(),
+    );
     println!("  data    {}", config.data.display());
     println!("  blobs   {}", config.blobs.display());
     match &config.web {
@@ -377,7 +382,14 @@ fn serve_one(server: &Server, stream: TcpStream) {
     // Health is deliberately outside the token, so a person setting this up can tell "the
     // server is not running" from "my token is wrong" without a second tool.
     if path == "/api/v1/health" {
-        let body = format!("{{\"velmd\":\"{}\",\"ok\":true}}", env!("CARGO_PKG_VERSION"));
+        // ⚠ `sha` is the commit of the **running process**, stamped at build time by
+        // `build.rs`. It is here so a deploy can verify what it actually restarted rather
+        // than reporting `git rev-parse HEAD` — the checkout, which is not the same claim.
+        let body = format!(
+            "{{\"velmd\":\"{}\",\"sha\":\"{}\",\"ok\":true}}",
+            env!("CARGO_PKG_VERSION"),
+            env!("VELM_GIT_SHA"),
+        );
         let _ = respond(&stream, 200, "application/json", body.as_bytes(), origin.as_deref());
         return;
     }
@@ -806,7 +818,7 @@ fn route(
             if let Some(hash) = path.strip_prefix("/api/v1/blobs/") {
                 return blob(server, hash, stream);
             }
-            static_file(server, path, stream)
+            static_file(server, path, headers, stream)
         }
     }
 }
@@ -908,7 +920,12 @@ fn blob(server: &Server, hash: &str, stream: &TcpStream) -> anyhow::Result<()> {
     respond(stream, 200, sniff(&bytes), &bytes, origin)
 }
 
-fn static_file(server: &Server, path: &str, stream: &TcpStream) -> anyhow::Result<()> {
+fn static_file(
+    server: &Server,
+    path: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    stream: &TcpStream,
+) -> anyhow::Result<()> {
     let origin = server.config.app_origin.as_deref();
     let Some(root) = &server.config.web else {
         return respond(stream, 404, "text/plain", b"not found\n", origin);
@@ -929,7 +946,50 @@ fn static_file(server: &Server, path: &str, stream: &TcpStream) -> anyhow::Resul
     let Ok(bytes) = std::fs::read(&file) else {
         return respond(stream, 404, "text/plain", b"not found\n", origin);
     };
-    respond(stream, 200, content_type(&file), &bytes, origin)
+
+    // ⚠ **Every file in this bundle is served under a name that never changes**, so a cache
+    // allowed to *reuse* one without asking will hand out last week's `chrome.js` beside this
+    // morning's wasm. Measured on velmapp.org: with no `Cache-Control` at all, Cloudflare fell
+    // back to caching by file extension — `.js` for four hours, `.html` and `.wasm` not at all
+    // — and injected `max-age=14400` into the browser too. A deploy therefore produced a
+    // client assembled from two different commits for four hours, which looked exactly like a
+    // deploy that had not happened. `no-cache` does not mean "do not store": it means "store
+    // it, but revalidate before every use", which is the correct rule for an unhashed name.
+    //
+    // The ETag is what makes that cheap rather than ruinous. Without a validator the 6.5 MB
+    // wasm was refetched in full on every single page load, because a cache with nothing to
+    // ask about has no choice but to ask for all of it.
+    let etag = etag_for(&bytes);
+    let extra = bundle_cache_headers(&etag);
+    if holds_already(headers.get("if-none-match"), &etag) {
+        return respond_with(stream, 304, content_type(&file), b"", origin, &extra);
+    }
+    respond_with(stream, 200, content_type(&file), &bytes, origin, &extra)
+}
+
+/// A file's validator: the first 64 bits of its BLAKE3, quoted as an entity tag.
+///
+/// Content-derived rather than mtime-derived on purpose. `git pull` rewrites the mtime of
+/// every file it touches whether or not the bytes moved, and `build-web.sh` copies the whole
+/// page set on every run, so a timestamp would announce a change on each deploy and throw the
+/// 6.5 MB wasm away for nothing. Strong, not weak: these bytes are the representation.
+fn etag_for(bytes: &[u8]) -> String {
+    format!("\"{}\"", &blake3::hash(bytes).to_hex()[..16])
+}
+
+/// The cache rule for the browser bundle, in one place so it is stated once.
+fn bundle_cache_headers(etag: &str) -> [String; 2] {
+    ["Cache-Control: no-cache".to_owned(), format!("ETag: {etag}")]
+}
+
+/// Whether an `If-None-Match` already holds this exact representation.
+///
+/// A list, per RFC 9110 §13.1.2, and a `W/` prefix is trimmed rather than compared: a client
+/// that offers two candidates must not be told "changed" about the one it is holding.
+fn holds_already(if_none_match: Option<&String>, etag: &str) -> bool {
+    if_none_match.is_some_and(|sent| {
+        sent.split(',').any(|candidate| candidate.trim().trim_start_matches("W/") == etag)
+    })
 }
 
 /// Resolve a request path inside `root`, or refuse.
@@ -1107,6 +1167,7 @@ fn respond_inner(
     let reason = match status {
         200 => "OK",
         204 => "No Content",
+        304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
         // ⚠ **403 and 409 were missing for two releases, and they were reachable the whole
@@ -1133,7 +1194,12 @@ fn respond_inner(
     // A 204 carries neither, per RFC 9110 §6.4.1 — and the one 204 that matters is the CORS
     // preflight, which has to survive an intermediary untouched or the cross-origin path
     // stops working entirely.
-    let mut head = if status == 204 {
+    //
+    // A 304 is the same shape for a different reason (RFC 9110 §15.4.5): it has no body, and
+    // a `Content-Length: 0` on one is a claim about a representation that was *not* sent —
+    // which some caches read as "the resource is now empty". The validator headers the caller
+    // passes in `extra` still go out below, which is the whole point of the response.
+    let mut head = if status == 204 || status == 304 {
         format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n")
     } else {
         format!(
@@ -1534,6 +1600,56 @@ mod tests {
         // matches, so anything else falls through to the trim and then to `static_file`'s own
         // check, which is where the defence actually lives.
         assert_eq!(static_target("/signin/../boards"), "signin/../boards");
+    }
+
+    /// ⚠ **The bug this is here to stop coming back.** Every file in `web/dist` is served
+    /// under a name that never changes, and `velmd` used to send no cache directive at all.
+    /// Cloudflare therefore fell back to caching by *file extension* — four hours for `.js`,
+    /// nothing for `.html` or `.wasm` — and injected `max-age=14400` into the browser too. For
+    /// four hours after every deploy the client was assembled from two different commits: new
+    /// markup, new wasm, last build's JavaScript. It healed by itself before it could be
+    /// investigated, which is why it survived several deploys being blamed on the deploy
+    /// script. A directive that says *"ask me"* is the whole fix; the ETag is what keeps
+    /// asking cheap.
+    #[test]
+    fn the_bundle_is_never_reused_without_asking_first() {
+        let headers = bundle_cache_headers(&etag_for(b"console.log(1)"));
+        assert!(headers.iter().any(|h| h == "Cache-Control: no-cache"), "{headers:?}");
+        assert!(headers.iter().any(|h| h.starts_with("ETag: \"")), "{headers:?}");
+        // The failure mode, named: anything that lets a cache *reuse* without asking.
+        for header in &headers {
+            let lowered = header.to_ascii_lowercase();
+            assert!(!lowered.contains("max-age"), "a reuse window came back: {header}");
+            assert!(!lowered.contains("immutable"), "a reuse promise came back: {header}");
+        }
+    }
+
+    /// The validator follows the bytes, not the clock — `git pull` and `build-web.sh` both
+    /// rewrite mtimes on files whose contents did not move, and an mtime-derived tag would
+    /// throw the 6.5 MB wasm away on every deploy for nothing.
+    #[test]
+    fn the_validator_is_the_bytes_and_nothing_else() {
+        assert_eq!(etag_for(b"same"), etag_for(b"same"));
+        assert_ne!(etag_for(b"same"), etag_for(b"different"));
+        let tag = etag_for(b"same");
+        assert!(tag.starts_with('"') && tag.ends_with('"'), "{tag} is not a quoted entity tag");
+    }
+
+    #[test]
+    fn a_client_holding_the_file_already_is_told_so_and_not_sent_it_again() {
+        let etag = etag_for(b"console.log(1)");
+        let stale = etag_for(b"console.log(2)");
+        assert!(holds_already(Some(&etag), &etag));
+        // A weak prefix, and a list of candidates: both are the client saying it holds this.
+        assert!(holds_already(Some(&format!("W/{etag}")), &etag));
+        assert!(holds_already(Some(&format!("{stale}, {etag}")), &etag));
+        // And the cases that must still send the file.
+        assert!(!holds_already(Some(&stale), &etag));
+        assert!(!holds_already(None, &etag));
+        assert!(!holds_already(Some(&String::new()), &etag));
+        // ⚠ `*` matches any *current* representation, so it must never be honoured here: a
+        // client sending it would be handed a 304 for a file it has never seen.
+        assert!(!holds_already(Some(&"*".to_owned()), &etag));
     }
 
     #[test]

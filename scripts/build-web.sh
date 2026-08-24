@@ -36,6 +36,13 @@ cp web/index.html web/selftest.js web/chrome.js web/boards.html web/boards.js \
    web/find.js web/home.html web/signin.html web/signin.js \
    web/tools.js web/inspect.js web/pictures.js web/icons.js web/dist/
 
+# The commit this bundle was built from, so the *bundle* can be identified on its own.
+# It has to be separate from the binary's stamp rather than folded into it: the server and
+# the browser client legitimately rebuild on different commits — a change under `crates/velmd`
+# rebuilds one and not the other, and `vellum-web` the reverse — so one number cannot answer
+# for both, and the deploy checks them separately.
+git rev-parse HEAD > web/dist/version.txt 2>/dev/null || echo unknown > web/dist/version.txt
+
 echo "web/dist ready — $(du -h web/dist/vellum_web_bg.wasm | cut -f1) of wasm"
 echo "A board and its pictures are not built, they are exported:"
 echo "  cargo run --release -p velmd -- snapshot --board COPY.vellum --out web/dist/board.bin"
