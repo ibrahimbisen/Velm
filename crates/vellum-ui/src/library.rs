@@ -241,6 +241,13 @@ pub struct AccountFields {
     pub server: String,
     pub username: String,
     pub password: String,
+    /// *Keep me signed in*. Ticked, the session lasts thirty days whether it is used or not;
+    /// unticked, it ends after the server's idle window.
+    ///
+    /// **Lives here rather than on `SettingsView`**, for the same reason the three text fields
+    /// do: `SettingsView` is `Copy` and rebuilt every frame, so a tick stored there would be
+    /// forgotten before the button was pressed.
+    pub remember: bool,
     pub state: AccountState,
     /// Who the app says is signed in. Empty unless `state` is
     /// [`AccountState::SignedIn`].
@@ -2355,6 +2362,7 @@ mod tests {
                     server: "boards.example.com".to_owned(),
                     username: "sam".to_owned(),
                     password: "a password".to_owned(),
+                    remember: true,
                     state,
                     signed_in_as: "sam".to_owned(),
                     signed_in_to: "https://boards.example.com/".to_owned(),
@@ -2684,6 +2692,24 @@ fn account_settings(
             },
         );
 
+        // Unticked by default, and the default is the safe direction: forgetting it shortens
+        // a session and can never lengthen one. The server reads the flag once, at the
+        // sign-in it arrives with, so a later request cannot assert it.
+        ui.add_space(space::UNIT);
+        ui.add_enabled_ui(editable, |ui| {
+            ui.checkbox(&mut account.remember, "Keep me signed in on this Mac");
+        });
+        ui.label(
+            egui::RichText::new(if account.remember {
+                "Velm stays signed in for thirty days, whether you use it or not."
+            } else {
+                "Velm signs out after two days of not using it."
+            })
+            .color(palette.muted)
+            .size(crate::theme::text::LABEL),
+        );
+        ui.add_space(space::UNIT);
+
         let complete = !account.server.trim().is_empty()
             && !account.username.trim().is_empty()
             && !account.password.is_empty();
@@ -2697,7 +2723,8 @@ fn account_settings(
             let server = account.server.trim().to_owned();
             let username = account.username.trim().to_owned();
             let password = Secret::new(std::mem::take(&mut account.password));
-            events.push(UiEvent::SignInRequested { server, username, password });
+            let remember = account.remember;
+            events.push(UiEvent::SignInRequested { server, username, password, remember });
         }
     }
 

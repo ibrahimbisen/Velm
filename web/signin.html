@@ -293,6 +293,15 @@
 
   .hint { margin: var(--unit) 0 0; color: var(--muted); font-size: var(--t-numeric); }
   .hint code { font: var(--t-numeric)/1 var(--mono); }
+  /* The whole row is the target, not the 13px box. A `label` wrapping the input gives that
+     for free and keeps the tap area at the 44px this file uses everywhere else. */
+  .check {
+    display: flex; align-items: center; gap: calc(var(--unit) * 1.5);
+    min-height: 44px; margin: calc(var(--unit) * 1.5) 0 0;
+    color: var(--muted); font-size: var(--t-numeric); cursor: pointer;
+    -webkit-user-select: none; user-select: none;
+  }
+  .check input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); cursor: pointer; }
   /* Reserved by `min-height` rather than shown and hidden: a per-field error that appears
      from nowhere shifts every control below it downward under the thumb that is reaching
      for one. */
@@ -397,6 +406,14 @@
       <input id="velm-signin-pass" name="password" type="password" required
              autocomplete="current-password" enterkeyhint="go" maxlength="128">
       <p class="field-error" id="velm-signin-pass-error"></p>
+
+      <!-- Remember me. Unticked by default, and the default is the safe direction: forgetting
+           it shortens a session and can never lengthen one. The server reads the flag once, at
+           the sign-in it was sent with, so a later request cannot assert it. -->
+      <label class="check" for="velm-signin-remember">
+        <input id="velm-signin-remember" name="remember" type="checkbox">
+        <span>Keep me signed in on this device</span>
+      </label>
 
       <button class="btn" id="velm-signin-go" type="submit">Sign in</button>
       <p class="hint" id="velm-lifetime"></p>

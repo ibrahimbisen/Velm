@@ -389,14 +389,27 @@ pub fn is_loopback(server: &str) -> bool {
 
 /// Seconds between round trips, when nobody says otherwise.
 ///
-/// Three seconds. Fast enough that moving a sticky on the iPad appears on the Mac before you
-/// have looked away from it, slow enough that an idle board is twenty requests a minute
-/// rather than a thousand. A failure backs off on its own from here.
+/// One second. A failure backs off on its own from here.
+///
+/// ⚠ **It was three, and three was the wrong end of the trade.** The web client polls on its
+/// own clock too, so the number a person actually experiences is the *sum*: an edit made on
+/// the Mac could take three seconds to be offered plus two more before a tab asked for it,
+/// and five seconds of lag does not read as slow, it reads as broken. At one second each the
+/// worst case is under two and the thing feels live, which is the whole point of syncing at
+/// all.
+///
+/// The cost is bounded and small: one round trip per second **for the board on screen only**
+/// — `Actions::attach_sync_to_hot_board` gives a round trip to the visible board and to
+/// nothing else — and an idle poll carries an empty delta, which `sync::handle` answers
+/// without a restore point, a save, or any write at all. Sixty requests a minute per open
+/// board, against a server whose audience is a household.
+///
+/// `--sync-every SECS` overrides it for anyone on a connection that cannot take this.
 ///
 /// It was a `const` inside [`parse_args`] and is `pub` now because sync can be turned on from
 /// Settings ▸ Account as well as from a flag, and a second cadence written out beside this
 /// one is two numbers that drift apart.
-pub const DEFAULT_SYNC_PERIOD: f64 = 3.0;
+pub const DEFAULT_SYNC_PERIOD: f64 = 1.0;
 
 /// What `main` should do after parsing.
 #[derive(Debug, PartialEq)]

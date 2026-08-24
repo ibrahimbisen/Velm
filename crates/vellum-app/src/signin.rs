@@ -138,12 +138,12 @@ impl SignIn {
 ///
 /// The password is moved into the worker and dropped there. It reaches exactly one place: the
 /// body of one POST.
-pub fn start(base: String, username: String, password: Secret) -> SignIn {
+pub fn start(base: String, username: String, password: Secret, remember: bool) -> SignIn {
     let (answer, inbound) = channel::<SignInReply>();
     let endpoint = session_endpoint(&base);
 
     let spawned = std::thread::Builder::new().name("velm-signin".to_owned()).spawn(move || {
-        let reply = post_session(&endpoint, base, username, &password);
+        let reply = post_session(&endpoint, base, username, &password, remember);
         // The receiver is gone: the app quit, or the person pressed Sign out while this was
         // still in the air. Nothing to do, and nothing to report it to.
         let _ = answer.send(reply);
@@ -167,16 +167,26 @@ fn post_session(
     base: String,
     username: String,
     password: &Secret,
+    remember: bool,
 ) -> SignInReply {
     #[derive(serde::Serialize)]
     struct Credentials<'a> {
         username: &'a str,
         password: &'a str,
+        /// *Keep me signed in*. velmd reads it once, at the sign-in it arrives with, and
+        /// stores the answer on the session it mints.
+        ///
+        /// ⚠ Always sent, including as `false`. velmd defaults a missing field to `false`, so
+        /// omitting it would work today and would stop working the moment that default
+        /// changed — and the direction it would break in is the one that lengthens a session
+        /// nobody asked to lengthen. Stating it costs five bytes.
+        remember: bool,
     }
 
     let body = match serde_json::to_vec(&Credentials {
         username: username.as_str(),
         password: password.expose(),
+        remember,
     }) {
         Ok(body) => body,
         // Unreachable in practice — two `&str` always encode — but this path must not

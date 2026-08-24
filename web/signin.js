@@ -231,10 +231,40 @@ export function sessionDaysFrom(body, fallback = DEFAULT_SESSION_DAYS) {
   return Math.round(raw);
 }
 
-/** The sentence under the sign-in button. One place, so the number cannot be said twice. */
-export function sessionSentence(days) {
-  const span = days === 1 ? 'a day' : `${days} days`;
-  return `This device stays signed in for ${span}. Sign out when you are done on a computer that is not yours.`;
+/**
+ * How long an ordinary session survives without being used, when the server does not say.
+ *
+ * Matches `SESSION_IDLE` in `accounts.rs`. A fallback only: `whoami` reports `idle_hours` and
+ * that number wins, for the reason `DEFAULT_SESSION_DAYS` gives above. Two servers on two
+ * versions must not both be described by whatever this file happened to be built with.
+ */
+export const DEFAULT_IDLE_HOURS = 48;
+
+/** `idle_hours` from a `whoami` body, or the fallback. Bounds match `sessionDaysFrom`. */
+export function idleHoursFrom(body, fallback = DEFAULT_IDLE_HOURS) {
+  const raw = body && typeof body === 'object' ? body.idle_hours : undefined;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return fallback;
+  if (raw < 1 || raw > 8760) return fallback;
+  return Math.round(raw);
+}
+
+/**
+ * The sentence under the sign-in button. One place, so a number cannot be said twice.
+ *
+ * ⚠ **Two lifetimes, and which one applies is the checkbox.** Naming only the thirty days
+ * would overstate an ordinary session by four weeks, and naming only the idle window would
+ * understate a remembered one. The sentence follows the tick, so what it says is always the
+ * rule the person is about to get.
+ */
+export function sessionSentence(days, idleHours = DEFAULT_IDLE_HOURS, remember = false) {
+  if (remember) {
+    const span = days === 1 ? 'a day' : `${days} days`;
+    return `This device stays signed in for ${span}. Sign out when you are done on a computer that is not yours.`;
+  }
+  const span = idleHours % 24 === 0
+    ? (idleHours === 24 ? 'a day' : `${idleHours / 24} days`)
+    : (idleHours === 1 ? 'an hour' : `${idleHours} hours`);
+  return `This device stays signed in for ${span} after you last use it. Tick the box above to stay signed in longer.`;
 }
 
 /**
@@ -515,6 +545,7 @@ const IDS = {
   signinUserError: 'velm-signin-user-error',
   signinPassError: 'velm-signin-pass-error',
   signinGo: 'velm-signin-go',
+  signinRemember: 'velm-signin-remember',
   lifetime: 'velm-lifetime',
   setup: 'velm-setup',
   setupUser: 'velm-setup-user',
@@ -556,6 +587,7 @@ export function mount(options = {}) {
   }
 
   let sessionDays = DEFAULT_SESSION_DAYS;
+  let idleHours = DEFAULT_IDLE_HOURS;
   let busy = false;
   let waitTimer = null;
 
@@ -719,10 +751,20 @@ export function mount(options = {}) {
     clearFieldErrors();
   }
 
+  /**
+   * Restate the lifetime for whichever rule the checkbox currently selects.
+   *
+   * Called on every tick as well as when the form is shown, so the sentence can never describe
+   * the other choice. Both numbers come from `whoami`; neither is computed here.
+   */
+  function drawLifetime() {
+    el.lifetime.textContent = sessionSentence(sessionDays, idleHours, el.signinRemember.checked);
+  }
+
   function showSignIn() {
     el.title.textContent = 'Sign in';
     el.sub.textContent = 'Your boards are on this server.';
-    el.lifetime.textContent = sessionSentence(sessionDays);
+    drawLifetime();
     el.setup.hidden = true;
     el.invite.hidden = true;
     el.retry.hidden = true;
@@ -940,7 +982,11 @@ export function mount(options = {}) {
     }
 
     await withBusy(el.signinGo, 'Signing in…', 'Sign in', async () => {
-      const attempt = await post('/api/v1/session', { username, password }, SUBMIT_TIMEOUT_MS);
+      // ⚠ Read at submit time, not captured when the form was built: the person may tick it
+      // after they have typed. The server stores the answer on the session it mints, so this
+      // is the only moment the choice can be made.
+      const remember = el.signinRemember.checked;
+      const attempt = await post('/api/v1/session', { username, password, remember }, SUBMIT_TIMEOUT_MS);
       if (attempt.error) {
         return failed({ phase: 'signin', network: true, timedOut: attempt.timedOut });
       }
@@ -1150,6 +1196,7 @@ export function mount(options = {}) {
     if (response.status === 401) {
       const { json } = await readBody(response, WHOAMI_TIMEOUT_MS);
       sessionDays = sessionDaysFrom(json);
+      idleHours = idleHoursFrom(json);
       if (!keepMessage) clearMessage();
       return readSetupFlag(json) ? showSetup() : showSignIn();
     }
@@ -1158,6 +1205,9 @@ export function mount(options = {}) {
   }
 
   el.signin.addEventListener('submit', submitSignIn);
+  // The sentence under the button names one of two rules, so it is redrawn on the tick rather
+  // than only when the form appears.
+  el.signinRemember.addEventListener('change', drawLifetime);
   el.setup.addEventListener('submit', submitSetup);
   el.invite.addEventListener('submit', submitInvite);
   el.retry.addEventListener('click', () => void begin());

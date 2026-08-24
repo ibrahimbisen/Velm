@@ -225,7 +225,7 @@ pub enum UiEvent {
     /// `server` is **raw**, exactly as it was typed. Normalising it in the chrome would put
     /// a second answer to *what is a valid address* beside the app's own, and two clients
     /// disagreeing about one input is a defect this repository has already paid for.
-    SignInRequested { server: String, username: String, password: Secret },
+    SignInRequested { server: String, username: String, password: Secret, remember: bool },
     /// *Sign out* was pressed. Nothing is carried: the app knows who is signed in.
     SignOutRequested,
 }
@@ -471,6 +471,7 @@ mod tests {
             server: "https://boards.example.com/".to_owned(),
             username: "sam".to_owned(),
             password: secret.clone(),
+            remember: true,
         };
         let mut sink = EventSink::default();
         sink.push(event.clone());

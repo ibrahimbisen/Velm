@@ -93,11 +93,18 @@ const TICK_MS: i32 = 250;
 
 /// How often a request actually goes out, when the page does not say.
 ///
-/// Two seconds is chosen against what the reply costs rather than against how live it feels:
-/// a poll with nothing to report is a version vector out and a version vector back — a few
+/// One second, chosen against what the reply costs rather than against how live it feels: a
+/// poll with nothing to report is a version vector out and a version vector back — a few
 /// hundred bytes — and `velmd`'s sync handler explicitly does no restore point, no save and
 /// no write at all for an empty delta, so an idle client costs the server a board open.
-pub const DEFAULT_PERIOD_MS: i32 = 2_000;
+///
+/// ⚠ **It was two seconds, and the number that matters is not this one on its own.** The
+/// desktop polls on its own clock, so what a person experiences is the *sum* of the two: at
+/// three seconds there and two here, an edit made on the Mac could take five seconds to
+/// appear in a tab, and five seconds does not read as slow, it reads as broken. Both ends
+/// moved to one second together; changing either alone only halves a problem that has two
+/// halves. `vellum_app::options::DEFAULT_SYNC_PERIOD` is the other one.
+pub const DEFAULT_PERIOD_MS: i32 = 1_000;
 
 /// A floor on the period, so a page cannot ask for a request per tick.
 const MIN_PERIOD_MS: i32 = 250;

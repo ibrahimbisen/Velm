@@ -391,6 +391,18 @@ struct Session {
     username: String,
     created: Instant,
     last_used: Instant,
+    /// Whether *Remember me* was ticked when this session was minted.
+    ///
+    /// It switches off the idle rule and nothing else. [`SESSION_MAX`] still applies, so a
+    /// remembered session ends after thirty days however much it is used — which is what
+    /// makes "you will sign in again eventually" true for every session rather than most of
+    /// them.
+    ///
+    /// ⚠ **Stored on the session rather than read from the request each time.** The choice
+    /// belongs to the sign-in it was made at: a later request from the same browser must not
+    /// be able to extend a session that was not remembered, or the flag would be a thing an
+    /// attacker holding a stolen cookie could simply assert.
+    remember: bool,
 }
 
 // ----- sessions ---------------------------------------------------------------------------
@@ -423,13 +435,19 @@ const COOKIE_HOST_PREFIXED: &str = "__Host-velm_session";
 /// escaping rules to get right anywhere.
 const SESSION_BYTES: usize = 32;
 
-/// How long a session survives without being used.
+/// How long a session survives without being used, when *Remember me* was not ticked.
 ///
-/// Twelve hours: a person who signed in on a tablet in the morning is still signed in that
-/// evening, and one who put the tablet on a shelf is not signed in next week. Sliding,
+/// Forty-eight hours: a person who signed in on a tablet on Friday is still signed in on
+/// Sunday, and one who put the tablet on a shelf is not signed in next month. Sliding,
 /// because the alternative — a hard expiry — signs somebody out in the middle of using the
 /// thing, which is the moment they are least able to see why.
-const SESSION_IDLE: Duration = Duration::from_secs(12 * 60 * 60);
+///
+/// ⚠ **It was twelve hours, and twelve was wrong for the audience.** A household server is
+/// used in bursts: somebody opens a board on Saturday, does not touch it on Sunday, and comes
+/// back on Monday. At twelve hours that is a password prompt every single time, which trains
+/// the household to pick a short password. Two days spans a weekend, which is the gap that
+/// actually occurs.
+const SESSION_IDLE: Duration = Duration::from_secs(48 * 60 * 60);
 
 /// How long a session survives at all, however much it is used.
 ///
@@ -1326,7 +1344,13 @@ impl Accounts {
     /// and then spends their whole budget on names that exist. The decoy is a real hash with
     /// the real parameters, so the two paths cost the same work by construction rather than
     /// by a sleep somebody tuned once.
-    fn sign_in(&mut self, raw_username: &str, password: &str, wire: &Wire) -> Outcome {
+    fn sign_in(
+        &mut self,
+        raw_username: &str,
+        password: &str,
+        wire: &Wire,
+        remember: bool,
+    ) -> Outcome {
         if self.unreadable {
             return Outcome::Broken;
         }
@@ -1392,6 +1416,7 @@ impl Accounts {
             username: account.username.clone(),
             created: now,
             last_used: now,
+            remember,
         });
         Outcome::SignedIn {
             id,
@@ -1526,9 +1551,15 @@ impl Accounts {
 /// stepping a server that has just booted, a laptop waking in another timezone) would sign
 /// everybody out for a reason nobody could ever reconstruct. `Instant` is monotonic and
 /// cannot.
+/// ⚠ **[`SESSION_MAX`] is checked for every session, remembered or not, and that ordering is
+/// the whole safety of the feature.** *Remember me* switches off the idle rule alone. A
+/// session that never expired at all would be a password that never changes, held in a cookie
+/// on a device that can be lost, and thirty days is the backstop that stops it becoming one.
 fn expired(session: &Session, now: Instant) -> bool {
-    now.duration_since(session.last_used) >= SESSION_IDLE
-        || now.duration_since(session.created) >= SESSION_MAX
+    if now.duration_since(session.created) >= SESSION_MAX {
+        return true;
+    }
+    !session.remember && now.duration_since(session.last_used) >= SESSION_IDLE
 }
 
 /// A fresh session id: [`SESSION_BYTES`] from the operating system, in hex.
@@ -2326,6 +2357,13 @@ struct Credentials {
     /// Optional through the container's `#[serde(default)]`, so a client written before
     /// invite codes existed sends the same body it always did.
     code: String,
+    /// Whether *Remember me* was ticked. Only read by [`Accounts::sign_in`].
+    ///
+    /// Defaults to `false` through the container's `#[serde(default)]`, so a client written
+    /// before this existed gets the ordinary idle rule rather than the long one. That is the
+    /// right direction for a default: forgetting to send it shortens a session, never
+    /// lengthens one.
+    remember: bool,
 }
 
 /// The body of a share request: the person to add or to take off.
@@ -2516,7 +2554,7 @@ pub fn sign_in(
     let outcome = {
         let mut accounts =
             server.accounts.lock().map_err(|_| anyhow::anyhow!("accounts lock poisoned"))?;
-        accounts.sign_in(&creds.username, &creds.password, &wire)
+        accounts.sign_in(&creds.username, &creds.password, &wire, creds.remember)
     };
 
     match outcome {
@@ -2606,11 +2644,7 @@ pub fn whoami(
             // Both halves were tested — `setup_open()` five ways, the client's branch too —
             // and the *seam between them* by nothing. Feedback 36's shape, and the reason the
             // test below asserts the wire body rather than the function.
-            let body = format!(
-                "{{\"setup\":{},\"session_days\":{}}}",
-                setup_is_open(server),
-                SESSION_MAX.as_secs() / 86_400
-            );
+            let body = signed_out_body(setup_is_open(server));
             respond_with(stream, 401, "application/json", body.as_bytes(), origin, &[])
         }
     }
@@ -2902,6 +2936,28 @@ fn invite_rows(accounts: &Accounts, now: u64) -> String {
     format!("[{}]", rows.join(","))
 }
 
+/// The body a signed-out `whoami` answers with.
+///
+/// ⚠ **A function, and it exists because the test used to build its own copy of this string.**
+/// `the_signed_out_answer_carries_the_key_the_client_branches_on` re-spelled the `format!` in
+/// its own body, so the two could drift and one of them did: `idle_hours` was added to the
+/// route and the test went on asserting a two-key object and passing. `minted_body` is the
+/// precedent, and its note says the same thing: assert the bytes the client actually reads.
+///
+/// **Two numbers, because there are two session lifetimes and a page that names one of them is
+/// lying about the other.** `session_days` is [`SESSION_MAX`], which is what *Remember me*
+/// buys and is the cap on every session either way. `idle_hours` is [`SESSION_IDLE`], which is
+/// what an ordinary session gets. The sign-in page prints whichever matches the state of its
+/// checkbox and does no arithmetic to get either, so changing a number here cannot leave a
+/// client quietly stating the old one.
+fn signed_out_body(setup: bool) -> String {
+    format!(
+        "{{\"setup\":{setup},\"session_days\":{},\"idle_hours\":{}}}",
+        SESSION_MAX.as_secs() / 86_400,
+        SESSION_IDLE.as_secs() / 3_600
+    )
+}
+
 /// The body a mint answers with.
 ///
 /// ⚠ **A function rather than a `format!` inside [`answer_change`]**, so the test asserts the
@@ -3030,7 +3086,17 @@ mod tests {
     /// otherwise have to sleep a second between attempts, which is a suite nobody runs.
     fn attempt(store: &mut Accounts, user: &str, password: &str, wire: &Wire) -> Outcome {
         store.attempts.clear();
-        store.sign_in(user, password, wire)
+        store.sign_in(user, password, wire, false)
+    }
+
+    /// [`attempt`], with *Remember me* ticked.
+    ///
+    /// Separate rather than a fifth parameter on `attempt`, because every existing caller
+    /// wants the ordinary session and a bool at the end of four arguments reads as noise at
+    /// each of them.
+    fn attempt_remembered(store: &mut Accounts, user: &str, password: &str, wire: &Wire) -> Outcome {
+        store.attempts.clear();
+        store.sign_in(user, password, wire, true)
     }
 
     fn found(store: &mut Accounts, user: &str, password: &str) -> Identity {
@@ -4061,6 +4127,60 @@ mod tests {
         );
     }
 
+    /// *Remember me* switches off the idle rule, and only the idle rule.
+    ///
+    /// Both halves are asserted against the same instant, because the thing that would break
+    /// silently is the two rules being combined the wrong way round: an `&&` where there is an
+    /// `||` would make a remembered session immortal, and nothing else in the suite would
+    /// notice for thirty days.
+    #[test]
+    fn remembering_a_session_drops_the_idle_rule_and_keeps_the_thirty_day_cap() {
+        let mut store = Accounts::open(&scratch("remember-me"));
+        found(&mut store, "owner", "a-long-enough-passphrase");
+
+        let ordinary = match attempt(&mut store, "owner", "a-long-enough-passphrase", &client_at(SOMEWHERE)) {
+            Outcome::SignedIn { id, .. } => id,
+            _ => panic!("the right password did not sign in"),
+        };
+        let remembered = match attempt_remembered(&mut store, "owner", "a-long-enough-passphrase", &client_at(SOMEWHERE)) {
+            Outcome::SignedIn { id, .. } => id,
+            _ => panic!("the right password did not sign in"),
+        };
+
+        // Just past the idle window. The ordinary one is gone; the remembered one is not.
+        let idled = Instant::now() + SESSION_IDLE + Duration::from_secs(60);
+        assert!(store.identity_of(&ordinary, idled).is_none(), "the idle rule stopped applying");
+        assert!(
+            store.identity_of(&remembered, idled).is_some(),
+            "Remember me did not survive the idle window"
+        );
+
+        // Past the hard cap. Neither survives, and that is the half that bounds a stolen cookie.
+        let capped = Instant::now() + SESSION_MAX + Duration::from_secs(60);
+        assert!(store.identity_of(&ordinary, capped).is_none());
+        assert!(
+            store.identity_of(&remembered, capped).is_none(),
+            "a remembered session outlived SESSION_MAX, so it never ends"
+        );
+    }
+
+    /// The default is the short session, and a client that has never heard of the flag gets it.
+    ///
+    /// Asserted on the wire type rather than through `sign_in`, because the direction of the
+    /// default is the whole point: forgetting to send it must shorten a session, never
+    /// lengthen one.
+    #[test]
+    fn a_body_with_no_remember_field_asks_for_the_ordinary_session() {
+        let without = credentials(br#"{"username":"sam","password":"another-long-passphrase"}"#)
+            .expect("the body did not parse");
+        assert!(!without.remember, "a body with no remember field asked to be remembered");
+        let with = credentials(
+            br#"{"username":"sam","password":"another-long-passphrase","remember":true}"#,
+        )
+        .expect("the body did not parse");
+        assert!(with.remember);
+    }
+
     // ----- rate limiting --------------------------------------------------------------------
 
     #[test]
@@ -4069,12 +4189,12 @@ mod tests {
         found(&mut store, "owner", "a-long-enough-passphrase");
 
         assert!(matches!(
-            store.sign_in("owner", "wrong-but-long-enough", &client_at(SOMEWHERE)),
+            store.sign_in("owner", "wrong-but-long-enough", &client_at(SOMEWHERE), false),
             Outcome::Wrong
         ));
         let stamped = store.attempts["owner"];
         assert!(
-            matches!(store.sign_in("owner", "a-long-enough-passphrase", &client_at(SOMEWHERE)), Outcome::Throttled),
+            matches!(store.sign_in("owner", "a-long-enough-passphrase", &client_at(SOMEWHERE), false), Outcome::Throttled),
             "the one-second interval did not apply"
         );
 
@@ -4094,7 +4214,7 @@ mod tests {
             .expect("this machine has been up for less than one second");
         store.attempts.insert("owner".to_owned(), then);
         assert!(matches!(
-            store.sign_in("owner", "a-long-enough-passphrase", &client_at(SOMEWHERE)),
+            store.sign_in("owner", "a-long-enough-passphrase", &client_at(SOMEWHERE), false),
             Outcome::SignedIn { .. }
         ));
     }
@@ -4106,9 +4226,9 @@ mod tests {
     fn the_interval_applies_to_a_username_that_does_not_exist() {
         let mut store = Accounts::open(&scratch("interval-unknown"));
         found(&mut store, "owner", "a-long-enough-passphrase");
-        assert!(matches!(store.sign_in("nobody", "a-long-enough-passphrase", &client_at(SOMEWHERE)), Outcome::Wrong));
+        assert!(matches!(store.sign_in("nobody", "a-long-enough-passphrase", &client_at(SOMEWHERE), false), Outcome::Wrong));
         assert!(
-            matches!(store.sign_in("nobody", "a-long-enough-passphrase", &client_at(SOMEWHERE)), Outcome::Throttled),
+            matches!(store.sign_in("nobody", "a-long-enough-passphrase", &client_at(SOMEWHERE), false), Outcome::Throttled),
             "an unknown username was not stamped, so the limiter tells them apart"
         );
     }
@@ -4275,16 +4395,21 @@ mod tests {
     /// than the function that feeds it.
     #[test]
     fn the_signed_out_answer_carries_the_key_the_client_branches_on() {
-        let body = |setup: bool| {
-            format!("{{\"setup\":{setup},\"session_days\":{}}}", SESSION_MAX.as_secs() / 86_400)
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&body(true)).expect("valid JSON");
+        // ⚠ `signed_out_body`, not a second `format!` written here. This test used to spell the
+        // string itself, so when `idle_hours` was added to the route the test kept asserting a
+        // two-key object and kept passing. One function, one set of bytes, one assertion.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&signed_out_body(true)).expect("valid JSON");
         assert_eq!(parsed["setup"], serde_json::json!(true), "the setup flag must be a bool");
         assert!(
             parsed["session_days"].as_u64().is_some_and(|d| d > 0),
             "the client prints this in a sentence and falls back silently when it is missing"
         );
-        assert!(body(false).contains("\"setup\":false"));
+        assert!(
+            parsed["idle_hours"].as_u64().is_some_and(|h| h > 0),
+            "the sign-in page prints this whenever Remember me is not ticked"
+        );
+        assert!(signed_out_body(false).contains("\"setup\":false"));
     }
 
     #[test]

@@ -566,8 +566,8 @@ impl ActiveState {
                 // `Library::set_*` writes the sidecar synchronously.
                 self.shell.library.set_glass_opacity(opacity);
             }
-            UiEvent::SignInRequested { server, username, password } => {
-                self.begin_sign_in(&server, username, password);
+            UiEvent::SignInRequested { server, username, password, remember } => {
+                self.begin_sign_in(&server, username, password, remember);
             }
             UiEvent::SignOutRequested => self.sign_out(),
             UiEvent::AccentChanged(accent) => {
@@ -890,7 +890,13 @@ impl ActiveState {
     /// A second press while one is in flight is ignored rather than queued: the fields are
     /// disabled in that state, so the only way to reach it is a race, and two sessions minted
     /// for one intent is one more than anybody asked for.
-    fn begin_sign_in(&mut self, server: &str, username: String, password: vellum_ui::Secret) {
+    fn begin_sign_in(
+        &mut self,
+        server: &str,
+        username: String,
+        password: vellum_ui::Secret,
+        remember: bool,
+    ) {
         if self.pending_signin.is_some() {
             return;
         }
@@ -909,7 +915,7 @@ impl ActiveState {
         log::info!("sign-in: {base} as {username}");
         self.account.state = vellum_ui::AccountState::SigningIn;
         self.account.message = None;
-        self.pending_signin = Some(crate::signin::start(base, username, password));
+        self.pending_signin = Some(crate::signin::start(base, username, password, remember));
     }
 
     /// Applies a sign-in answer, if one has landed. One `Option` test when nothing is out.
