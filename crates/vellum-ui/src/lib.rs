@@ -147,7 +147,7 @@ pub use find::FindBar;
 pub use icon::Icon;
 pub use library::{
     AccountState, BoardCard, IMPORT_STEPS, LayoutMode as LibraryLayout, Scope as LibraryScope,
-    SettingsTab, Space, Thumbnail,
+    SettingsTab, Space, Thumbnail, UploadProgress,
 };
 pub use menu::{MenuFlags, MenuHeader};
 pub use properties::ColorTarget;

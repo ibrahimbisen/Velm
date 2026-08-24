@@ -840,7 +840,7 @@ fn stem_of(path: &Path) -> String {
 /// different reserved characters, and a board called `Engine bay / wiring` must not
 /// become a directory. Anything that is not an ASCII letter, digit or dash becomes a
 /// dash, runs collapse, and an empty result falls back to a fixed name.
-fn slug(title: &str) -> String {
+pub(crate) fn slug(title: &str) -> String {
     let mut out = String::with_capacity(title.len());
     for ch in title.chars() {
         if ch.is_ascii_alphanumeric() {

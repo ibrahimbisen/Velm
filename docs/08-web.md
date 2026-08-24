@@ -191,7 +191,7 @@ with `-D warnings`, and do not "fix" this by weakening the native annotation.**
 
 ## 7. The server, and what it will and will not answer
 
-`velmd serve` puts the three exports behind HTTP. **Twenty-one routes, and nine of them change
+`velmd serve` puts the three exports behind HTTP. **Twenty-three routes, and ten of them change
 something on disk.**
 
 Boards and pictures:
@@ -213,6 +213,14 @@ Boards and pictures:
     POST   /api/v1/boards/{id}/rename      {"title"}
     POST   /api/v1/import                  paste or drop, into a new board
     POST   /api/v1/boards/{id}/sync        ⚠ the only route that changes a board's content
+    POST   /api/v1/blobs/{hash}            store one picture: the raw bytes, no wrapper.
+                                           ⚠ requires Content-Type: application/octet-stream,
+                                           and answers 415 without it. Up to 64 MiB, streamed
+                                           rather than buffered. Answers {"hash"} on 200, and
+                                           400 when the bytes do not hash to the name given.
+    POST   /api/v1/blobs/missing           a JSON array of up to 8,000 hex hashes, at most
+                                           512 KiB. Answers a JSON array: the ones this store
+                                           does not have, in the order asked, deduplicated.
 
 Accounts:
 
@@ -240,7 +248,7 @@ none. `/sync` merges rather than replaces, a Loro update cannot remove what it d
 and it takes a labelled restore point before the first change any board ever receives from the
 web, which is what makes that write acceptable at all.
 
-Seven decisions worth not re-deriving:
+Eight decisions worth not re-deriving:
 
 - **Two ways to be authorised: a bearer token, or a session cookie.** The token is the
   server-wide secret the desktop's sync sends and it sees every board. An account sees what it
@@ -270,6 +278,16 @@ Seven decisions worth not re-deriving:
   is an absolute server path and is never sent.
 - **A blob's hash is the traversal defence, and it is total.** `Hash: FromStr` decodes exactly
   64 hex characters, so no spelling of `..` or `/` survives it.
+- **An upload names its own content, and there is no quota.** The client says which blob it is
+  sending; the server hashes what arrives and refuses the request when the two disagree, so
+  nothing is stored under a name that is not its content. That check exists because **velmd can
+  never remove a blob** — a body corrupted in transit would otherwise be permanent disk that
+  nothing references. What bounds the disk is who holds an account, 64 MiB per request, sixteen
+  connections, and the fact that duplicate content costs nothing. **Distinct content is
+  unbounded.** A byte quota would need a walk of the whole store on every upload, or a cached
+  total that has to stay honest against `velmd import` and files copied in by hand; on a
+  single-operator server the account list is the quota. The exposure is not new either: `POST
+  /api/v1/import` has stored blobs for any authenticated caller since it shipped.
 
 Two more, on the gate itself:
 

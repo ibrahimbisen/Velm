@@ -542,7 +542,12 @@ fn backoff_after(failures: u32) -> Duration {
 ///
 /// Separate from [`Sync::new`] so the two things that are easy to get wrong — a doubled
 /// slash, and a board name with a space in it — are testable without starting a thread.
-fn endpoint_for(server: &str, board_id: &str) -> String {
+///
+/// `pub(crate)` so `crate::push` posts its first-run document to the **same** URL rather than
+/// deriving a second spelling of it. Two percent-encoders in one application drift, and the
+/// day they disagree is the day a board with a space in its name syncs from one code path and
+/// 404s from the other.
+pub(crate) fn endpoint_for(server: &str, board_id: &str) -> String {
     let base = server.trim_end_matches('/');
     format!("{base}/api/v1/boards/{}/sync", escape_segment(board_id))
 }

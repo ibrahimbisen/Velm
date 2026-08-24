@@ -216,6 +216,22 @@ pub enum AccountState {
     SignedIn,
 }
 
+/// How far the first run of *Send my boards to this server* has got.
+///
+/// Four counters and nothing else. The page has to know an upload is running so it can swap
+/// the button for progress and a Stop button, and a sentence alone cannot carry that.
+///
+/// It belongs to the **app's half** of [`AccountFields`]: the app replaces it every frame
+/// from what its worker thread has reported, and the page never writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UploadProgress {
+    pub boards_done: u32,
+    pub boards_total: u32,
+    /// The pictures in the board being sent now. Zero when it has none, which is common.
+    pub blobs_done: u32,
+    pub blobs_total: u32,
+}
+
 /// Settings ▸ Account's own memory between frames: what is being typed, and what the app
 /// last said about it.
 ///
@@ -257,6 +273,8 @@ pub struct AccountFields {
     pub signed_in_to: String,
     /// One sentence from the app, or `None` when nothing has failed.
     pub message: Option<String>,
+    /// A first run in flight, or `None`. The app's half, replaced every frame.
+    pub upload: Option<UploadProgress>,
 }
 
 impl std::fmt::Debug for AccountFields {
@@ -269,6 +287,7 @@ impl std::fmt::Debug for AccountFields {
             .field("signed_in_as", &self.signed_in_as)
             .field("signed_in_to", &self.signed_in_to)
             .field("message", &self.message)
+            .field("upload", &self.upload)
             .finish()
     }
 }
@@ -2367,6 +2386,7 @@ mod tests {
                     signed_in_as: "sam".to_owned(),
                     signed_in_to: "https://boards.example.com/".to_owned(),
                     message: Some("That username and password do not match.".to_owned()),
+                    upload: None,
                 },
                 ..LibraryState::default()
             };
@@ -2377,6 +2397,55 @@ mod tests {
                 library.account.password, "a password",
                 "the page cleared the password without a click"
             );
+        }
+    }
+
+    /// The first-run control draws in both of its states and starts nothing by being drawn.
+    ///
+    /// It is the second *submit* on this page and the one with the largest consequence: the
+    /// idle button copies a whole library over somebody's network, and the running state is
+    /// not reachable by `--show settings:Account` because it needs a server. So this is the
+    /// only automated cover either of them has.
+    #[test]
+    fn the_first_run_control_draws_and_sends_nothing_by_itself() {
+        for upload in [None, Some(UploadProgress {
+            boards_done: 11,
+            boards_total: 45,
+            blobs_done: 18,
+            blobs_total: 63,
+        })] {
+            let mut library = LibraryState {
+                scope: Scope::Settings,
+                settings_tab: SettingsTab::Account,
+                account: AccountFields {
+                    state: AccountState::SignedIn,
+                    signed_in_as: "sam".to_owned(),
+                    signed_in_to: "https://boards.example.com/".to_owned(),
+                    upload,
+                    ..AccountFields::default()
+                },
+                ..LibraryState::default()
+            };
+            let events = run(&[], &mut library);
+            assert!(events.is_empty(), "drawing it emitted {events:?}");
+            assert_eq!(library.account.upload, upload, "the page changed the app's counters");
+        }
+    }
+
+    /// Signed **out**, there is nothing to send a board to, so the control is not drawn at
+    /// all. The assertion that matters is the negative one: a button offered before a session
+    /// exists can only ever report *Sign in first*.
+    #[test]
+    fn the_first_run_control_is_not_offered_before_a_session() {
+        for state in [AccountState::SignedOut, AccountState::SigningIn] {
+            let mut library = LibraryState {
+                scope: Scope::Settings,
+                settings_tab: SettingsTab::Account,
+                account: AccountFields { state, ..AccountFields::default() },
+                ..LibraryState::default()
+            };
+            let events = run(&[], &mut library);
+            assert!(events.is_empty(), "the {state:?} page emitted {events:?}");
         }
     }
 
@@ -2728,6 +2797,13 @@ fn account_settings(
         }
     }
 
+    // Below the sign-in block, and only once there is a session. There is nothing to send a
+    // board to before one exists, and a button that can only report *Sign in first* is a
+    // control whose one outcome is the state you are already in.
+    if account.state == AccountState::SignedIn {
+        first_run(ui, palette, account.upload, events);
+    }
+
     if let Some(message) = account.message.as_deref() {
         ui.add_space(space::UNIT);
         ui.label(
@@ -2746,6 +2822,81 @@ fn account_settings(
     );
 
     ui.add_space(space::of(8));
+}
+
+/// Settings ▸ Account ▸ Your boards: the one button that puts this Mac's whole library on the
+/// server, and what it says while it is running.
+///
+/// # Why it is a button and not something that happens on its own
+///
+/// *"i want to enter my account and the server link and then from that point on my
+/// information on the mac and on the server will sync"*. The steady state is automatic, and
+/// the **first** run is not: it is 45 boards and about 1.3 GB of pictures, over whatever
+/// network the laptop happens to be on. Starting that without being asked would be the
+/// application deciding to use somebody's connection for an afternoon.
+///
+/// # Two states, and the running one has an exit
+///
+/// A long job with no way out is one people force quit, and a force quit in the middle of
+/// this is the one thing that could leave a board half sent. So the running state carries
+/// Stop, and the sentence under it says exactly what Stop does: the item being sent now
+/// finishes, and nothing after it starts.
+///
+/// The chrome performs nothing itself. The button emits; the app owns every socket.
+fn first_run(
+    ui: &mut Ui,
+    palette: Palette,
+    upload: Option<UploadProgress>,
+    events: &mut EventSink,
+) {
+    section(ui, palette, "Your boards");
+
+    let Some(progress) = upload else {
+        if ui.button("Send my boards to this server").clicked() {
+            events.push(UiEvent::UploadAllRequested);
+        }
+        ui.label(
+            egui::RichText::new(
+                "Velm copies every board and every picture to your server. Boards in \
+                 Recently deleted stay on this Mac.",
+            )
+            .color(palette.muted)
+            .size(crate::theme::text::LABEL),
+        );
+        return;
+    };
+
+    // "Sending board 12 of 45." The done count is boards **finished**, so the one in flight
+    // is the next number up and the sentence never claims a board that is still going.
+    ui.label(
+        egui::RichText::new(format!(
+            "Sending board {} of {}.",
+            progress.boards_done.saturating_add(1).min(progress.boards_total.max(1)),
+            progress.boards_total
+        ))
+        .color(palette.text),
+    );
+    // Only when this board has pictures, which many do not. A second line reading
+    // "Pictures 0 of 0." is a line that says nothing and moves the button.
+    if progress.blobs_total > 0 {
+        ui.label(
+            egui::RichText::new(format!(
+                "Pictures {} of {}.",
+                progress.blobs_done, progress.blobs_total
+            ))
+            .color(palette.muted)
+            .size(crate::theme::text::LABEL),
+        );
+    }
+    ui.add_space(space::UNIT);
+    if ui.button("Stop").clicked() {
+        events.push(UiEvent::UploadCancelled);
+    }
+    ui.label(
+        egui::RichText::new("Velm finishes the item it is sending, then stops.")
+            .color(palette.muted)
+            .size(crate::theme::text::LABEL),
+    );
 }
 
 /// Appearance and board behaviour — the application's own settings.

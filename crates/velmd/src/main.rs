@@ -48,6 +48,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod accounts;
+mod blobs;
 mod library_api;
 mod manage;
 mod manifest;

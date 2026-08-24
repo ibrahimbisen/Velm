@@ -625,15 +625,22 @@ impl Chrome {
     /// `signed_in_as` and `signed_in_to` are ignored unless `state` is
     /// [`AccountState::SignedIn`](crate::library::AccountState::SignedIn); the page draws
     /// neither in any other state.
+    ///
+    /// `upload` is a first run in flight, or `None`. Six arguments including `self`, which is
+    /// under clippy's threshold of seven — worth stating, because the seventh would have to
+    /// be a struct rather than another parameter.
     pub fn set_account_status(
         &mut self,
         state: crate::library::AccountState,
         signed_in_as: &str,
         signed_in_to: &str,
         message: Option<&str>,
+        upload: Option<crate::library::UploadProgress>,
     ) {
         let account = &mut self.library.account;
         account.state = state;
+        // `Copy` and four `u32`s, so this one is assigned rather than compared first.
+        account.upload = upload;
         // Compared before assigning, so an unchanged sentence is not a fresh `String` per
         // frame. The page reads these; nothing else does.
         if account.signed_in_as != signed_in_as {

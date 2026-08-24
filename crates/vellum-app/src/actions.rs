@@ -570,6 +570,8 @@ impl ActiveState {
                 self.begin_sign_in(&server, username, password, remember);
             }
             UiEvent::SignOutRequested => self.sign_out(),
+            UiEvent::UploadAllRequested => self.start_push(),
+            UiEvent::UploadCancelled => self.cancel_push(),
             UiEvent::AccentChanged(accent) => {
                 // **Not** "likewise": this one has a second half. The chrome has applied it
                 // to itself, but a selection ring is drawn by `vellum-render` and not by
@@ -972,6 +974,13 @@ impl ActiveState {
     /// own, and a sign-out that could fail is a sign-out that leaves somebody signed in.
     fn sign_out(&mut self) {
         self.pending_signin = None;
+        // ⚠ **Signing out stops a first run after the item it is sending now.** It has to:
+        // `recredential` detaches every `Sync`, but it cannot reach a worker that already
+        // holds a cloned credential, so without this the push would keep uploading with a
+        // session the person has just given up. Dropping the handle is the stop — the worker
+        // ends at its next `send`, which is `crate::signin`'s precedent.
+        self.push.running = None;
+        self.push.progress = None;
         self.sync = self.startup_sync.clone();
         self.account.state = vellum_ui::AccountState::SignedOut;
         self.account.username.clear();
@@ -1011,7 +1020,253 @@ impl ActiveState {
     /// way through entering.
     pub(crate) fn report_account(&mut self) {
         let crate::app::AccountStatus { state, username, server, message } = &self.account;
-        self.shell.set_account_status(*state, username, server, message.as_deref());
+        // The counters come off `self.push` rather than off `AccountStatus`, so there is one
+        // owner of "is a first run going" and the page cannot be told one thing while the
+        // worker is doing another.
+        let upload = self.push.progress;
+        self.shell.set_account_status(*state, username, server, message.as_deref(), upload);
+    }
+
+    // ----- the first run -------------------------------------------------------------
+
+    /// Starts *Send my boards to this server*.
+    ///
+    /// # The whole plan is built here, on this thread, before anything is spawned
+    ///
+    /// The worker never asks the library a question, because the library is main-thread state
+    /// and a worker holding a reference to it would be the second live view of the collection.
+    /// So this reads `Library::cards()` once and hands the worker a list of paths, titles and
+    /// recorded ids. Nothing after this point can change which boards are in the run.
+    ///
+    /// **Recently deleted does not travel.** The server has no trash, so a board sent from it
+    /// would arrive as an ordinary board and there would be no way to put it back. A board
+    /// restored later goes up on the next run.
+    ///
+    /// # Every open board is flushed first
+    ///
+    /// `Editor::flush` is the debounced save that would have happened within 250 ms anyway. It
+    /// runs on the hot board and on every parked one, so the file on disk equals what is on
+    /// screen at the moment the run starts. Edits made *during* the run are not in it and do
+    /// not need to be: the board's own `Sync` carries them afterwards, because the id now
+    /// agrees.
+    ///
+    /// A second press while one is going is ignored rather than queued. The page swaps the
+    /// button for Stop in that state, so the only way to reach it is a race, and two workers
+    /// on one library is one more than anybody asked for.
+    fn start_push(&mut self) {
+        if self.push.running.is_some() {
+            return;
+        }
+        let Some(config) = self.sync.as_ref() else {
+            self.account.message = Some("Sign in first.".to_owned());
+            return;
+        };
+        let server = config.options.server.clone();
+        let credential = config.credential.clone();
+
+        // The debounced save, taken now. A failure is logged and not fatal: the board still
+        // goes up, one autosave window behind what is on screen.
+        if let Err(error) = self.editor.flush() {
+            log::warn!("push: flushing the board on screen ({error})");
+        }
+        for parked in self.session.iter_mut() {
+            if let Err(error) = parked.editor_mut().flush() {
+                log::warn!("push: flushing a parked board ({error})");
+            }
+        }
+
+        let root = self.shell.library.root().to_path_buf();
+        let cards: Vec<(PathBuf, String)> = self
+            .shell
+            .library
+            .cards()
+            .iter()
+            .filter(|card| card.deleted.is_none())
+            .map(|card| (card.path.clone(), card.title.clone()))
+            .collect();
+        if cards.is_empty() {
+            self.account.message = Some("There are no boards on this Mac to send.".to_owned());
+            return;
+        }
+        let ids = self.push.ids(&root);
+        let boards: Vec<crate::push::PlanBoard> = cards
+            .into_iter()
+            .map(|(path, title)| {
+                let known_id = ids.id_for(&path, &server).map(str::to_owned);
+                crate::push::PlanBoard { path, title, known_id }
+            })
+            .collect();
+
+        let total = u32::try_from(boards.len()).unwrap_or(u32::MAX);
+        log::info!("push: {total} boards to {server}");
+        self.push.progress = Some(vellum_ui::UploadProgress {
+            boards_done: 0,
+            boards_total: total,
+            blobs_done: 0,
+            blobs_total: 0,
+        });
+        self.account.message = None;
+        self.push.running = Some(crate::push::start(crate::push::PushPlan {
+            server,
+            credential,
+            blobs: crate::editor::blob_directory(),
+            boards,
+        }));
+    }
+
+    /// Asks the run to stop. It ends after the item it is sending now.
+    ///
+    /// The handle is **kept**, not dropped, which is the difference between Cancel and
+    /// signing out: Cancel wants the summary sentence afterwards, and a dropped handle has no
+    /// channel to deliver one on.
+    fn cancel_push(&mut self) {
+        if let Some(push) = self.push.running.as_ref() {
+            push.stop();
+            self.account.message = Some("Stopping after this item.".to_owned());
+        }
+    }
+
+    /// Applies whatever the worker has reported. One `Option` test when nothing is running.
+    ///
+    /// ⚠ **Called on the frame path *above* the occlusion guard**, for the reason written
+    /// there: a board that finished while the window was behind another one must still have
+    /// its id recorded, or the record is lost and the next run makes a second board on the
+    /// server that no route can delete.
+    pub(crate) fn drain_push(&mut self) {
+        let Some(push) = self.push.running.as_mut() else { return };
+        let events = push.drain();
+        if events.is_empty() {
+            return;
+        }
+        let root = self.shell.library.root().to_path_buf();
+        let server = self.sync.as_ref().map(|config| config.options.server.clone());
+        let mut summary = None;
+        for event in events {
+            match event {
+                crate::push::PushEvent::Board { done, total, title } => {
+                    log::info!("push: board {} of {total}: {title}", done.saturating_add(1));
+                    let progress = self.push.progress.get_or_insert_default();
+                    progress.boards_done = done;
+                    progress.boards_total = total;
+                    // A new board starts with no picture count, so the second line goes away
+                    // until this board says how many it has.
+                    progress.blobs_done = 0;
+                    progress.blobs_total = 0;
+                }
+                crate::push::PushEvent::Blobs { done, total } => {
+                    let progress = self.push.progress.get_or_insert_default();
+                    progress.blobs_done = done;
+                    progress.blobs_total = total;
+                }
+                crate::push::PushEvent::Recorded { board, id } => {
+                    // ⚠ Written on the frame it lands, not batched to the end of the run. A
+                    // quit half way then loses at most the record for the board in flight.
+                    if let Some(server) = server.as_deref() {
+                        self.push.ids(&root).record(&board, server, &id);
+                    }
+                }
+                crate::push::PushEvent::BoardFailed { title, why } => {
+                    // Named in the log, not on the page. A list of two is fine on a page and
+                    // a list of twenty is not, which is why `DialogStack::toast_count` exists.
+                    log::warn!("push: {title} did not go ({why})");
+                }
+                crate::push::PushEvent::Finished(finished) => summary = Some(finished),
+            }
+        }
+        if let Some(summary) = summary {
+            self.finish_push(summary);
+        }
+    }
+
+    /// The one sentence the Account page shows when a run ends.
+    ///
+    /// Every branch says what happened **and** what to do about it, because the recovery for
+    /// all of them is the same gesture and the person should not have to guess it: press Send
+    /// again. Nothing here is a resumable transfer, and the sentence does not pretend it is —
+    /// a second run skips everything that is already there, which is the honest claim.
+    fn finish_push(&mut self, summary: crate::push::PushSummary) {
+        self.push.running = None;
+        self.push.progress = None;
+        // ⚠ **This is the half of the first run that ships silently when it is missed.**
+        // [`Self::attach_sync_to_hot_board`] reads the recorded id, but it returns early on a
+        // board that already *has* a `Sync`, and the board on screen attached at sign-in with
+        // the file stem. So a board the run created as `notes-2`, or one whose stem is the
+        // `board` fallback, would keep posting to the stem for the rest of the session: 404s
+        // at best, and at worst the merge into a stranger's board that `crate::push`'s id
+        // rule exists to close. Dropping every round trip costs one, because a dropped reply
+        // is re-derived from the board plus `Sync::since`, and the lazy attach rebuilds on
+        // the next frame with the id the server actually gave.
+        //
+        // Here rather than at each ending, because this is the single exit: done, stopped,
+        // failed and session lost all arrive through it.
+        self.recredential();
+        let sent = summary.boards_sent;
+        let total = summary.boards_total;
+
+        let sentence = if summary.session_lost {
+            "Your session ended. Sign in again, then press Send again.".to_owned()
+        } else if summary.unreachable {
+            "Could not reach your server. Check the address and press Send again.".to_owned()
+        } else if summary.worker_lost {
+            "Velm could not finish sending your boards. Press Send again.".to_owned()
+        } else if summary.stopped {
+            format!(
+                "Stopped. {sent} of {total} boards are on your server. Press Send again to \
+                 finish."
+            )
+        } else if summary.boards_failed > 0 {
+            // Singular and plural are written out rather than left as "1 boards", because a
+            // sentence that is visibly machine made is one people trust less than the number
+            // in it deserves.
+            let missed = if summary.boards_failed == 1 {
+                "1 board did not go".to_owned()
+            } else {
+                format!("{} boards did not go", summary.boards_failed)
+            };
+            format!(
+                "{sent} of {total} boards are on your server. {missed}. Press Send again to \
+                 try them."
+            )
+        } else {
+            format!(
+                "All {total} boards are on your server. New changes on this Mac now sync on \
+                 their own."
+            )
+        };
+
+        // The pictures that would not fit are a second sentence rather than a lost one: three
+        // of this user's real blobs are over 8 MiB, and a board that draws a grey box with no
+        // explanation reads as a failed upload.
+        //
+        // A `match` rather than a comparison chain: clippy's `comparison_chain` is in the
+        // style group and this gate is zero warnings.
+        let sentence = match summary.blobs_too_big {
+            0 => sentence,
+            1 => format!(
+                "{sentence} 1 picture was too large for your server. Every other picture went."
+            ),
+            many => format!(
+                "{sentence} {many} pictures were too large for your server. Every other \
+                 picture went."
+            ),
+        };
+
+        log::info!(
+            "push: {sent} sent, {} failed, {} pictures, {} bytes",
+            summary.boards_failed,
+            summary.blobs_sent,
+            summary.bytes
+        );
+        let anything_left = summary.session_lost
+            || summary.unreachable
+            || summary.worker_lost
+            || summary.boards_failed > 0;
+        self.shell.toast(if anything_left {
+            Toast::error(sentence.clone())
+        } else {
+            Toast::success(sentence.clone())
+        });
+        self.account.message = Some(sentence);
     }
 
     /// Give the board on screen its round trip, if it has not got one.
@@ -1021,28 +1276,47 @@ impl ActiveState {
     /// attaching at the open sites would leave every board opened by the *other* route
     /// silently unsynced. One call, on the frame path, cannot miss a route.
     ///
-    /// The board's **file stem** is its id, which is what `velmd`'s board list names a board
-    /// by. A board with no path — a bench board, or an import that has not been saved — has
-    /// no id on any server, so it gets nothing rather than a guess.
+    /// # Which id, and why the recorded one comes first
+    ///
+    /// The board's **file stem** used to be its id outright, because `velmd migrate import`
+    /// copied the files and the two sides therefore agreed. That is still the fallback and it
+    /// is byte for byte what it always was, so the existing bearer token setup is untouched.
+    ///
+    /// ⚠ **A board the first run created has an id the server chose, and it is often not the
+    /// stem.** `manage::free_stem` steps to `-2`, `-3` when a name is taken there, and
+    /// `slug` answers `board` for any title with no ASCII alphanumerics. So `crate::push`
+    /// records what the server answered, and this reads that record first. Without it, a
+    /// board that went up as `notes-2` would keep syncing to `notes`, which is a different
+    /// board belonging to somebody else.
+    ///
+    /// A board with no path — a bench board, or an import that has not been saved — has no id
+    /// on any server, so it gets nothing rather than a guess.
     fn attach_sync_to_hot_board(&mut self) {
         if self.editor.sync_state().is_some() {
             return;
         }
-        let Some(config) = self.sync.as_ref() else { return };
-        let Some(id) = self.editor.path().and_then(|path| path.file_stem()).map(|stem| stem.to_string_lossy().into_owned())
+        let Some(path) = self.editor.path().map(Path::to_path_buf) else { return };
+        let Some(stem) = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()) else {
+            return;
+        };
+        let Some((server, credential)) =
+            self.sync
+                .as_ref()
+                .map(|config| (config.options.server.clone(), config.credential.clone()))
         else {
             return;
         };
-        log::info!("sync: {id} <-> {}", config.options.server);
+        let root = self.shell.library.root().to_path_buf();
+        // The record first, the stem second. A board this Mac has never pushed has no record,
+        // which is exactly the setup that has always worked, so the fallback is not a
+        // degradation — it is the original behaviour, unchanged.
+        let id = self.push.ids(&root).id_for(&path, &server).map_or(stem, str::to_owned);
+        log::info!("sync: {id} <-> {server}");
         // ⚠ The clone is what makes `Self::recredential` necessary: this credential is moved
         // into the worker thread and that worker never changes its mind. A `Sync` that is
         // already attached is a `Sync` that is still using whatever was current when it was
         // built, which is why signing in and out drops them all rather than assigning a field.
-        self.editor.attach_sync(crate::sync::Sync::new(
-            config.options.server.clone(),
-            config.credential.clone(),
-            id,
-        ));
+        self.editor.attach_sync(crate::sync::Sync::new(server, credential, id));
     }
 
     /// Whether enough time has passed since the last request.

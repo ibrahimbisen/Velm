@@ -584,8 +584,9 @@ impl Shell {
         username: &str,
         server: &str,
         message: Option<&str>,
+        upload: Option<vellum_ui::UploadProgress>,
     ) {
-        self.chrome.set_account_status(state, username, server, message);
+        self.chrome.set_account_status(state, username, server, message, upload);
     }
 
     pub fn toast(&mut self, toast: Toast) {

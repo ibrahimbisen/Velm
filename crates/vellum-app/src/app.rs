@@ -200,6 +200,9 @@ pub(crate) struct ActiveState {
     pub(crate) startup_sync: Option<SyncConfig>,
     /// A sign-in in flight. `None` almost always.
     pub(crate) pending_signin: Option<crate::signin::SignIn>,
+    /// The first run of *Send my boards to this server*: the worker, the recorded board ids,
+    /// and the counters the Account page draws. One field, so the three cannot come apart.
+    pub(crate) push: crate::push::PushState,
     /// Where the account page's message comes from, and who the app believes is signed in.
     ///
     /// On `ActiveState` rather than in the chrome because the chrome is redrawn from this
@@ -673,6 +676,7 @@ impl Vellum {
         let mut state = ActiveState {
             startup_sync: sync.clone(),
             pending_signin: None,
+            push: crate::push::PushState::default(),
             account: AccountStatus::default(),
             sync,
             occluded: false,
@@ -1233,6 +1237,12 @@ impl ActiveState {
         // Settings ▸ Account would sit on *Signing in* for ever. One `Option` test when
         // nothing is in flight, which is almost always.
         self.drain_sign_in();
+
+        // The first run's progress, in the same place and for the same reason: a board that
+        // finished while the window was behind another one must still be recorded, or the id
+        // is lost and the next run makes a second board on the server. One `Option` test when
+        // nothing is running, which is almost always.
+        self.drain_push();
 
         // The sync round trip, for the same reason and in the same place: an answer that came
         // back while the window was behind another one must still land. Before the occlusion

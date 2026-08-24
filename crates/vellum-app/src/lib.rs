@@ -58,6 +58,9 @@ pub mod menubar;
 pub mod mesh;
 pub mod mindmap;
 pub mod options;
+/// The first run of *"my information on the mac and on the server will sync"*: every board
+/// and every picture, once, on a worker thread. `sync` is the steady state that follows it.
+pub mod push;
 pub mod signin;
 pub mod sync;
 pub mod session;

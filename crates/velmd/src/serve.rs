@@ -13,7 +13,7 @@
 //!
 //! # 🛑 RULE ZERO
 //!
-//! **Nothing here removes a file, and nothing here can destroy a board.** Four routes write,
+//! **Nothing here removes a file, and nothing here can destroy a board.** Five routes write,
 //! and each is safe for its own reason rather than by a shared rule:
 //!
 //! - `POST /api/v1/boards/{id}/sync` **merges** a Loro update, so it can add and cannot
@@ -26,6 +26,9 @@
 //! - `POST /api/v1/boards/{id}/rename` changes a **title inside a document**. No file is ever
 //!   renamed: `.vellum` is what `BoardDb::open` insists on, and a board's id in this API *is*
 //!   its file stem, so renaming the file would 404 every tab already open on it.
+//! - `POST /api/v1/blobs/{hash}` stores a picture under **a name that is a function of its
+//!   own content**, so the only file it can land on is one holding identical bytes, and every
+//!   path that could touch that one declines. See `blobs.rs` for the argument in full.
 //!
 //! There is no `DELETE` and no route that can remove anything, and `tests/rule_zero.rs` greps
 //! this file along with the rest of the crate for any call that could unlink or move one.
@@ -61,7 +64,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::{accounts, library_api, manage, paste, sync};
+use crate::{accounts, blobs, library_api, manage, paste, sync};
 use vellum_store::{BlobStore, BoardDb, Hash, list_boards};
 
 /// How many connections are served at once.
@@ -498,14 +501,18 @@ fn serve_one(server: &Server, stream: TcpStream) {
     }
 
     if method == "POST" {
-        // ⚠ **Eight routes answer POST now, and the 405 below has to name all of them.** An
+        // ⚠ **Ten routes answer POST now, and the 405 below has to name all of them.** An
         // error string that mentions only sync is a false claim in the one place a person
         // reads when they are already confused about why nothing happened.
         //
-        // The dispatch is an enum rather than eight `if`s with eight bodies, because
-        // everything after it — the length cap, the timeout raise, the body read, the 500 —
-        // is the same for all of them and was worth writing once. What differs is exactly two
-        // things: how many bytes the route will accept, and which function gets them.
+        // The dispatch is an enum rather than ten `if`s with ten bodies, because everything
+        // after it — the length cap, the timeout raise, the body read, the 500 — is the same
+        // for all of them and was worth writing once. What differs is exactly two things: how
+        // many bytes the route will accept, and which function gets them.
+        //
+        // ⚠ `Post::Blob` is the one exception and it is marked at its own arm: it reads its
+        // own body, because a picture can be 24 MB and `sync::read_body` refuses anything over
+        // 8 MiB whatever its caller allowed.
         enum Post<'a> {
             Sync(&'a str),
             Import,
@@ -519,6 +526,12 @@ fn serve_one(server: &Server, stream: TcpStream) {
             /// The board id. Sharing is registered here rather than in `manage.rs` because
             /// the shared list is `accounts.rs`'s state; the path shape follows `Rename`.
             Share(&'a str),
+            /// The hash the caller says its body holds. Checked, never trusted — and this is
+            /// the one POST that reads its own body, so it is answered before `read_body`.
+            Blob(&'a str),
+            /// Which of these blobs is not here yet, so a second push sends no bytes it does
+            /// not have to.
+            Missing,
         }
         // ⚠ Signing out is a **DELETE**, and it is answered before the POST block below,
         // because a session that could only be ended by a POST would be one a browser's own
@@ -538,6 +551,15 @@ fn serve_one(server: &Server, stream: TcpStream) {
             Some(Post::CreateInvite)
         } else if let Some(id) = accounts::share_target(path) {
             Some(Post::Share(id))
+        // ⚠ **The probe is tested before the upload, and the order is load-bearing.**
+        // `/api/v1/blobs/missing` also matches `upload_target`, so an inverted chain would
+        // route the probe to the upload and answer *"that is not a blob hash"* — loud, and it
+        // stores nothing, since `missing` is seven characters and can never parse as 64 hex.
+        // `blobs.rs` asserts both halves so the order is documented rather than remembered.
+        } else if blobs::is_missing(path) {
+            Some(Post::Missing)
+        } else if let Some(hash) = blobs::upload_target(path) {
+            Some(Post::Blob(hash))
         } else {
             manage::rename_target(path).map(Post::Rename)
         };
@@ -547,7 +569,8 @@ fn serve_one(server: &Server, stream: TcpStream) {
                 405,
                 "text/plain",
                 b"POST answers a board's sync route, the importer, making or naming a board, \
-                  sharing one, signing in, making an account, and minting an invite code\n",
+                  sharing one, signing in, making an account, minting an invite code, storing \
+                  a picture, and asking which pictures are missing\n",
                 origin.as_deref(),
             );
             return;
@@ -565,6 +588,13 @@ fn serve_one(server: &Server, stream: TcpStream) {
                 accounts::content_length(&headers)
             }
             Post::Create | Post::Rename(_) => manage::content_length(&headers),
+            // ⚠ **The upload's is the only one that can answer 415**, and that is the
+            // cross-site forgery defence rather than pedantry: `application/octet-stream` is
+            // off the CORS safelist, so a plain form on a page the owner visits cannot forge
+            // a request to the one route that writes to this disk for ever. `blobs.rs` gives
+            // the argument, and why naming the hash does *not* make the check unnecessary.
+            Post::Blob(_) => blobs::upload_length(&headers),
+            Post::Missing => blobs::manifest_length(&headers),
             Post::Sync(_) | Post::Import => sync::content_length(&headers),
         } {
             Ok(length) => length,
@@ -584,6 +614,26 @@ fn serve_one(server: &Server, stream: TcpStream) {
         // second gap between segments is two retransmits rather than a stall — see the
         // arithmetic on the head's timeout above.
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        // ⚠ **The one POST that reads its own body, and it has to branch here** — after the
+        // read timeout is raised, because it reads from the socket, and before `read_body`,
+        // because it must not call it at all. `read_body` re-checks `sync::MAX_BODY`
+        // internally whatever its caller allowed, so a 24 MB picture through it comes back as
+        // *"that request body did not arrive"*: a truthful-sounding 400 about the wrong thing.
+        // Three of the assets in the store this was written for are over that cap.
+        //
+        // `leftover` is what the head parser already pulled off the socket — up to the
+        // `BufReader`'s 8 KiB — and it is in scope exactly here. The six lines below repeat
+        // the shared 500 path deliberately: this arm returns before the body read that the
+        // shared one runs after.
+        if let Post::Blob(hash) = &post {
+            let answered = blobs::upload(server, hash, &leftover, length, &stream);
+            if let Err(error) = answered {
+                eprintln!("velmd: {}: {error:#}", printable(path));
+                let sentence = b"something went wrong\n";
+                let _ = respond(&stream, 500, "text/plain", sentence, origin.as_deref());
+            }
+            return;
+        }
         let Some(body) = sync::read_body(&stream, &leftover, length) else {
             let _ = respond(
                 &stream,
@@ -648,6 +698,11 @@ fn serve_one(server: &Server, stream: TcpStream) {
                     respond(&stream, 404, "text/plain", b"no such board\n", origin.as_deref())
                 }
             }
+            Post::Missing => blobs::missing(server, &body, &stream),
+            // Answered above, before `read_body` ran, because this is the one route whose
+            // body can be larger than `sync::MAX_BODY`. The arm exists so that adding a
+            // variant to `Post` is a compile error here rather than a silent fall-through.
+            Post::Blob(_) => unreachable!("a blob upload is answered before the shared body read"),
         };
         if let Err(error) = answered {
             eprintln!("velmd: {}: {error:#}", printable(path));

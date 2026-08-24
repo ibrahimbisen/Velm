@@ -228,6 +228,17 @@ pub enum UiEvent {
     SignInRequested { server: String, username: String, password: Secret, remember: bool },
     /// *Sign out* was pressed. Nothing is carried: the app knows who is signed in.
     SignOutRequested,
+    /// *Send my boards to this server* was pressed on Settings ▸ Account.
+    ///
+    /// Nothing is carried, and that is deliberate rather than lazy: the chrome does not know
+    /// which boards exist, where they are on disk, or which of them are in Recently deleted.
+    /// The app builds the whole plan, because the app is the half that owns the library.
+    UploadAllRequested,
+    /// *Stop* was pressed while a first run was going.
+    ///
+    /// It is a request, not a promise about timing. The app stops after the item it is
+    /// sending, never inside one request, and the sentence beside the button says so.
+    UploadCancelled,
 }
 
 impl UiEvent {
