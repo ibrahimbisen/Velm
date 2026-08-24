@@ -240,6 +240,15 @@ struct SpaceRecord {
     pinned: bool,
 }
 
+/// A library's filing, as the server is told it. See [`Library::filing_for_wire`].
+#[derive(Debug, Clone, Default)]
+pub struct FilingWire {
+    pub spaces: Vec<Space>,
+    pub starred: Vec<PathBuf>,
+    /// The path and the time it was deleted, in **seconds** since the epoch.
+    pub trashed: Vec<(PathBuf, u64)>,
+}
+
 /// Every board on disk, plus the user's filing of them.
 #[derive(Debug)]
 pub struct Library {
@@ -247,6 +256,19 @@ pub struct Library {
     sidecar: PathBuf,
     filing: Filing,
     cards: Vec<BoardCard>,
+    /// How many times the sidecar has been written this session.
+    ///
+    /// ⚠ **The one signal that says the filing changed, and it is here rather than at the
+    /// twelve call sites that change it.** Starring, filing, pinning, renaming a folder,
+    /// deleting a board, restoring one and emptying the trash all end in [`Self::persist`];
+    /// a caller that wants to know "did anything move?" — `crate::actions`, so it can send
+    /// the filing to the server — would otherwise have to remember all twelve, and the one it
+    /// forgot would be a star that never reached the web with nothing to notice it by.
+    ///
+    /// A `Cell` because `persist` takes `&self`, and it is a counter rather than a flag so a
+    /// reader can hold "what I last sent" and compare, with no way for two readers to consume
+    /// each other's notification.
+    revision: std::cell::Cell<u64>,
 }
 
 impl Library {
@@ -269,13 +291,22 @@ impl Library {
             Err(_) => Filing::default(),
         };
 
-        let mut library = Self { root, sidecar, filing, cards: Vec::new() };
+        let mut library =
+            Self { root, sidecar, filing, cards: Vec::new(), revision: std::cell::Cell::new(0) };
         library.rescan();
         library
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// How many times the filing has been written since this library was opened.
+    ///
+    /// Starts at 0 and only rises. A caller compares it against the value it last acted on;
+    /// see the field's own note for why the signal lives there and not at the call sites.
+    pub fn revision(&self) -> u64 {
+        self.revision.get()
     }
 
     /// Re-reads every board's index row. Cheap — one small SQLite query per file —
@@ -324,6 +355,29 @@ impl Library {
 
     pub fn is_starred(&self, path: &Path) -> bool {
         self.filing.starred.iter().any(|p| p == path)
+    }
+
+    /// The three keys the server's `/api/v1/library` reports, in this Mac's own paths.
+    ///
+    /// ⚠ **Paths, and the caller turns every one of them into a board id before it sends
+    /// anything.** A path is `/Users/<name>/Library/Application Support/…`, and `crate::push`'s
+    /// header states the rule this obeys: no path crosses the wire. It is returned as paths
+    /// anyway because that is the only name this struct has for a board — `crate::actions` owns
+    /// the `RemoteIds` map that turns one into an id, and this module has never heard of a
+    /// server.
+    ///
+    /// Everything, not only what is live. `rescan` has already pruned entries whose file has
+    /// gone, and a board that is merely not on the server yet must keep its star for the run
+    /// that puts it there.
+    pub fn filing_for_wire(&self) -> FilingWire {
+        FilingWire {
+            spaces: self.spaces(),
+            starred: self.filing.starred.clone(),
+            // ⚠ **Seconds, and it stays seconds all the way to the server.** That is what the
+            // sidecar holds and what `velmd`'s own `TrashedBoard` parses; the same field on
+            // the same wire in milliseconds puts every deleted board fifty thousand years out.
+            trashed: self.filing.trashed.iter().map(|t| (t.path.clone(), t.at)).collect(),
+        }
     }
 
     // ----- preferences that belong to the collection ------------------------
@@ -781,6 +835,7 @@ impl Library {
     /// Writes the sidecar. Failure is logged and not propagated: losing a star is not
     /// worth failing the action the user actually asked for.
     fn persist(&self) {
+        self.revision.set(self.revision.get().saturating_add(1));
         match serde_json::to_vec_pretty(&self.filing) {
             Ok(bytes) => {
                 if let Err(error) = std::fs::write(&self.sidecar, bytes) {

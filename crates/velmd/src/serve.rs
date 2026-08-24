@@ -513,7 +513,7 @@ fn serve_one(server: &Server, stream: TcpStream) {
     }
 
     if method == "POST" {
-        // ⚠ **Ten routes answer POST now, and the 405 below has to name all of them.** An
+        // ⚠ **Eleven routes answer POST now, and the 405 below has to name all of them.** An
         // error string that mentions only sync is a false claim in the one place a person
         // reads when they are already confused about why nothing happened.
         //
@@ -544,6 +544,9 @@ fn serve_one(server: &Server, stream: TcpStream) {
             /// Which of these blobs is not here yet, so a second push sends no bytes it does
             /// not have to.
             Missing,
+            /// The desktop's filing — which boards are starred, which folder each is in, and
+            /// what is in Recently deleted. The same path `GET` reports it from.
+            Filing,
         }
         // ⚠ Signing out is a **DELETE**, and it is answered before the POST block below,
         // because a session that could only be ended by a POST would be one a browser's own
@@ -568,6 +571,8 @@ fn serve_one(server: &Server, stream: TcpStream) {
         // route the probe to the upload and answer *"that is not a blob hash"* — loud, and it
         // stores nothing, since `missing` is seven characters and can never parse as 64 hex.
         // `blobs.rs` asserts both halves so the order is documented rather than remembered.
+        } else if library_api::is_filing(path) {
+            Some(Post::Filing)
         } else if blobs::is_missing(path) {
             Some(Post::Missing)
         } else if let Some(hash) = blobs::upload_target(path) {
@@ -582,7 +587,8 @@ fn serve_one(server: &Server, stream: TcpStream) {
                 "text/plain",
                 b"POST answers a board's sync route, the importer, making or naming a board, \
                   sharing one, signing in, making an account, minting an invite code, storing \
-                  a picture, and asking which pictures are missing\n",
+                  a picture, asking which pictures are missing, and storing the desktop's \
+                  filing\n",
                 origin.as_deref(),
             );
             return;
@@ -607,6 +613,10 @@ fn serve_one(server: &Server, stream: TcpStream) {
             // the argument, and why naming the hash does *not* make the check unnecessary.
             Post::Blob(_) => blobs::upload_length(&headers),
             Post::Missing => blobs::manifest_length(&headers),
+            // ⚠ **Not `manage`'s kilobyte.** A filing names every board on the Mac, so the
+            // cap that fits a board's *name* would refuse a library of six. Its own sentence,
+            // for the reason the comment above this match gives.
+            Post::Filing => library_api::content_length(&headers),
             Post::Sync(_) | Post::Import => sync::content_length(&headers),
         } {
             Ok(length) => length,
@@ -711,6 +721,11 @@ fn serve_one(server: &Server, stream: TcpStream) {
                 }
             }
             Post::Missing => blobs::missing(server, &body, &stream),
+            // ⚠ Admin only, and the check is inside rather than here: `may_file` is stricter
+            // than `may_see` — the filing is one file for the whole server, so a second
+            // account writing it would replace the first account's answer rather than add to
+            // it. 403 and not 404: nothing about a board's existence is disclosed by it.
+            Post::Filing => library_api::receive(server, &body, caller.as_ref(), &stream),
             // Answered above, before `read_body` ran, because this is the one route whose
             // body can be larger than `sync::MAX_BODY`. The arm exists so that adding a
             // variant to `Post` is a compile error here rather than a silent fall-through.

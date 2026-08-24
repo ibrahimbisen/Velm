@@ -1186,6 +1186,58 @@ impl ActiveState {
         }
     }
 
+    /// Sends the filing to the server when it has changed since the last time it was sent.
+    ///
+    /// # Why it is driven from the frame rather than from the events
+    ///
+    /// Twelve `LibraryEvent`s change the filing — starring, filing, pinning, renaming a
+    /// folder, deleting it, deleting a board, restoring one, emptying the trash — and three
+    /// more paths change it without one, from a confirmation dialog. Marking each would be
+    /// fifteen places to remember, and the one that was forgotten would be a star that never
+    /// reached the browser with nothing on either machine to say so. `Library::revision`
+    /// counts sidecar writes instead: every one of the fifteen ends in `persist`, so there is
+    /// one signal and it cannot be missed.
+    ///
+    /// # What it declines to do
+    ///
+    /// Nothing goes while a [`crate::push`] run is in flight. That worker holds one request at
+    /// a time deliberately — velmd's `MAX_CONNECTIONS` is 16 for the whole server and refuses
+    /// rather than queues — and a second client of ours taking a slot during a 1.3 GB run is
+    /// exactly how the owner's own browser gets locked out of their boards. The filing goes
+    /// afterwards, from [`Self::finish_push`], with the ids that run just recorded.
+    pub(crate) fn sync_filing(&mut self) {
+        let Some(config) = self.sync.as_ref() else { return };
+        if self.push.running.is_some()
+            || self.push.filing_busy.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let revision = self.shell.library.revision();
+        if self.push.filing_sent == Some(revision) {
+            return;
+        }
+        let server = config.options.server.clone();
+        let credential = config.credential.clone();
+        let filing = self.shell.library.filing_for_wire();
+        let root = self.shell.library.root().to_path_buf();
+        let ids = self.push.ids(&root);
+        let body = crate::push::filing_body(&filing, &|path| {
+            ids.id_for(path, &server).map(str::to_owned)
+        });
+        // ⚠ **Recorded before the request goes, not after it succeeds.** A failed send is not
+        // retried in a loop: the filing is a copy the Mac rewrites in full whenever anything
+        // moves, so the next star fixes it. Retrying on failure would put a request on the
+        // wire every frame against a server that is simply not there.
+        self.push.filing_sent = Some(revision);
+        self.push.filing_busy.store(true, std::sync::atomic::Ordering::Release);
+        crate::push::send_filing(
+            server,
+            credential,
+            body,
+            std::sync::Arc::clone(&self.push.filing_busy),
+        );
+    }
+
     /// The one sentence the Account page shows when a run ends.
     ///
     /// Every branch says what happened **and** what to do about it, because the recovery for
@@ -1195,6 +1247,12 @@ impl ActiveState {
     fn finish_push(&mut self, summary: crate::push::PushSummary) {
         self.push.running = None;
         self.push.progress = None;
+        // ⚠ **Cleared so the filing goes again on the next frame.** The run just recorded an
+        // id for every board it created, and the filing that went before it named none of
+        // them — `filing_body` drops an entry it cannot turn into an id, so a first run would
+        // otherwise land 44 boards on the server with no folders and no stars on any of them,
+        // and nothing would send again until the person happened to move something.
+        self.push.filing_sent = None;
         // ⚠ **This is the half of the first run that ships silently when it is missed.**
         // [`Self::attach_sync_to_hot_board`] reads the recorded id, but it returns early on a
         // board that already *has* a `Sync`, and the board on screen attached at sign-in with

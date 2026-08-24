@@ -486,6 +486,29 @@ bytes behind them, and the browser drew nothing where the picture was.
   header, which is why the query form exists at all. `boards.html` scrubs it out of the
   address bar with `replaceState`; it cannot scrub the entry.
 
+### The filing — folders, stars and Recently deleted
+
+`GET /api/v1/library` has always reported how the Mac files its boards. Nothing wrote it, so a
+server that received 44 boards through the push drew **Starred 0**, **Recently deleted 0** and
+*"No folders yet"* beside a Mac with four folders on it.
+
+`POST /api/v1/library` is the other half. The desktop sends the three keys as **board ids**,
+never as paths, and the server merges them onto `library.json` — every key it does not model,
+which is most of the file, is carried through untouched. A `.vellum` is never opened, moved or
+removed by it.
+
+| Rule | Where |
+|---|---|
+| `application/json` only, 415 otherwise | the CORS safelist is the forgery defence |
+| 256 KB cap, its own | a filing names every board; a board's name cap would refuse six |
+| The token, or an admin | one filing for the whole server |
+| Ids are intersected against live boards | a stale id is dropped, as it always was |
+
+The Mac sends it when `Library::revision` moves — every star, folder move, pin, rename, delete
+and restore ends in one `persist` — and again when a push finishes, with the ids that run just
+recorded. Never while a push is in flight: velmd refuses past 16 connections rather than
+queueing.
+
 ### One bug worth remembering, because of how it hid
 
 ⚠ **`velmd` never percent-decoded a board id, so nearly every board answered 404.** A browser

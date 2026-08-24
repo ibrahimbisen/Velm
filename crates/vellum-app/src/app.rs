@@ -1272,6 +1272,13 @@ impl ActiveState {
         // nothing is running, which is almost always.
         self.drain_push();
 
+        // The filing — folders, stars, Recently deleted — on to the server, when it has moved
+        // since the last time it was sent. Here rather than at the twelve places that change
+        // it, and above the occlusion guard for the reason the two drains above give: a star
+        // pressed on a window that is then covered must still reach the browser. Two
+        // comparisons when nothing has changed, which is every frame but a handful.
+        self.sync_filing();
+
         // The sync round trip, for the same reason and in the same place: an answer that came
         // back while the window was behind another one must still land. Before the occlusion
         // guard, so a board left open on a second monitor keeps up. Two comparisons when

@@ -2255,6 +2255,29 @@ pub fn may_see(server: &Server, board: &str, caller: Option<&Caller>) -> bool {
     })
 }
 
+/// Whether this caller may replace the server's copy of the desktop's filing.
+///
+/// ⚠ **Stricter than [`may_see`], and deliberately so.** The filing is one file for the whole
+/// server — which boards are starred, which folder each is in, what is in Recently deleted —
+/// so a second account writing it would replace the first account's answer rather than add to
+/// it. There is exactly one machine that owns that state: the Mac the boards came from.
+///
+/// So: the bearer token, which **is** that Mac's credential, or an admin account, which is
+/// who the person signs in as from it. A non-admin account is refused with 403 — it has
+/// nothing to say about how somebody else's library is filed.
+///
+/// The `None` arm follows [`may_see`]'s reasoning exactly, including why it is derived from
+/// the account store rather than assumed from the gate: a bare local `velmd serve` with no
+/// token and no accounts has always let every request through, and the moment one account
+/// exists an unidentified caller may do nothing.
+pub fn may_file(server: &Server, caller: Option<&Caller>) -> bool {
+    server.accounts.lock().is_ok_and(|accounts| match caller {
+        Some(Caller::Token) => true,
+        Some(Caller::Account(identity)) => identity.admin,
+        None => !accounts.any(),
+    })
+}
+
 /// Who owns this board and who it is shared with, for a caller entitled to know.
 ///
 /// `None` means *"do not tell this caller"*, and it is the answer in three different cases

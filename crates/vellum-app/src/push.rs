@@ -306,6 +306,13 @@ pub struct PushState {
     pub(crate) ids: Option<RemoteIds>,
     /// What the Account page draws while a run is going.
     pub(crate) progress: Option<vellum_ui::UploadProgress>,
+    /// A filing request in flight. See [`send_filing`] for why there may only be one.
+    pub(crate) filing_busy: Arc<AtomicBool>,
+    /// The `Library::revision` the last filing request was built from.
+    ///
+    /// `None` until the first one is sent, which is what makes a fresh sign-in send the whole
+    /// filing once rather than waiting for the person to move something.
+    pub(crate) filing_sent: Option<u64>,
 }
 
 impl PushState {
@@ -1273,6 +1280,152 @@ pub(crate) fn hashes_in(body: &str) -> Vec<Hash> {
     out
 }
 
+// ----- the filing --------------------------------------------------------------------------
+
+/// `POST /api/v1/library` — the filing, so the browser draws the sidebar the Mac draws.
+///
+/// *"i want the folders that are in the mac app to be transmitted to the web version as
+/// well"*, and *"i also want the pinned all boards recently used to be transmitted"*. Sending
+/// the boards was never enough: the browser was drawing **Starred 0**, **Recently deleted 0**
+/// and *"No folders yet"* beside a library with four folders and three stars in it, because
+/// nothing had ever told the server how any of it was filed.
+const FILING_PATH: &str = "/api/v1/library";
+
+/// The filing, translated from this Mac's paths to the server's board ids, as JSON.
+///
+/// # 🛑 No path crosses the wire
+///
+/// This module's header states the rule for pictures and documents; this is the same rule in
+/// the one place where it is easy to break, because the filing is **made** of paths. Every
+/// entry goes through `id_of`, and an entry `id_of` cannot name is **dropped**. There is no
+/// fallback to the file stem: a stem is what the path looks like on this Mac, and the whole
+/// reason [`RemoteIds`] exists is that the server may have called the board something else.
+///
+/// A board with no id is one that has never been sent. Dropping it costs a star that the next
+/// run puts back, and sending its local name instead would either name nothing on the server
+/// or — worse — name a **different** board and lend it somebody else's folder.
+///
+/// # Empty is a real answer
+///
+/// A library with nothing starred sends `"starred":[]`, and the server writes it. That is
+/// what makes unstarring on the Mac reach the browser: an omitted key would leave the old
+/// answer standing, and the star would come back on the next reload with nothing to explain
+/// it.
+///
+/// Pure, so the translation is tested without a socket or a server.
+pub fn filing_body(
+    filing: &crate::library::FilingWire,
+    id_of: &dyn Fn(&Path) -> Option<String>,
+) -> Vec<u8> {
+    /// A path list reduced to the ids the server knows, in the `"<id>.vellum"` shape its own
+    /// `stem_of` reduces back. The extension is not decoration: `library.json` is a file of
+    /// paths on the machine that wrote it, and velmd parses this field with `file_stem`.
+    fn ids(paths: &[PathBuf], id_of: &dyn Fn(&Path) -> Option<String>) -> Vec<String> {
+        paths.iter().filter_map(|path| id_of(path)).map(|id| format!("{id}.vellum")).collect()
+    }
+
+    let spaces: Vec<serde_json::Value> = filing
+        .spaces
+        .iter()
+        .map(|space| {
+            serde_json::json!({
+                // ⚠ **The key is `spaces`, and the folder's own key is `name`.** The user calls
+                // these Folders and every visible string says Folder; the serialised names
+                // deliberately did not move. `crate::library`'s `Filing` and velmd's own both
+                // spell out why at length — serde reads a renamed field as absent, and absent
+                // here means a server that answers "no folders" to a Mac that has four.
+                "name": space.name,
+                "boards": ids(&space.boards, id_of),
+                "pinned": space.pinned,
+            })
+        })
+        .collect();
+    let trashed: Vec<serde_json::Value> = filing
+        .trashed
+        .iter()
+        .filter_map(|(path, at)| {
+            // ⚠ **`at` stays seconds.** It is seconds in the sidecar, seconds in velmd's
+            // `TrashedBoard`, and seconds here. The same number sent as milliseconds puts
+            // every deleted board fifty thousand years into the future; sent the other way it
+            // lands in 1970. Two units on one wire is a thing to say out loud.
+            let id = id_of(path)?;
+            Some(serde_json::json!({ "path": format!("{id}.vellum"), "at": at }))
+        })
+        .collect();
+    let body = serde_json::json!({
+        "spaces": spaces,
+        "starred": ids(&filing.starred, id_of),
+        "trashed": trashed,
+    });
+    // `to_vec` and not `to_vec_pretty`: this is a request body, and the server writes its own
+    // file in its own shape. Falling back to an empty object is unreachable — every value here
+    // is a string, a bool or a number — and is written rather than unwrapped because
+    // `[profile.release]` sets `panic = "abort"`, so an `unwrap` here would take the app.
+    serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec())
+}
+
+/// Sends one filing, on its own thread, and forgets about it.
+///
+/// # Why fire and forget
+///
+/// There is nothing for the person to do about a failure. The filing is a **copy** — the Mac
+/// holds the authority and rewrites it in full every time anything moves — so a request that
+/// does not arrive is corrected by the next star, the next folder change, or the next Send.
+/// A dialog saying *"your folders did not reach the server"* would be a thing to dismiss and
+/// not a thing to act on. It is logged, once, at `warn`.
+///
+/// # One at a time
+///
+/// `busy` is held for the length of the request and cleared however it ends, including on a
+/// transport error. velmd refuses rather than queues past `MAX_CONNECTIONS`, and this must
+/// never be the request that takes the owner's own browser's slot — so the caller checks the
+/// flag, and the caller also declines to send while a `Push` is running, since that worker's
+/// one-request-at-a-time guarantee is the whole reason a 1.3 GB run does not lock the server.
+pub fn send_filing(
+    server: String,
+    credential: crate::sync::Credential,
+    body: Vec<u8>,
+    busy: Arc<AtomicBool>,
+) {
+    // Cloned rather than moved, so the failure path below can clear the flag: a thread that
+    // never started is one that will never clear it, and the filing would then be stuck for
+    // the rest of the session.
+    let clear = Arc::clone(&busy);
+    let spawned = std::thread::Builder::new().name("velm-filing".to_owned()).spawn(move || {
+        let http = ureq::Agent::config_builder()
+            .user_agent(USER_AGENT)
+            .http_status_as_error(false)
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            // Not `REQUEST_TIMEOUT`. That five minutes is sized for a 23 MB picture; a filing
+            // is a few kilobytes, and a minute is already generous for one.
+            .timeout_global(Some(Duration::from_secs(60)))
+            .build();
+        let agent: ureq::Agent = http.into();
+        let url = format!("{}{FILING_PATH}", server.trim_end_matches('/'));
+        let request = agent.post(&url).header("content-type", "application/json");
+        let request = match crate::sync::auth_header(&credential) {
+            Some((name, value)) => request.header(name, value),
+            None => request,
+        };
+        match request.send(body) {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if !(200..300).contains(&status) {
+                    log::warn!("filing: the server answered {status}");
+                }
+            }
+            Err(error) => log::warn!("filing: {error}"),
+        }
+        busy.store(false, Ordering::Release);
+    });
+    if let Err(error) = spawned {
+        // The thread never started, so nothing will clear the flag. Cleared here, or the
+        // filing would never be sent again for the rest of the session.
+        log::warn!("filing: could not start the sender ({error})");
+        clear.store(false, Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1538,4 +1691,90 @@ mod tests {
         assert!(push.stop.load(Ordering::Relaxed));
         drop(events);
     }
+
+    // ----- the filing ---------------------------------------------------------------------
+
+    /// 🛑 **No path crosses the wire, in this direction either.**
+    ///
+    /// The filing is made of absolute paths under the user's home directory, and this is the
+    /// one function that turns them into board ids. A single leak here puts the person's
+    /// account name into a browser.
+    #[test]
+    fn a_filing_carries_ids_and_never_a_path() {
+        let home = Path::new("/Users/somebody/Library/Application Support/Vellum/boards");
+        let one = home.join("my-truck.vellum");
+        let two = home.join("keyboard.vellum");
+        let filing = crate::library::FilingWire {
+            spaces: vec![vellum_ui::Space {
+                name: "cars".to_owned(),
+                boards: vec![one.clone()],
+                pinned: true,
+            }],
+            starred: vec![two.clone()],
+            trashed: vec![(one.clone(), 1_700_000_000)],
+        };
+        let body = filing_body(&filing, &|path| {
+            // The server renamed one of them, which is exactly why the mapping exists.
+            match path.file_stem().and_then(|s| s.to_str()) {
+                Some("my-truck") => Some("my-truck-2".to_owned()),
+                Some("keyboard") => Some("keyboard".to_owned()),
+                _ => None,
+            }
+        });
+        let text = String::from_utf8(body).expect("the body is not UTF-8");
+        assert!(!text.contains("somebody"), "a home directory reached the wire: {text}");
+        assert!(!text.contains("/Users"), "a path reached the wire: {text}");
+
+        let value: serde_json::Value = serde_json::from_str(&text).expect("not JSON");
+        assert_eq!(value["spaces"][0]["name"], "cars");
+        assert_eq!(value["spaces"][0]["boards"][0], "my-truck-2.vellum");
+        assert_eq!(value["spaces"][0]["pinned"], true);
+        assert_eq!(value["starred"][0], "keyboard.vellum");
+        assert_eq!(value["trashed"][0]["path"], "my-truck-2.vellum");
+        // ⚠ Seconds, not milliseconds. The same number sent as milliseconds puts this board
+        // fifty thousand years out; `velmd`'s `TrashedBoard` reads it as seconds.
+        assert_eq!(value["trashed"][0]["at"].as_u64(), Some(1_700_000_000));
+    }
+
+    /// A board the server has never heard of is dropped, never sent under its local stem.
+    ///
+    /// Sending the stem would either name nothing there or — worse — name a **different**
+    /// board and lend it somebody else's folder. That is the whole reason [`RemoteIds`]
+    /// exists, and this asserts the filing obeys it too.
+    #[test]
+    fn a_board_with_no_id_is_dropped_from_the_filing() {
+        let home = Path::new("/tmp/boards");
+        let known = home.join("known.vellum");
+        let unsent = home.join("unsent.vellum");
+        let filing = crate::library::FilingWire {
+            spaces: vec![vellum_ui::Space {
+                name: "Cars".to_owned(),
+                boards: vec![known.clone(), unsent.clone()],
+                pinned: false,
+            }],
+            starred: vec![unsent.clone()],
+            trashed: vec![(unsent, 5)],
+        };
+        let body = filing_body(&filing, &|path| {
+            (path.file_stem().and_then(|s| s.to_str()) == Some("known")).then(|| "known".to_owned())
+        });
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("not JSON");
+        assert_eq!(value["spaces"][0]["boards"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["spaces"][0]["boards"][0], "known.vellum");
+        // ⚠ Empty arrays, not absent keys. An omitted key leaves the server's old answer
+        // standing, so a star removed on the Mac would come back on the next reload.
+        assert_eq!(value["starred"].as_array().map(Vec::len), Some(0));
+        assert_eq!(value["trashed"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// An empty library says so, rather than saying nothing.
+    #[test]
+    fn an_empty_filing_is_still_a_filing() {
+        let body = filing_body(&crate::library::FilingWire::default(), &|_| None);
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("not JSON");
+        for key in ["spaces", "starred", "trashed"] {
+            assert_eq!(value[key].as_array().map(Vec::len), Some(0), "{key} is not an empty array");
+        }
+    }
+
 }

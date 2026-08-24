@@ -794,11 +794,16 @@ export function groupedSections(visible, spaces) {
 /**
  * The heading over the grid.
  *
- * `LibraryState::title()`. A folder keeps its own name as the heading; there is no *Settings*
- * here, because there is nothing on this page to set — see the file header.
+ * `LibraryState::title()`. A folder keeps its own name as the heading.
+ *
+ * ⚠ **`settings` is not a scope over boards**, and it is here anyway because it is a row in the
+ * same sidebar and the heading is drawn from one function. `boardsInScope` is never asked about
+ * it — `drawBoards` branches first — and `nothingHere` has no case for it for the same reason.
  */
 export function scopeTitle(scope) {
   switch (scope && scope.kind) {
+    case 'settings':
+      return 'Settings';
     case 'all':
       return 'All boards';
     case 'starred':
@@ -1183,6 +1188,24 @@ a.velm-lib-card:focus-visible, button.velm-lib-card:focus-visible {
 }
 .velm-lib-row-icon { flex: none; color: var(--ink-faint, #8B959B); }
 
+/* The Settings page. A column of facts, not a grid of cards — so it is capped at a reading
+   measure rather than filling the width a board grid needs. */
+.velm-settings { max-width: 60ch; }
+.velm-setting {
+  display: grid; grid-template-columns: 140px 1fr; gap: 2px 16px;
+  padding: 10px 0; border-bottom: 1px solid var(--line, #E5EAED);
+}
+.velm-setting-name { color: var(--ink-muted, #5C656B); font-size: 13px; }
+.velm-setting-value { font-size: 13px; word-break: break-word; }
+.velm-setting-note { grid-column: 2; color: var(--ink-faint, #8B959B); font-size: 11px; }
+.velm-settings-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 24px; }
+@media (max-width: 720px) {
+  /* One column. 140px of label beside a server address on a phone leaves the address in a
+     four-character gutter. */
+  .velm-setting { grid-template-columns: 1fr; }
+  .velm-setting-note { grid-column: 1; }
+}
+
 .velm-lib-empty { margin: 24px 0 0; color: var(--ink-muted, #5C656B); font-size: 13px; }
 .velm-lib-note { margin: 4px 0 12px; color: var(--ink-muted, #5C656B); font-size: 12px; max-width: 68ch; }
 
@@ -1461,6 +1484,27 @@ export function mount(options = {}) {
    * possible answer is 401.
    */
   let me = null;
+  /**
+   * The `velmd` version the last `connect` reported, for the Settings page to name.
+   *
+   * ⚠ Named `serverVersion` and not `velmdVersion`: that is already a **function** in this
+   * scope — the one that reads the version out of a health response — and a `let` beside it is
+   * a `SyntaxError` that takes the whole module. Measured: the page stayed on *Connecting…*
+   * with nothing on screen to say why, because a module that will not parse runs none of it.
+   *
+   * Kept because `render` is handed it and Settings is drawn from a click long afterwards. The
+   * empty string is *"not asked yet"*, which is a real state: Settings is reachable the moment
+   * the sidebar exists, and a page that says `velmd undefined` is worse than one that says
+   * nothing about the build.
+   */
+  let serverVersion = '';
+  /**
+   * The sentence under the heading that counts the boards, so Settings can put it back.
+   *
+   * Settings is not a page about boards, so *"4 boards, most recently changed first"* is a
+   * false line there — measured on the first draw, under a heading reading **Settings**.
+   */
+  let boardsSentence = '';
   /**
    * Which board the share panel is about, or `null` when the panel is closed.
    *
@@ -1777,11 +1821,15 @@ export function mount(options = {}) {
   }
 
   function render(version) {
+    serverVersion = typeof version === 'string' ? version : '';
     const held = library.boards.filter((board) => !board.trashed).length;
-    el.sub.textContent =
+    // Kept as well as shown: Settings replaces this line with its own, and going back to a
+    // board scope has to put the real sentence back without asking the server again.
+    boardsSentence =
       held === 0
         ? 'This server is not holding any boards yet.'
         : `${held} ${held === 1 ? 'board' : 'boards'}, most recently changed first.`;
+    el.sub.textContent = boardsSentence;
     // ⚠ Who is signed in goes on the line that already names the machine, rather than on a line
     // of its own. It is the same class of fact — *which server, which build, which account* —
     // and it is here because some cards now carry a Share button and some do not: without a
@@ -1841,6 +1889,26 @@ export function mount(options = {}) {
     el.boards.replaceChildren();
     el.boards.hidden = false;
     el.boards.append(libraryHead());
+
+    // ⚠ **Before the board list, and before the "no boards yet" line below it.** Settings is a
+    // page rather than a scope over boards, so every test under here — the empty library, the
+    // trash's note, the bands — is a question about the wrong thing.
+    const settings = state.scope.kind === 'settings';
+    // ⚠ **The footer holds *Change server* and *Forget this device*, and Settings offers both.**
+    // Left alone, the page draws each of them twice, thirty pixels apart. The whole `<footer>`
+    // is hidden rather than the two buttons, because `render` sets `hidden = false` on each of
+    // them every time the library is fetched and would undo a per-button hide.
+    const footer = doc.querySelector('.velm-main footer') || doc.querySelector('footer');
+    if (footer) footer.hidden = settings;
+    if (el.sub) {
+      el.sub.textContent = settings
+        ? 'Which server your boards are on, and who you are on it.'
+        : boardsSentence;
+    }
+    if (settings) {
+      el.boards.append(settingsPage());
+      return;
+    }
 
     const visible = boardsInScope(library.boards, state.scope, state.search);
 
@@ -1917,6 +1985,147 @@ export function mount(options = {}) {
     el.boards.append(gridOf(visible, 'boards'));
   }
 
+
+  /**
+   * The Settings page: which server, which account, and the three verbs this page already had.
+   *
+   * # Why it exists at all
+   *
+   * *"i want there to be settings"*. The desktop's sidebar has always ended in a Settings row
+   * and this one stopped at the folders — so *Change server*, *Forget this device* and signing
+   * out lived in a footer under the whole board grid, which on a library of 44 boards is a
+   * scroll nobody makes. Nothing new is offered here. What was already reachable is gathered
+   * where a person looks for it.
+   *
+   * # What is deliberately not here
+   *
+   * `SettingsTab::General` — the theme, translucency, link previews, Align objects. Every one
+   * of those is a key in the Mac's own `library.json` and is read by the Mac when it draws a
+   * board. This page has no route to write one and no board of its own to apply one to, so it
+   * says where they live instead of drawing four switches that would answer nothing.
+   */
+  function settingsPage() {
+    const page = doc.createElement('div');
+    page.className = 'velm-settings';
+
+    page.append(caption('Server'));
+    page.append(
+      settingRow(
+        'Address',
+        label(server.base),
+        serverVersion ? `velmd ${serverVersion}` : '',
+      ),
+    );
+
+    const serverActions = doc.createElement('div');
+    serverActions.className = 'velm-settings-actions';
+    serverActions.append(
+      settingButton('Change server', () => openConnectForm()),
+      // ⚠ The same handler the footer button has, wording included: it drops the address and
+      // the passphrase this browser is holding and reloads to a bare page. It does **not**
+      // touch a board, a blob or an account on the server.
+      settingButton('Forget this device', () => {
+        store.forget();
+        win.location.replace(new URL(win.location.pathname, win.location.href).href);
+      }),
+    );
+    page.append(serverActions);
+
+    page.append(caption('Account'));
+    if (me) {
+      page.append(
+        settingRow(
+          'Signed in as',
+          me.username,
+          me.admin ? 'This account can invite people and see every board' : '',
+        ),
+      );
+      const accountActions = doc.createElement('div');
+      accountActions.className = 'velm-settings-actions';
+      const out = settingButton('Sign out', () => signOut(out));
+      accountActions.append(out);
+      page.append(accountActions);
+    } else {
+      // ⚠ Three different states, one sentence, and that is honest rather than lazy: a server
+      // reached with a passphrase, a server with no accounts at all, and an older velmd with no
+      // `whoami` route are indistinguishable from here — `askWhoami` returns `null` for all
+      // three — and the thing to do about every one of them is the same.
+      page.append(
+        noteLine(
+          'velm-lib-note',
+          'This browser is not holding an account session for this server. Signing in gives you a name on it, invite codes, and boards other people can share with you.',
+        ),
+      );
+    }
+
+    page.append(
+      noteLine(
+        'velm-lib-note',
+        'How Velm looks, and how a board behaves as you work on it, are set in the Velm app on your Mac. Those answers live with your boards and follow them here.',
+      ),
+    );
+    return page;
+  }
+
+  /** One labelled fact: a name, its value, and an optional line under it. */
+  function settingRow(name, value, note) {
+    const row = doc.createElement('div');
+    row.className = 'velm-setting';
+    const key = doc.createElement('span');
+    key.className = 'velm-setting-name';
+    key.textContent = name;
+    const said = doc.createElement('span');
+    said.className = 'velm-setting-value';
+    // ⚠ `textContent`, never `innerHTML`. A username and a server address both arrive from
+    // outside this file, exactly as a board's title does.
+    said.textContent = value;
+    row.append(key, said);
+    if (note) {
+      const under = doc.createElement('span');
+      under.className = 'velm-setting-note';
+      under.textContent = note;
+      row.append(under);
+    }
+    return row;
+  }
+
+  function settingButton(name, run) {
+    const button = doc.createElement('button');
+    button.type = 'button';
+    button.className = 'btn';
+    button.textContent = name;
+    button.addEventListener('click', run);
+    return button;
+  }
+
+  /**
+   * Ends this browser's session, then reloads.
+   *
+   * `DELETE /api/v1/session`, which is the method `serve.rs` answers on purpose: a sign-out
+   * that a POST could do is one a page the person merely visits could be tricked into doing.
+   *
+   * A reload rather than a redraw, and rather than clearing `me` by hand. The cookie is gone,
+   * so every board this account could see through a share is gone with it, and the honest way
+   * to redraw a page whose whole answer changed is to ask again.
+   */
+  async function signOut(button) {
+    button.disabled = true;
+    button.textContent = 'Signing out…';
+    const answer = await accountRequest('session', { method: 'DELETE' }, HEALTH_TIMEOUT_MS);
+    if (answer.error) {
+      button.disabled = false;
+      button.textContent = 'Sign out';
+      // Said on the page rather than swallowed: a Sign out that quietly did nothing leaves
+      // somebody believing they signed out on a machine that is not theirs.
+      show(el.message, {
+        title: 'Could not sign out.',
+        detail: `${label(server.base)} did not answer. Check that it is running, and try again.`,
+      });
+      return;
+    }
+    win.location.reload();
+  }
+
   /** The heading, and the controls that change how the grid is arranged. */
   function libraryHead() {
     const head = doc.createElement('div');
@@ -1955,16 +2164,21 @@ export function mount(options = {}) {
       tools.append(gap);
     }
 
-    tools.append(
-      toggle('list', 'List', state.layout === 'list', () => {
-        state.layout = 'list';
-        drawLibrary();
-      }),
-      toggle('grid', 'Grid', state.layout === 'grid', () => {
-        state.layout = 'grid';
-        drawLibrary();
-      }),
-    );
+    // ⚠ Not on Settings. There is no grid there to lay out, and a pair of pressed-looking
+    // toggles that change nothing on the page under them is the *"switch that did not work"*
+    // the grouping pair above is kept off every other scope to avoid.
+    if (state.scope.kind !== 'settings') {
+      tools.append(
+        toggle('list', 'List', state.layout === 'list', () => {
+          state.layout = 'list';
+          drawLibrary();
+        }),
+        toggle('grid', 'Grid', state.layout === 'grid', () => {
+          state.layout = 'grid';
+          drawLibrary();
+        }),
+      );
+    }
 
     // ⚠ **Into the page header, ahead of the buttons — not into this section's own head.**
     // The Mac puts the view control, Import from Miro and New board on one line to the right
@@ -2000,10 +2214,15 @@ export function mount(options = {}) {
    *
    * ⚠ What is **not** here, and why. The desktop's sidebar carries a `+` that makes a folder, a
    * pin toggle and a `⋮` on every folder row offering *Rename…*, *Pin to top* and *Delete
-   * folder…*, and a *Settings* row pinned to the panel floor. `velmd` has no route for any of
-   * them and this page has no settings to hold, so none is drawn. A row of controls that all
-   * answer *"not here"* is six broken promises in a column; the one line at the foot says the
-   * same thing once, and says where the verbs actually are.
+   * folder…*. `velmd` has no route for any of them, so none is drawn. A row of controls that
+   * all answer *"not here"* is five broken promises in a column; the one line at the foot says
+   * the same thing once, and says where the verbs actually are.
+   *
+   * ⚠ **Settings *is* here now, and this comment used to say it was not.** The old reason was
+   * *"this page has no settings to hold"*, which stopped being true: the server address, the
+   * account and signing out are all things this page already does, from three buttons in a
+   * footer nobody scrolls to. `settingsPage` gathers them under the row the Mac has always had
+   * in the same place — last, under a rule, below the folders.
    */
   function drawSidebar() {
     if (!el.sidebar) return;
@@ -2047,6 +2266,12 @@ export function mount(options = {}) {
       for (const { space } of order) host.append(spaceRow(space));
       if (library.spaces.length === 0) host.append(noteLine('velm-lib-note', 'No folders yet'));
     }
+
+    // Last, under its own rule, exactly where `library.rs` puts it. ⚠ **No count beside it**:
+    // the desktop passes `None` there, and a **0** next to Settings reads as "nothing to set".
+    const floor = doc.createElement('div');
+    floor.className = 'velm-lib-rule';
+    host.append(floor, scopeRow({ kind: 'settings' }, 'Settings', null));
 
     host.append(
       noteLine(
@@ -2171,10 +2396,15 @@ export function mount(options = {}) {
     const label = doc.createElement('span');
     label.className = 'velm-lib-name';
     label.textContent = name;
-    const tally = doc.createElement('span');
-    tally.className = 'velm-lib-count';
-    tally.textContent = String(count);
-    button.append(label, tally);
+    button.append(label);
+    // ⚠ `null` and not `0`. `library.rs` passes `None` for a row that counts nothing, and says
+    // why in as many words: a **0** beside Settings reads as "there is nothing in here".
+    if (count !== null) {
+      const tally = doc.createElement('span');
+      tally.className = 'velm-lib-count';
+      tally.textContent = String(count);
+      button.append(tally);
+    }
     button.addEventListener('click', () => {
       state.scope = scope;
       drawLibrary();

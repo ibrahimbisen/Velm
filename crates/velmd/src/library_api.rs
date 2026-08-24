@@ -1,7 +1,9 @@
 //! The board library, with the desktop app's own filing on it.
 //!
 //! ```text
-//! GET /api/v1/library  ->  {"boards":[…],"spaces":[…]}
+//! GET  /api/v1/library  ->  {"boards":[…],"spaces":[…]}
+//! POST /api/v1/library     content-type: application/json
+//!                          body: {"spaces":[…],"starred":[…],"trashed":[…]} -> 204
 //! ```
 //!
 //! `/api/v1/boards` answers which boards exist and nothing about how they are filed. This
@@ -53,13 +55,22 @@
 //! board's identity in this API **is** its file stem everywhere else too, and because the
 //! filing is decoration on a list nobody can edit through this route.
 //!
-//! # 🛑 RULE ZERO — nothing here writes
+//! # 🛑 RULE ZERO — one file is written and it is not a board
 //!
-//! `std::fs::read` and `serde_json::from_slice`, and that is the whole of the I/O besides
-//! [`list_boards`]. The sidecar is never written back: velmd does not own the user's filing,
-//! it reports it. Nothing in this module removes, moves or truncates a file, so there is no
-//! call here for `tests/rule_zero.rs` to catch and none of its `RULE ZERO:` acknowledgements
-//! are needed.
+//! ⚠ **This module used to write nothing at all.** [`receive`] changed that, and the header
+//! it replaced said so in the strongest terms — so the difference is spelled out here rather
+//! than left for a reader who remembers the old sentence.
+//!
+//! What [`receive`] writes is `library.json` in the data directory, with a `RULE ZERO:`
+//! acknowledgement on the one `fs::write` that does it. No `.vellum`, no `-wal`, no `-shm` and
+//! no blob is opened, moved, truncated or removed anywhere in this module. The destination is
+//! `--data` joined to a constant, so no part of it comes from a request and a board can never
+//! be the target.
+//!
+//! The filing is still not this server's to own — the Mac is the authority and this is a
+//! copy. That is what makes the worst case survivable: a filing lost here is one the desktop
+//! sends again, and [`read_filing`] degrades a damaged one to "no folders" rather than
+//! refusing to serve the boards.
 //!
 //! ⚠ [`list_boards`] does open every board with SQLite, which is not a passive act — see
 //! `serve.rs`'s own header. That is why this takes the same board lock `/api/v1/boards` does.
@@ -357,6 +368,191 @@ pub(crate) fn handle(
     respond(stream, 200, "application/json", body.as_bytes(), origin)
 }
 
+// ----- receiving the desktop's filing -------------------------------------------------------
+
+/// The largest filing this route will read.
+///
+/// ⚠ **Its own cap, not [`crate::manage::MAX_BODY`] and not [`crate::sync::MAX_BODY`].** A
+/// board's name is a kilobyte, so a filing sent under that cap would be refused for a library
+/// of six boards. A filing names every board once under its folder and again, for some, in
+/// `starred` or `trashed`. Measured on the library this was written for — 44 boards, 4
+/// folders — it is about 3 KB. A quarter of a megabyte is far past any library a person files
+/// by hand, and far short of the eight megabytes sync reserves for a document.
+const MAX_FILING: usize = 256 * 1024;
+
+/// The one place the write route's address is spelled, and it is [`PATH`]'s.
+///
+/// The same path, a different method: `GET` reports the filing and `POST` replaces it. Two
+/// verbs on one noun rather than a second URL, because they are the two halves of one thing
+/// and a reader who finds either finds the other.
+pub(crate) fn is_filing(path: &str) -> bool {
+    path == PATH
+}
+
+/// The pre-body gate: the type, then the length.
+///
+/// ⚠ **415 on anything but `application/json`, and that is the cross-site forgery defence**
+/// rather than pedantry — `blobs::upload_length` makes the same argument for its own type and
+/// `accounts::sign_in` made it first. `application/json` is off the CORS safelist, so a plain
+/// form on a page the owner merely visits cannot forge a write to this route.
+///
+/// Decided from the request head alone, so it is testable without a socket, and refused
+/// before a byte of body is read.
+pub(crate) fn content_length(
+    headers: &BTreeMap<String, String>,
+) -> Result<usize, crate::sync::Refusal> {
+    let json = headers.get("content-type").is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+    });
+    if !json {
+        return Err(crate::sync::Refusal { status: 415, message: "send application/json\n" });
+    }
+    if headers.contains_key("transfer-encoding") {
+        return Err(crate::sync::Refusal {
+            status: 400,
+            message: "send a Content-Length; this server does not read chunked bodies\n",
+        });
+    }
+    let Some(raw) = headers.get("content-length") else {
+        return Err(crate::sync::Refusal {
+            status: 400,
+            message: "a filing needs a Content-Length\n",
+        });
+    };
+    let Ok(length) = raw.trim().parse::<u64>() else {
+        return Err(crate::sync::Refusal {
+            status: 400,
+            message: "that Content-Length is not a number\n",
+        });
+    };
+    // Two checks and one sentence, for the reason `manage::content_length` gives: `usize` is
+    // not guaranteed to be 64 bits, and a silent truncation here would read a short body and
+    // call it a whole filing.
+    match usize::try_from(length) {
+        Ok(length) if length <= MAX_FILING => Ok(length),
+        _ => Err(crate::sync::Refusal { status: 413, message: "that filing is too large\n" }),
+    }
+}
+
+/// The filing the desktop sent, merged onto whatever is on disk, as bytes to write.
+///
+/// ⚠ **A merge and not a replacement, and that is the whole reason this function exists.**
+/// [`Filing`] models three keys; the real sidecar carries about twenty — the theme, the
+/// accent, the translucency switch, the archived layer's six answers. Deserialising into
+/// `Filing` and serialising it back would write a file with seventeen keys missing, which is
+/// the exact failure `Filing`'s own header warns about on the desktop. So the three keys this
+/// server is being told about are copied across a `serde_json::Value` and every other key on
+/// disk is carried through untouched.
+///
+/// `None` when the body is not a filing this server can make sense of. The caller answers 400
+/// and writes nothing — a sidecar half replaced is worse than one not replaced at all.
+///
+/// Pure, so the merge can be tested without a socket or a directory.
+fn merged(body: &[u8], existing: Option<&[u8]>) -> Option<Vec<u8>> {
+    // Parsed as `Filing` first and used as `Value` second. The parse is the validation: a body
+    // whose `spaces` is a number, or whose `trashed[0].at` is a string, is refused here rather
+    // than written and then silently degraded to "no folders" by every later `GET`.
+    let _checked: Filing = serde_json::from_slice(body).ok()?;
+    let sent: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let sent = sent.as_object()?;
+
+    let mut out = existing
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    // ⚠ **These three and no others.** A desktop that sends a `theme` must not change the
+    // server's copy of one, and a future key on the wire must not arrive here by accident: an
+    // allow-list is the difference between "this route replaces the filing" and "this route
+    // replaces the file".
+    for key in ["spaces", "starred", "trashed"] {
+        match sent.get(key) {
+            Some(value) => {
+                out.insert(key.to_owned(), value.clone());
+            }
+            // Absent on the wire means absent afterwards. A desktop with nothing starred sends
+            // `"starred":[]`; one that omits the key entirely is one that has no opinion, and
+            // keeping a stale answer would leave stars on the web that the Mac has dropped.
+            None => {
+                out.remove(key);
+            }
+        }
+    }
+    serde_json::to_vec_pretty(&serde_json::Value::Object(out)).ok()
+}
+
+/// `POST /api/v1/library` — the desktop replaces this server's copy of its filing.
+///
+/// # Why this route exists
+///
+/// *"i want the folders that are in the mac app to be transmitted to the web version as
+/// well"*. Every board on this server arrived through `crate::push`, which sends documents
+/// and pictures and says nothing about how they are filed — so the browser drew four scopes
+/// with `Starred 0`, `Recently deleted 0` and *"No folders yet"* against a Mac with four
+/// folders and three stars. [`handle`] was already reading `library.json`; nothing was
+/// writing it.
+///
+/// # 🛑 RULE ZERO
+///
+/// This writes **one file**, `library.json`, in the data directory, and that file is not a
+/// board. No `.vellum`, no `-wal`, no `-shm` and no blob is opened, moved, truncated or
+/// removed here. The worst this route can do when it goes wrong is lose the filing — which
+/// [`read_filing`] already degrades to "no folders" for, and which the desktop rebuilds by
+/// sending again, because the Mac is the authority and this is a copy.
+///
+/// The write is a temporary file and a rename, so a crash half way leaves the previous filing
+/// whole rather than a truncated one.
+///
+/// # The board ids
+///
+/// The desktop sends **ids**, in the `"<id>.vellum"` shape [`stem_of`] reduces, and never a
+/// path — the same rule this module's header states for the outbound direction, applied to
+/// the inbound one. Nothing here trusts them: [`render`] intersects every id against the
+/// boards this server actually holds, so an id naming nothing is dropped on the next `GET`
+/// exactly as a stale one always was.
+pub(crate) fn receive(
+    server: &Server,
+    body: &[u8],
+    caller: Option<&crate::accounts::Caller>,
+    stream: &TcpStream,
+) -> anyhow::Result<()> {
+    let origin = server.config.app_origin.as_deref();
+    if !crate::accounts::may_file(server, caller) {
+        return respond(stream, 403, "text/plain", b"only an admin may file boards here\n", origin);
+    }
+    let sidecar = server.config.data.join("library.json");
+    let existing = std::fs::read(&sidecar).ok();
+    let Some(bytes) = merged(body, existing.as_deref()) else {
+        return respond(stream, 400, "text/plain", b"that is not a filing\n", origin);
+    };
+    // RULE ZERO: the target is `--data` joined to the constant `library.json`. It is a
+    // preference sidecar and never a board — no part of the path comes from the request, so a
+    // `.vellum`, a `-wal`, a `-shm` or a blob can never be what this truncates. `bytes` has
+    // already been parsed as a `Filing` above, so a body that is not one has been refused
+    // before this line is reached, and the desktop rewrites the whole filing whenever anything
+    // moves, so the worst a torn write costs is a folder list that arrives on the next change.
+    //
+    // ⚠ **A scratch file and a rename would be atomic and is deliberately not used.**
+    // `tests/rule_zero.rs` forbids `rename(` outright, with no acknowledgement escape, because
+    // a move is a delete from wherever the file used to be. This is the same single `fs::write`
+    // the desktop's own `Library::persist` makes onto the same file name, and it fails in the
+    // same recoverable way [`read_filing`] already handles.
+    //
+    // RULE ZERO: `--data` joined to the constant `library.json`. Not a board, and no part of
+    // the path comes from the request.
+    if let Err(error) = std::fs::write(&sidecar, &bytes) {
+        eprintln!(
+            "velmd: could not store {}: {}",
+            printable(&sidecar.display().to_string()),
+            printable(&error.to_string())
+        );
+        return respond(stream, 500, "text/plain", b"could not store that filing\n", origin);
+    }
+    respond(stream, 204, "text/plain", b"", origin)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,4 +800,105 @@ mod tests {
         // And the clock is milliseconds, which is the half a client can silently get wrong.
         assert_eq!(value["boards"][0]["modified"].as_u64(), Some(9_000));
     }
+
+    // ----- POST /api/v1/library -----------------------------------------------------------
+
+    /// The keys this server does not model must survive a filing arriving.
+    ///
+    /// ⚠ **This is the test that matters most in this file.** The Mac's sidecar carries the
+    /// theme, the accent, the translucency switch and the archived layer's six answers.
+    /// Deserialising into [`Filing`] and writing it back would drop every one of them, and the
+    /// boards would look perfectly fine while the user's settings quietly went.
+    #[test]
+    fn a_filing_merge_keeps_the_keys_this_server_does_not_model() {
+        let existing = br#"{"theme":"dark","minimap":true,"spaces":[],"starred":["old.vellum"]}"#;
+        let sent = br#"{"spaces":[{"name":"Cars","boards":["a.vellum"],"pinned":true}],
+                        "starred":["a.vellum"],"trashed":[]}"#;
+        let out = merged(sent, Some(existing)).expect("a good filing was refused");
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("the merge is not JSON");
+        assert_eq!(value["theme"], "dark", "an unmodelled key was dropped");
+        assert_eq!(value["minimap"], true, "an unmodelled key was dropped");
+        assert_eq!(value["spaces"][0]["name"], "Cars");
+        assert_eq!(value["starred"][0], "a.vellum", "the old star survived the replacement");
+    }
+
+    /// A key absent on the wire is absent afterwards, so unstarring on the Mac reaches here.
+    #[test]
+    fn a_key_the_desktop_omits_is_removed_rather_than_kept() {
+        let existing = br#"{"theme":"light","starred":["a.vellum"]}"#;
+        let out = merged(br#"{"spaces":[],"trashed":[]}"#, Some(existing)).expect("refused");
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(value.get("starred").is_none(), "a dropped star came back");
+        assert_eq!(value["theme"], "light", "an unmodelled key went with it");
+    }
+
+    /// A body that is not a filing is refused before anything is written.
+    #[test]
+    fn a_body_that_is_not_a_filing_is_refused() {
+        assert!(merged(b"{ not json", None).is_none());
+        assert!(merged(b"[1,2,3]", None).is_none(), "an array is not a filing");
+        assert!(
+            merged(br#"{"spaces":7}"#, None).is_none(),
+            "a filing whose spaces is a number was accepted"
+        );
+    }
+
+    /// The round trip this whole route exists for: what the desktop sends, a `GET` reports.
+    #[test]
+    fn a_filing_that_was_merged_is_read_back_by_the_get() {
+        let out = merged(
+            br#"{"spaces":[{"name":"Cars","boards":["one.vellum"],"pinned":true}],
+                 "starred":["one.vellum"],"trashed":[]}"#,
+            None,
+        )
+        .expect("refused");
+        let filing: Filing = serde_json::from_slice(&out).expect("the merge does not parse back");
+        let body = render(&[board_at("one", "One", 10)], &filing);
+        let value = parsed(&body);
+        assert_eq!(value["boards"][0]["starred"].as_bool(), Some(true));
+        assert_eq!(value["boards"][0]["space"], "Cars");
+        assert_eq!(value["spaces"][0]["pinned"].as_bool(), Some(true));
+        assert_eq!(value["spaces"][0]["boards"].as_u64(), Some(1));
+    }
+
+    /// The pre-body gate: the type first, then the length, then the cap.
+    #[test]
+    fn a_filing_is_gated_by_its_type_and_its_own_cap() {
+        let headers = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+        };
+        // Off the CORS safelist, or it is not a defence.
+        for forgeable in
+            ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data"]
+        {
+            let head = headers(&[("content-type", forgeable), ("content-length", "3")]);
+            assert_eq!(
+                content_length(&head).expect_err("a form type was accepted").status,
+                415,
+                "{forgeable} was not refused"
+            );
+        }
+        let head = headers(&[("content-length", "3")]);
+        assert_eq!(content_length(&head).expect_err("no type was accepted").status, 415);
+
+        let good = |len: usize| headers(&[("content-type", "application/json"), ("content-length", &len.to_string())]);
+        assert_eq!(content_length(&good(MAX_FILING)).unwrap(), MAX_FILING);
+        let over = content_length(&good(MAX_FILING + 1)).expect_err("over the cap passed");
+        assert_eq!(over.status, 413);
+        assert!(over.message.contains("filing"), "the refusal names the wrong route: {}", over.message);
+
+        // ⚠ The cap must be past `manage`'s, or a filing of six boards is refused as if it
+        // were a board's name. Asserted rather than assumed: the two constants are in
+        // different files and nothing else would notice them crossing.
+        const { assert!(MAX_FILING > crate::manage::MAX_BODY) };
+    }
+
+    /// One path, two verbs. A drift between them is a 404 nobody can explain.
+    #[test]
+    fn the_write_route_is_the_read_route() {
+        assert!(is_filing(PATH));
+        assert!(!is_filing("/api/v1/libraryy"));
+        assert!(!is_filing("/api/v1/boards"));
+    }
+
 }
