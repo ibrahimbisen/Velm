@@ -648,7 +648,7 @@ fn hashes_of(items: &[Item]) -> BTreeSet<Hash> {
 /// the browser reads it from `BoardIndex`, which `velmd` computes itself, and a grep of
 /// `crates/velmd/src` finds no writer at all. Sending it would upload bytes nothing will
 /// ever ask for.
-fn blob_hashes(board: &Board) -> BTreeSet<Hash> {
+pub(crate) fn blob_hashes(board: &Board) -> BTreeSet<Hash> {
     match board.items() {
         Ok(items) => hashes_of(&items),
         Err(error) => {
@@ -1261,7 +1261,7 @@ fn read_answer(response: ureq::http::Response<ureq::Body>) -> Answer {
 /// and a comma list identically, because a hash is 64 hex characters and nothing else in any
 /// of those framings is. A token that is not exactly 64 hex characters is ignored, so a
 /// `{"missing":[…]}` wrapper costs nothing either.
-fn hashes_in(body: &str) -> Vec<Hash> {
+pub(crate) fn hashes_in(body: &str) -> Vec<Hash> {
     let mut out = Vec::new();
     for token in body.split(|ch: char| !ch.is_ascii_hexdigit()) {
         if token.len() == 64

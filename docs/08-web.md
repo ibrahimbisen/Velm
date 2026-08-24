@@ -444,6 +444,29 @@ die in the tab is a promise this client must not make.
 
 - **The Agent Canvas is absent**, deferred by the user's own direction.
 
+### 2026-08-24: a picture can now go **in**, from either end
+
+Two halves of one hole. `POST /api/v1/blobs/{hash}` had existed since the day before, and
+only *Send my boards* ever called it — a whole-library batch somebody has to press a button
+for. So a board that was already on the server got new items on every edit and none of the
+bytes behind them, and the browser drew nothing where the picture was.
+
+- **The Mac now uploads a live-synced board's pictures on a timer.** `vellum-app/src/blobsync.rs`
+  is a second worker beside `sync.rs`: a three-second scan of the hot board's hashes, a
+  `POST /api/v1/blobs/missing` probe, then up to sixteen uploads a batch. Two workers rather
+  than one branch, because a 23 MB picture on the sync worker stalls the 5 KB document delta
+  the other machine is waiting for. The settled set only ever grows, which is sound because
+  `velmd` has no route that removes a blob.
+- **The browser can add one.** ⌘V with a picture on the clipboard, a dropped file, or the
+  Image tool — which opens a file dialog rather than arming a mode, because a picture arrives
+  from the browser and not from a gesture on the canvas. The page hashes the bytes with
+  BLAKE3 **in wasm** (`velm_picture_hash`), uploads, and only then writes the item
+  (`velm_place_picture`). That order is the whole design: an item naming a hash the server
+  has not got draws nothing for ever, which is the defect this section exists to close.
+- **⌘V and not `navigator.clipboard`.** `clip.rs`'s decision — never touch the clipboard API —
+  stands. A `paste` event is a different thing: already resolved, no permission, and it only
+  fires because the person pressed the keys. That is the door the decision left open.
+
 ### Untested rather than working
 
 - **iPad jetsam survival is unmeasured.** wasm linear memory never returns to the OS, so peak
@@ -453,6 +476,12 @@ die in the tab is a promise this client must not make.
 - **Nothing has been served over HTTPS from a real domain.** Every measurement here is
   loopback, which is a secure context by exemption — so the one thing the whole hosting guide
   turns on has not been exercised.
+- **Nothing on the picture-in path has run against a live account.** Every check was a
+  browser probe against a stub: the BLAKE3 matches the published `"abc"` test vector, the
+  upload is a `POST` of `application/octet-stream` to `/api/v1/blobs/{64 hex}`, and a
+  non-picture is refused with a sentence. What has not happened is one real ⌘V against a real
+  server. The board client needs WebGPU and no browser reachable from this machine's
+  Playwright exposes `navigator.gpu`.
 - **The `?token=` in a board link lands in browser history.** A navigation cannot carry a
   header, which is why the query form exists at all. `boards.html` scrubs it out of the
   address bar with `replaceState`; it cannot scrub the entry.

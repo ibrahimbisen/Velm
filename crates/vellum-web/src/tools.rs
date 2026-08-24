@@ -1022,7 +1022,7 @@ fn resettle(board: &Board, projection: &mut Projection) {
 /// Grouped even though it is a single `add`, because a single `add` is several Loro
 /// operations — the node, its placement, its kind — and without the group `⌘Z` would undo
 /// a placement and leave an empty node behind.
-fn add_one(
+pub(crate) fn add_one(
     board: &mut Board,
     projection: &mut Projection,
     kind: ItemKind,
@@ -1410,7 +1410,7 @@ pub fn pointer_up(viewer: &mut crate::Viewer) -> bool {
 ///
 /// Silently nothing when there is no server behind this board: a static `board.bin` has
 /// nowhere to push to, and that is the ordinary development case rather than an error.
-fn finish(changed: bool, board: &Board, push: &mut Option<crate::push::Pusher>) -> bool {
+pub(crate) fn finish(changed: bool, board: &Board, push: &mut Option<crate::push::Pusher>) -> bool {
     if changed && let Some(pusher) = push.as_mut() {
         pusher.note_edit();
         pusher.tick(board);

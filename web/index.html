@@ -202,8 +202,21 @@
       }
       if (editable === 'yes') {
         const canvas = document.getElementById('canvas');
+        // ⚠ **Before the toolbar, because the toolbar is given its picker.** A picture is
+        // the one entry in *More* that is not a mode: it arrives from the system file
+        // dialog rather than from a gesture on the board. `mountPictures` answers `null`
+        // when there is nowhere to upload to — a static `board.bin` — and the Image tool
+        // then says what it has always said instead of offering a dialog that cannot finish.
+        //
+        // It also takes ⌘V and a dropped file, which is why it mounts even though the only
+        // control that names it lives in the toolbar.
+        const { mountPictures } = await import('./pictures.js');
+        const pictures = mountPictures(velm, { canvas, blobBase, blobSuffix });
         const { mountTools } = await import('./tools.js');
-        mountTools(velm, { canvas });
+        mountTools(velm, {
+          canvas,
+          onPickPicture: pictures ? () => pictures.pick() : undefined,
+        });
         const { mountInspector } = await import('./inspect.js');
         mountInspector(velm, { canvas });
       }

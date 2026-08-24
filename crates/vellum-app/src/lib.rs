@@ -39,6 +39,10 @@ pub mod app;
 pub mod appearance;
 pub mod assets;
 pub mod bench;
+/// The pictures a live-synced board references, sent to the server as it edits. `sync` moves
+/// the document and this moves the bytes it names; without it a picture pasted on the Mac
+/// reaches the browser as a hash with nothing behind it.
+pub mod blobsync;
 pub mod capture;
 pub mod chart;
 pub mod chrome_pass;

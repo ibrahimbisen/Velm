@@ -93,6 +93,7 @@ mod push;
 mod style;
 mod widgets;
 mod images;
+mod pictures;
 mod layout;
 mod input;
 mod handles;

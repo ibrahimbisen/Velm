@@ -190,6 +190,30 @@ pub(crate) struct ActiveState {
     /// same server. The `Editor` holds the round trip itself, so a parked board keeps its
     /// place in the conversation across a tab switch — see `Editor::sync`.
     pub(crate) sync: Option<SyncConfig>,
+    /// The picture half of sync, for the server [`SyncConfig`] names.
+    ///
+    /// One per credential and **not** one per board: it is content-addressed, so a hash
+    /// settled while looking at one board is settled for every board on that server, and a
+    /// per-board cache would re-probe the same 3,458 pictures on every tab switch.
+    ///
+    /// `None` until the first frame that has both a server and a board, and dropped whole by
+    /// [`ActiveState::recredential`] — the rule `crate::sync::Sync` states: a worker owns a
+    /// clone of the credential it was built with and never changes its mind.
+    pub(crate) blob_sync: Option<crate::blobsync::BlobSync>,
+    /// The server refused the credential the picture worker was built with.
+    ///
+    /// ⚠ **Without this the drop is a hot loop, and it is not an edge case on this
+    /// deployment.** `ActiveState::apply_blob_sync` drops the worker on a 401 and rebuilds it
+    /// on the next frame it finds `None` — but a 401 on a *blob* does not detach the board's
+    /// `Sync` and does not clear `self.sync`, so every condition for a rebuild is still true
+    /// one frame later. A fresh `BlobSync` has no `scanned_at` and no `retry_after`, so it
+    /// asks immediately, is refused, and is dropped again: one OS thread spawned and one 401
+    /// per round trip, for as long as the app is open. `velmd` keeps sessions in memory only
+    /// and forgets them on restart, which is precisely when every open Mac would start.
+    ///
+    /// Cleared by [`ActiveState::recredential`] alone — signing in or out is the only event
+    /// that can make the answer different.
+    pub(crate) blob_sync_refused: bool,
     /// The `--sync-server` and `$VELM_SYNC_TOKEN` setup exactly as it was at startup.
     ///
     /// Kept so **signing out restores it rather than turning sync off**. Somebody who syncs
@@ -679,6 +703,10 @@ impl Vellum {
             push: crate::push::PushState::default(),
             account: AccountStatus::default(),
             sync,
+            // Built on the first frame that has a board to ask about, not here: `BlobSync::new`
+            // spawns a thread, and a launch with no server would spawn one that never speaks.
+            blob_sync: None,
+            blob_sync_refused: false,
             occluded: false,
             recorder,
             window,

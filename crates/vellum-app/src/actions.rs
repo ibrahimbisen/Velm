@@ -63,12 +63,6 @@ const ZOOM_STEP: f64 = 1.15;
 /// Enough to see that there are two, small enough that they are obviously a pair.
 const OFFSET: f64 = 24.0;
 
-/// The longest edge a pasted image is given, in world units.
-///
-/// A screenshot off a 5K display is 5120px on its long side, and pasted at its own
-/// size it arrives larger than the visible board and mostly off-screen. Scaled down it
-/// still lands bigger than a sticky, which is the size relationship that reads.
-const MAX_PASTED_IMAGE: f64 = 1_200.0;
 
 /// Past this many characters, pasted text becomes a text item rather than a sticky.
 ///
@@ -699,6 +693,12 @@ impl ActiveState {
             return;
         }
         self.attach_sync_to_hot_board();
+        // ⚠ **Before the `busy_with_a_group` guard below, not after.** That guard exists
+        // because a *remote document update* must not settle somebody's half-typed sticky.
+        // A picture upload reads bytes off the disk and opens no undo group, so holding it
+        // behind a caret would stop pictures reaching the browser for as long as somebody is
+        // typing and buy nothing.
+        self.apply_blob_sync();
 
         if self.sync_is_due() {
             // ⚠ **`asked_at` moves whether or not the request went**, and that is not
@@ -1005,6 +1005,14 @@ impl ActiveState {
     ///
     /// RULE ZERO: this drops threads and channels. No file is opened and no board changes.
     fn recredential(&mut self) {
+        // ⚠ Dropped, never reused. Its worker owns a clone of the old credential *and* a
+        // `settled` set built against the old server — keeping either across a sign-in would
+        // upload with a credential that has been given up, or skip every picture on a server
+        // that has none of them.
+        self.blob_sync = None;
+        // ⚠ The latch, not just the worker. It is what stops a refused session rebuilding a
+        // worker every frame, so signing in has to lift it or pictures never go up again.
+        self.blob_sync_refused = false;
         self.editor.detach_sync();
         for parked in self.session.iter_mut() {
             // The accessor, not the field: `Parked`'s fields are private and this is a
@@ -1317,6 +1325,75 @@ impl ActiveState {
         // already attached is a `Sync` that is still using whatever was current when it was
         // built, which is why signing in and out drops them all rather than assigning a field.
         self.editor.attach_sync(crate::sync::Sync::new(server, credential, id));
+    }
+
+    /// Send the hot board's pictures to the server it syncs with.
+    ///
+    /// # Why this is here and not inside `crate::sync`
+    ///
+    /// `crate::sync` moves the **document**. A picture pasted on the Mac reaches `velmd` as an
+    /// item naming a hash, and until this ran, the bytes behind that hash never moved: the
+    /// browser drew nothing and `GET /api/v1/blobs/{hash}` answered 404 for ever. Uploading was
+    /// wired only into `crate::push`, which is a whole-library batch somebody has to press a
+    /// button for. `crate::blobsync`'s header carries the rest of the argument.
+    ///
+    /// # The three guards, in order, and each is load-bearing
+    ///
+    /// 1. **A board with no `Sync` is skipped.** It has no id on this server, so there is
+    ///    nowhere its pictures belong. That also makes the bench board and an unsaved import
+    ///    free rather than an error.
+    /// 2. **Drained every frame**, which is what clears `outstanding` —
+    ///    `crate::sync::Sync::drain` records what skipping it costs.
+    /// 3. **`wants_scan` before the board is read**, because reading it walks every item.
+    ///
+    /// RULE ZERO: nothing here opens a board file or writes one. It reads items already in
+    /// memory and reads blobs the store hands out by hash.
+    fn apply_blob_sync(&mut self) {
+        // The hot board is not in the conversation, so its pictures have no home yet.
+        if self.editor.sync_state().is_none() {
+            return;
+        }
+        // ⚠ **Before the rebuild, and this guard is the whole reason the field exists.**
+        // A 401 on a blob leaves the board's `Sync` attached and `self.sync` set, so without
+        // it every condition below is still true on the very next frame and the drop turns
+        // into a thread spawned and a 401 sent per round trip. See `blob_sync_refused`.
+        if self.blob_sync_refused {
+            return;
+        }
+        if self.blob_sync.is_none() {
+            let Some((server, credential)) = self
+                .sync
+                .as_ref()
+                .map(|config| (config.options.server.clone(), config.credential.clone()))
+            else {
+                return;
+            };
+            self.blob_sync = Some(crate::blobsync::BlobSync::new(
+                server,
+                credential,
+                crate::editor::blob_directory(),
+            ));
+        }
+
+        let refused = self.blob_sync.as_mut().is_some_and(crate::blobsync::BlobSync::drain);
+        if refused {
+            // ⚠ Dropped rather than left to back off. Every later batch would be refused the
+            // same way, and a worker retrying a dead session for the life of the process is
+            // how a sign-out turns into an hourly 401 nobody is reading. The next credential
+            // builds a new one — `Self::recredential`'s contract.
+            log::warn!("blobs: this session was refused, so pictures stop going up");
+            self.blob_sync = None;
+            self.blob_sync_refused = true;
+            return;
+        }
+        if !self.blob_sync.as_ref().is_some_and(crate::blobsync::BlobSync::wants_scan) {
+            return;
+        }
+        // ⚠ **Behind `wants_scan`, never before it.** This walks every item on the board.
+        let wanted = crate::push::blob_hashes(self.editor.board());
+        if let Some(blobs) = self.blob_sync.as_mut() {
+            blobs.request(wanted);
+        }
     }
 
     /// Whether enough time has passed since the last request.
@@ -8989,15 +9066,20 @@ impl ActiveState {
         // Sized from the image's own pixels so it arrives the shape it is. Capped
         // because a 6000px screenshot pasted at full size fills the board and lands
         // mostly outside the viewport.
+        //
+        // ⚠ **`vellum_project::picture` and not a rule of this file's own.** The browser
+        // client places a picture too, and the two have to agree: the same screenshot
+        // arriving 1,200 units wide here and 5,120 wide in a tab is one board disagreeing
+        // with itself about a picture somebody just added. That crate is also where the
+        // rule is actually tested — `vellum-web` compiles no test at all.
         let (width, height) = match image::load_from_memory(bytes) {
-            Ok(decoded) => {
-                let (w, h) = (f64::from(decoded.width()), f64::from(decoded.height()));
-                let scale = (MAX_PASTED_IMAGE / w.max(h)).min(1.0);
-                ((w * scale).max(1.0), (h * scale).max(1.0))
-            }
+            Ok(decoded) => vellum_project::picture::fitted(
+                f64::from(decoded.width()),
+                f64::from(decoded.height()),
+            ),
             Err(error) => {
                 log::warn!("pasted image dimensions unreadable, using a default: {error}");
-                (480.0, 360.0)
+                vellum_project::picture::FALLBACK_SIZE
             }
         };
 

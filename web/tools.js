@@ -84,6 +84,8 @@
 //     the tool palette is a row of controls that cannot be clicked, and that shipped once on
 //     the desktop.
 
+import { ICONS, svg } from './icons.js';
+
 const STYLE_ID = 'velm-tools-style';
 
 /// The gap between a floating surface and whatever it is keeping clear of.
@@ -325,50 +327,15 @@ const SWATCHES = [
 // the accent means *selection* or *the active tool*, and the palette says which tool is
 // active with a tinted background rather than by recolouring a glyph.
 
-const ICONS = {
-  // A pointer. Closed, so the outline reads as an arrow rather than as a stray tick.
-  select: 'M5 3.5l10.5 6.5-4.7 1.3-1.3 4.7z',
-  // A hand, palm and three fingers. Kept blunt on purpose — at 20px a realistic hand is mud.
-  hand: 'M7 12V5.5h1.8V10m0-1.4h1.8V10m0-1.2h1.8v1.4m0-.6h1.7v4.3a3.2 3.2 0 0 1-3.2 3.2H10a2.8 2.8 0 0 1-2.4-1.4L5.4 12.4 7 11.4z',
-  // A note with a folded corner. The fold is what tells it from *Frame* at a glance.
-  sticky: 'M4 4h12v7.5L11.5 16H4zM16 11.5h-4.5V16',
-  // A T with a serif foot, which is how every application in the world draws this.
-  text: 'M4.5 5h11M10 5v10M7.5 15h5',
-  // A square and a circle. Miro's, and it says "some shape" rather than naming one.
-  shape: 'M3 3.5h7.5V11H3zM12.7 8.6a4 4 0 1 1 0 8 4 4 0 0 1 0-8z',
-  // Crop marks. Miro's frame glyph, and the same subject as the Velm mark.
-  frame: 'M6.5 3v14M13.5 3v14M3 6.5h14M3 13.5h14',
-  // A nib, with the ink edge across its heel.
-  pen: 'M3.5 16.5l1.3-4L13.7 3.3l2.7 2.7-9.2 9.2zM12.2 4.8l2.7 2.7',
-  // A block rubbing along a line, which is what makes it an eraser and not a shape.
-  eraser: 'M3.2 12.5l7.3-7.3 5.3 5.3-5 5H6.4zM16.5 16.5H8.5M6.9 8.8l5.3 5.3',
-  // An elbow, ending in an arrowhead: the connector's own subject.
-  connector: 'M3.5 5h4.5a3 3 0 0 1 3 3v6M8.5 11.5l2.5 3 2.5-3',
-  // The rest, as three marks. Zero-length subpaths do not render under `square` caps, so
-  // each dot is a short segment rather than a point.
-  more: 'M4 10h1.6M9.2 10h1.6M14.4 10h1.6',
-  // The same three marks, turned: the `⋮` on the selection bar, as geometry.
-  moreVertical: 'M10 4v1.6M10 9.2v1.6M10 14.4v1.6',
-  undo: 'M6.5 5.5L3 9l3.5 3.5M3 9h8a4 4 0 0 1 0 8H7',
-  redo: 'M13.5 5.5L17 9l-3.5 3.5M17 9H9a4 4 0 0 0 0 8h4',
-  lock: 'M5.5 9h9v7.5h-9zM7.5 9V6.5a2.5 2.5 0 0 1 5 0V9',
-  // The shackle open at one side, which is the only difference a reader can see at 20px.
-  unlock: 'M5.5 9h9v7.5h-9zM7.5 9V6.5a2.5 2.5 0 0 1 5 0',
-  // A droplet, for opacity. A checkerboard is the other convention and is unreadable at 20.
-  opacity: 'M10 3.2l4.2 5.4a5.3 5.3 0 1 1-8.4 0z',
-  // A pen line of varying weight, for the stroke width.
-  strokeWidth: 'M3.5 6h13M3.5 10h13M3.5 14.5h13',
-};
 
 /// One 20-grid icon as inline SVG.
 ///
 /// `aria-hidden`, because every button carries an `aria-label` — a screen reader announcing
 /// both would say the name twice.
-function svg(path) {
-  return '<svg viewBox="0 0 20 20" width="20" height="20" fill="none" aria-hidden="true">'
-    + `<path d="${path}" stroke="currentColor" stroke-width="1.5"`
-    + ' stroke-linecap="square" stroke-linejoin="miter"/></svg>';
-}
+// ⚠ The icons are `vellum_ui::icon`'s, through the generated `icons.js`, and not this
+// file's own. Three modules on this page each hand-wrote the same set and the three
+// disagreed; `crates/vellum-ui/examples/web-icons.rs` says what that cost and how to
+// regenerate. Nothing here draws an icon of its own.
 
 // ---------------------------------------------------------------------------------------
 // Style
@@ -382,6 +349,7 @@ function svg(path) {
 
 const CSS = `
 .velm-tools,
+.velm-tools-undo,
 .velm-tools-bar,
 .velm-tools-menu,
 .velm-tools-pop {
@@ -819,7 +787,10 @@ function asNumber(value, fallback, low, high) {
  * surfaces and three window listeners, and a caller that wants them gone should not have to
  * know that.
  */
-export function mountTools(mod, { canvas, document: docOption, editing = true } = {}) {
+export function mountTools(
+  mod,
+  { canvas, document: docOption, editing = true, onPickPicture } = {},
+) {
   if (!mod || !canvas) return null;
   const doc = docOption || canvas.ownerDocument;
   if (!doc) return null;
@@ -882,6 +853,19 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
     for (const [key, node] of toolButtons) node.setAttribute('aria-pressed', String(key === id));
   };
   const armTool = (id) => {
+    // ⚠ **Image is a door, not a mode.** Every other entry here arms a tool and waits for
+    // a gesture on the canvas; a picture arrives from the system file dialog, which is a
+    // browser gesture with nothing on the board to press. So this one runs the picker
+    // `pictures.js` supplies and never reaches `set_tool` — which would refuse it anyway,
+    // and say so, because `Tool::Image` is a tool this build has no gesture for.
+    //
+    // Falls through when the page did not supply a picker — a static board has nowhere to
+    // upload to — and the refusal below is then the honest answer it always was.
+    if (id === 'image' && typeof onPickPicture === 'function') {
+      if (can('velm_caret_commit')) invoke('velm_caret_commit');
+      onPickPicture();
+      return;
+    }
     if (!can('set_tool')) return;
     // ⚠ **The answer is the refusal.** Two of the fourteen tools are not in this build, and a
     // button that goes pressed for a tool that did not arm is this file's own prohibited
@@ -1231,7 +1215,10 @@ export function mountTools(mod, { canvas, document: docOption, editing = true } 
         const node = el(doc, 'button', 'velm-tools-row');
         node.type = 'button';
         node.textContent = tool.label;
-        if (can('set_tool')) {
+        // Image is reachable through the picker rather than through `set_tool`, so it stays
+        // enabled on a build that has the picker even when the tool verb is missing.
+        const picks = tool.id === 'image' && typeof onPickPicture === 'function';
+        if (picks || can('set_tool')) {
           node.addEventListener('click', () => { closePopover(); armTool(tool.id); });
         } else {
           node.disabled = true;

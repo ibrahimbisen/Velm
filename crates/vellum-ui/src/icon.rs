@@ -203,7 +203,14 @@ pub enum Icon {
 impl Icon {
     /// The icon's geometry in the unit box.
     #[expect(clippy::too_many_lines, reason = "a lookup table reads better unsplit")]
-    const fn prims(self) -> &'static [Prim] {
+    /// The geometry, in the unit box.
+    ///
+    /// **Public so the browser client can share this table rather than keep a second one.**
+    /// `examples/web-icons.rs` walks every icon through here and writes `web/icons.js`, which
+    /// is what makes a tool in a tab and the same tool on the Mac the same drawing. Before
+    /// that, `web/tools.js`, `web/chrome.js` and `web/find.js` each hand-wrote their own SVG
+    /// paths — three copies of a table that is hard to draw once.
+    pub const fn prims(self) -> &'static [Prim] {
         match self {
             Self::Select => const { &[
                 outline(&[(0.168, 0.195), (0.168, 0.179), (0.179, 0.168), (0.195, 0.168), (0.862, 0.439), (0.874, 0.451), (0.873, 0.468), (0.859, 0.478), (0.604, 0.544), (0.584, 0.553), (0.566, 0.566), (0.553, 0.584), (0.544, 0.604), (0.478, 0.859), (0.468, 0.873), (0.451, 0.874), (0.439, 0.862)]),

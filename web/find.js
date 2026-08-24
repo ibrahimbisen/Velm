@@ -43,10 +43,11 @@
 //     already set, which is what makes the two of them a ladder rather than a race: whichever
 //     surface claimed the key first keeps it.
 //   - **Placement.** `chrome.js` owns the top-left, `inspect.js`'s toggle the top-right, its
-//     panel the right side, and `tools.js`'s palette the left. This sits **below the whole top
-//     band**, measured from those surfaces' live `getBoundingClientRect()` and never from a
-//     constant. A panel underneath another panel is a field you can type into and cannot see,
-//     and the desktop shipped that once — a selection bar behind the tool column.
+//     panel the right side, and `tools.js`'s palette the left. This **joins the top-right
+//     row**, immediately left of `inspect.js`'s toggle, and the panel drops from that corner.
+//     Every edge is measured from those surfaces' live `getBoundingClientRect()` and never
+//     from a constant. A panel underneath another panel is a field you can type into and
+//     cannot see, and the desktop shipped that once — a selection bar behind the tool column.
 //
 // # ⚠ Debounced, and the number is stated
 //
@@ -64,6 +65,8 @@
 // for the reason `chrome.js` gives: this design draws its structure with hairlines, and two
 // nearly-identical hairlines on one screen read as a mistake rather than as a system. Light
 // only, no `prefers-color-scheme` block — the page it lives in has none.
+
+import { ICONS, svg } from './icons.js';
 
 const STYLE_ID = 'velm-find-style';
 const CONTAINER_CLASS = 'velm-find';
@@ -115,9 +118,13 @@ const CSS = `
 .velm-find {
   position: fixed;
   /* Overwritten by place() on the first pass, which runs synchronously at mount. These are
-     what is drawn if it is ever skipped: below chrome.js's bar, out of everyone's way. */
-  top: calc(max(12px, env(safe-area-inset-top)) + 60px);
-  left: max(12px, env(safe-area-inset-left));
+     what is drawn if it is ever skipped: the top-right row, one 44px target and one gap
+     clear of inspect.js's toggle.
+     ⚠ A right anchor here and a left one from place(), never both at once — a fixed box
+     given both stretches between them instead of sitting at its own width, so place()
+     writes right:auto before the first left it writes. */
+  top: max(12px, env(safe-area-inset-top));
+  right: calc(max(12px, env(safe-area-inset-right)) + 52px);
   display: flex;
   /* ⚠ The whole reason this can sit over the board at all. Taken back by the toggle, the
      panel and — explicitly, see below — the results list. */
@@ -366,10 +373,6 @@ const CSS = `
 // ⚠ Geometry, never a character. `CLAUDE.md` trap 10: a glyph outside the bundled face draws
 // tofu, and the desktop app has paid for this three times — `↗`, `▶` and `ⓘ` are all drawn
 // there for the same reason. There is no `🔍` and no `×` in this file.
-const ICON_FIND = 'M8.5 3.5a5 5 0 1 0 0 10 5 5 0 1 0 0-10M12.4 12.4 16.5 16.5';
-const ICON_PREV = 'M5 12.5 10 7.5l5 5';
-const ICON_NEXT = 'M5 7.5 10 12.5l5-5';
-const ICON_CLOSE = 'M5.5 5.5 14.5 14.5M14.5 5.5 5.5 14.5';
 
 /// The name each verb is exported under, in the order they are tried.
 ///
@@ -394,11 +397,10 @@ function bound(mod, name) {
   return null;
 }
 
-function svg(path) {
-  return '<svg viewBox="0 0 20 20" width="20" height="20" fill="none" aria-hidden="true">'
-    + `<path d="${path}" stroke="currentColor" stroke-width="1.5"`
-    + ' stroke-linecap="square" stroke-linejoin="miter"/></svg>';
-}
+// ⚠ The icons are `vellum_ui::icon`'s, through the generated `icons.js`, and not this
+// file's own. Three modules on this page each hand-wrote the same set and the three
+// disagreed; `crates/vellum-ui/examples/web-icons.rs` says what that cost and how to
+// regenerate. Nothing here draws an icon of its own.
 
 function ensureStyle(doc) {
   if (doc.getElementById(STYLE_ID)) return;
@@ -546,7 +548,7 @@ export function mountFind(mod, { canvas, document: docOption, open: openAtMount 
   toggle.type = 'button';
   toggle.setAttribute('aria-label', 'Find on this board');
   toggle.setAttribute('aria-expanded', 'false');
-  toggle.innerHTML = svg(ICON_FIND);
+  toggle.innerHTML = svg(ICONS.find);
   if (canFind) {
     // The hint names the key as well as the verb, and it only ever appears under a mouse
     // pointer — which is the only kind of reader that has the key to press.
@@ -708,17 +710,17 @@ export function mountFind(mod, { canvas, document: docOption, open: openAtMount 
     : { width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 });
 
   /**
-   * Put the panel where nothing else is.
+   * Put the toggle in the top-right corner, and the panel where nothing else is.
    *
-   * ⚠ **The top band is reserved unconditionally**, which is `tools.js`'s decision and its
-   * reason: making it conditional closes a loop, because the horizontal clamps below depend
-   * on the vertical placement. `chrome.js` owns one strip across the top-left and
-   * `inspect.js`'s toggle keeps the top-right corner, so this sits under both of them and
-   * costs a few pixels of height on a wide monitor to be certain of it.
+   * ⚠ **This shares the top band rather than sitting under it.** The toggle is drawn on the
+   * same row as `inspect.js`'s, immediately to its left, and the panel drops from that
+   * corner. Only one of the two children is ever visible — `open` hides the toggle and
+   * `close` hides the panel — so right-aligning the *container* puts the toggle in the
+   * corner when it is closed and lands the open panel's right edge in the same place.
    *
    * ⚠ **Every rectangle is read live and none is a constant.** The palette's width follows
    * the icon size and wraps into a second column on a short window; the properties panel is
-   * `min(264px, 100vw - 24px)` and is not always up. A constant for either goes stale
+   * `min(264px, 100vw - 24px)` and is not always up. A constant for any of them goes stale
    * silently, and what it produces is a field you can type into and cannot see.
    *
    * ⚠ **The panel narrows before it overlaps.** When the free span between the palette and
@@ -732,9 +734,18 @@ export function mountFind(mod, { canvas, document: docOption, open: openAtMount 
     const vh = win.innerHeight || 0;
     if (!vw || !vh) return;
 
+    const inspectToggle = surface('.velm-inspect-toggle');
+    const chrome = surface('.velm-chrome');
+    // ⚠ Taken from a neighbour's live top and not from `GAP`. Both top-band surfaces open at
+    // `max(12px, env(safe-area-inset-top))`, which GAP is not, so a constant here sits four
+    // pixels proud of the row it is meant to join — and lands wrong by the whole inset on a
+    // notched device.
     let top = GAP;
-    for (const rect of [surface('.velm-chrome'), surface('.velm-inspect-toggle')]) {
-      if (rect) top = Math.max(top, rect.bottom + GAP);
+    for (const rect of [inspectToggle, chrome]) {
+      if (rect) {
+        top = Math.round(rect.top);
+        break;
+      }
     }
 
     const nextHeight = `${Math.round(Math.max(MIN_PANEL_HEIGHT, vh - top - GAP))}px`;
@@ -750,13 +761,22 @@ export function mountFind(mod, { canvas, document: docOption, open: openAtMount 
     const height = own.height || 0;
     const shares = (rect) => Boolean(rect) && top < rect.bottom && top + height > rect.top;
 
-    let leftEdge = GAP;
-    const palette = surface('.velm-tools');
-    if (shares(palette)) leftEdge = palette.right + GAP;
-
+    // ⚠ The inspect toggle is subtracted unconditionally, not through `shares`. It is on this
+    // exact row by construction, and asking `shares` about it reads the container's height
+    // from the frame *before* this one — which on the first pass is zero, and a zero height
+    // shares nothing, so the two toggles would stack on the first frame and separate on the
+    // second.
     let rightEdge = vw - GAP;
+    if (inspectToggle) rightEdge = Math.min(rightEdge, inspectToggle.left - GAP);
     const properties = surface('.velm-inspect');
     if (shares(properties)) rightEdge = Math.min(rightEdge, properties.left - GAP);
+
+    // `chrome.js`'s bar now shares this row, so it is a horizontal limit where it used to be
+    // a vertical one. The palette still only matters when an open panel hangs down to it.
+    let leftEdge = GAP;
+    for (const rect of [chrome, surface('.velm-tools')]) {
+      if (shares(rect)) leftEdge = Math.max(leftEdge, rect.right + GAP);
+    }
 
     const span = Math.max(MIN_PANEL_WIDTH, rightEdge - leftEdge);
     const nextWidth = `${Math.round(span)}px`;
@@ -766,16 +786,17 @@ export function mountFind(mod, { canvas, document: docOption, open: openAtMount 
     }
 
     const width = boxOf(container).width || 0;
-    // Centred in the **free span** rather than in the window, so an open properties panel
-    // pushes the find bar left instead of leaving it sitting against the panel's edge.
-    const centred = leftEdge + (rightEdge - leftEdge - width) / 2;
+    // Right-aligned, so the toggle keeps the corner and the panel grows leftwards from it.
     // `Math.max(leftEdge, …)` and not the right limit alone: on a narrow window the two
     // limits cross, and the left one wins — `tools.js`'s rule, for its reason. A surface
     // pushed off the right edge is unreachable; one that overlaps is still usable.
-    const x = Math.min(Math.max(centred, leftEdge), Math.max(leftEdge, rightEdge - width));
+    const x = Math.max(leftEdge, rightEdge - width);
 
     const nextLeft = `${Math.round(x)}px`;
     const nextTop = `${Math.round(top)}px`;
+    // See the CSS: the fallback anchors by `right`, and a fixed box holding both edges
+    // stretches between them. Cleared on the one pass that first writes a `left`.
+    if (state.placedLeft === '') container.style.right = 'auto';
     if (nextLeft !== state.placedLeft) {
       state.placedLeft = nextLeft;
       container.style.left = nextLeft;
@@ -1096,11 +1117,11 @@ export function mountFind(mod, { canvas, document: docOption, open: openAtMount 
   input.addEventListener('input', searchSoon);
   input.addEventListener('keydown', onFieldKeyDown);
 
-  const prev = iconButton('Previous match', 'Previous match (⇧Enter)', ICON_PREV,
+  const prev = iconButton('Previous match', 'Previous match (⇧Enter)', ICONS.prev,
     () => step(-1), canFocus, 'focus_match');
-  const next = iconButton('Next match', 'Next match (Enter)', ICON_NEXT,
+  const next = iconButton('Next match', 'Next match (Enter)', ICONS.next,
     () => step(1), canFocus, 'focus_match');
-  const close = iconButton('Close find', 'Close find (Esc)', ICON_CLOSE,
+  const close = iconButton('Close find', 'Close find (Esc)', ICONS.close,
     closePanel, true, '');
 
   row.append(input, count, prev, next, close);

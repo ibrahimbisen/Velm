@@ -103,6 +103,8 @@
 // (`docs/05` §2), so two nearly-identical hairlines on one screen read as a mistake rather
 // than as a system.
 
+import { ICONS, svg } from './icons.js';
+
 const STYLE_ID = 'velm-inspect-style';
 const PANEL_CLASS = 'velm-inspect';
 
@@ -404,32 +406,22 @@ const CSS = `
 }
 `;
 
-// Icons: line drawings on a 20 grid, 1.5px stroke, square caps — `chrome.js`'s set and the
-// same rule, so the two surfaces on this page are drawn by one hand. None is accented: in
-// Velm the accent means *selection* or *the active thing*, which is what `aria-pressed`
-// already colours below.
+// The icons are `vellum_ui::icon`'s, through the generated `icons.js` — see
+// `crates/vellum-ui/examples/web-icons.rs`. Two are **not** in that table and are drawn here:
+// the panel toggle and the open-in-a-new-tab arrow have no counterpart on the Mac, because
+// the Mac has no side panel to toggle and no browser to hand a link to. They stay 20-grid
+// line drawings so the row they sit in is drawn by one hand.
+//
+// None is accented: in Velm the accent means *selection* or *the active thing*, which is what
+// `aria-pressed` already colours below.
 const ICON_PANEL = 'M3.5 4.5h13v11h-13zM12 4.5v11';
-const ICON_LOCK = 'M6.5 9V6.75a3.5 3.5 0 017 0V9M4.5 9h11v6.5h-11z';
-const ICON_UNLOCK = 'M6.5 9V6.75a3.5 3.5 0 016.9-.8M4.5 9h11v6.5h-11z';
 const ICON_OPEN = 'M10.5 4.5H15.5V9.5M15.5 4.5L9 11M13 11.5v4h-9v-9h4';
-const ICON_COPY = 'M7.5 7.5h8v8h-8zM12.5 7.5v-3h-8v8h3';
-const ICON_ALIGN_LEFT = 'M4 5.5h12M4 10h8M4 14.5h11';
-const ICON_ALIGN_CENTER = 'M4 5.5h12M6 10h8M4.5 14.5h11';
-const ICON_ALIGN_RIGHT = 'M4 5.5h12M8 10h8M5 14.5h11';
 
-/**
- * One icon, as a self-contained SVG string.
- *
- * `innerHTML` is used for exactly this and for nothing else in the file: the argument is one
- * of the module-level constants above, never a value that has been anywhere near a board.
- * Everything a document supplies — a headline, a URL, a family name, a reason — goes in
- * through `textContent`.
- */
-function svg(path) {
-  return '<svg viewBox="0 0 20 20" width="20" height="20" fill="none" aria-hidden="true">'
-    + '<path d="' + path + '" stroke="currentColor" stroke-width="1.5"'
-    + ' stroke-linecap="square" stroke-linejoin="miter"/></svg>';
-}
+// `svg` comes from `icons.js` and takes either a generated subpath list or one of the two
+// legacy path strings above. `innerHTML` is used for its answer and for nothing else in this
+// file: the argument is always a module-level constant, never a value that has been anywhere
+// near a board. Everything a document supplies — a headline, a URL, a family name, a reason —
+// goes in through `textContent`.
 
 function ensureStyle() {
   if (document.getElementById(STYLE_ID)) return;
@@ -877,9 +869,9 @@ function segmented(ctx, parent, spec) {
 // ---------------------------------------------------------------------------------------
 
 const ALIGN_OPTIONS = [
-  { value: 'left', label: 'Align left', icon: ICON_ALIGN_LEFT },
-  { value: 'center', label: 'Align centre', icon: ICON_ALIGN_CENTER },
-  { value: 'right', label: 'Align right', icon: ICON_ALIGN_RIGHT },
+  { value: 'left', label: 'Align left', icon: ICONS.textAlignLeft },
+  { value: 'center', label: 'Align centre', icon: ICONS.textAlignCenter },
+  { value: 'right', label: 'Align right', icon: ICONS.textAlignRight },
 ];
 
 /**
@@ -1137,7 +1129,7 @@ function linkSection(ctx, body, model) {
   }
   control.append(open);
 
-  const copy = iconButton('Copy link', 'Copy the address', ICON_COPY);
+  const copy = iconButton('Copy link', 'Copy the address', ICONS.duplicate);
   const clipboard = typeof navigator !== 'undefined' && navigator.clipboard;
   if (!clipboard) {
     // WebGPU already requires a secure context, so this should be unreachable in a working
@@ -1298,7 +1290,7 @@ function header(ctx, body, model) {
     const locked = model.locked && model.locked.state === 'uniform' && model.locked.value === true;
     const can = gate(ctx, 'locked', 'style');
     const button = iconButton(locked ? 'Unlock' : 'Lock', locked ? 'Unlock' : 'Lock',
-      locked ? ICON_LOCK : ICON_UNLOCK);
+      locked ? ICONS.lock : ICONS.unlock);
     button.setAttribute('aria-pressed', String(locked));
     if (!can.enabled) {
       refuse(button, can.why);

@@ -29,6 +29,9 @@ pub mod handle;
 pub mod connector;
 pub mod frame;
 pub mod look;
+/// The size a newly placed picture arrives at, shared by both clients so a paste on the
+/// Mac and a paste in a tab put the same picture on the board at the same size.
+pub mod picture;
 pub mod project;
 pub mod runs;
 pub mod theme;

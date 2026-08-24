@@ -361,7 +361,7 @@ fn place(board: &mut Board, items: &[Item], dx: f64, dy: f64) -> Vec<(usize, Doc
 ///
 /// The viewport is already in **physical** pixels — it is set from the canvas — so the centre
 /// takes no ratio conversion, while a noted aim is CSS pixels and takes one.
-fn aim_world(camera: &Camera) -> WorldPoint {
+pub(crate) fn aim_world(camera: &Camera) -> WorldPoint {
     let viewport = camera.viewport();
     let centre = ScreenPoint::new(viewport.width / 2.0, viewport.height / 2.0);
     let screen = match AIM.with(|aim| aim.get()) {

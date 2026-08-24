@@ -51,6 +51,8 @@
 // in has none, and a bar that flips to dark over a light board is worse than one that does
 // not flip at all.
 
+import { ICONS, svg } from './icons.js';
+
 const STYLE_ID = 'velm-chrome-style';
 const BAR_CLASS = 'velm-chrome';
 
@@ -227,19 +229,11 @@ const CSS = `
 // None of them is accented, and that is a decision rather than an omission. In Velm the
 // accent means *selection* or *the active tool*, and a read-only viewer has neither; colour
 // applied for emphasis alone is precisely the "looks current" failure §2 rules out.
-const ICON_BACK = 'M16 10H5m4.5-4.5L5 10l4.5 4.5';
-const ICON_MINUS = 'M5 10h10';
-const ICON_PLUS = 'M10 5v10M5 10h10';
-/// Four corner brackets around a frame that is never drawn — the Velm mark, scaled from its
-/// 48 grid to this one. Fit-to-board *is* the mark's own subject: a bounded view onto
-/// something with no edges.
-const ICON_FIT = 'M3.5 8.5V3.5H8.5M11.5 3.5H16.5V8.5M16.5 11.5V16.5H11.5M8.5 16.5H3.5V11.5';
 
-function svg(path) {
-  return '<svg viewBox="0 0 20 20" width="20" height="20" fill="none" aria-hidden="true">'
-    + `<path d="${path}" stroke="currentColor" stroke-width="1.5"`
-    + ' stroke-linecap="square" stroke-linejoin="miter"/></svg>';
-}
+// ⚠ The icons are `vellum_ui::icon`'s, through the generated `icons.js`, and not this
+// file's own. Three modules on this page each hand-wrote the same set and the three
+// disagreed; `crates/vellum-ui/examples/web-icons.rs` says what that cost and how to
+// regenerate. Nothing here draws an icon of its own.
 
 function ensureStyle() {
   if (document.getElementById(STYLE_ID)) return;
@@ -348,7 +342,7 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
     back.href = listUrl.href;
     back.title = 'All boards (Esc)';
     back.setAttribute('aria-label', 'All boards');
-    back.innerHTML = svg(ICON_BACK) + '<span class="velm-chrome-back-label">Boards</span>';
+    back.innerHTML = svg(ICONS.back) + '<span class="velm-chrome-back-label">Boards</span>';
   }
 
   // The title when the caller has one, the id when it does not, and nothing at all when
@@ -379,9 +373,9 @@ export function mountChrome(mod, { canvas, boardId, boardTitle, token } = {}) {
   const fitBoard = needsCamera(() => mod.fit_board());
 
   const controls = [];
-  if (canZoom) controls.push(button('Zoom out', 'Zoom out (-)', ICON_MINUS, zoomOut));
-  if (canFit) controls.push(button('Fit board to the screen', 'Fit board (0)', ICON_FIT, fitBoard));
-  if (canZoom) controls.push(button('Zoom in', 'Zoom in (+)', ICON_PLUS, zoomIn));
+  if (canZoom) controls.push(button('Zoom out', 'Zoom out (-)', ICONS.minus, zoomOut));
+  if (canFit) controls.push(button('Fit board to the screen', 'Fit board (0)', ICONS.fit, fitBoard));
+  if (canZoom) controls.push(button('Zoom in', 'Zoom in (+)', ICONS.plus, zoomIn));
   for (const control of controls) control.disabled = !ready;
 
   // ⚠ **The one thing that tells you a board has stopped keeping up.**

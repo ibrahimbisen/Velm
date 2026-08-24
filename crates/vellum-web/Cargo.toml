@@ -44,6 +44,13 @@ vellum-chart.workspace = true
 vellum-flow.workspace = true
 vellum-mindmap.workspace = true
 vellum-table.workspace = true
+# Naming a picture before it is uploaded. `POST /api/v1/blobs/{hash}` makes the client say
+# what the bytes hash to and the server checks it, so a tab that wants to add a picture has
+# to be able to compute a BLAKE3-256 — the same one `vellum_store::Hash` computes, which is
+# what makes a picture added in a tab and one added on the Mac the same blob. Already a
+# workspace dependency for `vellum-store`; the `rayon` feature is off, so this is the
+# portable implementation and it crosses to wasm untouched.
+blake3.workspace = true
 serde.workspace = true
 vellum-render.workspace = true
 vellum-shapes.workspace = true
